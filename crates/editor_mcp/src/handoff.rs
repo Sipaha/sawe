@@ -39,6 +39,22 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_COUNT: u32 = 5;
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long to pause after connect attempt `attempt` failed, or `None` when
+/// there is nothing left to wait for.
+///
+/// The last attempt has no successor, so pausing after it burned one of the
+/// user's seconds on a decision that was already made: the loop's next act is
+/// to return `LockBusyButUnreachable`.
+fn retry_delay(attempt: u32) -> Option<Duration> {
+    (attempt < RETRY_COUNT).then_some(RETRY_INTERVAL)
+}
+
+/// The wait a user still faces once the first connect attempt has failed —
+/// what the message printed at that point promises them.
+fn remaining_retry_wait() -> Duration {
+    RETRY_INTERVAL * (RETRY_COUNT - 1)
+}
+
 #[derive(Debug)]
 pub enum HandoffOutcome {
     /// We acquired the lock — we are the canonical instance.
@@ -138,9 +154,24 @@ pub fn try_handoff_to_existing_instance(paths: Vec<PathBuf>) -> Result<HandoffOu
                     log::debug!(
                         "editor_mcp: handoff attempt {attempt}/{RETRY_COUNT} failed: {err}"
                     );
-                    // Main-thread retry loop, not a test.
-                    #[allow(clippy::disallowed_methods)]
-                    smol::Timer::after(RETRY_INTERVAL).await;
+                    if attempt == 1 {
+                        // Said on the terminal rather than only in the log,
+                        // because this is a command the user typed and the
+                        // alternative is several seconds of total silence
+                        // before either an opened file or an error. The
+                        // healthy hand-off never reaches this arm — it
+                        // connects on the first attempt and returns above —
+                        // so an ordinary `sawe <path>` stays silent.
+                        eprintln!(
+                            "sawe: the running instance is not answering yet; retrying for up to {}s…",
+                            remaining_retry_wait().as_secs()
+                        );
+                    }
+                    if let Some(delay) = retry_delay(attempt) {
+                        // Main-thread retry loop, not a test.
+                        #[allow(clippy::disallowed_methods)]
+                        smol::Timer::after(delay).await;
+                    }
                 }
             }
         }
@@ -568,6 +599,31 @@ mod tests {
         assert!(
             err.to_string().contains("did not reply within"),
             "got {err:?}"
+        );
+    }
+
+    /// The retry loop must not pause after its final attempt: that pause
+    /// expires with the decision already made, so it is pure added latency on
+    /// a command the user typed. Guarding it turns the worst case from
+    /// `RETRY_COUNT` intervals into `RETRY_COUNT - 1`, which is also what the
+    /// message printed after the first failure promises.
+    #[test]
+    fn the_last_attempt_does_not_pause_before_giving_up() {
+        assert_eq!(
+            retry_delay(RETRY_COUNT),
+            None,
+            "the final attempt has nothing to wait for"
+        );
+        let total: Duration = (1..=RETRY_COUNT).filter_map(retry_delay).sum();
+        assert_eq!(
+            total,
+            RETRY_INTERVAL * (RETRY_COUNT - 1),
+            "the loop must spend one interval less than it has attempts"
+        );
+        assert_eq!(
+            total,
+            remaining_retry_wait(),
+            "the wait promised after the first failure must be the wait actually served"
         );
     }
 
