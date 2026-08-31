@@ -632,7 +632,7 @@ fn run() -> Result<()> {
 
     let (server, server_name) =
         IpcOneShotServer::<IpcHandshake>::new().context("Handshake before Zed spawn")?;
-    let url = format!("zed-cli://{server_name}");
+    let url = format!("sawe-cli://{server_name}");
 
     let open_behavior = if args.new {
         cli::OpenBehavior::AlwaysNew
@@ -993,10 +993,8 @@ mod linux {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| paths::data_dir().clone());
 
-            let sock_path = data_dir.join(format!(
-                "zed-{}.sock",
-                *release_channel::RELEASE_CHANNEL_NAME
-            ));
+            let sock_path =
+                paths::cli_ipc_socket_in(&data_dir, release_channel::RELEASE_CHANNEL_NAME.as_str());
             let sock = UnixDatagram::unbound()?;
             if sock.connect(&sock_path).is_err() {
                 self.boot_background(ipc_url, user_data_dir)?;
@@ -1411,7 +1409,7 @@ mod mac_os {
                             kCFStringEncodingUTF8,
                             ptr::null(),
                         ));
-                        // equivalent to: open zed-cli:... -a /Applications/Zed\ Preview.app
+                        // equivalent to: open sawe-cli:... -a /Applications/Sawe\ Preview.app
                         let urls_to_open =
                             CFArray::from_copyable(&[url_to_open.as_concrete_TypeRef()]);
                         LSOpenFromURLSpec(

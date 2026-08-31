@@ -173,6 +173,32 @@ pub fn temp_dir() -> &'static PathBuf {
     TEMP_DIR.get_or_init(|| base_dir().join("cache"))
 }
 
+/// Returns the path to the datagram socket a second process uses to hand its
+/// command line to the already-running instance — the CLI hand-off.
+///
+/// `data_dir` is a parameter rather than a call to [`data_dir`] because the CLI
+/// may have been given `--user-data-dir`, and the editor it wakes up must be
+/// looked for under the same root.
+///
+/// This lives here, not at its two call sites, for the same reason the rebrand
+/// assertions at the bottom of this file exist. Those assert that the
+/// directories this crate hands out are named after this fork and not after the
+/// product it was forked from — and `zed-<channel>.sock` sat inside a directory
+/// they were passing, uncaught, for as long as it did precisely because the
+/// file name was appended by callers in `crates/cli` and `crates/zed`. A name
+/// this crate never spells is a name this crate cannot guard, so the
+/// construction moves in and the guard grows a case for it.
+pub fn cli_ipc_socket_in(data_dir: &Path, release_channel: &str) -> PathBuf {
+    data_dir.join(format!("sawe-{release_channel}.sock"))
+}
+
+/// Returns the path to the IPC socket of the crash-handler subprocess for the
+/// given pid. Same rule as [`cli_ipc_socket_in`]: composed here so the rebrand
+/// assertions can see the whole name.
+pub fn crash_handler_socket(pid: u32) -> PathBuf {
+    temp_dir().join(format!("sawe-crash-handler-{pid}"))
+}
+
 /// Returns the path to the hang traces directory.
 pub fn hang_traces_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -608,36 +634,66 @@ mod rebrand_tests {
     // under `cfg(test)`/`test-support`, `home_dir()` is hard-coded to
     // `/home/zed`, so the home prefix would otherwise trip the assertion on a
     // segment the rebrand doesn't own. Strip it first.
-    fn app_relative_lossy(p: &std::path::Path) -> String {
+    fn app_relative_lossy(p: &Path) -> String {
         p.strip_prefix(home_dir())
             .unwrap_or(p)
             .to_string_lossy()
             .to_ascii_lowercase()
     }
 
-    #[test]
-    fn config_dir_contains_sawe() {
-        let p = config_dir();
+    /// A path is ours when it names this fork and does not name the product it
+    /// was forked from. `label` is the function that produced it, so a failure
+    /// says which one drifted rather than only what it now spells.
+    #[track_caller]
+    fn assert_is_ours(label: &str, path: &Path) {
+        let lossy = path.to_string_lossy().to_ascii_lowercase();
         assert!(
-            p.to_string_lossy().contains("sawe") || p.to_string_lossy().contains("Sawe"),
-            "config_dir should mention sawe; got {p:?}"
+            lossy.contains("sawe"),
+            "{label} should mention sawe; got {path:?}"
         );
         assert!(
-            !app_relative_lossy(p).contains("zed"),
-            "config_dir must not mention zed; got {p:?}"
+            !app_relative_lossy(path).contains("zed"),
+            "{label} must not mention zed; got {path:?}"
         );
     }
 
     #[test]
-    fn data_dir_contains_sawe() {
-        let p = data_dir();
-        assert!(
-            p.to_string_lossy().contains("sawe") || p.to_string_lossy().contains("Sawe"),
-            "data_dir should mention sawe; got {p:?}"
+    fn app_controlled_dirs_are_ours() {
+        // `remote_server_dir_relative` / `remote_wsl_server_dir_relative` are
+        // deliberately absent: `.zed_server` is still a preserved upstream
+        // identifier at the time of writing, and renaming it has a
+        // compatibility consequence on remote hosts rather than being cosmetic.
+        assert_is_ours("base_dir", base_dir());
+        assert_is_ours("config_dir", config_dir());
+        assert_is_ours("data_dir", data_dir());
+        assert_is_ours("state_dir", state_dir());
+        assert_is_ours("temp_dir", temp_dir());
+        assert_is_ours("logs_dir", logs_dir());
+        assert_is_ours("database_dir", database_dir());
+        assert_is_ours("hang_traces_dir", hang_traces_dir());
+        assert_is_ours("remote_server_state_dir", remote_server_state_dir());
+    }
+
+    #[test]
+    fn app_controlled_files_are_ours() {
+        assert_is_ours("log_file", log_file());
+        assert_is_ours("old_log_file", old_log_file());
+        assert_is_ours("settings_file", settings_file());
+        assert_is_ours("keymap_file", keymap_file());
+    }
+
+    /// The case the two directory assertions could not see. Both of these file
+    /// names used to be composed at their call sites in other crates, which is
+    /// how a `zed-<channel>.sock` lived under a `data_dir()` this module was
+    /// asserting was clean. Composition moved into this crate so the assertion
+    /// covers the whole name; if it ever moves back out, this test stops
+    /// covering it, so it must not.
+    #[test]
+    fn caller_composed_names_are_ours() {
+        assert_is_ours(
+            "cli_ipc_socket_in",
+            &cli_ipc_socket_in(data_dir(), "stable"),
         );
-        assert!(
-            !app_relative_lossy(p).contains("zed"),
-            "data_dir must not mention zed; got {p:?}"
-        );
+        assert_is_ours("crash_handler_socket", &crash_handler_socket(4242));
     }
 }

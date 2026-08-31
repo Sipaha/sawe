@@ -54,7 +54,7 @@ impl OpenUrlModal {
         }
 
         // Handle this fork's own URLs internally.
-        if url.starts_with("sawe://") || url.starts_with("zed-cli://") {
+        if url.starts_with("sawe://") || url.starts_with("sawe-cli://") {
             OpenListener::global(cx).open(RawOpenRequest {
                 urls: vec![url],
                 ..Default::default()

@@ -41,7 +41,13 @@ pub(crate) const SCROLL_LINES: f32 = 3.0;
 pub(crate) const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) const DOUBLE_CLICK_DISTANCE: Pixels = px(5.0);
-pub(crate) const KEYRING_LABEL: &str = "zed-github-account";
+/// Label of this fork's entries in the user's Secret Service keyring. That
+/// keyring is a namespace shared with every other application on the machine,
+/// including a real Zed, so this is the one on-disk name in the rebrand whose
+/// collision is with another product rather than merely inelegant: two
+/// installs writing `zed-github-account` would read and overwrite each other's
+/// credentials. Renaming costs a single re-authentication.
+pub(crate) const KEYRING_LABEL: &str = "sawe-github-account";
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 const FILE_PICKER_PORTAL_MISSING: &str =

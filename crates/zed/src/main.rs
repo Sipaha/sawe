@@ -215,7 +215,7 @@ struct HandoffArgs {
     /// went into `paths`, rendered as typed. The file *is* opened; only the
     /// position is lost, so this is a separate loss from `unforwarded`.
     dropped_positions: Vec<String>,
-    /// `zed-cli://<server>` handshake urls. Not the user's arguments at all —
+    /// `sawe-cli://<server>` handshake urls. Not the user's arguments at all —
     /// see [`handoff_loss_report`].
     cli_handshakes: Vec<String>,
 }
@@ -240,12 +240,12 @@ struct HandoffArgs {
 /// It reaches here whenever this binary is invoked directly — a dev build, or
 /// the bundle's `libexec/sawe-bin`. Note that it does *not* arrive from the
 /// desktop entry: `Exec=` there is `bin/sawe`, which is `crates/cli`, and the
-/// CLI passes the editor only `zed-cli://<server>` in argv and sends the user's
+/// CLI passes the editor only `sawe-cli://<server>` in argv and sends the user's
 /// URLs over that IPC channel instead.
 fn split_handoff_args(paths_or_urls: &[String], diff_paths: &[String]) -> HandoffArgs {
     let mut handoff = HandoffArgs::default();
     for arg in paths_or_urls {
-        if arg.starts_with("zed-cli://") {
+        if arg.starts_with("sawe-cli://") {
             handoff.cli_handshakes.push(arg.clone());
         } else if let Some(path) = file_url_as_path(arg) {
             carry_path(&mut handoff, arg, path);
@@ -357,7 +357,7 @@ fn file_url_as_path(arg: &str) -> Option<PathBuf> {
 ///   opened at all — measured, the running instance grows a second window of
 ///   `kind: "folder"` rooted at that nonexistent path — so "opened at the
 ///   start of the file" would have asserted more than this process knows.
-/// - the `zed-cli://<server>` ipc handshake, which is not the user's argument
+/// - the `sawe-cli://<server>` ipc handshake, which is not the user's argument
 ///   at all: it is the socket `crates/cli` opened before it booted this
 ///   process, and the user's real request is on the far end of it. Listing that
 ///   url among "arguments NOT opened" told the user two untrue things — that
@@ -378,9 +378,9 @@ fn file_url_as_path(arg: &str) -> Option<PathBuf> {
 /// What it *does* say about provenance — that the connection was opened by
 /// "the `sawe` command that started this process" — is deliberate, and was
 /// weighed against the third mode, direct invocation of this binary
-/// (`libexec/sawe-bin zed-cli://…`, a dev build), where there is no `sawe`
+/// (`libexec/sawe-bin sawe-cli://…`, a dev build), where there is no `sawe`
 /// command at all. Left as it stands: that mode has no user request to
-/// describe either, because a live `zed-cli://<server>` only ever comes from
+/// describe either, because a live `sawe-cli://<server>` only ever comes from
 /// `crates/cli`. In the two modes anyone reaches by *using* the product the
 /// clause is exactly true, and naming the producer is the half of the sentence
 /// that explains why an argument the reader never typed is in their argv. Fed
@@ -851,7 +851,7 @@ fn main() {
                         background_executor1.spawn(task).detach();
                     }
                 },
-                |pid| paths::temp_dir().join(format!("zed-crash-handler-{pid}")),
+                paths::crash_handler_socket,
                 move |duration| background_executor.timer(duration),
             )),
         )
@@ -2538,7 +2538,7 @@ impl ToString for IdType {
 /// new scheme only needs to be added here.
 fn is_url_scheme(arg: &str) -> bool {
     arg.starts_with("file://")
-        || arg.starts_with("zed-cli://")
+        || arg.starts_with("sawe-cli://")
         || arg.starts_with("ssh://")
         || arg.starts_with("sawe://")
 }
@@ -2987,16 +2987,16 @@ mod tests {
         );
     }
 
-    /// `zed-cli://<server>` is the ipc handshake `crates/cli` puts in this
+    /// `sawe-cli://<server>` is the ipc handshake `crates/cli` puts in this
     /// process's argv, not something a user typed. Listing it among "arguments
     /// NOT opened" named an internal url at a person and understated the harm.
     #[test]
     fn a_cli_handshake_is_not_reported_as_one_of_the_users_arguments() {
-        let split = split_handoff_args(&["zed-cli:///tmp/socket-name".to_string()], &[]);
+        let split = split_handoff_args(&["sawe-cli:///tmp/socket-name".to_string()], &[]);
         assert_eq!(
             split,
             HandoffArgs {
-                cli_handshakes: vec!["zed-cli:///tmp/socket-name".to_string()],
+                cli_handshakes: vec!["sawe-cli:///tmp/socket-name".to_string()],
                 ..Default::default()
             },
             "the handshake is neither a path to carry nor a user argument to list"
@@ -3010,7 +3010,7 @@ mod tests {
             ]
         );
         assert!(
-            !lines[0].contains("zed-cli://"),
+            !lines[0].contains("sawe-cli://"),
             "the internal url must not be shown to a person"
         );
         assert!(
