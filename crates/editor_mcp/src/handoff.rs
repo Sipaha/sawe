@@ -7,6 +7,14 @@ use smol::net::unix::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Wire name of the tool the handoff calls on the existing instance. The
+/// handoff dials the GLOBAL socket, so this name must be in
+/// [`crate::lifecycle::GLOBAL_TOOLS`] — `lifecycle`'s
+/// `handoff_tool_is_global` test asserts exactly that against this constant,
+/// so a rename or an accidental drop from the allow-list fails a test instead
+/// of silently breaking `sawe <path>` on a second launch.
+pub const HANDOFF_TOOL_NAME: &str = "editor.handle_cli_args";
+
 const RETRY_COUNT: u32 = 5;
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -88,7 +96,7 @@ pub fn try_handoff_to_existing_instance(paths: Vec<PathBuf>) -> Result<HandoffOu
                         "id": 1,
                         "method": "tools/call",
                         "params": {
-                            "name": "editor.handle_cli_args",
+                            "name": HANDOFF_TOOL_NAME,
                             "arguments": HandleCliArgsArgs {
                                 paths: path_strings.clone(),
                                 cwd: cwd.clone(),

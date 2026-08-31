@@ -177,6 +177,16 @@ const GLOBAL_TOOLS: &[&str] = &[
     "editor.subscribe",
     "editor.unsubscribe",
     "editor.list_subscriptions",
+    // Single-instance CLI handoff. `handoff::try_handoff_to_existing_instance`
+    // dials `socket_path()` — the GLOBAL socket — so this MUST be global or a
+    // second `sawe <path>` invocation gets "Tool not found", the handoff
+    // returns Err, and main.rs logs "continuing as canonical" and silently
+    // drops the paths the user asked to open. Same class of regression as the
+    // Remote Control block below. It is deliberately NOT in SHARED_TOOLS: it
+    // opens arbitrary absolute paths through `workspace::open_paths` and
+    // carries no `solution_id` to inject, so serving it to a scoped subagent
+    // is a cross-solution escape hatch with no isolation to gain.
+    "editor.handle_cli_args",
     // Solution lifecycle + discovery (a scoped subagent never
     // creates/opens/closes/deletes/reorders Solutions).
     "solutions.list",
@@ -189,6 +199,15 @@ const GLOBAL_TOOLS: &[&str] = &[
     "solutions.reorder_members",
     "solutions.set_active_member",
     "solutions.find_for_path",
+    // Switching a window's active Solution is cross-solution by definition:
+    // the params are a `window_id` (windows host many Solutions — the same
+    // argument that keeps all of `windows.*` global) plus the *target*
+    // `solution_id`, which is precisely the Solution you are NOT on. On a
+    // per-solution socket the bound id is force-injected over that target, so
+    // the tool could only ever "switch" to the Solution it is already bound
+    // to — and that self-switch is not a no-op: it closes every open editor
+    // item and replays the tab snapshot. Global-only, never SHARED_TOOLS.
+    "solutions.switch",
     // Member management + inspection: shared (see SHARED_TOOLS) — kept on the
     // global socket (the operator addresses any Solution by id, and a member
     // must be addable before the Solution can open) and also cloned into each
@@ -734,6 +753,51 @@ mod tests {
             assert!(is_global_tool(name), "{name} must be a global-socket tool");
             assert!(is_shared_tool(name), "{name} must also reach scoped agents");
         }
+    }
+
+    // The single-instance CLI handoff dials the GLOBAL socket
+    // (`handoff::try_handoff_to_existing_instance` -> `socket_path()`) and
+    // calls exactly this tool. It was missing from GLOBAL_TOOLS, so the split
+    // moved it onto per-solution sockets only and every second `sawe <path>`
+    // launch got `-32601 Tool not found` -> handoff Err -> main.rs warned
+    // "continuing as canonical" and dropped the user's paths on the floor.
+    // Asserting against the constant the handoff actually sends keeps a rename
+    // from re-opening the gap behind a stale string literal here.
+    #[test]
+    fn handoff_tool_is_global() {
+        assert!(
+            is_global_tool(crate::handoff::HANDOFF_TOOL_NAME),
+            "{} is what the single-instance handoff calls on the GLOBAL socket; \
+             leaving it out of GLOBAL_TOOLS makes `sawe <path>` silently stop \
+             opening paths in the running editor.",
+            crate::handoff::HANDOFF_TOOL_NAME,
+        );
+        // Opening arbitrary absolute paths is not something a Solution-scoped
+        // subagent should reach, and the tool declares no `solution_id` for a
+        // per-solution socket to inject, so sharing it would buy zero isolation.
+        assert!(
+            !is_shared_tool(crate::handoff::HANDOFF_TOOL_NAME),
+            "{} must not be served from per-solution sockets",
+            crate::handoff::HANDOFF_TOOL_NAME,
+        );
+    }
+
+    // `solutions.switch` targets a *different* Solution than the caller's, in a
+    // window that hosts many Solutions. On a per-solution socket the bound id is
+    // force-injected over the caller's target `solution_id`, so the tool could
+    // only ever self-switch — which closes every open editor item and replays
+    // the tab snapshot. It must be global, and must NOT be shared.
+    #[test]
+    fn solution_switch_is_global_and_not_shared() {
+        assert!(
+            is_global_tool("solutions.switch"),
+            "solutions.switch must be a global-socket tool"
+        );
+        assert!(
+            !is_shared_tool("solutions.switch"),
+            "solutions.switch must not be served from per-solution sockets, where \
+             solution_id injection would overwrite the caller's target"
+        );
     }
 
     #[test]
