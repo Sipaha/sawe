@@ -2,7 +2,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use smol::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use smol::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use smol::net::unix::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,6 +18,23 @@ pub const HANDOFF_TOOL_NAME: &str = "editor.handle_cli_args";
 /// JSON-RPC id the handoff sends, and the id it must match a frame against
 /// before treating that frame as the reply.
 const HANDOFF_REQUEST_ID: i64 = 1;
+
+/// How long to wait for the reply frame once the request is on the wire.
+///
+/// This bounds the *whole* read phase rather than each frame. A per-frame
+/// timer would be the wrong shape: the server broadcasts `editor/notification`
+/// frames to every connected client (this one never subscribes and still
+/// receives them), so a busy editor can refresh a per-frame timer
+/// indefinitely while our reply never arrives.
+///
+/// 30s is chosen against an asymmetric cost. Too short is the worse failure:
+/// `handle_cli_args` awaits `open_paths`, so the reply is gated on a real
+/// workspace open that can take seconds on a large cold project, and a
+/// premature timeout puts us straight back into the silent "continuing as
+/// canonical" path that drops the user's file. Too long merely makes a wedged
+/// editor take 30s to report itself. So: comfortably above any plausible
+/// open, still a bounded wait instead of hanging the user's terminal forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 const RETRY_COUNT: u32 = 5;
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -113,66 +130,9 @@ pub fn try_handoff_to_existing_instance(paths: Vec<PathBuf>) -> Result<HandoffOu
                     bytes.push(b'\n');
                     stream.write_all(&bytes).await.context("send handoff")?;
 
-                    // Read newline-delimited frames until the one carrying our
-                    // request id. `editor/notification` frames interleave with
-                    // responses on this socket and carry no `id` at all — and
-                    // opening a path makes the server emit `buffer_opened`
-                    // *before* the reply, so the very first frame is routinely
-                    // a notification. Parsing frame 1 blindly (what this used
-                    // to do) therefore failed with "missing
-                    // result.structuredContent" exactly when the handoff had
-                    // in fact worked, and only for paths not already open —
-                    // which is why it read as intermittent.
-                    let response = loop {
-                        let mut buffer = Vec::new();
-                        let mut byte = [0u8; 1];
-                        loop {
-                            match stream.read(&mut byte).await {
-                                Ok(0) => break,
-                                Ok(_) => {
-                                    if byte[0] == b'\n' {
-                                        break;
-                                    }
-                                    buffer.push(byte[0]);
-                                }
-                                Err(err) => return Err(err.into()),
-                            }
-                        }
-                        if buffer.is_empty() {
-                            return Err(anyhow!(
-                                "existing instance closed the connection before replying"
-                            ));
-                        }
-                        let frame: serde_json::Value =
-                            serde_json::from_slice(&buffer).context("parse handoff response")?;
-                        if frame.get("id").and_then(|id| id.as_i64()) == Some(HANDOFF_REQUEST_ID) {
-                            break frame;
-                        }
-                    };
-                    // Surface a JSON-RPC error verbatim. "Tool not found"
-                    // here means `HANDOFF_TOOL_NAME` fell off the global
-                    // socket's catalog (see `lifecycle::GLOBAL_TOOLS`), which
-                    // the generic message below used to hide.
-                    if let Some(err) = response.get("error") {
-                        let message = err
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .unwrap_or("(no message)");
-                        return Err(anyhow!("existing instance returned an error: {message}"));
-                    }
-                    let structured = response
-                        .get("result")
-                        .and_then(|r| r.get("structuredContent"))
-                        .cloned()
-                        .ok_or_else(|| anyhow!("missing result.structuredContent"))?;
-                    let outcome: HandleCliArgsResult = serde_json::from_value(structured)?;
-                    if !outcome.handled {
-                        let detail = outcome.error.as_deref().unwrap_or("(no detail)");
-                        return Err(anyhow!("existing instance refused handoff: {detail}"));
-                    }
-                    return Ok(HandoffOutcome::HandedOff {
-                        focused_window_id: outcome.focused_window_id,
-                    });
+                    let response =
+                        read_reply_frame(&mut stream, HANDOFF_REQUEST_ID, READ_TIMEOUT).await?;
+                    return interpret_reply(response);
                 }
                 Err(err) => {
                     log::debug!(
@@ -188,4 +148,324 @@ pub fn try_handoff_to_existing_instance(paths: Vec<PathBuf>) -> Result<HandoffOu
             lockholder_pid: holder_pid,
         })
     })
+}
+
+/// One newline-delimited unit read off the socket.
+enum Frame {
+    Line(Vec<u8>),
+    /// Peer closed with nothing buffered.
+    Eof,
+}
+
+async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
+    let mut buffer = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte).await {
+            // A final frame without a trailing newline is still a frame.
+            Ok(0) => {
+                return Ok(if buffer.is_empty() {
+                    Frame::Eof
+                } else {
+                    Frame::Line(buffer)
+                });
+            }
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    return Ok(Frame::Line(buffer));
+                }
+                buffer.push(byte[0]);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// Read newline-delimited frames until one carries `request_id`.
+///
+/// `editor/notification` frames interleave with responses on this socket and
+/// carry no `id` at all — and opening a path makes the server emit
+/// `buffer_opened` *before* the reply, so the first frame back is routinely a
+/// notification. Taking frame 1 as the reply (what this used to do) therefore
+/// failed with "missing result.structuredContent" exactly when the handoff had
+/// in fact worked, and only for paths not already open, which is why it read
+/// as intermittent.
+///
+/// A frame that does not parse is a hard error rather than something to skip:
+/// every frame on this socket is `serde_json` output from our own server, so
+/// garbage means the protocol is broken and failing loudly beats waiting out
+/// the timeout.
+async fn read_reply_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    request_id: i64,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let read = async {
+        loop {
+            match read_line(reader).await? {
+                Frame::Eof => {
+                    return Err(anyhow!(
+                        "existing instance closed the connection before replying"
+                    ));
+                }
+                Frame::Line(buffer) => {
+                    // Blank keepalive lines are not frames.
+                    if buffer.iter().all(u8::is_ascii_whitespace) {
+                        continue;
+                    }
+                    let frame: serde_json::Value =
+                        serde_json::from_slice(&buffer).context("parse handoff response")?;
+                    // A notification has no `id`; a foreign or null `id` is
+                    // someone else's reply. Neither is ours.
+                    if frame.get("id").and_then(serde_json::Value::as_i64) == Some(request_id) {
+                        return Ok(frame);
+                    }
+                }
+            }
+        }
+    };
+    let expire = async {
+        #[allow(clippy::disallowed_methods)]
+        smol::Timer::after(timeout).await;
+        Err(anyhow!(
+            "existing instance did not reply within {timeout:?} (it may be wedged)"
+        ))
+    };
+    smol::future::or(read, expire).await
+}
+
+/// Turn the matched reply frame into an outcome.
+fn interpret_reply(response: serde_json::Value) -> Result<HandoffOutcome> {
+    // Surface a JSON-RPC error verbatim. "Tool not found" here means
+    // `HANDOFF_TOOL_NAME` fell off the global socket's catalog (see
+    // `lifecycle::GLOBAL_TOOLS`), which the generic message below used to hide.
+    if let Some(err) = response.get("error") {
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("(no message)");
+        return Err(anyhow!("existing instance returned an error: {message}"));
+    }
+    let structured = response
+        .get("result")
+        .and_then(|r| r.get("structuredContent"))
+        .cloned()
+        .ok_or_else(|| anyhow!("missing result.structuredContent"))?;
+    let outcome: HandleCliArgsResult = serde_json::from_value(structured)?;
+    if !outcome.handled {
+        let detail = outcome.error.as_deref().unwrap_or("(no detail)");
+        return Err(anyhow!("existing instance refused handoff: {detail}"));
+    }
+    Ok(HandoffOutcome::HandedOff {
+        focused_window_id: outcome.focused_window_id,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smol::io::Cursor;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(250);
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        smol::block_on(future)
+    }
+
+    fn read_frames(script: &str) -> Result<serde_json::Value> {
+        let mut reader = Cursor::new(script.as_bytes().to_vec());
+        block_on(read_reply_frame(
+            &mut reader,
+            HANDOFF_REQUEST_ID,
+            TEST_TIMEOUT,
+        ))
+    }
+
+    /// The regression this whole change exists for: the reply is NOT the first
+    /// frame. A leading `buffer_opened` notification (no `id`) and a foreign
+    /// reply (`id: 99`) must both be skipped.
+    #[test]
+    fn reply_is_found_behind_a_notification_and_a_foreign_id() {
+        let script = concat!(
+            r#"{"jsonrpc":"2.0","method":"editor/notification","params":{"kind":"buffer_opened"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":99,"result":{"structuredContent":{"handled":false}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"handled":true,"opened_paths":["/tmp/a"],"focused_window_id":"window:7"}}}"#,
+            "\n",
+        );
+        let frame = read_frames(script).expect("reply found");
+        assert_eq!(frame["id"].as_i64(), Some(1));
+        match interpret_reply(frame).expect("handed off") {
+            HandoffOutcome::HandedOff { focused_window_id } => {
+                assert_eq!(focused_window_id.as_deref(), Some("window:7"));
+            }
+            other => panic!("expected HandedOff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_stream_edge_cases() {
+        // (name, script, expected substring of the error)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "eof before any frame",
+                "",
+                "closed the connection before replying",
+            ),
+            (
+                "eof after only a notification",
+                "{\"jsonrpc\":\"2.0\",\"method\":\"editor/notification\"}\n",
+                "closed the connection before replying",
+            ),
+            (
+                "malformed frame is a hard error",
+                "not json at all\n",
+                "parse handoff response",
+            ),
+            (
+                "null id is not our id, then eof",
+                "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{}}\n",
+                "closed the connection before replying",
+            ),
+        ];
+        for (name, script, expected) in cases {
+            let err = read_frames(script)
+                .expect_err(&format!("{name}: expected an error"))
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "{name}: expected error containing {expected:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// Bare newlines are keepalives, not frames, and must not be mistaken for
+    /// EOF. The reply still arrives after them.
+    #[test]
+    fn blank_lines_are_skipped_not_treated_as_eof() {
+        let script = concat!(
+            "\n",
+            "  \n",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"handled":true}}}"#,
+            "\n",
+        );
+        let frame = read_frames(script).expect("reply found past blank lines");
+        assert_eq!(frame["id"].as_i64(), Some(1));
+    }
+
+    /// A final frame with no trailing newline is still a frame.
+    #[test]
+    fn reply_without_trailing_newline_is_read() {
+        let script = r#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"handled":true}}}"#;
+        let frame = read_frames(script).expect("unterminated reply read");
+        assert_eq!(frame["id"].as_i64(), Some(1));
+    }
+
+    /// An error response carrying OUR id is returned by the reader (it is our
+    /// reply) and turned into a legible error by `interpret_reply`. This is the
+    /// shape that "Tool not found" arrives in when the tool falls off
+    /// `GLOBAL_TOOLS` — the defect this module's constant is pinned against.
+    #[test]
+    fn jsonrpc_error_with_our_id_is_reported_verbatim() {
+        let script = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Tool not found: editor.handle_cli_args"}}"#,
+            "\n",
+        );
+        let frame = read_frames(script).expect("error frame is still our reply");
+        let err = interpret_reply(frame)
+            .expect_err("error response")
+            .to_string();
+        assert!(
+            err.contains("Tool not found: editor.handle_cli_args"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reply_missing_structured_content_is_reported() {
+        let frame = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}});
+        let err = interpret_reply(frame)
+            .expect_err("no structuredContent")
+            .to_string();
+        assert!(
+            err.contains("missing result.structuredContent"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn refusal_is_reported_with_its_detail() {
+        let frame = serde_json::json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"structuredContent":{"handled":false,"error":"path resolution failed"}}
+        });
+        let err = interpret_reply(frame).expect_err("refused").to_string();
+        assert!(err.contains("path resolution failed"), "got {err:?}");
+    }
+
+    /// A reader that never yields and never closes — the wedged-handler case.
+    /// Before the bound was added this hung the user's terminal forever.
+    struct NeverReady;
+
+    impl AsyncRead for NeverReady {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn a_wedged_peer_times_out_instead_of_hanging() {
+        let mut reader = NeverReady;
+        let err = block_on(read_reply_frame(
+            &mut reader,
+            HANDOFF_REQUEST_ID,
+            TEST_TIMEOUT,
+        ))
+        .expect_err("must not hang");
+        assert!(
+            err.to_string().contains("did not reply within"),
+            "got {err:?}"
+        );
+    }
+
+    /// A notification arriving before a wedged handler must not refresh the
+    /// bound: the deadline covers the whole read phase, not each frame.
+    #[test]
+    fn notification_then_silence_still_times_out() {
+        let notification = b"{\"jsonrpc\":\"2.0\",\"method\":\"editor/notification\"}\n";
+        let mut reader = Cursor::new(notification.to_vec()).chain(NeverReady);
+        let err = block_on(read_reply_frame(
+            &mut reader,
+            HANDOFF_REQUEST_ID,
+            TEST_TIMEOUT,
+        ))
+        .expect_err("must not hang");
+        assert!(
+            err.to_string().contains("did not reply within"),
+            "got {err:?}"
+        );
+    }
+
+    /// Finding 3: the handoff's constant must equal the name the tool actually
+    /// registers under. `lifecycle`'s `handoff_tool_is_global` only pins
+    /// constant <-> allow-list; without this, renaming `HandleCliArgsTool::NAME`
+    /// in `crates/workspace/src/mcp/handle_cli_args.rs` leaves every test green
+    /// and silently re-breaks `sawe <path>` on a second launch.
+    #[test]
+    fn constant_matches_the_registered_tool_name() {
+        use context_server::listener::McpServerTool as _;
+        assert_eq!(
+            workspace::mcp::handle_cli_args::HandleCliArgsTool::NAME,
+            HANDOFF_TOOL_NAME,
+            "the handoff calls HANDOFF_TOOL_NAME but the tool registers under a \
+             different wire name — `sawe <path>` would get 'Tool not found'"
+        );
+    }
 }
