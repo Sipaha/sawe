@@ -529,6 +529,12 @@ impl AutoUpdater {
         })?;
 
         set_status("Fetching remote server release", cx);
+        // Not a name this fork produces, and deliberately not rebranded by the
+        // disown pass: it is the asset name in *Zed Industries'* release feed,
+        // sent as a query parameter to `cloud.zed.dev`. Spelling it
+        // `sawe-remote-server` would ask their API for an asset that does not
+        // exist. What lands on the remote host is named by
+        // `paths::remote_server_binary_name`, which is ours.
         let release = Self::get_release_asset(
             &this,
             release_channel,
@@ -584,6 +590,7 @@ impl AutoUpdater {
                 .context("auto-update not initialized")
         })?;
 
+        // Upstream's asset name, not ours - see `download_remote_server_release`.
         let release =
             Self::get_release_asset(&this, channel, version, "zed-remote-server", os, arch, cx)
                 .await?;

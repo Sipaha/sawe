@@ -4,12 +4,13 @@ set -eu
 # Uninstalls sawe that was installed using the install.sh script
 #
 # Deliberately does NOT touch $HOME/.zed_server (upstream's uninstaller does).
-# `.zed_server` is a preserved shared identifier -- paths::remote_server_dir_relative()
-# returns it unchanged -- so a real Zed uses the same directory, and the binaries
-# inside it are named `zed-remote-server-<channel>-<version>` by both products, so
-# ours cannot even be told apart from theirs. It is also populated by *incoming*
-# remote connections rather than by installing this editor, so removing it would
-# delete another product's files that this install never created.
+# That directory belonged to this fork too until the disown pass, when
+# paths::remote_server_dir_relative() became `.sawe_server` -- so on a host that
+# saw an older build of this editor, `.zed_server` may hold binaries of ours,
+# named `zed-remote-server-<channel>-<version>` exactly as a real Zed names its
+# own. We cannot tell them apart, so we remove neither. `.sawe_server` is not
+# removed either: it is populated on a *remote* host by an incoming connection,
+# not by installing this editor here, and this script uninstalls a local install.
 
 check_remaining_installations() {
     platform="$(uname -s)"
