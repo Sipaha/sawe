@@ -199,17 +199,93 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
     }
 }
 
-/// The path arguments the single-instance hand-off can carry.
+/// How the single-instance hand-off splits the command line.
 ///
-/// URLs are filtered out because `editor.handle_cli_args` opens paths, not
-/// URLs. That filter is about the *hand-off*, and must not be mistaken for the
-/// set of things a giving-up exit drops — see [`dropped_args_report`].
-fn handoff_paths(paths_or_urls: &[String]) -> Vec<PathBuf> {
-    paths_or_urls
-        .iter()
-        .filter(|arg| !is_url_scheme(arg))
-        .map(PathBuf::from)
-        .collect()
+/// This is about the *hand-off* only, and must not be mistaken for the set of
+/// things a giving-up exit drops — those exits drop everything, see
+/// [`dropped_args_report`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HandoffArgs {
+    /// Carried to the running instance and opened there.
+    paths: Vec<PathBuf>,
+    /// Everything the hand-off cannot carry, rendered the way the user typed
+    /// it so the report can name it back to them.
+    unforwarded: Vec<String>,
+}
+
+/// Split the command line into what `editor.handle_cli_args` can carry and
+/// what it cannot.
+///
+/// The tool's contract is a list of paths, which it hands to
+/// `workspace::open_paths` — so a path goes, and anything that needs URL
+/// routing (`OpenRequest::parse` -> `handle_open_request`, both of which live
+/// in this crate and are unreachable from the `workspace` crate that serves
+/// the tool) does not. `--diff` pairs are in the same position: they are read
+/// only by this process's own startup, further down this file.
+///
+/// `file://` is the exception, and it is less a special case than a spelling:
+/// `OpenRequest::parse_file_path` turns such a URL into a path with one strip
+/// and one percent-decode and opens it exactly as this hand-off would.
+/// Carrying it is therefore parity with the canonical instance, not new
+/// behaviour — and it is the form the shipped desktop entry produces, since
+/// `Exec=` is `%U` (`script/bundle-linux`), so a file manager's "open with
+/// Sawe" arrives here as a URL and used to be dropped in silence.
+fn split_handoff_args(paths_or_urls: &[String], diff_paths: &[String]) -> HandoffArgs {
+    let mut paths = Vec::new();
+    let mut unforwarded = Vec::new();
+    for arg in paths_or_urls {
+        if let Some(path) = file_url_as_path(arg) {
+            paths.push(path);
+        } else if is_url_scheme(arg) {
+            unforwarded.push(arg.clone());
+        } else {
+            paths.push(PathBuf::from(arg));
+        }
+    }
+    // `--diff` takes its two paths as one argument pair; clap enforces the
+    // pairing, but `chunks` is used rather than indexing so a hypothetical odd
+    // tail is reported rather than panicked on.
+    for pair in diff_paths.chunks(2) {
+        unforwarded.push(format!("--diff {}", pair.join(" ")));
+    }
+    HandoffArgs { paths, unforwarded }
+}
+
+/// A `file://` URL as the path it denotes, or `None` if it is not one.
+///
+/// Deliberately byte-for-byte the rule in `OpenRequest::parse_file_path`
+/// (strip the scheme, percent-decode, take the rest verbatim), including its
+/// treatment of an authority component: `file://host/p` yields the relative
+/// `host/p` there too. Diverging here would make the same URL open different
+/// files depending on whether an instance happened to be running.
+fn file_url_as_path(arg: &str) -> Option<PathBuf> {
+    let file = arg.strip_prefix("file://")?;
+    let decoded = urlencoding::decode(file).log_err()?;
+    Some(PathBuf::from(decoded.into_owned()))
+}
+
+/// The stderr line for a hand-off that *succeeded* and still left arguments
+/// behind.
+///
+/// This branch had no accounting at all: `sawe /tmp/a sawe://x` opened
+/// `/tmp/a` in the running instance, threw `sawe://x` away and exited 0 with
+/// an empty terminal. That is worse than the give-up exits this session
+/// already fixed, because nothing failed and the user has no reason to look.
+///
+/// The exit code stays 0 on purpose. The hand-off did happen and the paths did
+/// open; a non-zero exit would report the whole command as failed, and the
+/// canonical instance exits 0 for the same arguments. And this names the
+/// arguments rather than counting them: unlike the give-up exits, only a
+/// subset is lost, so the user needs to know which.
+fn unforwarded_args_report(unforwarded: &[String]) -> Vec<String> {
+    if unforwarded.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "sawe: the running instance opens paths only — {} argument(s) were NOT opened: {}",
+        unforwarded.len(),
+        unforwarded.join(", ")
+    )]
 }
 
 /// The stderr lines that go with an exit that opened nothing.
@@ -224,12 +300,13 @@ fn handoff_paths(paths_or_urls: &[String]) -> Vec<PathBuf> {
 ///   without opening anything, which is the same silent drop with no error
 ///   value to carry;
 /// - the count is over **every** command-line argument, not only the ones
-///   [`handoff_paths`] would have carried. A canonical instance turns each
-///   element of `paths_or_urls` into a URL and feeds it to the open listener
-///   (`parse_url_arg` + `open_listener.open`, further down this file), so a
-///   `sawe://…` argument is lost by these exits exactly as a path is. Sizing
-///   this line off the hand-off's path list instead made `sawe sawe://…`
-///   report nothing at all about what it had just thrown away;
+///   [`split_handoff_args`] would have carried. A canonical instance turns
+///   each element of `paths_or_urls` into a URL and feeds it to the open
+///   listener (`parse_url_arg` + `open_listener.open`, further down this
+///   file), and reads `--diff` pairs there too, so those arguments are lost by
+///   these exits exactly as a path is. Sizing this line off the hand-off's
+///   path list instead made `sawe sawe://…` report nothing at all about what
+///   it had just thrown away;
 /// - with no arguments there is nothing to warn about, so a second `sawe` with
 ///   no arguments stays as quiet as it has always been.
 fn dropped_args_report(handoff_failure: Option<&str>, arg_count: usize) -> Vec<String> {
@@ -494,10 +571,11 @@ fn main() {
     // its MCP server is reachable, hand off our CLI paths to it and exit.
     // Otherwise we continue and become the canonical instance (later we'll
     // bind the MCP server in `editor_mcp::start_server`).
-    let handoff_paths = handoff_paths(&args.paths_or_urls);
-    // Sized off every argument, not off `handoff_paths`: the exits below open
-    // nothing at all, so a `sawe://…` argument is dropped just like a path.
-    let dropped_arg_count = args.paths_or_urls.len();
+    let handoff_args = split_handoff_args(&args.paths_or_urls, &args.diff);
+    // Sized off every argument, not off what the hand-off carries: the exits
+    // below open nothing at all, so a `sawe://…` argument and a `--diff` pair
+    // are dropped just like a path.
+    let dropped_arg_count = args.paths_or_urls.len() + args.diff.len();
     // Why the reason is carried to the exit site instead of being reported
     // here: a hand-off failure is only *user-visible harm* if we then give up
     // without opening anything. When it fails and we go on to become the
@@ -506,12 +584,17 @@ fn main() {
     // ordinary case noisy for nothing. So the reason rides along and is
     // printed only by the branch that returns without doing the work.
     let mut handoff_failure: Option<String> = None;
-    match editor_mcp::try_handoff_to_existing_instance(handoff_paths) {
+    match editor_mcp::try_handoff_to_existing_instance(handoff_args.paths.clone()) {
         Ok(editor_mcp::HandoffOutcome::HandedOff { focused_window_id }) => {
             log::info!(
                 "sawe: handed off to existing instance (window: {:?})",
                 focused_window_id
             );
+            // The one exit that opened something and can still have lost
+            // something. Silent for the ordinary path-only hand-off.
+            for line in unforwarded_args_report(&handoff_args.unforwarded) {
+                eprintln!("{line}");
+            }
             return;
         }
         Ok(editor_mcp::HandoffOutcome::LockBusyButUnreachable { lockholder_pid }) => {
@@ -2532,7 +2615,11 @@ fn check_for_conpty_dll() {
 
 #[cfg(test)]
 mod tests {
-    use super::{dropped_args_report, handoff_paths, unreachable_instance_report};
+    use super::{
+        HandoffArgs, dropped_args_report, split_handoff_args, unforwarded_args_report,
+        unreachable_instance_report,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn dropped_args_are_reported_without_a_failure_to_blame() {
@@ -2575,27 +2662,110 @@ mod tests {
     /// The hand-off carries paths only, but the exits that give up drop
     /// *everything* — so the dropped-argument count must come from the whole
     /// argument list and not from what the hand-off was given. Sizing it off
-    /// `handoff_paths` made `sawe sawe://…` report nothing at all.
+    /// the hand-off's paths made `sawe sawe://…` report nothing at all.
     #[test]
     fn a_url_argument_is_not_handed_off_but_is_still_reported_as_dropped() {
         let args = vec![
             "/tmp/a.txt".to_string(),
             "sawe://file/tmp/b.txt".to_string(),
-            "file:///tmp/c.txt".to_string(),
         ];
 
-        let carried = handoff_paths(&args);
+        let split = split_handoff_args(&args, &[]);
         assert_eq!(
-            carried.len(),
-            1,
-            "only the plain path is a hand-off path, got {carried:?}"
+            split.paths,
+            vec![PathBuf::from("/tmp/a.txt")],
+            "a scheme the tool cannot route is not a hand-off path"
         );
 
         assert_eq!(
             dropped_args_report(None, args.len()),
-            vec!["sawe: 3 argument(s) from the command line were NOT opened."],
+            vec!["sawe: 2 argument(s) from the command line were NOT opened."],
             "the report is sized off every argument, not off the hand-off's paths"
         );
+    }
+
+    /// A `file://` URL is a path spelled differently, and the running instance
+    /// opens it with `workspace::open_paths` exactly as it opens a path — so
+    /// it is carried, not reported. The desktop entry's `Exec=%U` makes this
+    /// the shape a file manager sends, which is why it must not be lost.
+    #[test]
+    fn a_file_url_is_carried_as_the_path_it_denotes() {
+        let split = split_handoff_args(
+            &[
+                "file:///tmp/c.txt".to_string(),
+                "file:///tmp/a%20b.txt".to_string(),
+            ],
+            &[],
+        );
+        assert_eq!(
+            split,
+            HandoffArgs {
+                paths: vec![PathBuf::from("/tmp/c.txt"), PathBuf::from("/tmp/a b.txt")],
+                unforwarded: Vec::new(),
+            },
+            "a file:// URL must be percent-decoded and carried, as OpenRequest::parse does"
+        );
+        assert!(
+            unforwarded_args_report(&split.unforwarded).is_empty(),
+            "nothing was lost, so nothing is said"
+        );
+    }
+
+    /// The hole this task exists for: the hand-off *succeeds*, opens the path,
+    /// and used to exit 0 having thrown the rest away without a word.
+    #[test]
+    fn a_successful_handoff_names_what_it_could_not_carry() {
+        let split = split_handoff_args(
+            &["/tmp/a.txt".to_string(), "sawe://x".to_string()],
+            &["/tmp/old.rs".to_string(), "/tmp/new.rs".to_string()],
+        );
+        assert_eq!(
+            split.paths,
+            vec![PathBuf::from("/tmp/a.txt")],
+            "the plain path is still handed off"
+        );
+        assert_eq!(
+            unforwarded_args_report(&split.unforwarded),
+            vec![
+                "sawe: the running instance opens paths only — 2 argument(s) were NOT opened: \
+                 sawe://x, --diff /tmp/old.rs /tmp/new.rs"
+            ],
+            "both the URL and the diff pair must be named back to the user"
+        );
+    }
+
+    /// `--diff` is read only by this process's own startup, so a hand-off
+    /// abandons it — and the give-up exits drop it too, which the count they
+    /// print must include. Verified rather than assumed: it is a separate clap
+    /// field from `paths_or_urls` and neither path handles it.
+    #[test]
+    fn diff_pairs_are_abandoned_by_the_handoff_and_counted_by_the_giving_up_exits() {
+        let diff = vec!["/tmp/old.rs".to_string(), "/tmp/new.rs".to_string()];
+        let split = split_handoff_args(&[], &diff);
+        assert!(
+            split.paths.is_empty(),
+            "a diff pair is not a path the hand-off can open"
+        );
+        assert_eq!(split.unforwarded, vec!["--diff /tmp/old.rs /tmp/new.rs"]);
+        assert_eq!(
+            dropped_args_report(None, diff.len()),
+            vec!["sawe: 2 argument(s) from the command line were NOT opened."],
+            "`sawe --diff a b` at a give-up exit used to report nothing at all"
+        );
+    }
+
+    /// The ordinary case — one or more plain paths against a healthy instance
+    /// — must stay exactly as silent as it has always been.
+    #[test]
+    fn the_ordinary_handoff_stays_silent() {
+        let split = split_handoff_args(&["/tmp/a.txt".to_string(), "rel/b.txt".to_string()], &[]);
+        assert_eq!(
+            split.paths,
+            vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("rel/b.txt")],
+            "a relative path is carried too; the tool joins it with our cwd"
+        );
+        assert!(unforwarded_args_report(&split.unforwarded).is_empty());
+        assert!(unforwarded_args_report(&[]).is_empty());
     }
 
     /// The lock-held-but-unreachable exit must name both states it cannot
