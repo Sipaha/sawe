@@ -1231,22 +1231,30 @@ mod tests {
     /// it: the same spellings that route above must reach no arm at all, so
     /// they land on the `unhandled url` branch like any other scheme we do not
     /// serve. Asserted spelling by spelling rather than on the prefix, because
-    /// what must not survive is an *arm*, and an arm is per-spelling.
+    /// what must not survive is an *arm*, and an arm is per-spelling — so the
+    /// list below is one entry per arm of [`OpenRequest::parse`], including
+    /// the two that match indirectly (`agent_skills`'
+    /// `SKILL_SHARE_LINK_PREFIX` and `client::parse_zed_link`'s
+    /// `channel/…`). Add an entry here whenever an arm is added.
     #[gpui::test]
     fn no_arm_claims_the_disowned_scheme(cx: &mut TestAppContext) {
         let _app_state = init_test(cx);
 
         for zed_url in [
             "zed://file/tmp/probe.rs",
+            "zed://ssh/user@host/tmp/probe.rs",
             "zed://",
             "zed://open",
+            "zed://open/",
             "zed://settings",
             "zed://settings/theme",
             "zed://schemas/settings",
             "zed://extension/foo",
             "zed://agent?prompt=hi",
+            "zed://agent/shared/2b1cf1a4-1f0d-4d0e-9a6e-3f6a0f2b7c11",
             "zed://skill?data=e30",
             "zed://git/clone?repo=https://github.com/x/y.git",
+            "zed://git/commit/abc123?repo=path/to/repo",
             "zed://channel/the-channel-123",
         ] {
             let request = parse_one(cx, zed_url);
