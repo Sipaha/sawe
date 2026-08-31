@@ -2279,8 +2279,9 @@ mod tests {
 mod live_tests {
     use super::*;
     use crate::transport::live_remote_support::{
-        DECOY_DIR, DECOY_NAME, OURS_DIR, OURS_NAME, SilentDelegate, decoy_digest_script,
-        init_release_channel, list_our_dir_script, run, seed_decoy_script,
+        DECOY_DIR, DECOY_NAME, HOME_SCRIPT, OURS_DIR, OURS_NAME, SilentDelegate,
+        decoy_digest_script, init_release_channel, list_our_dir_script,
+        require_prebuilt_server_binary, run, seed_decoy_script,
     };
 
     struct Target {
@@ -2303,11 +2304,29 @@ mod live_tests {
             }
         }
 
+        fn description(&self) -> String {
+            format!("{}@{}:{}", self.user, self.host, self.port)
+        }
+
         /// The options are deliberately self-contained: an explicit identity
-        /// file, `IdentitiesOnly`, and a throwaway known-hosts file, so that the
-        /// test reads and writes nothing under the operator's `~/.ssh`.
+        /// file, `IdentitiesOnly`, a throwaway known-hosts file, and — the part
+        /// that makes the rest of it true — `-F /dev/null`, which makes `ssh`,
+        /// `scp` and `sftp` skip both `~/.ssh/config` and `/etc/ssh/ssh_config`.
+        /// Without it a `Host *` stanza carrying `ControlMaster auto` and a
+        /// `ControlPath` under `~/.ssh` would have every invocation here, and
+        /// every one the transport makes with these args, *create* a socket in
+        /// the operator's `~/.ssh`.
+        ///
+        /// Deliberately no `-o ControlPath=none`: these args are passed to the
+        /// transport, which appends its own `-o ControlPath=<temp socket>`
+        /// *after* them, and `ssh` takes the **first** value it obtains for an
+        /// option — so ours would win and disable the transport's own
+        /// multiplexing rather than merely neutralising the operator's config.
+        /// `-F` is not subject to that rule and is enough on its own.
         fn client_args(&self) -> Vec<String> {
             [
+                "-F",
+                "/dev/null",
                 "-o",
                 &format!("IdentityFile={}", self.key),
                 "-o",
@@ -2357,6 +2376,9 @@ mod live_tests {
     /// docker run -d --name sawe-ssh -p 127.0.0.1:22022:22 ubuntu:24.04 sleep infinity
     /// docker exec sawe-ssh sh -c 'apt-get update -qq && apt-get install -y -qq openssh-server'
     /// docker exec sawe-ssh sh -c 'mkdir -p /run/sshd /root/.ssh'
+    /// # the test deletes ~/.zed_server and ~/.sawe_server on the target and
+    /// # refuses to run without this marker saying the target is disposable:
+    /// docker exec sawe-ssh sh -c 'touch /root/.sawe-live-test-target'
     /// ssh-keygen -q -t ed25519 -N "" -f /tmp/probe-key
     /// docker exec -i sawe-ssh sh -c 'cat > /root/.ssh/authorized_keys' < /tmp/probe-key.pub
     /// docker exec -d sawe-ssh /usr/sbin/sshd -D
@@ -2364,18 +2386,31 @@ mod live_tests {
     /// SAWE_TEST_SSH_HOST=127.0.0.1 SAWE_TEST_SSH_PORT=22022 SAWE_TEST_SSH_KEY=/tmp/probe-key \
     ///   ZED_COPY_REMOTE_SERVER=$PWD/target/debug/remote_server \
     ///   cargo test -p remote --lib ssh::live_tests -- --ignored --nocapture
+    ///
+    /// # teardown: the container publishes a root login on a loopback port and
+    /// # its private key is sitting in /tmp until both are gone.
+    /// docker rm -f sawe-ssh
+    /// rm -f /tmp/probe-key /tmp/probe-key.pub
     /// ```
     #[gpui::test]
     #[ignore = "needs an ssh target; see the doc comment"]
     async fn ssh_upload_uses_our_names_and_spares_the_neighbour(cx: &mut gpui::TestAppContext) {
         let target = Target::from_env();
+        require_prebuilt_server_binary();
         cx.executor().allow_parking();
         init_release_channel(cx);
 
-        let decoy_before = target
-            .exec(&seed_decoy_script())
+        // The transport uploads to paths relative to the connection user's
+        // `$HOME`, and `Target::exec` connects as that same user, so resolving
+        // it here reaches the same directory the client will write into.
+        let home = target
+            .exec(HOME_SCRIPT)
             .await
-            .expect("planting the decoy");
+            .expect("resolving the target home directory");
+        let decoy_before = target
+            .exec(&seed_decoy_script(&home, &target.description()))
+            .await
+            .unwrap_or_else(|error| panic!("planting the decoy: {error:#}"));
 
         let options = target.connection_options();
         let connection = cx
@@ -2385,6 +2420,20 @@ mod live_tests {
             })
             .await
             .expect("connecting over ssh");
+
+        // Read and asserted first, before the path assertion below. The two
+        // properties are independent, and this is the one the rename was made
+        // for: with the path assertion first, reverting `paths.rs` to the
+        // upstream names panics there and this comparison never runs at all.
+        let decoy_after = target
+            .exec(&decoy_digest_script(&home))
+            .await
+            .expect("re-reading the decoy");
+        assert_eq!(
+            decoy_before, decoy_after,
+            "connecting must not touch {DECOY_DIR}/{DECOY_NAME} — that file stands in for a \
+             real Zed's uploaded server, and before the rename this client overwrote it"
+        );
 
         let relpath = connection
             .remote_binary_path
@@ -2397,22 +2446,12 @@ mod live_tests {
         );
 
         let listing = target
-            .exec(&list_our_dir_script())
+            .exec(&list_our_dir_script(&home))
             .await
             .expect("listing our server directory");
         assert!(
             listing.lines().any(|line| line.trim() == OURS_NAME),
             "expected {OURS_NAME} on the host, got:\n{listing}"
-        );
-
-        let decoy_after = target
-            .exec(&decoy_digest_script())
-            .await
-            .expect("re-reading the decoy");
-        assert_eq!(
-            decoy_before, decoy_after,
-            "connecting must not touch {DECOY_DIR}/{DECOY_NAME} — that file stands in for a \
-             real Zed's uploaded server, and before the rename this client overwrote it"
         );
     }
 }

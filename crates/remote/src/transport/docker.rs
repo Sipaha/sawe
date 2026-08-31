@@ -842,12 +842,21 @@ impl RemoteConnection for DockerExecConnection {
 mod tests {
     use super::*;
     use crate::transport::live_remote_support::{
-        DECOY_DIR, DECOY_NAME, OURS_DIR, OURS_NAME, SilentDelegate, decoy_digest_script,
-        init_release_channel, list_our_dir_script, run, seed_decoy_script,
+        DECOY_DIR, DECOY_NAME, HOME_SCRIPT, OURS_DIR, OURS_NAME, SilentDelegate,
+        decoy_digest_script, init_release_channel, list_our_dir_script,
+        require_prebuilt_server_binary, run, seed_decoy_script,
     };
 
+    /// The user the client uploads as, and therefore the only user whose home
+    /// the helper scripts may look at.
+    const REMOTE_USER: &str = "root";
+
     async fn container_exec(container: &str, script: &str) -> Result<String> {
-        run("docker", &["exec", container, "sh", "-c", script]).await
+        run(
+            "docker",
+            &["exec", "-u", REMOTE_USER, container, "sh", "-c", script],
+        )
+        .await
     }
 
     /// The claim FORK.md #119 makes, checked against a real container rather
@@ -863,27 +872,37 @@ mod tests {
     ///
     /// ```text
     /// docker run -d --name sawe-probe ubuntu:24.04 sleep infinity
+    /// # the test deletes ~/.zed_server and ~/.sawe_server on the target and
+    /// # refuses to run without this marker saying the target is disposable:
+    /// docker exec -u root sawe-probe sh -c 'touch "$HOME"/.sawe-live-test-target'
     /// cargo build -p remote_server --bin remote_server
     /// SAWE_TEST_DOCKER_CONTAINER=sawe-probe \
     ///   ZED_COPY_REMOTE_SERVER=$PWD/target/debug/remote_server \
     ///   cargo test -p remote --lib docker::tests -- --ignored --nocapture
+    ///
+    /// # teardown
+    /// docker rm -f sawe-probe
     /// ```
     #[gpui::test]
     #[ignore = "needs a running container; see the doc comment"]
     async fn docker_upload_uses_our_names_and_spares_the_neighbour(cx: &mut gpui::TestAppContext) {
         let container = std::env::var("SAWE_TEST_DOCKER_CONTAINER")
             .expect("set SAWE_TEST_DOCKER_CONTAINER to a running container's name or id");
+        require_prebuilt_server_binary();
         cx.executor().allow_parking();
         init_release_channel(cx);
 
-        let decoy_before = container_exec(&container, &seed_decoy_script())
+        let home = container_exec(&container, HOME_SCRIPT)
             .await
-            .expect("planting the decoy");
+            .expect("resolving the container home directory");
+        let decoy_before = container_exec(&container, &seed_decoy_script(&home, &container))
+            .await
+            .unwrap_or_else(|error| panic!("planting the decoy: {error:#}"));
 
         let options = DockerConnectionOptions {
             name: "sawe-probe".into(),
             container_id: container.clone(),
-            remote_user: "root".into(),
+            remote_user: REMOTE_USER.into(),
             upload_binary_over_docker_exec: true,
             use_podman: false,
             remote_env: Default::default(),
@@ -897,6 +916,27 @@ mod tests {
             .await
             .expect("connecting to the container");
 
+        // Checked before the decoy is re-read: if the client uploaded into some
+        // other user's home, the decoy this test planted is not the file the
+        // client could have clobbered, and comparing its digest proves nothing.
+        assert_eq!(
+            connection.remote_dir_for_server, home,
+            "the helper scripts and the client must agree on whose home is being written to"
+        );
+
+        // Read and asserted first, before the path assertion below. The two
+        // properties are independent, and this is the one the rename was made
+        // for: with the path assertion first, reverting `paths.rs` to the
+        // upstream names panics there and this comparison never runs at all.
+        let decoy_after = container_exec(&container, &decoy_digest_script(&home))
+            .await
+            .expect("re-reading the decoy");
+        assert_eq!(
+            decoy_before, decoy_after,
+            "connecting must not touch {DECOY_DIR}/{DECOY_NAME} — that file stands in for a \
+             real Zed's uploaded server, and before the rename this client overwrote it"
+        );
+
         let relpath = connection
             .remote_binary_relpath
             .as_ref()
@@ -907,21 +947,12 @@ mod tests {
             "the uploaded binary must not share a name or a directory with another editor's"
         );
 
-        let listing = container_exec(&container, &list_our_dir_script())
+        let listing = container_exec(&container, &list_our_dir_script(&home))
             .await
             .expect("listing our server directory");
         assert!(
             listing.lines().any(|line| line.trim() == OURS_NAME),
             "expected {OURS_NAME} in the container, got:\n{listing}"
-        );
-
-        let decoy_after = container_exec(&container, &decoy_digest_script())
-            .await
-            .expect("re-reading the decoy");
-        assert_eq!(
-            decoy_before, decoy_after,
-            "connecting must not touch {DECOY_DIR}/{DECOY_NAME} — that file stands in for a \
-             real Zed's uploaded server, and before the rename this client overwrote it"
         );
     }
 }
