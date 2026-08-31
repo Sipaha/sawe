@@ -162,13 +162,7 @@ Note: This setting has no effect in Vim mode, as rewrap is already allowed every
 
 You can find the names of your currently installed extensions by listing the subfolders under the [extension installation location](../extensions/installing-extensions.md#installation-location):
 
-On macOS:
-
-```sh
-ls ~/Library/Application\ Support/Zed/extensions/installed/
-```
-
-On Linux:
+On macOS and Linux:
 
 ```sh
 ls ~/.spk/sawe/data/extensions/installed
@@ -177,7 +171,7 @@ ls ~/.spk/sawe/data/extensions/installed
 On Windows:
 
 ```pwsh
-Get-ChildItem "$env:LOCALAPPDATA\Zed\extensions\installed" -Name
+Get-ChildItem "$env:USERPROFILE\.spk\sawe\data\extensions\installed" -Name
 ```
 
 Define extensions which should be installed (`true`) or never installed (`false`).
