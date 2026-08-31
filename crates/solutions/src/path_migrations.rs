@@ -920,6 +920,16 @@ impl ReconcileContext {
 /// editor start" (`drain_and_apply_blocking`), so an avoidable instant failure
 /// costs the user a whole session's worth of stale paths.
 ///
+/// `foreign_keys` buys nothing measurable *today* — no table in
+/// `solution_agent.db` declares a `REFERENCES` clause, so the pragma is inert
+/// on this file whichever way it is set — and it is issued anyway, for the same
+/// reason `CONNECTION_PRAGMAS` issues it: without it this connection runs on
+/// `SQLITE_DEFAULT_FOREIGN_KEYS`, a libsqlite3-sys *compile* flag that happens
+/// to be 1 in the current vendored build. A bump that flipped it would leave the
+/// two connections on one file disagreeing about constraint enforcement, and
+/// the first `REFERENCES` clause added to this schema would then be enforced by
+/// the store and skipped by the migration.
+///
 /// `journal_mode` is deliberately NOT set here: it is a file-header property
 /// that `SolutionAgentDb` already establishes, and this connection is the
 /// short-lived one. The pragma values are duplicated rather than imported
@@ -929,7 +939,9 @@ impl ReconcileContext {
 /// of truth.
 fn open_agent_db(path: &str) -> Result<Connection> {
     let connection = Connection::open_file(path);
-    connection.exec("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=500;")?()?;
+    connection
+        .exec("PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=500; PRAGMA foreign_keys=ON;")?(
+    )?;
     Ok(connection)
 }
 
@@ -2425,6 +2437,59 @@ mod tests {
                 "SELECT local_path FROM solution_members WHERE id = 1"
             ),
             vec!["/base/new/member"]
+        );
+    }
+
+    /// `open_agent_db` opens the SECOND connection this process holds on
+    /// `solution_agent.db`, and everything it needs beyond `journal_mode` is
+    /// per-connection state that the file header cannot carry. Its doc names
+    /// three pragmas; this reads back what the connection actually has, so the
+    /// doc cannot drift from the statement below it again.
+    #[test]
+    fn the_migration_connection_sets_its_own_pragmas() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("solution_agent.db");
+        let connection = open_agent_db(&path.to_string_lossy()).expect("open the agent db");
+
+        let synchronous = connection
+            .select_row::<i64>("PRAGMA synchronous")
+            .expect("prepare synchronous")()
+        .expect("read synchronous");
+        let busy_timeout = connection
+            .select_row::<i64>("PRAGMA busy_timeout")
+            .expect("prepare busy_timeout")()
+        .expect("read busy_timeout");
+        let foreign_keys = connection
+            .select_row::<i64>("PRAGMA foreign_keys")
+            .expect("prepare foreign_keys")()
+        .expect("read foreign_keys");
+
+        assert_eq!(
+            synchronous,
+            Some(1),
+            "synchronous must be NORMAL (1); dropping the pragma silently returns \
+             this connection to sqlite's FULL (2) while the store's connection stays \
+             on NORMAL"
+        );
+        assert_eq!(
+            busy_timeout,
+            Some(500),
+            "busy_timeout must be 500 ms. At sqlite's default of 0 an overlap with \
+             the agent store's writer on this same file is an instant `database is \
+             locked` instead of a short wait, and the reconcile's failure path is to \
+             retry a whole editor start later"
+        );
+        // Not mutation-tight, and stated rather than hidden — exactly as in
+        // `solution_agent::db::tests::connection_pragmas_are_in_effect_on_a_file_database`:
+        // this libsqlite3-sys build compiles with `SQLITE_DEFAULT_FOREIGN_KEYS=1`,
+        // so deleting the pragma leaves this green. What it pins is the effective
+        // state, which is what the two connections have to agree on.
+        assert_eq!(
+            foreign_keys,
+            Some(1),
+            "foreign keys must be ON here for the same reason they are ON on the \
+             store's connection — explicitly, rather than by grace of a \
+             libsqlite3-sys compile flag"
         );
     }
 }
