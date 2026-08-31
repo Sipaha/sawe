@@ -262,7 +262,9 @@ For each section:
   upstream file modifications" in the same commit.
 - New files: prefer `src/<module>.rs`, NOT `src/<module>/mod.rs`. New crates:
   set `[lib] path = "<name>.rs"` in Cargo.toml.
-- Build verification: `cargo build --bin sawe` MUST pass before commit.
+- Build verification: `cargo build --bin sawe` MUST pass before commit, **with
+  zero warnings** — it is the only check that compiles the shipping cfg universe,
+  so grep its log for `^warning` as well as `^error`.
   If you ran `cargo build … | tail` and saw "succeeded" — re-check with
   `set -o pipefail` or read the captured output; the pipe masks cargo exit
   codes (CLAUDE.md trap).
@@ -271,7 +273,7 @@ For each section:
 
 cd /home/spk/.spk/sawe/solutions/spk-solutions/sawe
 cargo build --bin sawe 2>&1 | tee /tmp/build.txt
-grep -E "^error|could not compile" /tmp/build.txt    # must be empty
+grep -E "^error|could not compile|^warning" /tmp/build.txt    # must be empty
 cargo clippy -p <crate> --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.txt
 cargo test -p <crate> --no-fail-fast 2>&1 | tee /tmp/test.txt
 grep "test result:" /tmp/test.txt | awk '{ tot+=$4; failed+=$6 } END { print "TOTAL:", tot, "failed:", failed }'
@@ -389,7 +391,7 @@ When the sub-agent finishes:
 git log --oneline -3                                   # did it actually commit?
 git status                                             # clean? (if not — uncommitted leftovers)
 cargo build --bin sawe 2>&1 | tee /tmp/build.txt
-grep -E "^error|could not compile" /tmp/build.txt      # must be empty
+grep -E "^error|could not compile|^warning" /tmp/build.txt      # must be empty
 cargo clippy -p <touched-crate> --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.txt
 cargo test -p <touched-crate> --no-fail-fast 2>&1 | tee /tmp/test.txt
 grep "test result:" /tmp/test.txt | awk '{ tot+=$4; failed+=$6 } END { print tot, failed }'
