@@ -166,6 +166,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/settings_ui/src/page_data.rs` | **First local change (phase 2b task 5).** Dropped the "Debugger Panel" section (`debugger.dock` dock-position picker) from the Panels page and the "Debugger Button" switch (`debugger.button`) from the Status Bar section. Both settings are inert in this fork — the debugger is hosted in the band, not a dock, and the dock strips the button gated are gone — so rendering working-looking controls for them was exactly the dead-control trap. The settings fields themselves are kept in the schema (deleting them is a migration), annotated as inert in `assets/settings/default.json` and `docs/src/debugger.md`. | `settings_ui` |
 | `crates/install_cli/src/install_cli_binary.rs`, `crates/install_cli/src/install_cli.rs`, `crates/install_cli/Cargo.toml` | **First local change (decision #115).** `File → Install CLI` targets `/usr/local/bin/sawe`, never removes an entry it cannot prove it created, and no longer registers a URL scheme. `register_zed_scheme.rs` (the `cli::RegisterZedScheme` palette action + `cx.register_url_scheme(ZED_URL_SCHEME)`) is **deleted**, along with the crate's `client` dependency, which existed only for that constant. | `install_cli` |
 
+| `crates/zed/src/zed/open_listener.rs`, `crates/zed/src/zed/open_url_modal.rs`, `crates/zed/src/zed/windows_only_instance.rs`, `crates/zed/src/main.rs`, `crates/cli/src/main.rs`, `crates/client/src/client.rs`, `crates/client/src/zed_urls.rs`, `crates/agent_skills/agent_skills.rs`, `crates/settings_ui/src/settings_ui.rs`, `crates/settings/src/settings_store.rs`, `crates/json_schema_store/src/json_schema_store.rs`, `crates/terminal/src/alacritty/hyperlinks.rs`, `crates/zed_actions/src/lib.rs`, `crates/project/src/lsp_store/json_language_server_ext.rs`, `assets/settings/default.json`, `tooling/xtask/src/tasks/workflows/run_tests.rs`, `docs/src/**` | **Decision #116.** `sawe://` is the URL scheme this fork parses and produces; `zed://` has no arm, no normalisation and no producer. Every routing arm, the settings **Copy Link**, the skill share link, the builtin-JSON-schema URI prefix (`sawe://schemas/`, which the JSON language server round-trips), the terminal hyperlink regex, the Open-URL modal placeholder and short-circuit, and both CLI/editor url classifiers moved together. | `zed` |
+
 Locked rebrand identifiers (display name, bundle ids, URL scheme, config dirs, etc.) — see `.rules` § "Locked rebrand identifiers". Changing any requires explicit approval — they're cross-referenced in spec docs.
 
 ## Key architectural decisions
@@ -2021,3 +2023,61 @@ How to apply:
 - **The refusal is deliberately stricter than "does it look like a Sawe path?"**, and it costs something: if the app moves (bundle relocated, a different channel installed over it), the existing symlink points at the old `cli` and is no longer provably ours, so `Install CLI` refuses to repair itself and instead tells the user exactly what is there to remove. That is the price of the only test that cannot be wrong in the destructive direction — every looser rule is a heuristic, and a wrong heuristic here deletes somebody else's binary with admin rights.
 - **`register_zed_scheme` is deleted, not repointed at `sawe`.** It registered `ZED_URL_SCHEME = "zed"` from two places: a `cli: register zed scheme` palette action, and the last line of `Install CLI`, unconditionally. Both are gone. It was *not* turned into a `register_sawe_scheme`, because nothing would call it and no platform needs it: `sawe://` is already declared at install time on all three targets (`osx_url_schemes = ["sawe"]` on all four channels, `x-scheme-handler/sawe` in `sawe.desktop.in`, `HKCU\Software\Classes\sawe` in `sawe.iss`), and `register_url_scheme` is implemented **only on macOS** — `gpui_linux` and `gpui_windows` both return `Err("register_url_scheme unimplemented")`. The imperative call adds exactly one thing on top of the declarative registration, `NSWorkspace.setDefaultApplication`, which only matters when two *installed* apps claim the same scheme; once `zed://` is disowned that can only be two Sawe channels fighting over `sawe://`, a case this fork has never needed. If it ever does, the function was twelve lines and this entry says where it went.
 - **A correction to the recon that produced this work:** the claim that the `Install CLI` *menu item* routinely showed Linux users an "Error registering zed:// scheme" was wrong twice over. The call site was `register_zed_scheme(cx).await.log_err()` — the error went to the log, never to a dialog — so the menu item could not produce that message on **any** platform; and on Linux/FreeBSD `install_cli_binary` early-returns behind `cfg!(any(target_os = "linux", target_os = "freebsd"))` with an informational prompt, so it never reached `install_script` or the scheme registration at all. The palette action was the only route to the dialog, on every platform. What the menu item actually did was worse than the reported symptom and silent: on macOS it reached the unconditional `remove_file` under administrator privileges *and* `setDefaultApplication`, reporting neither. Do not cite the Linux dialog as the motivation.
+
+### 116. `sawe://` is the scheme this fork parses, and `zed://` gets no arm and no producer
+
+What: `OpenRequest::parse`'s routing table, and everything that mints a link for it,
+are spelled `sawe://`. `zed://` reaches no arm; it is an ordinary unrecognised URL.
+
+Why: `zed://` is a different product's external contract. The ruling is that a user
+may have both editors installed and they must not intersect in any way — so this fork
+neither claims the scheme with the OS (decision #115, phase 1) nor answers it in
+process. Commit `915bd2b73f`, earlier the same day, had gone the other way: it added a
+single `normalize_fork_url_scheme` at the top of `parse` rewriting `sawe://` into
+`zed://` so the upstream-spelled arms would match, on the invented premise that
+`zed://` was a preserved upstream identifier like `.zed_server`. It is not; `.rules`
+§3 names `.zed_server` / `.zed_wsl_server` as the *only* preserved ones and locks
+`sawe://` as the fork's scheme. That normalisation is deleted, not inverted: an alias
+in either direction is still two spellings for one route.
+
+How to apply:
+
+- **Generation and parsing move in one commit, always.** Deleting the parse arms alone
+  breaks the schema round trip at the halfway point — `SCHEMA_URI_PREFIX` is handed to
+  `vscode-json-language-server`, which hands it back as a `vscode/content` request, so
+  `json_schema_store`, `settings_store`'s `LSP_SETTINGS_SCHEMA_URL_PREFIX`,
+  `assets/settings/default.json`'s `$schema` and `main.rs`'s re-synthesised
+  `format!("sawe://schemas/{}")` are one unit. The failure mode this decision exists to
+  prevent is a producer left behind spelling a URL nobody parses; the guard against it
+  is `no_arm_claims_the_disowned_scheme` in `open_listener.rs`, which asserts per
+  spelling that a `zed://` url sets no `kind`, no `open_paths`, **and** no
+  `join_channel` / `open_channel_notes` — the last two because `client::parse_zed_link`
+  reaches `OpenRequest` through fields the first two assertions do not cover, and an
+  earlier version of the test passed with that arm restored.
+
+- **No special branch and no message for an incoming `zed://`.** The question that
+  dissolves the idea is how one would arrive: after phase 1 the only routes were the
+  user typing it, or our own "Open URL" modal, **whose placeholder suggested
+  `zed://…`** — we were the one proposing it. The placeholder now reads `sawe://...`
+  and the case has no producer. Measured on a live instance, `zed://settings` and
+  `vscode://settings` are now treated identically at both entry points: through the
+  url handler both log one `ERROR … unhandled url: <url>`, and on the command line both
+  fall out of `is_url_scheme`, are carried as paths and fail canonicalisation with
+  `failed to canonicalize root path "$PWD/<url>"`. "Ordinary unrecognised URL" is
+  therefore a statement about parity, not about a nice message; if the argv path
+  deserves a better one, that is a change for *all* unknown schemes, not for this one.
+
+- **`client::parse_zed_link` keeps its `<server_url>/channel/…` arm and loses only the
+  `zed://` one**, along with `ZED_URL_SCHEME`, its sole consumer. It was not renamed
+  and not repointed at `sawe://channel/…`: the links it parses are minted by the collab
+  web app on `ClientSettings::server_url`, a service this fork does not talk to
+  (`collab` is disabled, so both `ZedLink` variants dead-end at `join_channel` /
+  `open_channel_notes`), so a fork-branded spelling would advertise a route to nothing.
+  Deleting the function outright would go past "disable, don't delete" and touch
+  `editor`, `command_palette` and `main.rs` for a subsystem that is only switched off.
+
+- **`zed-cli://` and `zed-dock-action://` are deliberately untouched here.** They are
+  distinct prefixes, both ends ours, and they belong to the on-disk / internal-name
+  pass, not to the URL-scheme contract. So is `acp_thread`'s `MentionUri`, which is
+  `zed:///…` (empty authority): a self-consistent ACP resource-link namespace that is
+  persisted in thread history and never reaches `cx.open_url`.
