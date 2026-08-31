@@ -198,6 +198,35 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
         .detach();
     }
 }
+
+/// The stderr lines that go with a `sawe is already running` exit.
+///
+/// Extracted from that exit site because its rules are exactly the ones this
+/// path keeps getting wrong, and only a pure function makes them assertable:
+///
+/// - a carried hand-off failure is reported once, never twice;
+/// - the "paths were dropped" line does **not** depend on there being a
+///   failure to report. The hand-off can return `BecameCanonical` — no error
+///   at all — and the single-instance check below it can still send us home
+///   without opening anything, which is the same silent path-drop with no
+///   error value to carry;
+/// - with no paths on the command line there is nothing to warn about, so a
+///   second `sawe` with no arguments stays as quiet as it has always been.
+fn dropped_paths_report(handoff_failure: Option<&str>, path_count: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(reason) = handoff_failure {
+        lines.push(format!(
+            "sawe: could not hand off to the running instance: {reason}"
+        ));
+    }
+    if path_count > 0 {
+        lines.push(format!(
+            "sawe: {path_count} path(s) from the command line were NOT opened."
+        ));
+    }
+    lines
+}
+
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
 fn main() {
@@ -466,7 +495,15 @@ fn main() {
             process::exit(1);
         }
         Ok(editor_mcp::HandoffOutcome::BecameCanonical) => {
-            // Continue normal startup; we'll bind the MCP server later.
+            // Continue normal startup; we'll bind the MCP server later. Note
+            // that "we may take the lock" is not "we will open the paths":
+            // the upstream single-instance check below owns a *different*
+            // socket (`data_dir()/zed-<channel>.sock`, bound at startup) than
+            // the one this probe read (`state/mcp.lock`, taken much later, in
+            // `editor_mcp::start_server`), so a live instance that is still
+            // initialising leaves the lock free while owning that socket. We
+            // can therefore reach the exit site below with no failure to
+            // report and still drop everything the user asked for.
         }
         Err(err) => {
             log::warn!("sawe: handoff probe failed: {err}; continuing as canonical");
@@ -516,20 +553,15 @@ fn main() {
     };
     if failed_single_instance_check {
         println!("sawe is already running");
-        // This is the exit that used to lose the user's file in silence: the
-        // hand-off failed, another instance owns the single-instance socket,
-        // so we return having opened nothing. Only the stdout line above was
-        // ever printed, which is why a `-32601 Tool not found` on the
-        // hand-off path stayed invisible for as long as it did. The reason
-        // goes to stderr so the existing stdout line stays byte-identical for
-        // anything parsing it.
-        if let Some(reason) = handoff_failure {
-            eprintln!("sawe: could not hand off to the running instance: {reason}");
-            if handoff_path_count > 0 {
-                eprintln!(
-                    "sawe: {handoff_path_count} path(s) from the command line were NOT opened."
-                );
-            }
+        // This is the exit that used to lose the user's file in silence:
+        // another instance owns the single-instance socket, so we return
+        // having opened nothing. Only the stdout line above was ever printed,
+        // which is why a `-32601 Tool not found` on the hand-off path stayed
+        // invisible for as long as it did. Everything else goes to stderr so
+        // the existing stdout line stays byte-identical for anything parsing
+        // it.
+        for line in dropped_paths_report(handoff_failure.as_deref(), handoff_path_count) {
+            eprintln!("{line}");
         }
         return;
     }
@@ -2459,5 +2491,48 @@ fn check_for_conpty_dll() {
         }
     } else {
         log::warn!("Failed to load conpty.dll. Terminal will work with reduced functionality.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dropped_paths_report;
+
+    #[test]
+    fn dropped_paths_are_reported_without_a_failure_to_blame() {
+        // `HandoffOutcome::BecameCanonical` followed by a failed
+        // single-instance check: nothing errored, so there is no reason to
+        // print — but the paths are dropped all the same and saying so is the
+        // whole point.
+        assert_eq!(
+            dropped_paths_report(None, 2),
+            vec!["sawe: 2 path(s) from the command line were NOT opened."]
+        );
+    }
+
+    #[test]
+    fn a_failure_is_reported_once_alongside_the_dropped_paths() {
+        assert_eq!(
+            dropped_paths_report(
+                Some("existing instance returned an error: Tool not found"),
+                1
+            ),
+            vec![
+                "sawe: could not hand off to the running instance: existing instance returned an error: Tool not found",
+                "sawe: 1 path(s) from the command line were NOT opened.",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_quiet_cases_stay_quiet() {
+        // A second `sawe` with no path arguments has lost nothing, so it says
+        // nothing beyond the one stdout line the caller prints.
+        assert!(dropped_paths_report(None, 0).is_empty());
+        // A failure with no paths still explains itself, but claims no loss.
+        assert_eq!(
+            dropped_paths_report(Some("connection refused"), 0),
+            vec!["sawe: could not hand off to the running instance: connection refused"]
+        );
     }
 }
