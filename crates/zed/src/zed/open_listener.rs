@@ -63,7 +63,7 @@ pub enum OpenRequestKind {
         session_id: String,
     },
     InstallSkill {
-        /// Full `SKILL.md` contents embedded in a `zed://skill` share link.
+        /// Full `SKILL.md` contents embedded in a `sawe://skill` share link.
         content: String,
     },
     DockMenuAction {
@@ -161,12 +161,7 @@ impl OpenRequest {
         }
 
         for original_url in request.urls {
-            // The routing table below is written against `zed://`, so a
-            // `sawe://` url is rewritten before it is matched — but the
-            // diagnostic at the bottom must still echo what the user actually
-            // passed, or a mistyped `sawe://xyz` is reported as `zed://xyz`.
-            let rewritten = normalize_fork_url_scheme(&original_url);
-            let url = rewritten.as_deref().unwrap_or(original_url.as_str());
+            let url = original_url.as_str();
             if let Some(server_name) = url.strip_prefix("zed-cli://") {
                 this.kind = Some(OpenRequestKind::CliConnection(connect_to_cli(server_name)?));
             } else if let Some(action_index) = url.strip_prefix("zed-dock-action://") {
@@ -175,16 +170,16 @@ impl OpenRequest {
                 });
             } else if let Some(file) = url.strip_prefix("file://") {
                 this.parse_file_path(file)
-            } else if let Some(file) = url.strip_prefix("zed://file") {
+            } else if let Some(file) = url.strip_prefix("sawe://file") {
                 this.parse_file_path(file)
-            } else if let Some(file) = url.strip_prefix("zed://ssh") {
+            } else if let Some(file) = url.strip_prefix("sawe://ssh") {
                 let ssh_url = "ssh:/".to_string() + file;
                 this.parse_ssh_file_path(&ssh_url, cx)?
-            } else if let Some(extension_id) = url.strip_prefix("zed://extension/") {
+            } else if let Some(extension_id) = url.strip_prefix("sawe://extension/") {
                 this.kind = Some(OpenRequestKind::Extension {
                     extension_id: extension_id.to_string(),
                 });
-            } else if let Some(session_id_str) = url.strip_prefix("zed://agent/shared/") {
+            } else if let Some(session_id_str) = url.strip_prefix("sawe://agent/shared/") {
                 if uuid::Uuid::parse_str(session_id_str).is_ok() {
                     this.kind = Some(OpenRequestKind::SharedAgentThread {
                         session_id: session_id_str.to_string(),
@@ -194,23 +189,23 @@ impl OpenRequest {
                 }
             } else if url.starts_with(agent_skills::SKILL_SHARE_LINK_PREFIX) {
                 this.parse_skill_install_url(url)?
-            } else if let Some(agent_path) = url.strip_prefix("zed://agent") {
+            } else if let Some(agent_path) = url.strip_prefix("sawe://agent") {
                 this.parse_agent_url(agent_path)
-            } else if url == "zed://" || url == "zed://open" || url == "zed://open/" {
+            } else if url == "sawe://" || url == "sawe://open" || url == "sawe://open/" {
                 this.kind = Some(OpenRequestKind::FocusApp);
-            } else if let Some(schema_path) = url.strip_prefix("zed://schemas/") {
+            } else if let Some(schema_path) = url.strip_prefix("sawe://schemas/") {
                 this.kind = Some(OpenRequestKind::BuiltinJsonSchema {
                     schema_path: schema_path.to_string(),
                 });
-            } else if url == "zed://settings" || url == "zed://settings/" {
+            } else if url == "sawe://settings" || url == "sawe://settings/" {
                 this.kind = Some(OpenRequestKind::Setting { setting_path: None });
-            } else if let Some(setting_path) = url.strip_prefix("zed://settings/") {
+            } else if let Some(setting_path) = url.strip_prefix("sawe://settings/") {
                 this.kind = Some(OpenRequestKind::Setting {
                     setting_path: Some(setting_path.to_string()),
                 });
-            } else if let Some(clone_path) = url.strip_prefix("zed://git/clone") {
+            } else if let Some(clone_path) = url.strip_prefix("sawe://git/clone") {
                 this.parse_git_clone_url(clone_path)?
-            } else if let Some(commit_path) = url.strip_prefix("zed://git/commit/") {
+            } else if let Some(commit_path) = url.strip_prefix("sawe://git/commit/") {
                 this.parse_git_commit_url(commit_path)?
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(url, cx)?
@@ -254,7 +249,7 @@ impl OpenRequest {
     }
 
     fn parse_skill_install_url(&mut self, url: &str) -> Result<()> {
-        // Format: zed://skill?data=<base64url of SKILL.md contents>
+        // Format: sawe://skill?data=<base64url of SKILL.md contents>
         let content = agent_skills::decode_skill_share_link(url)?;
         self.kind = Some(OpenRequestKind::InstallSkill { content });
         Ok(())
@@ -339,33 +334,6 @@ impl OpenRequest {
         self.parse_file_path(url.path());
         Ok(())
     }
-}
-
-/// Rewrite this fork's own URL scheme onto the one the routing table is
-/// written against.
-///
-/// `sawe://` is a locked rebrand identifier: `sawe.desktop.in` declares
-/// `x-scheme-handler/sawe`, so the desktop hands `sawe://…` links to this
-/// editor, and `sawe --help` advertises the scheme verbatim. Every arm of
-/// [`OpenRequest::parse`] was nevertheless written against `zed://`, so the
-/// fork's advertised scheme fell through to `unhandled url` in the log and the
-/// editor opened nothing at all — measured on a canonical instance given
-/// `sawe://file/tmp/probe.rs`: one `ERROR unhandled url` line, zero windows.
-///
-/// Normalising the spelling once, here, keeps the two exactly equivalent
-/// instead of duplicating a dozen arms and letting them drift; it also covers
-/// the prefixes those arms match indirectly, `agent_skills`'
-/// `SKILL_SHARE_LINK_PREFIX` and `client::parse_zed_link`'s `zed://channel/…`.
-/// `zed://` keeps working: it is a preserved upstream identifier and existing
-/// links use it. Only the two-slash form is rewritten, so a path argument that
-/// merely begins with `sawe` is untouched.
-///
-/// Returns `None` when there was nothing to rewrite, so the caller keeps the
-/// spelling it was handed: the `unhandled url` diagnostic has to name the url
-/// the user passed, not the one this function invented for the matcher.
-fn normalize_fork_url_scheme(url: &str) -> Option<String> {
-    url.strip_prefix("sawe://")
-        .map(|rest| format!("zed://{rest}"))
 }
 
 fn parse_ssh_url(url: &str) -> Result<url::Url> {
@@ -1234,76 +1202,95 @@ mod tests {
         }
     }
 
-    /// `sawe://` is the fork's own URL scheme — declared by `sawe.desktop.in`
-    /// and advertised by `sawe --help` — and every arm of `parse` was written
-    /// against `zed://`, so it reached `unhandled url` and opened nothing.
-    /// Each pair here is a *different* arm, because a single-arm fix would
-    /// have left the rest of the routing table inert.
+    /// `sawe://` is the fork's own URL scheme and every arm of `parse` is
+    /// written against it. Each entry is a *different* arm, because a
+    /// single-arm change would leave the rest of the routing table inert.
     #[gpui::test]
-    fn a_sawe_url_routes_exactly_where_the_zed_spelling_does(cx: &mut TestAppContext) {
+    fn every_arm_routes_the_forks_own_scheme(cx: &mut TestAppContext) {
         let _app_state = init_test(cx);
 
-        for (sawe_url, zed_url) in [
-            ("sawe://file/tmp/probe.rs", "zed://file/tmp/probe.rs"),
-            ("sawe://", "zed://"),
-            ("sawe://open", "zed://open"),
-            ("sawe://settings", "zed://settings"),
-            ("sawe://settings/theme", "zed://settings/theme"),
-            ("sawe://schemas/settings", "zed://schemas/settings"),
-            ("sawe://extension/foo", "zed://extension/foo"),
-            ("sawe://agent?prompt=hi", "zed://agent?prompt=hi"),
+        for sawe_url in [
+            "sawe://file/tmp/probe.rs",
+            "sawe://",
+            "sawe://open",
+            "sawe://settings",
+            "sawe://settings/theme",
+            "sawe://schemas/settings",
+            "sawe://extension/foo",
+            "sawe://agent?prompt=hi",
         ] {
-            let parse = |url: &str| {
-                let url = url.to_string();
-                cx.update(|cx| {
-                    OpenRequest::parse(
-                        RawOpenRequest {
-                            urls: vec![url],
-                            ..Default::default()
-                        },
-                        cx,
-                    )
-                    .unwrap()
-                })
-            };
-            let from_sawe = parse(sawe_url);
-            let from_zed = parse(zed_url);
-            assert_eq!(
-                format!("{:?}", from_sawe.kind),
-                format!("{:?}", from_zed.kind),
-                "{sawe_url} must route where {zed_url} routes"
-            );
-            assert_eq!(
-                from_sawe.open_paths, from_zed.open_paths,
-                "{sawe_url} must open what {zed_url} opens"
-            );
+            let request = parse_one(cx, sawe_url);
             assert!(
-                from_sawe.kind.is_some() || !from_sawe.open_paths.is_empty(),
+                request.kind.is_some() || !request.open_paths.is_empty(),
                 "{sawe_url} must be routed somewhere, not fall through to `unhandled url`"
             );
         }
     }
 
-    /// The rewrite is prefix-exact: a path that merely starts with the four
-    /// letters is not a URL and must not be rewritten into one.
-    #[test]
-    fn only_the_scheme_spelling_is_rewritten() {
-        assert_eq!(
-            normalize_fork_url_scheme("sawe://settings").as_deref(),
-            Some("zed://settings")
-        );
-        assert_eq!(
-            normalize_fork_url_scheme("/home/me/sawe/src/main.rs"),
-            None,
-            "a path that merely begins with the four letters is not rewritten"
-        );
-        assert_eq!(normalize_fork_url_scheme("sawe.rs"), None);
-        assert_eq!(
-            normalize_fork_url_scheme("zed://settings"),
-            None,
-            "the preserved upstream spelling is left alone, so it is also what \
-             gets logged when it does not route"
-        );
+    /// `zed://` is another product's external contract and this fork disowns
+    /// it: the same spellings that route above must reach no arm at all, so
+    /// they land on the `unhandled url` branch like any other scheme we do not
+    /// serve. Asserted spelling by spelling rather than on the prefix, because
+    /// what must not survive is an *arm*, and an arm is per-spelling.
+    #[gpui::test]
+    fn no_arm_claims_the_disowned_scheme(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+
+        for zed_url in [
+            "zed://file/tmp/probe.rs",
+            "zed://",
+            "zed://open",
+            "zed://settings",
+            "zed://settings/theme",
+            "zed://schemas/settings",
+            "zed://extension/foo",
+            "zed://agent?prompt=hi",
+            "zed://skill?data=e30",
+            "zed://git/clone?repo=https://github.com/x/y.git",
+            "zed://channel/the-channel-123",
+        ] {
+            let request = parse_one(cx, zed_url);
+            assert!(
+                request.kind.is_none(),
+                "{zed_url} must not be claimed by any arm, got {:?}",
+                request.kind
+            );
+            assert!(
+                request.open_paths.is_empty(),
+                "{zed_url} must not open anything, got {:?}",
+                request.open_paths
+            );
+            // `parse_zed_link`'s channel arms set neither `kind` nor
+            // `open_paths`, so they slip past the two assertions above.
+            assert!(
+                request.join_channel.is_none(),
+                "{zed_url} must not be read as a channel link, got {:?}",
+                request.join_channel
+            );
+            assert!(
+                request.open_channel_notes.is_empty(),
+                "{zed_url} must not be read as a channel-notes link, got {:?}",
+                request.open_channel_notes
+            );
+            assert!(
+                request.remote_connection.is_none(),
+                "{zed_url} must not open a remote connection"
+            );
+        }
+    }
+
+    fn parse_one(cx: &mut TestAppContext, url: &str) -> OpenRequest {
+        let url = url.to_string();
+        cx.update(|cx| {
+            OpenRequest::parse(
+                RawOpenRequest {
+                    urls: vec![url],
+                    ..Default::default()
+                },
+                cx,
+            )
+            .unwrap()
+        })
     }
 
     #[gpui::test]
@@ -1372,7 +1359,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://agent".into()],
+                    urls: vec!["sawe://agent".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1426,7 +1413,7 @@ mod tests {
         let result = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://skill?data=!!!notbase64".into()],
+                    urls: vec!["sawe://skill?data=!!!notbase64".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1437,7 +1424,7 @@ mod tests {
     }
 
     fn agent_url_with_prompt(prompt: &str) -> String {
-        let mut serializer = url::form_urlencoded::Serializer::new("zed://agent?".to_string());
+        let mut serializer = url::form_urlencoded::Serializer::new("sawe://agent?".to_string());
         serializer.append_pair("prompt", prompt);
         serializer.finish()
     }
@@ -1480,7 +1467,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://agent/?prompt=hello".into()],
+                    urls: vec!["sawe://agent/?prompt=hello".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1507,7 +1494,7 @@ mod tests {
     fn test_parse_focus_app_url(cx: &mut TestAppContext) {
         let _app_state = init_test(cx);
 
-        for url in ["zed://", "zed://open", "zed://open/"] {
+        for url in ["sawe://", "sawe://open", "sawe://open/"] {
             let request = cx.update(|cx| {
                 OpenRequest::parse(
                     RawOpenRequest {
@@ -1563,7 +1550,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec![format!("zed://agent/shared/{session_id}")],
+                    urls: vec![format!("sawe://agent/shared/{session_id}")],
                     ..Default::default()
                 },
                 cx,
@@ -1588,7 +1575,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://agent/shared/not-a-uuid".into()],
+                    urls: vec!["sawe://agent/shared/not-a-uuid".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1607,7 +1594,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://git/commit/abc123?repo=path/to/repo".into()],
+                    urls: vec!["sawe://git/commit/abc123?repo=path/to/repo".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1628,7 +1615,7 @@ mod tests {
         let request = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://git/commit/def456?repo=path%20with%20spaces".into()],
+                    urls: vec!["sawe://git/commit/def456?repo=path%20with%20spaces".into()],
                     ..Default::default()
                 },
                 cx,
@@ -1649,7 +1636,7 @@ mod tests {
             assert!(
                 OpenRequest::parse(
                     RawOpenRequest {
-                        urls: vec!["zed://git/commit/abc123?repo=".into()],
+                        urls: vec!["sawe://git/commit/abc123?repo=".into()],
                         ..Default::default()
                     },
                     cx,
@@ -1664,7 +1651,7 @@ mod tests {
         let result = cx.update(|cx| {
             OpenRequest::parse(
                 RawOpenRequest {
-                    urls: vec!["zed://git/commit/abc123?foo=bar".into()],
+                    urls: vec!["sawe://git/commit/abc123?foo=bar".into()],
                     ..Default::default()
                 },
                 cx,
@@ -2026,7 +2013,7 @@ mod tests {
             OpenRequest::parse(
                 RawOpenRequest {
                     urls: vec![
-                        "zed://git/clone/?repo=https://github.com/zed-industries/zed.git".into(),
+                        "sawe://git/clone/?repo=https://github.com/zed-industries/zed.git".into(),
                     ],
                     ..Default::default()
                 },
@@ -2051,7 +2038,7 @@ mod tests {
             OpenRequest::parse(
                 RawOpenRequest {
                     urls: vec![
-                        "zed://git/clone?repo=https://github.com/zed-industries/zed.git".into(),
+                        "sawe://git/clone?repo=https://github.com/zed-industries/zed.git".into(),
                     ],
                     ..Default::default()
                 },
@@ -2076,7 +2063,7 @@ mod tests {
             OpenRequest::parse(
                 RawOpenRequest {
                     urls: vec![
-                        "zed://git/clone/?repo=https%3A%2F%2Fgithub.com%2Fzed-industries%2Fzed.git"
+                        "sawe://git/clone/?repo=https%3A%2F%2Fgithub.com%2Fzed-industries%2Fzed.git"
                             .into(),
                     ],
                     ..Default::default()

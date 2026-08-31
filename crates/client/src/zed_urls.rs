@@ -65,5 +65,5 @@ pub fn acp_registry_blog(cx: &App) -> String {
 }
 
 pub fn shared_agent_thread_url(session_id: &str) -> String {
-    format!("zed://agent/shared/{}", session_id)
+    format!("sawe://agent/shared/{}", session_id)
 }

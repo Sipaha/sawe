@@ -1539,7 +1539,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                                 });
                             } else {
                                 log::warn!(
-                                    "zed://agent received but the AgentPanel is not registered \
+                                    "sawe://agent received but the AgentPanel is not registered \
                                      (is `disable_ai` enabled?)"
                                 );
                             }
@@ -1676,7 +1676,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                                     .project()
                                     .update(cx, |project, _| project.lsp_store())
                             })?;
-                            let uri = format!("zed://schemas/{}", schema_path);
+                            let uri = format!("sawe://schemas/{}", schema_path);
                             let json_schema_content =
                                 json_schema_store::handle_schema_request(lsp_store, uri, cx)
                                     .await?;
@@ -1725,8 +1725,8 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 });
             }
             OpenRequestKind::Setting { setting_path } => {
-                // zed://settings/languages/$(language)/tab_size  - DONT SUPPORT
-                // zed://settings/languages/Rust/tab_size  - SUPPORT
+                // sawe://settings/languages/$(language)/tab_size  - DONT SUPPORT
+                // sawe://settings/languages/Rust/tab_size  - SUPPORT
                 // languages.$(language).tab_size
                 // [ languages $(language) tab_size]
                 cx.spawn(async move |cx| {
@@ -2359,8 +2359,7 @@ struct Args {
     /// Use `path:line:row` syntax to open a file at a specific location.
     /// Non-existing paths and directories will ignore `:line:row` suffix.
     ///
-    /// URLs can be `file://`, `ssh://`, or `sawe://` scheme — the last of
-    /// which also accepts the upstream `zed://` spelling it aliases.
+    /// URLs can be `file://`, `ssh://`, or `sawe://` scheme.
     paths_or_urls: Vec<String>,
 
     /// Open a Solution by name or id and skip the Welcome screen.
@@ -2539,7 +2538,6 @@ impl ToString for IdType {
 /// new scheme only needs to be added here.
 fn is_url_scheme(arg: &str) -> bool {
     arg.starts_with("file://")
-        || arg.starts_with("zed://")
         || arg.starts_with("zed-cli://")
         || arg.starts_with("ssh://")
         || arg.starts_with("sawe://")

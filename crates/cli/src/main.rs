@@ -28,14 +28,13 @@ use walkdir::WalkDir;
 use std::io::IsTerminal;
 
 /// Argument spellings this CLI forwards to the editor as *urls* rather than
-/// canonicalising into paths. `sawe://` belongs here for the same reason
-/// `zed://` does — it is this fork's own registered scheme (`sawe.desktop.in`
-/// declares `x-scheme-handler/sawe`) — and its absence meant a `sawe://…`
-/// argument went through `parse_path_with_position` instead and reached the
-/// editor as the absolute path `$PWD/sawe://…`.
-const URL_PREFIX: [&'static str; 6] = [
-    "zed://", "sawe://", "http://", "https://", "file://", "ssh://",
-];
+/// canonicalising into paths. `sawe://` is this fork's own registered scheme
+/// (`sawe.desktop.in` declares `x-scheme-handler/sawe`); its absence once meant
+/// a `sawe://…` argument went through `parse_path_with_position` instead and
+/// reached the editor as the absolute path `$PWD/sawe://…`. `zed://` is
+/// deliberately *not* here: it is another product's scheme and this fork
+/// disowns it, so it is classified like any other unrecognised argument.
+const URL_PREFIX: [&'static str; 5] = ["sawe://", "http://", "https://", "file://", "ssh://"];
 
 /// The uninstall script shipped inside this binary, and the environment
 /// variable it reads the release channel from. Both live here, next to each
@@ -364,8 +363,8 @@ mod tests {
     /// `sawe://` is this fork's registered URL scheme, and it was missing from
     /// `URL_PREFIX`: the CLI classified `sawe://settings` as a *path*, ran it
     /// through `parse_path_with_position` and sent the editor the absolute
-    /// path `$PWD/sawe://settings`. The scheme must be classified exactly like
-    /// the upstream spelling it aliases.
+    /// path `$PWD/sawe://settings`. `zed://` is the disowned spelling and must
+    /// *not* be classified as a url this CLI forwards.
     /// The channel the uninstaller acts on is a contract between this binary
     /// and a shell script, and nothing but this test connects the two ends:
     /// a mismatch is silent and destructive, because the script's
@@ -389,7 +388,10 @@ mod tests {
     #[test]
     fn the_forks_own_url_scheme_is_classified_as_a_url() {
         assert!(is_url_argument("sawe://settings"));
-        assert!(is_url_argument("zed://settings"));
+        assert!(
+            !is_url_argument("zed://settings"),
+            "the disowned scheme is not a url this fork forwards"
+        );
         assert!(is_url_argument("file:///tmp/x"));
         assert!(is_url_argument("ssh://host/tmp/x"));
         assert!(

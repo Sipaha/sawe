@@ -1936,13 +1936,10 @@ impl ProtoClient for Client {
     }
 }
 
-/// prefix for the zed:// url scheme
-pub const ZED_URL_SCHEME: &str = "zed";
-
-/// A parsed Zed link that can be handled internally by the application.
+/// A parsed channel link that can be handled internally by the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZedLink {
-    /// Join a channel: `zed.dev/channel/channel-name-123` or `zed://channel/channel-name-123`
+    /// Join a channel: `zed.dev/channel/channel-name-123`
     Channel { channel_id: u64 },
     /// Open channel notes: `zed.dev/channel/channel-name-123/notes` or with heading `notes#heading`
     ChannelNotes {
@@ -1951,20 +1948,24 @@ pub enum ZedLink {
     },
 }
 
-/// Parses the given link into a Zed link.
+/// Parses the given link into a channel link.
 ///
-/// Returns a [`Some`] containing the parsed link if the link is a recognized Zed link
-/// that should be handled internally by the application.
+/// Returns a [`Some`] containing the parsed link if the link is a recognized
+/// channel link that should be handled internally by the application.
 /// Returns [`None`] for links that should be opened in the browser.
+///
+/// Only the `<server_url>/channel/…` spelling is recognised. This used to also
+/// accept `zed://channel/…` via a `ZED_URL_SCHEME = "zed"` constant; that arm
+/// is gone because this fork disowns another product's URL scheme, and no
+/// fork-branded spelling replaced it: the links this function parses are minted
+/// by the collab web app on `server_url`, a service this fork does not talk to
+/// (`collab` is a disabled subsystem, so both `ZedLink` variants dead-end), so
+/// inventing a `sawe://channel/…` would be advertising a route to nothing.
 pub fn parse_zed_link(link: &str, cx: &App) -> Option<ZedLink> {
     let server_url = &ClientSettings::get_global(cx).server_url;
     let path = link
         .strip_prefix(server_url)
-        .and_then(|result| result.strip_prefix('/'))
-        .or_else(|| {
-            link.strip_prefix(ZED_URL_SCHEME)
-                .and_then(|result| result.strip_prefix("://"))
-        })?;
+        .and_then(|result| result.strip_prefix('/'))?;
 
     let mut parts = path.split('/');
 
