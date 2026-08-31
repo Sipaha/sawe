@@ -37,6 +37,24 @@ const URL_PREFIX: [&'static str; 6] = [
     "zed://", "sawe://", "http://", "https://", "file://", "ssh://",
 ];
 
+/// The uninstall script shipped inside this binary, and the environment
+/// variable it reads the release channel from. Both live here, next to each
+/// other, because they are one contract in two languages: the binary sets the
+/// variable and the script reads it, and when the two spellings drifted apart
+/// (`ZED_CHANNEL` set here, `SAWE_CHANNEL` read there) `--uninstall` from a
+/// preview or nightly install silently fell back to `stable` and removed a
+/// different install's data.
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(feature = "no-bundled-uninstall")
+))]
+static UNINSTALL_SCRIPT: &[u8] = include_bytes!("../../../script/uninstall.sh");
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(feature = "no-bundled-uninstall")
+))]
+const UNINSTALL_CHANNEL_ENV: &str = "SAWE_CHANNEL";
+
 /// Whether this argument is a url to forward as-is rather than a path to
 /// canonicalise. Named so the classification is testable: it used to be an
 /// inline `URL_PREFIX.iter().any(..)` at the single call site, which is why the
@@ -348,6 +366,26 @@ mod tests {
     /// through `parse_path_with_position` and sent the editor the absolute
     /// path `$PWD/sawe://settings`. The scheme must be classified exactly like
     /// the upstream spelling it aliases.
+    /// The channel the uninstaller acts on is a contract between this binary
+    /// and a shell script, and nothing but this test connects the two ends:
+    /// a mismatch is silent and destructive, because the script's
+    /// `${VAR:-stable}` default makes a preview or nightly uninstall remove
+    /// the *stable* install's data.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "macos"),
+        not(feature = "no-bundled-uninstall")
+    ))]
+    #[test]
+    fn the_uninstall_script_reads_the_channel_variable_this_binary_sets() {
+        let script = std::str::from_utf8(UNINSTALL_SCRIPT)
+            .expect("the bundled uninstall script must be utf-8");
+        assert!(
+            script.contains(&format!("${{{UNINSTALL_CHANNEL_ENV}:-")),
+            "script/uninstall.sh must read ${UNINSTALL_CHANNEL_ENV}, \
+             which is the variable this binary sets"
+        );
+    }
+
     #[test]
     fn the_forks_own_url_scheme_is_classified_as_a_url() {
         assert!(is_url_argument("sawe://settings"));
@@ -571,8 +609,6 @@ fn run() -> Result<()> {
         not(feature = "no-bundled-uninstall")
     ))]
     if args.uninstall {
-        static UNINSTALL_SCRIPT: &[u8] = include_bytes!("../../../script/uninstall.sh");
-
         let tmp_dir = tempfile::tempdir()?;
         let script_path = tmp_dir.path().join("uninstall.sh");
         fs::write(&script_path, UNINSTALL_SCRIPT)?;
@@ -582,7 +618,10 @@ fn run() -> Result<()> {
 
         let status = std::process::Command::new("sh")
             .arg(&script_path)
-            .env("ZED_CHANNEL", &*release_channel::RELEASE_CHANNEL_NAME)
+            .env(
+                UNINSTALL_CHANNEL_ENV,
+                &*release_channel::RELEASE_CHANNEL_NAME,
+            )
             .status()
             .context("Failed to execute uninstall script")?;
 
