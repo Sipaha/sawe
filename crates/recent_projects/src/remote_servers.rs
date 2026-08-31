@@ -424,8 +424,11 @@ impl ProjectPicker {
                 connection_string: format!("mock-{}", options.id).into(),
                 nickname: None,
             },
-            #[cfg(not(any(test, feature = "test-support")))]
-            _ => unreachable!("Mock variant is only available in test/test-support"),
+            // Reachable only when `remote/test-support` is enabled by feature
+            // unification without this crate's own `test-support`; the arms above
+            // are exhaustive in every other configuration.
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("RemoteConnectionOptions::Mock requires remote/test-support"),
         };
         let _path_task = cx
             .spawn_in(window, {
