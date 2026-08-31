@@ -87,8 +87,14 @@ Rules that still apply:
   id (`Caches`, `HTTPStorages`, `Preferences`, `Saved Application
   State`), not ours to name. GitHub `Sipaha/sawe`; attribution string
   `Fork of Zed by Zed Industries, Inc., modified by Simonov Pavel`; per-project config
-  dir `.sawe/` (replacing upstream `.zed/`; `.zed_server` /
-  `.zed_wsl_server` remain unchanged as preserved upstream identifiers).
+  dir `.sawe/` (replacing upstream `.zed/`); and, on a remote host, the
+  upload directory `.sawe_server` plus the binaries
+  `sawe-remote-server-<channel>-<version>` inside it (replacing upstream
+  `.zed_server` / `.zed_wsl_server` and `zed-remote-server-…`, which were
+  carved out as *preserved upstream identifiers* until the disown pass
+  withdrew that carve-out — see FORK.md #119. §3 now names no preserved
+  upstream identifier; the cargo crate name `zed` is a build convention,
+  not identity, and is covered under "Build + test conventions").
   These are user-visible identity, not merge-friendliness — they don't
   change just because the merge cost went away.
 

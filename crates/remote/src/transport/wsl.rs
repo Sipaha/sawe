@@ -178,11 +178,8 @@ impl WslRemoteConnection {
             _ => version.to_string(),
         };
 
-        let binary_name = format!(
-            "zed-remote-server-{}-{}",
-            release_channel.dev_name(),
-            version_str
-        );
+        let binary_name =
+            paths::remote_server_binary_name(release_channel.dev_name(), &version_str, false);
 
         let dst_path =
             paths::remote_server_dir_relative().join(RelPath::unix(&binary_name).unwrap());

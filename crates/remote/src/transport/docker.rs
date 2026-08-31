@@ -192,11 +192,8 @@ impl DockerExecConnection {
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
         };
-        let binary_name = format!(
-            "zed-remote-server-{}-{}",
-            release_channel.dev_name(),
-            version_str
-        );
+        let binary_name =
+            paths::remote_server_binary_name(release_channel.dev_name(), &version_str, false);
         let dst_path =
             paths::remote_server_dir_relative().join(RelPath::unix(&binary_name).unwrap());
 
@@ -451,7 +448,7 @@ impl DockerExecConnection {
         let stderr = String::from_utf8_lossy(&output.stderr);
         log::debug!("failed to change ownership for via chown: {stderr}",);
         anyhow::bail!(
-            "failed to change ownership for zed_remote_server via chown: {}",
+            "failed to change ownership for the remote server via chown: {}",
             stderr,
         );
     }
@@ -838,5 +835,125 @@ impl RemoteConnection for DockerExecConnection {
 
     fn default_system_shell(&self) -> String {
         String::from("/bin/sh")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SilentDelegate;
+
+    impl RemoteClientDelegate for SilentDelegate {
+        fn ask_password(
+            &self,
+            _prompt: String,
+            _tx: futures::channel::oneshot::Sender<askpass::EncryptedPassword>,
+            _cx: &mut AsyncApp,
+        ) {
+            unimplemented!("the docker transport never asks for a password")
+        }
+
+        fn get_download_url(
+            &self,
+            _platform: RemotePlatform,
+            _release_channel: ReleaseChannel,
+            _version: Option<SemanticVersion>,
+            _cx: &mut AsyncApp,
+        ) -> Task<Result<Option<String>>> {
+            unimplemented!("the binary is supplied via ZED_COPY_REMOTE_SERVER")
+        }
+
+        fn download_server_binary_locally(
+            &self,
+            _platform: RemotePlatform,
+            _release_channel: ReleaseChannel,
+            _version: Option<SemanticVersion>,
+            _cx: &mut AsyncApp,
+        ) -> Task<Result<PathBuf>> {
+            unimplemented!("the binary is supplied via ZED_COPY_REMOTE_SERVER")
+        }
+
+        fn set_status(&self, status: Option<&str>, _cx: &mut AsyncApp) {
+            if let Some(status) = status {
+                eprintln!("docker status: {status}");
+            }
+        }
+    }
+
+    /// The whole point of the disown pass, checked against a real container
+    /// rather than by reading: the client must upload into *this fork's* server
+    /// directory under *this fork's* file name, so that a Zed installed for the
+    /// same user on the same host neither adopts our binary nor has its own
+    /// adopted by us. Before the rename both products wrote `.zed_server` with
+    /// byte-identical file names inside it.
+    ///
+    /// Ignored by default because it needs a real container and a Linux
+    /// `remote_server` build:
+    ///
+    /// ```text
+    /// docker run -d --name sawe-probe ubuntu:24.04 sleep infinity
+    /// cargo build -p remote_server --bin remote_server
+    /// SAWE_TEST_DOCKER_CONTAINER=sawe-probe \
+    ///   ZED_COPY_REMOTE_SERVER=$PWD/target/debug/remote_server \
+    ///   cargo test -p remote --lib docker::tests -- --ignored --nocapture
+    /// ```
+    #[gpui::test]
+    #[ignore = "needs a running container; see the doc comment"]
+    async fn the_uploaded_binary_lands_under_the_forks_own_names(cx: &mut gpui::TestAppContext) {
+        let Ok(container) = std::env::var("SAWE_TEST_DOCKER_CONTAINER") else {
+            panic!("set SAWE_TEST_DOCKER_CONTAINER to a running container's name or id");
+        };
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            release_channel::init_test(SemanticVersion::new(0, 1, 0), ReleaseChannel::Dev, cx)
+        });
+
+        let options = DockerConnectionOptions {
+            name: "sawe-probe".into(),
+            container_id: container.clone(),
+            remote_user: "root".into(),
+            upload_binary_over_docker_exec: true,
+            use_podman: false,
+            remote_env: Default::default(),
+        };
+
+        let connection = cx
+            .update(|cx| {
+                let delegate: Arc<dyn RemoteClientDelegate> = Arc::new(SilentDelegate);
+                cx.spawn(async move |cx| DockerExecConnection::new(options, delegate, cx).await)
+            })
+            .await
+            .expect("connecting to the container");
+
+        let relpath = connection
+            .remote_binary_relpath
+            .as_ref()
+            .expect("a binary path");
+        assert_eq!(
+            relpath.display(PathStyle::Posix).as_ref(),
+            ".sawe_server/sawe-remote-server-dev-build",
+            "the uploaded binary must not share a name or a directory with another editor's"
+        );
+
+        // And it is really there, under that name, in the container.
+        let listing = connection
+            .run_docker_exec(
+                "ls",
+                None,
+                &Default::default(),
+                &[
+                    "-1",
+                    &format!("{}/.sawe_server", connection.remote_dir_for_server),
+                ],
+            )
+            .await
+            .expect("listing the server directory");
+        assert!(
+            listing
+                .lines()
+                .any(|line| line.trim() == "sawe-remote-server-dev-build"),
+            "expected sawe-remote-server-dev-build in the container, got:\n{listing}"
+        );
     }
 }

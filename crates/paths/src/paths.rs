@@ -58,19 +58,46 @@ static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// (or `~/.spk/sawe-dev/config` for dev builds). See `base_dir`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Returns the relative path to the zed_server directory on the ssh host.
+/// Returns the relative path, from the remote user's home directory, of the
+/// directory this fork uploads its remote-server binaries into.
+///
+/// This is a *shared* filesystem on a machine we do not own: another editor may
+/// be installed on the same host for the same user. It was `.zed_server` until
+/// the disown pass, which is the directory upstream Zed uses — and since both
+/// products also spelled the binaries inside it identically, neither could tell
+/// its own uploads from the other's. See [`remote_server_binary_name`].
 pub fn remote_server_dir_relative() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".zed_server").unwrap());
+        LazyLock::new(|| RelPath::unix(".sawe_server").unwrap());
     *CACHED
 }
 
-// Remove this once 223 goes stable
-/// Returns the relative path to the zed_wsl_server directory on the wsl host.
-pub fn remote_wsl_server_dir_relative() -> &'static RelPath {
-    static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".zed_wsl_server").unwrap());
-    *CACHED
+/// The shared `sawe-remote-server-<channel>-` prefix of every binary this fork
+/// uploads into [`remote_server_dir_relative`]. Split out because the server
+/// scans for it by prefix when it reaps superseded versions, and that scan must
+/// not match a file some other product wrote.
+pub fn remote_server_binary_prefix(release_channel_dev_name: &str) -> String {
+    format!("sawe-remote-server-{release_channel_dev_name}-")
+}
+
+/// The file name of the remote-server binary for a given channel and version.
+///
+/// Composed here rather than at its three call sites (`ssh`, `wsl`, `docker`)
+/// for the reason decision #117 exists: a name this crate does not spell is a
+/// name the rebrand assertions below cannot guard, and this one lands in a
+/// directory shared with another product. `version` is passed in because the
+/// callers derive it differently per channel (`build` for Dev, and the Docker
+/// transport appends the commit on Nightly).
+pub fn remote_server_binary_name(
+    release_channel_dev_name: &str,
+    version: &str,
+    is_windows: bool,
+) -> String {
+    format!(
+        "{}{version}{}",
+        remote_server_binary_prefix(release_channel_dev_name),
+        if is_windows { ".exe" } else { "" }
+    )
 }
 
 /// Sets a custom directory for all user data, overriding the default data directory.
@@ -200,6 +227,20 @@ pub fn cli_ipc_socket_in(data_dir: &Path, release_channel: &str) -> PathBuf {
 /// assertions can see the whole name.
 pub fn crash_handler_socket(pid: u32) -> PathBuf {
     temp_dir().join(format!("sawe-crash-handler-{pid}"))
+}
+
+/// The crash-handler IPC socket of the remote server's *run* process, on the
+/// remote host. Same rule again: `remote_server` used to compose this name at
+/// the call site, which decision #117 recorded as a knowingly-outstanding
+/// instance of the pattern it forbids rather than an exception to it.
+pub fn remote_server_crash_handler_socket(pid: u32) -> PathBuf {
+    temp_dir().join(format!("sawe-remote-server-crash-handler-{pid}"))
+}
+
+/// The crash-handler IPC socket of the remote server's *proxy* process, on the
+/// remote host. See [`remote_server_crash_handler_socket`].
+pub fn remote_server_proxy_crash_handler_socket(pid: u32) -> PathBuf {
+    temp_dir().join(format!("sawe-remote-server-proxy-crash-handler-{pid}"))
 }
 
 /// Returns the path to the hang traces directory.
@@ -662,10 +703,10 @@ mod rebrand_tests {
 
     #[test]
     fn app_controlled_dirs_are_ours() {
-        // `remote_server_dir_relative` / `remote_wsl_server_dir_relative` are
-        // deliberately absent: `.zed_server` is still a preserved upstream
-        // identifier at the time of writing, and renaming it has a
-        // compatibility consequence on remote hosts rather than being cosmetic.
+        assert_is_ours(
+            "remote_server_dir_relative",
+            remote_server_dir_relative().as_std_path(),
+        );
         assert_is_ours("base_dir", base_dir());
         assert_is_ours("config_dir", config_dir());
         assert_is_ours("data_dir", data_dir());
@@ -698,5 +739,42 @@ mod rebrand_tests {
             &cli_ipc_socket_in(data_dir(), "stable"),
         );
         assert_is_ours("crash_handler_socket", &crash_handler_socket(4242));
+        assert_is_ours(
+            "remote_server_crash_handler_socket",
+            &remote_server_crash_handler_socket(4242),
+        );
+        assert_is_ours(
+            "remote_server_proxy_crash_handler_socket",
+            &remote_server_proxy_crash_handler_socket(4242),
+        );
+        // The one name in this set that lands in a directory shared with
+        // another product, so the assertion is load-bearing rather than
+        // hygienic. Both spellings the callers can produce are covered: the
+        // Windows `.exe` arm is a separate `format!` branch.
+        assert_is_ours(
+            "remote_server_binary_name",
+            Path::new(&remote_server_binary_name("stable", "1.2.3", false)),
+        );
+        assert_is_ours(
+            "remote_server_binary_name (windows)",
+            Path::new(&remote_server_binary_name("stable", "1.2.3", true)),
+        );
+        assert_is_ours(
+            "remote_server_binary_prefix",
+            Path::new(&remote_server_binary_prefix("stable")),
+        );
+    }
+
+    /// The reaper in `remote_server` strips the prefix off a directory entry to
+    /// recover the version. If the two ever drift, it silently stops matching
+    /// its own uploads — and, before the disown pass, matched the other
+    /// product's instead.
+    #[test]
+    fn the_binary_prefix_is_the_binary_name_minus_its_version() {
+        let name = remote_server_binary_name("nightly", "1.2.3", false);
+        assert_eq!(
+            name.strip_prefix(&remote_server_binary_prefix("nightly")),
+            Some("1.2.3")
+        );
     }
 }
