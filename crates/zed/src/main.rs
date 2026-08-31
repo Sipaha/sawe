@@ -437,6 +437,15 @@ fn main() {
             }
         })
         .collect();
+    let handoff_path_count = handoff_paths.len();
+    // Why the reason is carried to the exit site instead of being reported
+    // here: a hand-off failure is only *user-visible harm* if we then give up
+    // without opening anything. When it fails and we go on to become the
+    // canonical instance (stale lock, dev channel, ZED_STATELESS) we do open
+    // the user's paths, and shouting about the failed probe would make the
+    // ordinary case noisy for nothing. So the reason rides along and is
+    // printed only by the branch that returns without doing the work.
+    let mut handoff_failure: Option<String> = None;
     match editor_mcp::try_handoff_to_existing_instance(handoff_paths) {
         Ok(editor_mcp::HandoffOutcome::HandedOff { focused_window_id }) => {
             log::info!(
@@ -446,9 +455,13 @@ fn main() {
             return;
         }
         Ok(editor_mcp::HandoffOutcome::LockBusyButUnreachable { lockholder_pid }) => {
+            // `{:?}` on the Option printed the literal `Some(12345)` at the
+            // user, on the one line this branch has to explain itself with.
+            let holder = lockholder_pid
+                .map(|pid| format!("PID {pid}"))
+                .unwrap_or_else(|| "an unrecorded PID".to_string());
             eprintln!(
-                "Another sawe instance is starting (lock held by PID {:?}); please wait or terminate it.",
-                lockholder_pid
+                "Another sawe instance is starting (lock held by {holder}); please wait or terminate it."
             );
             process::exit(1);
         }
@@ -457,6 +470,7 @@ fn main() {
         }
         Err(err) => {
             log::warn!("sawe: handoff probe failed: {err}; continuing as canonical");
+            handoff_failure = Some(err.to_string());
         }
     }
 
@@ -502,6 +516,21 @@ fn main() {
     };
     if failed_single_instance_check {
         println!("sawe is already running");
+        // This is the exit that used to lose the user's file in silence: the
+        // hand-off failed, another instance owns the single-instance socket,
+        // so we return having opened nothing. Only the stdout line above was
+        // ever printed, which is why a `-32601 Tool not found` on the
+        // hand-off path stayed invisible for as long as it did. The reason
+        // goes to stderr so the existing stdout line stays byte-identical for
+        // anything parsing it.
+        if let Some(reason) = handoff_failure {
+            eprintln!("sawe: could not hand off to the running instance: {reason}");
+            if handoff_path_count > 0 {
+                eprintln!(
+                    "sawe: {handoff_path_count} path(s) from the command line were NOT opened."
+                );
+            }
+        }
         return;
     }
 
