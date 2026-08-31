@@ -1,7 +1,7 @@
 //! Handoff: connect to an existing instance's MCP socket and forward CLI args.
 use anyhow::{Context as _, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use smol::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use smol::net::unix::UnixStream;
 use std::path::PathBuf;
@@ -246,8 +246,42 @@ fn interpret_reply(response: serde_json::Value) -> Result<HandoffOutcome> {
             .unwrap_or("(no message)");
         return Err(anyhow!("existing instance returned an error: {message}"));
     }
-    let structured = response
-        .get("result")
+    // A *tool-level* failure is not a JSON-RPC error: `context_server`'s
+    // dispatcher (`listener.rs`, the `Err(err)` arm of `handle_call_tool`)
+    // answers with a successful response whose `result.isError` is `true`,
+    // the real message in `result.content[..].text`, and
+    // `structuredContent` omitted. Without this branch that shape fell
+    // through to the generic "missing result.structuredContent" below and
+    // the actual reason was thrown away. `isError` is also serialized as
+    // `false` on success, so this must test for `true`, not for presence.
+    let result = response.get("result");
+    if result
+        .and_then(|r| r.get("isError"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        let message = result
+            .and_then(|r| r.get("content"))
+            .and_then(Value::as_array)
+            .map(|chunks| {
+                // Mirrors `CallToolResponse::text_contents`: only `text`
+                // chunks carry a message, and the first chunk is not
+                // guaranteed to be one (a tool may answer with an image or
+                // a resource link), so collect every text chunk rather than
+                // indexing content[0].
+                chunks
+                    .iter()
+                    .filter_map(|chunk| chunk.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| "(no message)".to_string());
+        return Err(anyhow!(
+            "existing instance reported a tool failure: {message}"
+        ));
+    }
+    let structured = result
         .and_then(|r| r.get("structuredContent"))
         .cloned()
         .ok_or_else(|| anyhow!("missing result.structuredContent"))?;
@@ -382,6 +416,90 @@ mod tests {
             err.contains("Tool not found: editor.handle_cli_args"),
             "got {err:?}"
         );
+    }
+
+    /// A tool-level failure is a *successful* JSON-RPC response carrying
+    /// `result.isError: true` — not a JSON-RPC `error` member — so it needs
+    /// its own branch. Before that branch existed every one of these shapes
+    /// came back as "missing result.structuredContent" and the reason the
+    /// hand-off failed was discarded.
+    #[test]
+    fn tool_level_error_is_reported_verbatim() {
+        // (name, `result` object, expected substring of the error)
+        let cases: &[(&str, serde_json::Value, &str)] = &[
+            (
+                "text message",
+                serde_json::json!({
+                    "isError": true,
+                    "content": [{"type": "text", "text": "open_paths failed: no such file"}]
+                }),
+                "open_paths failed: no such file",
+            ),
+            (
+                "content absent",
+                serde_json::json!({"isError": true}),
+                "(no message)",
+            ),
+            (
+                "content empty",
+                serde_json::json!({"isError": true, "content": []}),
+                "(no message)",
+            ),
+            (
+                "first chunk is not text",
+                serde_json::json!({
+                    "isError": true,
+                    "content": [
+                        {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+                        {"type": "text", "text": "the real reason"}
+                    ]
+                }),
+                "the real reason",
+            ),
+            (
+                "no text chunk at all",
+                serde_json::json!({
+                    "isError": true,
+                    "content": [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
+                }),
+                "(no message)",
+            ),
+        ];
+        for (name, result, expected) in cases {
+            let frame = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result});
+            let err = interpret_reply(frame)
+                .expect_err(&format!("{name}: expected an error"))
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "{name}: expected error containing {expected:?}, got {err:?}"
+            );
+            assert!(
+                !err.contains("missing result.structuredContent"),
+                "{name}: tool failure fell through to the generic message: {err:?}"
+            );
+        }
+    }
+
+    /// The success response also carries `isError`, as `false` — so the
+    /// branch above must test for `true` rather than for the key's presence,
+    /// or every successful hand-off becomes a reported failure.
+    #[test]
+    fn is_error_false_is_not_a_failure() {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "isError": false,
+                "content": [{"type": "text", "text": "opened 1 path(s)"}],
+                "structuredContent": {"handled": true, "focused_window_id": "window:3"}
+            }
+        });
+        match interpret_reply(frame).expect("handed off") {
+            HandoffOutcome::HandedOff { focused_window_id } => {
+                assert_eq!(focused_window_id.as_deref(), Some("window:3"));
+            }
+            other => panic!("expected HandedOff, got {other:?}"),
+        }
     }
 
     #[test]
