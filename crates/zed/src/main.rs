@@ -199,31 +199,70 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
     }
 }
 
-/// The stderr lines that go with a `sawe is already running` exit.
+/// The path arguments the single-instance hand-off can carry.
 ///
-/// Extracted from that exit site because its rules are exactly the ones this
+/// URLs are filtered out because `editor.handle_cli_args` opens paths, not
+/// URLs. That filter is about the *hand-off*, and must not be mistaken for the
+/// set of things a giving-up exit drops — see [`dropped_args_report`].
+fn handoff_paths(paths_or_urls: &[String]) -> Vec<PathBuf> {
+    paths_or_urls
+        .iter()
+        .filter(|arg| !is_url_scheme(arg))
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// The stderr lines that go with an exit that opened nothing.
+///
+/// Extracted from those exit sites because its rules are exactly the ones this
 /// path keeps getting wrong, and only a pure function makes them assertable:
 ///
 /// - a carried hand-off failure is reported once, never twice;
-/// - the "paths were dropped" line does **not** depend on there being a
+/// - the "arguments were dropped" line does **not** depend on there being a
 ///   failure to report. The hand-off can return `BecameCanonical` — no error
 ///   at all — and the single-instance check below it can still send us home
-///   without opening anything, which is the same silent path-drop with no
-///   error value to carry;
-/// - with no paths on the command line there is nothing to warn about, so a
-///   second `sawe` with no arguments stays as quiet as it has always been.
-fn dropped_paths_report(handoff_failure: Option<&str>, path_count: usize) -> Vec<String> {
+///   without opening anything, which is the same silent drop with no error
+///   value to carry;
+/// - the count is over **every** command-line argument, not only the ones
+///   [`handoff_paths`] would have carried. A canonical instance turns each
+///   element of `paths_or_urls` into a URL and feeds it to the open listener
+///   (`parse_url_arg` + `open_listener.open`, further down this file), so a
+///   `sawe://…` argument is lost by these exits exactly as a path is. Sizing
+///   this line off the hand-off's path list instead made `sawe sawe://…`
+///   report nothing at all about what it had just thrown away;
+/// - with no arguments there is nothing to warn about, so a second `sawe` with
+///   no arguments stays as quiet as it has always been.
+fn dropped_args_report(handoff_failure: Option<&str>, arg_count: usize) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(reason) = handoff_failure {
         lines.push(format!(
             "sawe: could not hand off to the running instance: {reason}"
         ));
     }
-    if path_count > 0 {
+    if arg_count > 0 {
         lines.push(format!(
-            "sawe: {path_count} path(s) from the command line were NOT opened."
+            "sawe: {arg_count} argument(s) from the command line were NOT opened."
         ));
     }
+    lines
+}
+
+/// The stderr lines that go with the `LockBusyButUnreachable` exit: the lock is
+/// held but nothing answers on the socket.
+///
+/// Two states produce that and this process cannot tell them apart. The
+/// running instance may still be starting — its `start_server` has taken the
+/// lock but not yet published the socket symlink — or its MCP server may have
+/// failed outright, in which case it holds the lock for the rest of its life
+/// (`editor_mcp::lifecycle::InstanceLock`) and no amount of waiting helps. So
+/// this names both and gives advice that is right for either.
+fn unreachable_instance_report(holder: &str, arg_count: usize) -> Vec<String> {
+    let mut lines = vec![format!(
+        "sawe: the running instance ({holder}) is not accepting hand-offs — it is \
+         either still starting or its MCP server failed to start."
+    )];
+    lines.extend(dropped_args_report(None, arg_count));
+    lines.push("sawe: retry shortly; if it persists, restart sawe.".to_string());
     lines
 }
 
@@ -455,18 +494,10 @@ fn main() {
     // its MCP server is reachable, hand off our CLI paths to it and exit.
     // Otherwise we continue and become the canonical instance (later we'll
     // bind the MCP server in `editor_mcp::start_server`).
-    let handoff_paths: Vec<PathBuf> = args
-        .paths_or_urls
-        .iter()
-        .filter_map(|arg| {
-            if is_url_scheme(arg) {
-                None
-            } else {
-                Some(PathBuf::from(arg))
-            }
-        })
-        .collect();
-    let handoff_path_count = handoff_paths.len();
+    let handoff_paths = handoff_paths(&args.paths_or_urls);
+    // Sized off every argument, not off `handoff_paths`: the exits below open
+    // nothing at all, so a `sawe://…` argument is dropped just like a path.
+    let dropped_arg_count = args.paths_or_urls.len();
     // Why the reason is carried to the exit site instead of being reported
     // here: a hand-off failure is only *user-visible harm* if we then give up
     // without opening anything. When it fails and we go on to become the
@@ -489,9 +520,14 @@ fn main() {
             let holder = lockholder_pid
                 .map(|pid| format!("PID {pid}"))
                 .unwrap_or_else(|| "an unrecorded PID".to_string());
-            eprintln!(
-                "Another sawe instance is starting (lock held by {holder}); please wait or terminate it."
-            );
+            // This used to claim the other instance "is starting" and drop the
+            // arguments without a word. Since `editor_mcp::start_server` now
+            // keeps the lock across a failed bind, a *permanently* MCP-less
+            // editor also lands here — "please wait" would be wrong advice for
+            // half the cases, and the silent drop was wrong for all of them.
+            for line in unreachable_instance_report(&holder, dropped_arg_count) {
+                eprintln!("{line}");
+            }
             process::exit(1);
         }
         Ok(editor_mcp::HandoffOutcome::BecameCanonical) => {
@@ -560,7 +596,7 @@ fn main() {
         // invisible for as long as it did. Everything else goes to stderr so
         // the existing stdout line stays byte-identical for anything parsing
         // it.
-        for line in dropped_paths_report(handoff_failure.as_deref(), handoff_path_count) {
+        for line in dropped_args_report(handoff_failure.as_deref(), dropped_arg_count) {
             eprintln!("{line}");
         }
         return;
@@ -2496,43 +2532,90 @@ fn check_for_conpty_dll() {
 
 #[cfg(test)]
 mod tests {
-    use super::dropped_paths_report;
+    use super::{dropped_args_report, handoff_paths, unreachable_instance_report};
 
     #[test]
-    fn dropped_paths_are_reported_without_a_failure_to_blame() {
+    fn dropped_args_are_reported_without_a_failure_to_blame() {
         // `HandoffOutcome::BecameCanonical` followed by a failed
         // single-instance check: nothing errored, so there is no reason to
-        // print — but the paths are dropped all the same and saying so is the
-        // whole point.
+        // print — but the arguments are dropped all the same and saying so is
+        // the whole point.
         assert_eq!(
-            dropped_paths_report(None, 2),
-            vec!["sawe: 2 path(s) from the command line were NOT opened."]
+            dropped_args_report(None, 2),
+            vec!["sawe: 2 argument(s) from the command line were NOT opened."]
         );
     }
 
     #[test]
-    fn a_failure_is_reported_once_alongside_the_dropped_paths() {
+    fn a_failure_is_reported_once_alongside_the_dropped_args() {
         assert_eq!(
-            dropped_paths_report(
+            dropped_args_report(
                 Some("existing instance returned an error: Tool not found"),
                 1
             ),
             vec![
                 "sawe: could not hand off to the running instance: existing instance returned an error: Tool not found",
-                "sawe: 1 path(s) from the command line were NOT opened.",
+                "sawe: 1 argument(s) from the command line were NOT opened.",
             ]
         );
     }
 
     #[test]
     fn the_quiet_cases_stay_quiet() {
-        // A second `sawe` with no path arguments has lost nothing, so it says
+        // A second `sawe` with no arguments has lost nothing, so it says
         // nothing beyond the one stdout line the caller prints.
-        assert!(dropped_paths_report(None, 0).is_empty());
-        // A failure with no paths still explains itself, but claims no loss.
+        assert!(dropped_args_report(None, 0).is_empty());
+        // A failure with no arguments still explains itself, but claims no loss.
         assert_eq!(
-            dropped_paths_report(Some("connection refused"), 0),
+            dropped_args_report(Some("connection refused"), 0),
             vec!["sawe: could not hand off to the running instance: connection refused"]
         );
+    }
+
+    /// The hand-off carries paths only, but the exits that give up drop
+    /// *everything* — so the dropped-argument count must come from the whole
+    /// argument list and not from what the hand-off was given. Sizing it off
+    /// `handoff_paths` made `sawe sawe://…` report nothing at all.
+    #[test]
+    fn a_url_argument_is_not_handed_off_but_is_still_reported_as_dropped() {
+        let args = vec![
+            "/tmp/a.txt".to_string(),
+            "sawe://file/tmp/b.txt".to_string(),
+            "file:///tmp/c.txt".to_string(),
+        ];
+
+        let carried = handoff_paths(&args);
+        assert_eq!(
+            carried.len(),
+            1,
+            "only the plain path is a hand-off path, got {carried:?}"
+        );
+
+        assert_eq!(
+            dropped_args_report(None, args.len()),
+            vec!["sawe: 3 argument(s) from the command line were NOT opened."],
+            "the report is sized off every argument, not off the hand-off's paths"
+        );
+    }
+
+    /// The lock-held-but-unreachable exit must name both states it cannot
+    /// distinguish, and must not stay silent about the arguments it drops.
+    #[test]
+    fn an_unreachable_instance_names_both_causes_and_its_losses() {
+        let lines = unreachable_instance_report("PID 4242", 2);
+        assert_eq!(
+            lines,
+            vec![
+                "sawe: the running instance (PID 4242) is not accepting hand-offs — it is either still starting or its MCP server failed to start.",
+                "sawe: 2 argument(s) from the command line were NOT opened.",
+                "sawe: retry shortly; if it persists, restart sawe.",
+            ]
+        );
+
+        // With nothing to open, the loss line disappears but the diagnosis and
+        // the advice do not: the user still asked for a window to be raised.
+        let quiet = unreachable_instance_report("an unrecorded PID", 0);
+        assert_eq!(quiet.len(), 2, "no loss line when nothing was dropped");
+        assert!(quiet[0].contains("an unrecorded PID"));
     }
 }
