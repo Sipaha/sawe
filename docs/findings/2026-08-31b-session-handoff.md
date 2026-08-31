@@ -5,7 +5,7 @@ Supersedes `findings/2026-08-31-session-handoff.md` for everything after
 blob bug, the destructive-rewrite class and the `rebuild_streams` performance work,
 all still shipped and untouched.
 
-**41 commits, all on `origin/main`. Working tree clean. No UI shipped.**
+**45 commits, all on `origin/main`. Working tree clean. No UI shipped.**
 
 That previous handoff said the actionable pool was drained — "every item this
 session identified has shipped; what is left either needs the maintainer or is
@@ -267,7 +267,32 @@ so `PRAGMA wal_checkpoint(TRUNCATE)` first, or copy `.db` **and** `.db-wal`. Nev
 
 ## Resume recipe
 
-Read this file, then `docs/INDEX.md`, then `git log --oneline -45` to confirm the
-chain ends at HEAD. Pick from the pool per `docs/workflow/supervisor-mode.md` § 7.
+Read this file, then `docs/INDEX.md`, then `git log --oneline -50` to confirm the
+chain ends at `fde9ac75cf`. Pick from the pool per `docs/workflow/supervisor-mode.md` § 7.
 The pool above is genuinely thinner than what this session started with — but so was
 the last one's, and it hid five real defects. Dig.
+
+---
+
+## Final gate, controller-verified at `fde9ac75cf`
+
+`cargo check --workspace --all-targets` exit 0, zero errors, zero warnings ·
+`cargo build --bin sawe` exit 0, zero warnings · `cargo fmt --all --check` clean ·
+`script/check-{licenses,keymaps,todos}` all exit 0.
+
+The whole-branch review returned **coherent**: the contended regions in
+`crates/zed/src/main.rs` (four tasks), `crates/editor_mcp/` (three) and `FORK.md`
+(five) read as one design. It swept the tree itself for `solution_agent.db` by path
+and found no seventh site the branch missed, and confirmed there is no
+double-reporting on any CLI exit and no case that exits non-zero having lost nothing.
+
+Its three findings were all seams where a comment or a durable record contradicted
+the code the branch itself changed — fixed in one wave and re-reviewed.
+
+**One asymmetry is documented rather than resolved, deliberately:**
+`failed_single_instance_check` returns **0** after losing the user's arguments,
+including after the full 30 s `READ_TIMEOUT`, while its 4 s sibling
+`LockBusyButUnreachable` exits **1** for strictly less harm. Both codes are
+inherited and were preserved on purpose; FORK.md #114 now says so and warns that
+aligning them is an interface change. Whoever forwards arguments to
+`zed-<channel>.sock` should decide it, since forwarding removes the loss entirely.
