@@ -655,10 +655,27 @@ pub fn start_server(cx: &mut App) -> Result<()> {
 /// The failure is not local to this crate: with no server bound, the editor
 /// keeps running and keeps owning `data_dir()/zed-<channel>.sock`, so every
 /// later `sawe <path>` from the user's shell loses that gate to this process
-/// and exits having opened nothing (`main.rs`, the `failed_single_instance_check`
-/// branch). Nothing else in the session mentions that the CLI integration is
-/// down, and the state does not clear until the editor is restarted — so this
-/// says so once, out loud, rather than only in `logs/sawe.log`.
+/// and exits having opened nothing. Nothing else in the session mentions that
+/// the CLI integration is down, and the state does not clear until the editor
+/// is restarted — so this says so once, out loud, rather than only in
+/// `logs/sawe.log`.
+///
+/// *Which* give-up the later invocation takes differs between this function's
+/// two callers, because they differ in whether `state/mcp.lock` ends up held —
+/// and that lock is the only thing `handoff::probe_lock` reads (see
+/// [`InstanceLock`] and FORK.md #113):
+///
+/// - **The failed startup task below.** The guard is parked in [`InstanceLock`]
+///   before that task runs, so the lock *is* held. The next `sawe <path>`
+///   probes a busy lock, then fails to reach `mcp.sock` through
+///   `handoff::RETRY_COUNT` one-second attempts, and gives up as
+///   `HandoffOutcome::LockBusyButUnreachable` — `unreachable_instance_report`
+///   on stderr, exit 1. It never reaches `failed_single_instance_check`.
+/// - **The [`LockError::Io`] arm above.** The lock was never acquired, so the
+///   probe finds it free and answers `BecameCanonical`; the invocation carries
+///   on to the *other* gate, which this process owns. That is
+///   `main.rs`'s `failed_single_instance_check` branch: `sawe is already
+///   running` on stdout, `dropped_args_report` on stderr, and a 0 exit.
 fn report_startup_failure(reason: impl std::fmt::Display) {
     log::error!("editor_mcp: the MCP server did not start: {reason}");
     eprintln!(
