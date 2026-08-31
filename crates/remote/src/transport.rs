@@ -15,6 +15,8 @@ use rpc::proto::Envelope;
 use util::command::Child;
 
 pub mod docker;
+#[cfg(test)]
+pub(crate) mod live_remote_support;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod ssh;

@@ -2274,3 +2274,145 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::transport::live_remote_support::{
+        DECOY_DIR, DECOY_NAME, OURS_DIR, OURS_NAME, SilentDelegate, decoy_digest_script,
+        init_release_channel, list_our_dir_script, run, seed_decoy_script,
+    };
+
+    struct Target {
+        host: String,
+        port: u16,
+        user: String,
+        key: String,
+    }
+
+    impl Target {
+        fn from_env() -> Self {
+            Self {
+                host: std::env::var("SAWE_TEST_SSH_HOST").expect("set SAWE_TEST_SSH_HOST"),
+                port: std::env::var("SAWE_TEST_SSH_PORT")
+                    .expect("set SAWE_TEST_SSH_PORT")
+                    .parse()
+                    .expect("SAWE_TEST_SSH_PORT must be a port number"),
+                user: std::env::var("SAWE_TEST_SSH_USER").unwrap_or_else(|_| "root".into()),
+                key: std::env::var("SAWE_TEST_SSH_KEY").expect("set SAWE_TEST_SSH_KEY"),
+            }
+        }
+
+        /// The options are deliberately self-contained: an explicit identity
+        /// file, `IdentitiesOnly`, and a throwaway known-hosts file, so that the
+        /// test reads and writes nothing under the operator's `~/.ssh`.
+        fn client_args(&self) -> Vec<String> {
+            [
+                "-o",
+                &format!("IdentityFile={}", self.key),
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "BatchMode=yes",
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect()
+        }
+
+        async fn exec(&self, script: &str) -> Result<String> {
+            let port = self.port.to_string();
+            let destination = format!("{}@{}", self.user, self.host);
+            let mut args: Vec<String> = self.client_args();
+            args.extend(["-p".into(), port, destination, script.into()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            run("ssh", &args).await
+        }
+
+        fn connection_options(&self) -> SshConnectionOptions {
+            SshConnectionOptions {
+                host: self.host.clone().into(),
+                username: Some(self.user.clone()),
+                port: Some(self.port),
+                args: Some(self.client_args()),
+                upload_binary_over_ssh: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// The SSH arm of the check in `docker::tests` — the transport this fork's
+    /// users actually reach a remote host with. Same two halves: our binary
+    /// lands under our own directory and file name, and a neighbouring editor's
+    /// upload is byte-for-byte untouched.
+    ///
+    /// Ignored by default. A container is a perfectly good target and keeps the
+    /// operator's own SSH configuration out of it entirely:
+    ///
+    /// ```text
+    /// docker run -d --name sawe-ssh -p 127.0.0.1:22022:22 ubuntu:24.04 sleep infinity
+    /// docker exec sawe-ssh sh -c 'apt-get update -qq && apt-get install -y -qq openssh-server'
+    /// docker exec sawe-ssh sh -c 'mkdir -p /run/sshd /root/.ssh'
+    /// ssh-keygen -q -t ed25519 -N "" -f /tmp/probe-key
+    /// docker exec -i sawe-ssh sh -c 'cat > /root/.ssh/authorized_keys' < /tmp/probe-key.pub
+    /// docker exec -d sawe-ssh /usr/sbin/sshd -D
+    /// cargo build -p remote_server --bin remote_server
+    /// SAWE_TEST_SSH_HOST=127.0.0.1 SAWE_TEST_SSH_PORT=22022 SAWE_TEST_SSH_KEY=/tmp/probe-key \
+    ///   ZED_COPY_REMOTE_SERVER=$PWD/target/debug/remote_server \
+    ///   cargo test -p remote --lib ssh::live_tests -- --ignored --nocapture
+    /// ```
+    #[gpui::test]
+    #[ignore = "needs an ssh target; see the doc comment"]
+    async fn ssh_upload_uses_our_names_and_spares_the_neighbour(cx: &mut gpui::TestAppContext) {
+        let target = Target::from_env();
+        cx.executor().allow_parking();
+        init_release_channel(cx);
+
+        let decoy_before = target
+            .exec(&seed_decoy_script())
+            .await
+            .expect("planting the decoy");
+
+        let options = target.connection_options();
+        let connection = cx
+            .update(|cx| {
+                let delegate: Arc<dyn RemoteClientDelegate> = Arc::new(SilentDelegate);
+                cx.spawn(async move |cx| SshRemoteConnection::new(options, delegate, cx).await)
+            })
+            .await
+            .expect("connecting over ssh");
+
+        let relpath = connection
+            .remote_binary_path
+            .as_ref()
+            .expect("a binary path");
+        assert_eq!(
+            relpath.display(PathStyle::Posix).as_ref(),
+            format!("{OURS_DIR}/{OURS_NAME}"),
+            "the uploaded binary must not share a name or a directory with another editor's"
+        );
+
+        let listing = target
+            .exec(&list_our_dir_script())
+            .await
+            .expect("listing our server directory");
+        assert!(
+            listing.lines().any(|line| line.trim() == OURS_NAME),
+            "expected {OURS_NAME} on the host, got:\n{listing}"
+        );
+
+        let decoy_after = target
+            .exec(&decoy_digest_script())
+            .await
+            .expect("re-reading the decoy");
+        assert_eq!(
+            decoy_before, decoy_after,
+            "connecting must not touch {DECOY_DIR}/{DECOY_NAME} — that file stands in for a \
+             real Zed's uploaded server, and before the rename this client overwrote it"
+        );
+    }
+}

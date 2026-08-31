@@ -841,55 +841,25 @@ impl RemoteConnection for DockerExecConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::live_remote_support::{
+        DECOY_DIR, DECOY_NAME, OURS_DIR, OURS_NAME, SilentDelegate, decoy_digest_script,
+        init_release_channel, list_our_dir_script, run, seed_decoy_script,
+    };
 
-    struct SilentDelegate;
-
-    impl RemoteClientDelegate for SilentDelegate {
-        fn ask_password(
-            &self,
-            _prompt: String,
-            _tx: futures::channel::oneshot::Sender<askpass::EncryptedPassword>,
-            _cx: &mut AsyncApp,
-        ) {
-            unimplemented!("the docker transport never asks for a password")
-        }
-
-        fn get_download_url(
-            &self,
-            _platform: RemotePlatform,
-            _release_channel: ReleaseChannel,
-            _version: Option<SemanticVersion>,
-            _cx: &mut AsyncApp,
-        ) -> Task<Result<Option<String>>> {
-            unimplemented!("the binary is supplied via ZED_COPY_REMOTE_SERVER")
-        }
-
-        fn download_server_binary_locally(
-            &self,
-            _platform: RemotePlatform,
-            _release_channel: ReleaseChannel,
-            _version: Option<SemanticVersion>,
-            _cx: &mut AsyncApp,
-        ) -> Task<Result<PathBuf>> {
-            unimplemented!("the binary is supplied via ZED_COPY_REMOTE_SERVER")
-        }
-
-        fn set_status(&self, status: Option<&str>, _cx: &mut AsyncApp) {
-            if let Some(status) = status {
-                eprintln!("docker status: {status}");
-            }
-        }
+    async fn container_exec(container: &str, script: &str) -> Result<String> {
+        run("docker", &["exec", container, "sh", "-c", script]).await
     }
 
-    /// The whole point of the disown pass, checked against a real container
-    /// rather than by reading: the client must upload into *this fork's* server
-    /// directory under *this fork's* file name, so that a Zed installed for the
-    /// same user on the same host neither adopts our binary nor has its own
-    /// adopted by us. Before the rename both products wrote `.zed_server` with
-    /// byte-identical file names inside it.
+    /// The claim FORK.md #119 makes, checked against a real container rather
+    /// than by reading: connecting must upload into *this fork's* directory
+    /// under *this fork's* file name, **and must leave a neighbouring editor's
+    /// upload byte-for-byte alone**. Both halves matter — before the rename the
+    /// two products wrote one directory with identical file names inside it, so
+    /// a client that merely put its own binary in the right place could still
+    /// be overwriting somebody else's on the way.
     ///
     /// Ignored by default because it needs a real container and a Linux
-    /// `remote_server` build:
+    /// `remote_server` build. The container needs nothing but a shell:
     ///
     /// ```text
     /// docker run -d --name sawe-probe ubuntu:24.04 sleep infinity
@@ -900,14 +870,15 @@ mod tests {
     /// ```
     #[gpui::test]
     #[ignore = "needs a running container; see the doc comment"]
-    async fn the_uploaded_binary_lands_under_the_forks_own_names(cx: &mut gpui::TestAppContext) {
-        let Ok(container) = std::env::var("SAWE_TEST_DOCKER_CONTAINER") else {
-            panic!("set SAWE_TEST_DOCKER_CONTAINER to a running container's name or id");
-        };
+    async fn docker_upload_uses_our_names_and_spares_the_neighbour(cx: &mut gpui::TestAppContext) {
+        let container = std::env::var("SAWE_TEST_DOCKER_CONTAINER")
+            .expect("set SAWE_TEST_DOCKER_CONTAINER to a running container's name or id");
         cx.executor().allow_parking();
-        cx.update(|cx| {
-            release_channel::init_test(SemanticVersion::new(0, 1, 0), ReleaseChannel::Dev, cx)
-        });
+        init_release_channel(cx);
+
+        let decoy_before = container_exec(&container, &seed_decoy_script())
+            .await
+            .expect("planting the decoy");
 
         let options = DockerConnectionOptions {
             name: "sawe-probe".into(),
@@ -932,28 +903,25 @@ mod tests {
             .expect("a binary path");
         assert_eq!(
             relpath.display(PathStyle::Posix).as_ref(),
-            ".sawe_server/sawe-remote-server-dev-build",
+            format!("{OURS_DIR}/{OURS_NAME}"),
             "the uploaded binary must not share a name or a directory with another editor's"
         );
 
-        // And it is really there, under that name, in the container.
-        let listing = connection
-            .run_docker_exec(
-                "ls",
-                None,
-                &Default::default(),
-                &[
-                    "-1",
-                    &format!("{}/.sawe_server", connection.remote_dir_for_server),
-                ],
-            )
+        let listing = container_exec(&container, &list_our_dir_script())
             .await
-            .expect("listing the server directory");
+            .expect("listing our server directory");
         assert!(
-            listing
-                .lines()
-                .any(|line| line.trim() == "sawe-remote-server-dev-build"),
-            "expected sawe-remote-server-dev-build in the container, got:\n{listing}"
+            listing.lines().any(|line| line.trim() == OURS_NAME),
+            "expected {OURS_NAME} in the container, got:\n{listing}"
+        );
+
+        let decoy_after = container_exec(&container, &decoy_digest_script())
+            .await
+            .expect("re-reading the decoy");
+        assert_eq!(
+            decoy_before, decoy_after,
+            "connecting must not touch {DECOY_DIR}/{DECOY_NAME} — that file stands in for a \
+             real Zed's uploaded server, and before the rename this client overwrote it"
         );
     }
 }
