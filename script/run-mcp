@@ -141,7 +141,7 @@ socket_path="$socket_dir/mcp.sock"
 lock_path="$socket_dir/mcp.lock"
 mkdir -p "$socket_dir"
 
-# Strip stale socket (symlink to a /tmp/zed-mcp*/mcp.sock that no live
+# Strip stale socket (symlink to a /tmp/sawe-mcp*/mcp.sock that no live
 # process owns) and stale lock (PID file pointing at a dead process). Done
 # unconditionally and BEFORE any check that could exit non-zero — so a
 # failed precheck never leaves the door open for a follow-up wait-loop to

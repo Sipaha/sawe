@@ -479,7 +479,7 @@ pub fn cleanup_legacy_runtime_dir() {
 /// children of `legacy` — real configuration (`settings.json`, `themes/`, the
 /// remote-control keys) sits in the same directory and must survive.
 fn cleanup_legacy_runtime_dir_in(legacy: &Path) {
-    // `mcp.sock` is a *symlink* to a short `/tmp/zed-mcp*/mcp.sock` (the
+    // `mcp.sock` is a *symlink* to a short `/tmp/sawe-mcp*/mcp.sock` (the
     // 108-byte `sun_path` limit), and a dangling symlink reports
     // `exists() == false` — so probe with `symlink_metadata`.
     for name in ["mcp.sock", "mcp.lock"] {
@@ -1024,7 +1024,7 @@ mod tests {
     fn cleanup_legacy_removes_a_dangling_socket_symlink() {
         let legacy = tempdir().expect("tempdir");
         let root = legacy.path();
-        std::os::unix::fs::symlink("/tmp/zed-mcp-gone/mcp.sock", root.join("mcp.sock"))
+        std::os::unix::fs::symlink("/tmp/sawe-mcp-gone/mcp.sock", root.join("mcp.sock"))
             .expect("symlink");
         assert!(!root.join("mcp.sock").exists(), "precondition: dangling");
 
