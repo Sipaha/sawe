@@ -11082,8 +11082,12 @@ async fn test_git_repository_status(cx: &mut gpui::TestAppContext) {
     });
 }
 
+// Disabled upstream as flaky in 4376eb8217. It still races: `diff_stat` is filled in
+// asynchronously, so the (empty) `a.txt` entry now arrives as `Some(0/0)` rather than
+// the asserted `None`. The postprocessing this test is named for -- nested repo
+// excluded, combined `DA` status -- does hold.
 #[gpui::test]
-#[ignore]
+#[ignore = "flaky: races the asynchronous diff_stat fill, which yields Some(0/0) instead of None"]
 async fn test_git_status_postprocessing(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     cx.executor().allow_parking();
@@ -12132,8 +12136,11 @@ async fn test_file_status(cx: &mut gpui::TestAppContext) {
     });
 }
 
+// Disabled upstream as flaky in 30c4434b70. It still races: the initial scan drains as
+// `[HeadChanged, BranchListChanged]` because the status pass has not landed yet, while
+// the test asserts exactly `[StatusesChanged]`.
 #[gpui::test]
-#[ignore]
+#[ignore = "flaky: races the initial git scan, which drains HeadChanged/BranchListChanged before StatusesChanged"]
 async fn test_ignored_dirs_events(cx: &mut gpui::TestAppContext) {
     init_test(cx);
     cx.executor().allow_parking();

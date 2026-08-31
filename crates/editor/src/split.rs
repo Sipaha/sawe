@@ -4306,8 +4306,14 @@ mod tests {
         );
     }
 
+    // Upstream added this test already ignored, in the same commit that introduced
+    // the split diff (618f848c1f): it encodes a desired alignment that was never
+    // implemented. Joining an added line into the unmodified line below it renders
+    // `NEWeee` at the top of the deleted block followed by three spacers; the test
+    // asserts the spacers come first so the joined line stays on the unmodified
+    // line's original row.
     #[gpui::test]
-    #[ignore]
+    #[ignore = "asserts an unimplemented alignment: the joined line renders above the spacers, not below"]
     async fn test_joining_added_line_with_unmodified_line(cx: &mut gpui::TestAppContext) {
         use rope::Point;
         use unindent::Unindent as _;
