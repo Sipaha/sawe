@@ -161,6 +161,7 @@ impl OpenRequest {
         }
 
         for url in request.urls {
+            let url = normalize_fork_url_scheme(url);
             if let Some(server_name) = url.strip_prefix("zed-cli://") {
                 this.kind = Some(OpenRequestKind::CliConnection(connect_to_cli(server_name)?));
             } else if let Some(action_index) = url.strip_prefix("zed-dock-action://") {
@@ -333,6 +334,31 @@ impl OpenRequest {
         self.parse_file_path(url.path());
         Ok(())
     }
+}
+
+/// Rewrite this fork's own URL scheme onto the one the routing table is
+/// written against.
+///
+/// `sawe://` is a locked rebrand identifier: `sawe.desktop.in` declares
+/// `x-scheme-handler/sawe`, so the desktop hands `sawe://…` links to this
+/// editor, and `sawe --help` advertises the scheme verbatim. Every arm of
+/// [`OpenRequest::parse`] was nevertheless written against `zed://`, so the
+/// fork's advertised scheme fell through to `unhandled url` in the log and the
+/// editor opened nothing at all — measured on a canonical instance given
+/// `sawe://file/tmp/probe.rs`: one `ERROR unhandled url` line, zero windows.
+///
+/// Normalising the spelling once, here, keeps the two exactly equivalent
+/// instead of duplicating a dozen arms and letting them drift; it also covers
+/// the prefixes those arms match indirectly, `agent_skills`'
+/// `SKILL_SHARE_LINK_PREFIX` and `client::parse_zed_link`'s `zed://channel/…`.
+/// `zed://` keeps working: it is a preserved upstream identifier and existing
+/// links use it. Only the two-slash form is rewritten, so a path argument that
+/// merely begins with `sawe` is untouched.
+fn normalize_fork_url_scheme(url: String) -> String {
+    if let Some(rest) = url.strip_prefix("sawe://") {
+        return format!("zed://{rest}");
+    }
+    url
 }
 
 fn parse_ssh_url(url: &str) -> Result<url::Url> {
@@ -1199,6 +1225,76 @@ mod tests {
         for (input, expected_url, host, username, port, path) in cases {
             assert_ssh_parse(cx, input, expected_url, host, username, port, path);
         }
+    }
+
+    /// `sawe://` is the fork's own URL scheme — declared by `sawe.desktop.in`
+    /// and advertised by `sawe --help` — and every arm of `parse` was written
+    /// against `zed://`, so it reached `unhandled url` and opened nothing.
+    /// Each pair here is a *different* arm, because a single-arm fix would
+    /// have left the rest of the routing table inert.
+    #[gpui::test]
+    fn a_sawe_url_routes_exactly_where_the_zed_spelling_does(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+
+        for (sawe_url, zed_url) in [
+            ("sawe://file/tmp/probe.rs", "zed://file/tmp/probe.rs"),
+            ("sawe://", "zed://"),
+            ("sawe://open", "zed://open"),
+            ("sawe://settings", "zed://settings"),
+            ("sawe://settings/theme", "zed://settings/theme"),
+            ("sawe://schemas/settings", "zed://schemas/settings"),
+            ("sawe://extension/foo", "zed://extension/foo"),
+            ("sawe://agent?prompt=hi", "zed://agent?prompt=hi"),
+        ] {
+            let parse = |url: &str| {
+                let url = url.to_string();
+                cx.update(|cx| {
+                    OpenRequest::parse(
+                        RawOpenRequest {
+                            urls: vec![url],
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                    .unwrap()
+                })
+            };
+            let from_sawe = parse(sawe_url);
+            let from_zed = parse(zed_url);
+            assert_eq!(
+                format!("{:?}", from_sawe.kind),
+                format!("{:?}", from_zed.kind),
+                "{sawe_url} must route where {zed_url} routes"
+            );
+            assert_eq!(
+                from_sawe.open_paths, from_zed.open_paths,
+                "{sawe_url} must open what {zed_url} opens"
+            );
+            assert!(
+                from_sawe.kind.is_some() || !from_sawe.open_paths.is_empty(),
+                "{sawe_url} must be routed somewhere, not fall through to `unhandled url`"
+            );
+        }
+    }
+
+    /// The rewrite is prefix-exact: a path that merely starts with the four
+    /// letters is not a URL and must not be rewritten into one.
+    #[test]
+    fn only_the_scheme_spelling_is_rewritten() {
+        assert_eq!(
+            normalize_fork_url_scheme("sawe://settings".into()),
+            "zed://settings"
+        );
+        assert_eq!(
+            normalize_fork_url_scheme("/home/me/sawe/src/main.rs".into()),
+            "/home/me/sawe/src/main.rs"
+        );
+        assert_eq!(normalize_fork_url_scheme("sawe.rs".into()), "sawe.rs");
+        assert_eq!(
+            normalize_fork_url_scheme("zed://settings".into()),
+            "zed://settings",
+            "the preserved upstream spelling passes through untouched"
+        );
     }
 
     #[gpui::test]

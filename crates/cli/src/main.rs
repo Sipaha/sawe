@@ -27,7 +27,25 @@ use walkdir::WalkDir;
 
 use std::io::IsTerminal;
 
-const URL_PREFIX: [&'static str; 5] = ["zed://", "http://", "https://", "file://", "ssh://"];
+/// Argument spellings this CLI forwards to the editor as *urls* rather than
+/// canonicalising into paths. `sawe://` belongs here for the same reason
+/// `zed://` does — it is this fork's own registered scheme (`sawe.desktop.in`
+/// declares `x-scheme-handler/sawe`) — and its absence meant a `sawe://…`
+/// argument went through `parse_path_with_position` instead and reached the
+/// editor as the absolute path `$PWD/sawe://…`.
+const URL_PREFIX: [&'static str; 6] = [
+    "zed://", "sawe://", "http://", "https://", "file://", "ssh://",
+];
+
+/// Whether this argument is a url to forward as-is rather than a path to
+/// canonicalise. Named so the classification is testable: it used to be an
+/// inline `URL_PREFIX.iter().any(..)` at the single call site, which is why the
+/// missing `sawe://` entry was invisible from the test suite.
+fn is_url_argument(argument: &str) -> bool {
+    URL_PREFIX
+        .iter()
+        .any(|&prefix| argument.starts_with(prefix))
+}
 
 struct Detect;
 
@@ -323,6 +341,24 @@ mod tests {
         let result = f();
         env::set_current_dir(old_cwd)?;
         result
+    }
+
+    /// `sawe://` is this fork's registered URL scheme, and it was missing from
+    /// `URL_PREFIX`: the CLI classified `sawe://settings` as a *path*, ran it
+    /// through `parse_path_with_position` and sent the editor the absolute
+    /// path `$PWD/sawe://settings`. The scheme must be classified exactly like
+    /// the upstream spelling it aliases.
+    #[test]
+    fn the_forks_own_url_scheme_is_classified_as_a_url() {
+        assert!(is_url_argument("sawe://settings"));
+        assert!(is_url_argument("zed://settings"));
+        assert!(is_url_argument("file:///tmp/x"));
+        assert!(is_url_argument("ssh://host/tmp/x"));
+        assert!(
+            !is_url_argument("sawe/src/main.rs"),
+            "a path that merely starts with the four letters is not a url"
+        );
+        assert!(!is_url_argument("/tmp/sawe.rs"));
     }
 
     #[test]
@@ -644,7 +680,7 @@ fn run() -> Result<()> {
     let wsl = None;
 
     for path in args.paths_with_position.iter() {
-        if URL_PREFIX.iter().any(|&prefix| path.starts_with(prefix)) {
+        if is_url_argument(path) {
             urls.push(path.to_string());
         } else if path == "-" && args.paths_with_position.len() == 1 {
             let file = NamedTempFile::new()?;
