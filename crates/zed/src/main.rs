@@ -62,7 +62,7 @@ use std::{
 };
 use theme::{ActiveTheme, GlobalTheme, ThemeRegistry};
 use theme_settings::load_user_theme;
-use util::{ResultExt, TryFutureExt, maybe};
+use util::{ResultExt, TryFutureExt, maybe, paths::PathWithPosition};
 use uuid::Uuid;
 use workspace::{
     AppState, MultiWorkspace, SerializedWorkspaceLocation, SessionWorkspace, Toast,
@@ -211,6 +211,13 @@ struct HandoffArgs {
     /// Everything the hand-off cannot carry, rendered the way the user typed
     /// it so the report can name it back to them.
     unforwarded: Vec<String>,
+    /// Arguments whose `:line:column` suffix was split off before the path
+    /// went into `paths`, rendered as typed. The file *is* opened; only the
+    /// position is lost, so this is a separate loss from `unforwarded`.
+    dropped_positions: Vec<String>,
+    /// `zed-cli://<server>` handshake urls. Not the user's arguments at all —
+    /// see [`handoff_loss_report`].
+    cli_handshakes: Vec<String>,
 }
 
 /// Split the command line into what `editor.handle_cli_args` can carry and
@@ -236,24 +243,75 @@ struct HandoffArgs {
 /// CLI passes the editor only `zed-cli://<server>` in argv and sends the user's
 /// URLs over that IPC channel instead.
 fn split_handoff_args(paths_or_urls: &[String], diff_paths: &[String]) -> HandoffArgs {
-    let mut paths = Vec::new();
-    let mut unforwarded = Vec::new();
+    let mut handoff = HandoffArgs::default();
     for arg in paths_or_urls {
-        if let Some(path) = file_url_as_path(arg) {
-            paths.push(path);
+        if arg.starts_with("zed-cli://") {
+            handoff.cli_handshakes.push(arg.clone());
+        } else if let Some(path) = file_url_as_path(arg) {
+            carry_path(&mut handoff, arg, path);
         } else if is_url_scheme(arg) {
-            unforwarded.push(arg.clone());
+            handoff.unforwarded.push(arg.clone());
         } else {
-            paths.push(PathBuf::from(arg));
+            carry_path(&mut handoff, arg, PathBuf::from(arg));
         }
     }
     // `--diff` takes its two paths as one argument pair; clap enforces the
     // pairing, but `chunks` is used rather than indexing so a hypothetical odd
     // tail is reported rather than panicked on.
     for pair in diff_paths.chunks(2) {
-        unforwarded.push(format!("--diff {}", pair.join(" ")));
+        handoff
+            .unforwarded
+            .push(format!("--diff {}", pair.join(" ")));
     }
-    HandoffArgs { paths, unforwarded }
+    handoff
+}
+
+/// Put `path` on the hand-off's carry list, splitting off a `:line:column`
+/// suffix the hand-off has no way to deliver.
+///
+/// Splitting it off is not a nicety. `editor.handle_cli_args` passes what it is
+/// given straight to `workspace::open_paths`, so the suffix used to travel as
+/// part of the *filename*: `sawe probe.rs:3:2` against a running instance
+/// opened a window rooted at the nonexistent `…/probe.rs:3:2` — measured, with
+/// `windows.list` reporting `kind: "folder"` and that literal string as its
+/// root path — and never opened the file. A canonical instance given the same
+/// argument opens `…/probe.rs` and puts the cursor on line 3
+/// (`derive_paths_with_position` -> `navigate_to_positions`), so the hand-off
+/// was not merely losing the position, it was opening a different thing.
+///
+/// `as_typed` is what the user wrote, including the `file://` spelling, so the
+/// report names the argument back rather than a decoded form of it.
+fn carry_path(handoff: &mut HandoffArgs, as_typed: &str, path: PathBuf) {
+    let (path, dropped_position) = split_off_position(path);
+    if dropped_position {
+        handoff.dropped_positions.push(as_typed.to_string());
+    }
+    handoff.paths.push(path);
+}
+
+/// The path a `path:line:column` argument denotes, and whether a position was
+/// taken off it.
+///
+/// Deliberately the same rule as `derive_paths_with_position`, which is what
+/// the canonical instance applies to the identical argument: a suffix is only
+/// split off when the literal string does not already name a real file, so a
+/// file whose name genuinely contains a colon still opens. That check is
+/// skipped on Windows, where a colon cannot appear in a file name and
+/// `name:stream` is an NTFS alternate data stream. The existence test uses
+/// this process's cwd, which is the cwd the hand-off sends alongside the paths
+/// (`editor_mcp::handoff`), so both ends resolve a relative path the same way.
+fn split_off_position(path: PathBuf) -> (PathBuf, bool) {
+    let Some(path_str) = path.to_str() else {
+        return (path, false);
+    };
+    let parsed = PathWithPosition::parse_str(path_str);
+    if parsed.row.is_none() || parsed.path == path {
+        return (path, false);
+    }
+    if !cfg!(windows) && path.is_file() {
+        return (path, false);
+    }
+    (parsed.path, true)
 }
 
 /// A `file://` URL as the path it denotes, or `None` if it is not one.
@@ -275,28 +333,67 @@ fn file_url_as_path(arg: &str) -> Option<PathBuf> {
     Some(PathBuf::from(decoded.into_owned()))
 }
 
-/// The stderr line for a hand-off that *succeeded* and still left arguments
-/// behind.
+/// The stderr lines for a hand-off that *succeeded* and still left part of the
+/// command line behind.
 ///
-/// This branch had no accounting at all: `sawe /tmp/a sawe://x` opened
-/// `/tmp/a` in the running instance, threw `sawe://x` away and exited 0 with
-/// an empty terminal. That is worse than the give-up exits this session
+/// This branch had no accounting at all: `sawe /tmp/a sawe://settings` opened
+/// `/tmp/a` in the running instance, threw `sawe://settings` away and exited 0
+/// with an empty terminal. That is worse than the give-up exits this session
 /// already fixed, because nothing failed and the user has no reason to look.
 ///
-/// The exit code stays 0 on purpose. The hand-off did happen and the paths did
-/// open; a non-zero exit would report the whole command as failed, and the
-/// canonical instance exits 0 for the same arguments. And this names the
-/// arguments rather than counting them: unlike the give-up exits, only a
-/// subset is lost, so the user needs to know which.
-fn unforwarded_args_report(unforwarded: &[String]) -> Vec<String> {
-    if unforwarded.is_empty() {
-        return Vec::new();
+/// Three losses, three lines, because they are three different facts:
+///
+/// - arguments the hand-off cannot carry at all. Named rather than counted:
+///   unlike the give-up exits, only a subset is lost, so the user has to know
+///   which.
+/// - a `:line:column` suffix, dropped from a path that *was* opened. Carrying
+///   it would mean navigating an editor from
+///   `crates/workspace/src/mcp/handle_cli_args.rs`, and the navigation
+///   (`recent_projects::navigate_to_positions`, which downcasts the opened item
+///   to an `Editor`) sits *above* `workspace` in the crate graph. So this line
+///   is the honest half of the fix and the position itself stays lost; see
+///   [`carry_path`] for what was fixed instead.
+/// - the `zed-cli://<server>` ipc handshake, which is not the user's argument
+///   at all: it is the socket `crates/cli` opened before it booted this
+///   process, and the user's real request is on the far end of it. Listing that
+///   url among "arguments NOT opened" told the user two untrue things — that
+///   they had passed it, and that one argument was the extent of the damage.
+///   Nothing the `sawe` command asked for was opened, and because the CLI joins
+///   its receiver thread it waits for a reply this process never sends.
+///
+/// The exit code stays 0. A non-zero exit from this binary means "the running
+/// editor could not be reached, your work was not done" (FORK.md #114); folding
+/// "I cannot route that" into the same code would make the exit status depend
+/// on whether another editor happened to be running, which is exactly the
+/// coupling the hand-off's parity rule exists to prevent. That holds for the
+/// handshake too: a canonical instance answers it, a handing-off one cannot,
+/// and it is the presence of the other editor that decides which.
+fn handoff_loss_report(handoff: &HandoffArgs) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !handoff.unforwarded.is_empty() {
+        lines.push(format!(
+            "sawe: the running instance opens paths only — {} argument(s) were NOT opened: {}",
+            handoff.unforwarded.len(),
+            handoff.unforwarded.join(", ")
+        ));
     }
-    vec![format!(
-        "sawe: the running instance opens paths only — {} argument(s) were NOT opened: {}",
-        unforwarded.len(),
-        unforwarded.join(", ")
-    )]
+    if !handoff.dropped_positions.is_empty() {
+        lines.push(format!(
+            "sawe: the running instance cannot be given a cursor position — {} argument(s) \
+             opened at the start of the file instead: {}",
+            handoff.dropped_positions.len(),
+            handoff.dropped_positions.join(", ")
+        ));
+    }
+    if !handoff.cli_handshakes.is_empty() {
+        lines.push(
+            "sawe: the `sawe` command that started this process opened a connection the running \
+             instance cannot answer — nothing it asked for was opened, and it will wait until \
+             interrupted."
+                .to_string(),
+        );
+    }
+    lines
 }
 
 /// The stderr lines that go with an exit that opened nothing.
@@ -603,7 +700,7 @@ fn main() {
             );
             // The one exit that opened something and can still have lost
             // something. Silent for the ordinary path-only hand-off.
-            for line in unforwarded_args_report(&handoff_args.unforwarded) {
+            for line in handoff_loss_report(&handoff_args) {
                 eprintln!("{line}");
             }
             return;
@@ -2235,7 +2332,8 @@ struct Args {
     /// Use `path:line:row` syntax to open a file at a specific location.
     /// Non-existing paths and directories will ignore `:line:row` suffix.
     ///
-    /// URLs can either be `file://` or `sawe://` scheme.
+    /// URLs can be `file://`, `ssh://`, or `sawe://` scheme — the last of
+    /// which also accepts the upstream `zed://` spelling it aliases.
     paths_or_urls: Vec<String>,
 
     /// Open a Solution by name or id and skip the Welcome screen.
@@ -2627,7 +2725,7 @@ fn check_for_conpty_dll() {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandoffArgs, dropped_args_report, split_handoff_args, unforwarded_args_report,
+        HandoffArgs, dropped_args_report, handoff_loss_report, split_handoff_args,
         unreachable_instance_report,
     };
     use std::path::PathBuf;
@@ -2713,12 +2811,12 @@ mod tests {
             split,
             HandoffArgs {
                 paths: vec![PathBuf::from("/tmp/c.txt"), PathBuf::from("/tmp/a b.txt")],
-                unforwarded: Vec::new(),
+                ..Default::default()
             },
             "a file:// URL must be percent-decoded and carried, as OpenRequest::parse does"
         );
         assert!(
-            unforwarded_args_report(&split.unforwarded).is_empty(),
+            handoff_loss_report(&split).is_empty(),
             "nothing was lost, so nothing is said"
         );
     }
@@ -2734,13 +2832,13 @@ mod tests {
         assert_eq!(
             split,
             HandoffArgs {
-                paths: Vec::new(),
                 unforwarded: vec![arg],
+                ..Default::default()
             },
             "an escape that is not valid UTF-8 must not be silently swallowed"
         );
         assert_eq!(
-            unforwarded_args_report(&split.unforwarded),
+            handoff_loss_report(&split),
             vec![
                 "sawe: the running instance opens paths only — 1 argument(s) were NOT opened: \
                  file:///tmp/%FF.txt"
@@ -2753,7 +2851,7 @@ mod tests {
     #[test]
     fn a_successful_handoff_names_what_it_could_not_carry() {
         let split = split_handoff_args(
-            &["/tmp/a.txt".to_string(), "sawe://x".to_string()],
+            &["/tmp/a.txt".to_string(), "sawe://settings".to_string()],
             &["/tmp/old.rs".to_string(), "/tmp/new.rs".to_string()],
         );
         assert_eq!(
@@ -2762,10 +2860,10 @@ mod tests {
             "the plain path is still handed off"
         );
         assert_eq!(
-            unforwarded_args_report(&split.unforwarded),
+            handoff_loss_report(&split),
             vec![
                 "sawe: the running instance opens paths only — 2 argument(s) were NOT opened: \
-                 sawe://x, --diff /tmp/old.rs /tmp/new.rs"
+                 sawe://settings, --diff /tmp/old.rs /tmp/new.rs"
             ],
             "both the URL and the diff pair must be named back to the user"
         );
@@ -2801,8 +2899,96 @@ mod tests {
             vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("rel/b.txt")],
             "a relative path is carried too; the tool joins it with our cwd"
         );
-        assert!(unforwarded_args_report(&split.unforwarded).is_empty());
-        assert!(unforwarded_args_report(&[]).is_empty());
+        assert!(handoff_loss_report(&split).is_empty());
+        assert!(handoff_loss_report(&HandoffArgs::default()).is_empty());
+    }
+
+    /// The help text promises `path:line:row`, and a canonical instance keeps
+    /// that promise. The hand-off used to send the suffix on as part of the
+    /// filename, so the running instance opened a *different, nonexistent*
+    /// path. The file must be carried, and the loss of the position said out
+    /// loud rather than left for the user to notice.
+    #[test]
+    fn a_position_suffix_is_split_off_the_path_and_reported() {
+        let split = split_handoff_args(
+            &[
+                "/tmp/sawe-taskr-absent.rs:3:2".to_string(),
+                "file:///tmp/sawe-taskr-absent.rs:12".to_string(),
+            ],
+            &[],
+        );
+        assert_eq!(
+            split.paths,
+            vec![
+                PathBuf::from("/tmp/sawe-taskr-absent.rs"),
+                PathBuf::from("/tmp/sawe-taskr-absent.rs"),
+            ],
+            "both spellings must hand off the path the argument denotes"
+        );
+        assert_eq!(
+            handoff_loss_report(&split),
+            vec![
+                "sawe: the running instance cannot be given a cursor position — 2 argument(s) \
+                 opened at the start of the file instead: /tmp/sawe-taskr-absent.rs:3:2, \
+                 file:///tmp/sawe-taskr-absent.rs:12"
+            ],
+            "the argument is named back as typed, file:// spelling included"
+        );
+    }
+
+    /// The suffix is only a suffix when the literal string is not itself a
+    /// file — the rule `derive_paths_with_position` applies on the canonical
+    /// side. Without it, `sawe 'weird:1:2.txt'` would open a file that does not
+    /// exist and report a position the user never asked for.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_file_whose_name_contains_a_colon_is_carried_whole() {
+        let path =
+            std::env::temp_dir().join(format!("sawe-taskr-colon-{}:3:2", std::process::id()));
+        std::fs::write(&path, b"probe").expect("temp file");
+        let arg = path.to_string_lossy().into_owned();
+
+        let split = split_handoff_args(&[arg], &[]);
+        std::fs::remove_file(&path).expect("cleanup");
+
+        assert_eq!(
+            split.paths,
+            vec![path],
+            "a real file whose name ends in :3:2 must be carried verbatim"
+        );
+        assert!(
+            handoff_loss_report(&split).is_empty(),
+            "nothing was lost, so nothing is said"
+        );
+    }
+
+    /// `zed-cli://<server>` is the ipc handshake `crates/cli` puts in this
+    /// process's argv, not something a user typed. Listing it among "arguments
+    /// NOT opened" named an internal url at a person and understated the harm.
+    #[test]
+    fn a_cli_handshake_is_not_reported_as_one_of_the_users_arguments() {
+        let split = split_handoff_args(&["zed-cli:///tmp/socket-name".to_string()], &[]);
+        assert_eq!(
+            split,
+            HandoffArgs {
+                cli_handshakes: vec!["zed-cli:///tmp/socket-name".to_string()],
+                ..Default::default()
+            },
+            "the handshake is neither a path to carry nor a user argument to list"
+        );
+        let lines = handoff_loss_report(&split);
+        assert_eq!(
+            lines,
+            vec![
+                "sawe: the `sawe` command that started this process opened a connection the \
+                 running instance cannot answer — nothing it asked for was opened, and it will \
+                 wait until interrupted."
+            ]
+        );
+        assert!(
+            !lines[0].contains("zed-cli://"),
+            "the internal url must not be shown to a person"
+        );
     }
 
     /// The lock-held-but-unreachable exit must name both states it cannot
