@@ -332,6 +332,13 @@ impl StatusBar {
             .find_map(|item| item.to_any().downcast().ok())
     }
 
+    /// How many items are in the left group. [`Self::position_of_item`]
+    /// flattens both groups into one index space (left items first), so this
+    /// is what tells a caller which group a returned position landed in.
+    pub fn left_item_count(&self) -> usize {
+        self.left_items.len()
+    }
+
     pub fn position_of_item<T>(&self) -> Option<usize>
     where
         T: StatusItemView,

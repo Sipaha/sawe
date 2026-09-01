@@ -28,9 +28,15 @@ pub struct ProjectToolbar {
     project_tab_strip: Option<Entity<ProjectTabStrip>>,
     /// Toggles for the project-zone docks (ProjectPanel / OutlinePanel /
     /// GitPanel), one `PanelButtons` per dock so a panel moved between docks
-    /// keeps exactly one button. They live here, at the leading edge of the
-    /// project toolbar, instead of in the vertical edge strips this fork used
-    /// to flank the workspace with.
+    /// keeps exactly one button. They live here, in the project toolbar,
+    /// instead of in the vertical edge strips this fork used to flank the
+    /// workspace with.
+    ///
+    /// Each group is painted on the side its dock opens on: left and bottom at
+    /// the row's leading edge, right at its trailing edge. Because a group is
+    /// bound to a `Dock` *entity* and not to a list of panels, dragging a panel
+    /// between docks moves its toggle across the row with no code here — see
+    /// `leading_dock_buttons` / `trailing_dock_buttons`.
     dock_buttons: [Entity<PanelButtons>; 3],
     branch_popover_handle: PopoverMenuHandle<git_ui::branch_picker::BranchesPopup>,
     repository_popover_handle: PopoverMenuHandle<ContextMenu>,
@@ -128,6 +134,35 @@ impl ProjectToolbar {
             self.project_tab_strip = Some(strip);
         }
         self.project_tab_strip.clone()
+    }
+
+    /// The dock-toggle groups painted at the row's leading edge, each paired
+    /// with the name `structure_node` reports it under, in painted order.
+    ///
+    /// Destructured rather than indexed so the fixed left/bottom/right order
+    /// `new` builds is checked by the compiler: adding a fourth dock stops
+    /// compiling here instead of silently relabelling a group in the dump.
+    fn leading_dock_buttons(&self) -> [(&'static str, &Entity<PanelButtons>); 2] {
+        let [left, bottom, _right] = &self.dock_buttons;
+        [("left", left), ("bottom", bottom)]
+    }
+
+    /// The dock-toggle group painted at the row's trailing edge, on the side
+    /// its panels actually open on.
+    fn trailing_dock_buttons(&self) -> (&'static str, &Entity<PanelButtons>) {
+        let [_left, _bottom, right] = &self.dock_buttons;
+        ("right", right)
+    }
+
+    /// Whether the leading dock-toggle cluster paints anything, which is what
+    /// the divider between that cluster and the project tabs is gated on. The
+    /// trailing group deliberately does not count: it is painted at the far
+    /// end of the row, so counting it would draw the divider with nothing to
+    /// its left.
+    fn has_leading_dock_buttons(&self, window: &Window, cx: &App) -> bool {
+        self.leading_dock_buttons()
+            .into_iter()
+            .any(|(_, buttons)| buttons.read(cx).has_visible_buttons(window, cx))
     }
 
     /// Resolve the repository the branch widget should display: the shared
@@ -405,16 +440,14 @@ impl ProjectToolbar {
     /// `self.workspace.upgrade()`: the dump holds that borrow across this
     /// call.
     pub fn structure_node(&self, workspace: &Workspace, window: &Window, cx: &App) -> VisualNode {
-        // Index order is fixed by `new`, which builds left / bottom / right.
-        let dock_sides = ["left", "bottom", "right"];
+        let dock_button_node = |(side, buttons): (&str, &Entity<PanelButtons>)| {
+            VisualNode::new(format!("DockButtons({side})"))
+                .with_visible(buttons.read(cx).has_visible_buttons(window, cx))
+        };
         let mut children: Vec<VisualNode> = self
-            .dock_buttons
-            .iter()
-            .zip(dock_sides)
-            .map(|(buttons, side)| {
-                VisualNode::new(format!("DockButtons({side})"))
-                    .with_visible(buttons.read(cx).has_visible_buttons(window, cx))
-            })
+            .leading_dock_buttons()
+            .into_iter()
+            .map(dock_button_node)
             .collect();
 
         // `render` builds the strip through `ensure_project_tab_strip`, so a
@@ -464,6 +497,8 @@ impl ProjectToolbar {
                 .with_attribute("occupant_introspectable", false),
         );
 
+        children.push(dock_button_node(self.trailing_dock_buttons()));
+
         VisualNode::new("ProjectToolbar").with_children(children)
     }
 }
@@ -493,10 +528,9 @@ impl Render for ProjectToolbar {
             .upgrade()
             .and_then(|workspace| workspace.read(cx).run_config_strip().cloned());
 
-        let has_dock_buttons = self
-            .dock_buttons
-            .iter()
-            .any(|buttons| buttons.read(cx).has_visible_buttons(window, cx));
+        let has_leading_dock_buttons = self.has_leading_dock_buttons(window, cx);
+        let (_, trailing_dock_buttons) = self.trailing_dock_buttons();
+        let trailing_dock_buttons = trailing_dock_buttons.clone();
 
         h_flex()
             .w_full()
@@ -517,21 +551,19 @@ impl Render for ProjectToolbar {
             .pl_2()
             .child(
                 h_flex().gap_1().children(
-                    self.dock_buttons
-                        .iter()
-                        .cloned()
-                        .map(IntoElement::into_any_element),
+                    self.leading_dock_buttons()
+                        .into_iter()
+                        .map(|(_, buttons)| buttons.clone().into_any_element()),
                 ),
             )
-            // The one separator between the dock toggles and the project tabs;
-            // `PanelButtons` deliberately draws none of its own so the three
-            // per-dock groups read as a single group here. Drawn only when
-            // there is in fact a group to separate: all three toggles can be
-            // hidden at once (`"project_panel": {"button": false}` and friends)
-            // and are all absent while the panels load asynchronously at
-            // startup, and a divider with nothing to its left is just a stray
-            // vertical rule.
-            .when(has_dock_buttons, |this| {
+            // The one separator between the leading dock toggles and the
+            // project tabs; `PanelButtons` deliberately draws none of its own
+            // so the per-dock groups read as a single group here. Drawn only
+            // when there is in fact a group to separate: the toggles can be
+            // hidden (`"project_panel": {"button": false}` and friends) and are
+            // all absent while the panels load asynchronously at startup, and a
+            // divider with nothing to its left is just a stray vertical rule.
+            .when(has_leading_dock_buttons, |this| {
                 this.child(
                     div()
                         .px_1p5()
@@ -563,6 +595,13 @@ impl Render for ProjectToolbar {
                     ),
             )
             .children(run_config)
+            // Last child in the row, so the right dock's toggles sit flush
+            // against the trailing padding — the mirror of the left dock's
+            // toggle at `pl_2`, and on the side those panels open on. Placing
+            // them after the run-config strip rather than inside the git
+            // cluster keeps them pinned to the window edge instead of drifting
+            // as the strip's width and the conditional git widgets change.
+            .child(trailing_dock_buttons)
             .pr_1p5()
     }
 }
@@ -571,7 +610,7 @@ impl Render for ProjectToolbar {
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{Action as _, Focusable as _, TestAppContext};
     use serde_json::json;
     use settings::SettingsStore;
     use std::path::{Path, PathBuf};
@@ -704,13 +743,15 @@ mod tests {
             vec![
                 "DockButtons(left)",
                 "DockButtons(bottom)",
-                "DockButtons(right)",
                 "ProjectTabStrip",
                 "UpdateButton",
                 "PushButton",
                 "RepositorySelector",
                 "BranchWidget",
                 "RunConfigStrip",
+                // The right dock's toggles are painted last, at the trailing
+                // edge, on the side the panels they open live on.
+                "DockButtons(right)",
             ]
         );
 
@@ -927,13 +968,85 @@ mod tests {
         assert_eq!(work_directory(&repository, cx), PathBuf::from("/plain"));
     }
 
-    /// The divider between the dock toggles and the project tabs is gated on
-    /// the toggles existing. A workspace with no panel loaded into any dock is
-    /// both the startup state (the panels load asynchronously) and the state
-    /// with all three `"button": false`; drawing the divider there leaves a
-    /// vertical rule with nothing to its left.
+    /// A panel that actually renders a dock button, which
+    /// `workspace::dock::test::TestPanel` deliberately does not (its `icon`
+    /// is `None`, so it is invisible to `has_visible_buttons`).
+    struct ButtonedPanel {
+        position: workspace::dock::DockPosition,
+        focus_handle: gpui::FocusHandle,
+    }
+    gpui::actions!(title_bar_test_only, [ToggleButtonedPanel]);
+
+    impl gpui::EventEmitter<workspace::dock::PanelEvent> for ButtonedPanel {}
+
+    impl gpui::Focusable for ButtonedPanel {
+        fn focus_handle(&self, _cx: &App) -> gpui::FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for ButtonedPanel {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus_handle(cx))
+        }
+    }
+
+    impl workspace::dock::Panel for ButtonedPanel {
+        fn persistent_name() -> &'static str {
+            "ButtonedPanel"
+        }
+
+        fn panel_key() -> &'static str {
+            "ButtonedPanel"
+        }
+
+        fn position(&self, _window: &Window, _cx: &App) -> workspace::dock::DockPosition {
+            self.position
+        }
+
+        fn position_is_valid(&self, _position: workspace::dock::DockPosition) -> bool {
+            true
+        }
+
+        fn set_position(
+            &mut self,
+            position: workspace::dock::DockPosition,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+            self.position = position;
+        }
+
+        fn default_size(&self, _window: &Window, _cx: &App) -> gpui::Pixels {
+            px(240.)
+        }
+
+        fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
+            Some(IconName::Folder)
+        }
+
+        fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+            Some("Buttoned Panel")
+        }
+
+        fn toggle_action(&self) -> Box<dyn gpui::Action> {
+            ToggleButtonedPanel.boxed_clone()
+        }
+
+        fn activation_priority(&self) -> u32 {
+            0
+        }
+    }
+
+    /// The divider between the *leading* dock toggles and the project tabs is
+    /// gated on those toggles existing. Two states leave the leading cluster
+    /// empty and must not draw it: no panel loaded into any dock (both the
+    /// startup state, since panels load asynchronously, and the state with
+    /// every `"button": false`), and a panel loaded only into the right dock —
+    /// whose toggles are painted at the far end of the row, so they leave
+    /// nothing to the divider's left.
     #[gpui::test]
-    async fn test_no_dock_buttons_means_no_divider(cx: &mut TestAppContext) {
+    async fn test_only_leading_dock_buttons_gate_the_divider(cx: &mut TestAppContext) {
         init_test(cx);
         let (project, _) = setup_solution_member("Divider", single_repo_tree(), cx).await;
 
@@ -944,16 +1057,40 @@ mod tests {
             cx.new(|cx| super::ProjectToolbar::new(workspace, None, cx))
         });
 
-        let dock_buttons = toolbar.read_with(cx, |toolbar, _| toolbar.dock_buttons.clone());
-        let has_dock_buttons = cx.update(|window, cx| {
-            dock_buttons
-                .iter()
-                .any(|buttons| buttons.read(cx).has_visible_buttons(window, cx))
+        let has_leading_dock_buttons = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| toolbar.read(cx).has_leading_dock_buttons(window, cx))
+        };
+
+        assert!(
+            !has_leading_dock_buttons(cx),
+            "no panel is loaded into any dock, so the leading toggle cluster \
+             is empty and the divider must not draw"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| ButtonedPanel {
+                position: workspace::dock::DockPosition::Right,
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_panel(panel, window, cx);
         });
         assert!(
-            !has_dock_buttons,
-            "no panel is loaded into any dock, so the toggle group is empty \
-             and the divider must not draw"
+            !has_leading_dock_buttons(cx),
+            "the right dock's toggles are painted at the trailing edge, so a \
+             right-dock panel leaves nothing to the divider's left"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| ButtonedPanel {
+                position: workspace::dock::DockPosition::Left,
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_panel(panel, window, cx);
+        });
+        assert!(
+            has_leading_dock_buttons(cx),
+            "a left-dock panel puts a toggle at the leading edge, which is \
+             exactly what the divider separates from the project tabs"
         );
     }
 }

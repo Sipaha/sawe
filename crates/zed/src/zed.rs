@@ -654,15 +654,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         });
         workspace.set_solution_band_item(solution_band.into(), window, cx);
         workspace.status_bar().update(cx, |status_bar, cx| {
-            // Ahead of the session tab strip on purpose, even though the band
-            // paints the dialog half left of the utility half. The left group
-            // is `min_w_0().overflow_x_hidden()` (`status_bar.rs`), so on a
-            // narrow window whatever sits last gets clipped: the tab strip is
-            // variable-width and already absorbs a squeeze through its
-            // overflow popover, while these three fixed icons are the ONLY
-            // way to reach the git graph (it has no keybinding). Clipping has
-            // to land on the surface that can handle it.
-            status_bar.add_left_item(utility_buttons, window, cx);
             status_bar.add_left_item(session_tab_strip, window, cx);
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
@@ -670,6 +661,25 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
+            // The band's utility half is pinned to the window's right edge
+            // (`SolutionBand::render` paints it as the last child of a
+            // `w_full` row), so the buttons that choose its content are
+            // pinned there too. `render_right_tools` walks `right_items` in
+            // reverse, so registering *first* is what paints *last*: flush
+            // against the right edge, outboard of "Remote Control". The
+            // reversal cannot disturb Terminal / Git Graph / Debug among
+            // themselves — `UtilityButtons` is one item that renders all
+            // three from `UtilityKind::ALL` inside its own row.
+            //
+            // Moving out of the left group also makes these unclippable: the
+            // right group is `flex_shrink_0` while the left is
+            // `min_w_0().overflow_x_hidden()` (`status_bar.rs`). That is the
+            // right trade for the only mouse path to the git graph; the ~70px
+            // it takes off the left group's budget lands on the items
+            // registered last there (the activity indicator, the merge
+            // conflict indicator, the file name), all of which are readouts a
+            // user can lose without losing a destination.
+            status_bar.add_right_item(utility_buttons, window, cx);
             status_bar.add_right_item(remote_control_status, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
@@ -5537,6 +5547,55 @@ mod tests {
             }
         }
         assert!(has_default_theme);
+    }
+
+    /// Pins where `initialize_workspace` mounts the band's utility buttons.
+    /// They must be in the status bar's RIGHT group, and must register ahead
+    /// of the remote-control item — `StatusBar::render_right_tools` iterates
+    /// `right_items` in reverse, so "registered first" is what paints flush
+    /// against the window's right edge, under the band's right-hand utility
+    /// half. Nothing else catches a regression here: `dump_visual_structure`
+    /// deliberately emits no children for the status bar, so a silent revert
+    /// to `add_left_item` would be invisible to structural verification.
+    #[gpui::test]
+    async fn test_utility_buttons_sit_at_the_outer_end_of_the_right_status_bar_group(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let (left_item_count, utility_position, remote_control_position) = window
+            .update(cx, |multi_workspace, _, cx| {
+                let status_bar = multi_workspace.workspace().read(cx).status_bar().clone();
+                let status_bar = status_bar.read(cx);
+                (
+                    status_bar.left_item_count(),
+                    status_bar
+                        .position_of_item::<solution_agent::utility_buttons::UtilityButtons>(),
+                    status_bar.position_of_item::<remote_control_ui::RemoteControlStatusItem>(),
+                )
+            })
+            .unwrap();
+
+        let utility_position =
+            utility_position.expect("the utility buttons must be in the status bar at all");
+        let remote_control_position =
+            remote_control_position.expect("the remote control item must be in the status bar");
+
+        assert!(
+            utility_position >= left_item_count,
+            "the band's utility buttons must be registered with `add_right_item`: \
+             `position_of_item` returned {utility_position}, which is still inside \
+             the left group of {left_item_count} items"
+        );
+        assert!(
+            utility_position < remote_control_position,
+            "the right group paints in reverse registration order, so the utility \
+             buttons must be registered BEFORE the remote-control item to end up \
+             flush against the window's right edge (got {utility_position}, \
+             remote control at {remote_control_position})"
+        );
     }
 
     #[gpui::test]

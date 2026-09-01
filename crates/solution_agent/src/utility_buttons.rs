@@ -1,6 +1,8 @@
-//! The Solution band's utility button group, mounted in the status bar's
-//! left group next to `session_tab_strip` (which selects the band's *other*
-//! half). Three buttons — Terminal / Git Graph / Debug Panel — pick which
+//! The Solution band's utility button group, mounted at the outer end of the
+//! status bar's **right** group so it sits under the band's utility half,
+//! which the band paints against the window's right edge. (`session_tab_strip`,
+//! which selects the band's *other* half, stays on the left for the same
+//! reason.) Three buttons — Terminal / Git Graph / Debug Panel — pick which
 //! content `Workspace::solution_band_utility_item` slot the band's utility
 //! section shows, and hide the section when the shown one is clicked again
 //! (`solution_band::utility_button_click` is the rule; spec §3).
