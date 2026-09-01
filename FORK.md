@@ -117,7 +117,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/project/src/task_inventory.rs` | Adds `Inventory::before_commit_templates(worktree)` accessor (mirrors `templates_with_hooks` shape) so the git panel can enumerate pre-commit-flagged tasks without touching `templates_from_settings`. Also adds `Inventory::task_templates_from_settings(worktree)` — a synchronous, context-free listing of settings-derived task templates used by the `task-ref` run-config provider (language runnables excluded; those need the async `list_tasks`). | `git_ui` (S-PCH-HK), `run_config` (S-RUN) |
 | `crates/workspace/src/welcome.rs` | `render_agent_card` gated off via `false &&` — fork uses `solution_agent`, not upstream agent panel. | `solution_agent` |
 | `crates/workspace/src/active_file_name.rs` | `ActiveFileName::new` now takes the `Workspace` (holds a `WeakEntity<Project>`); the status-bar label prefixes the worktree-relative path with the worktree's root name so it's unambiguous across a Solution's worktrees. (`status_bar.show_active_file` also flipped to `true` in `default.json`.) | rebrand / solutions |
-| `crates/git_ui/src/commit_view.rs` | S-DET commit-view surface (header / parents / refs / contains / affected-files / footer decomposed into `commit_view::*` submodules) **and** a `single_file: Option<RepoPath>` mode (`CommitView::open_file_diff`) that renders just the diff editor — no metadata chrome, tab titled with the file name — used by the git-graph changed-files list. | `git_ui` (S-DET) / `git_graph` |
+| `crates/git_ui/src/commit_view.rs` | S-DET commit-view surface (header / parents / refs / contains / affected-files / footer decomposed into `commit_view::*` submodules) **and** a `single_file: Option<RepoPath>` mode (`CommitView::open_file_diff`) that renders just the diff editor — no metadata chrome, tab titled with the file name. Its one caller is the git panel's Commit tab, and since #125 it opens into the pane's preview slot rather than a tab of its own. | `git_ui` (S-DET) / `git_graph` |
 | `crates/paths/src/paths.rs` | `.zed` → `.sawe` rename for per-worktree config dir. Adds `run_configurations_file()` (global `~/.spk/sawe/config/run-configurations.json`) and `local_run_configurations_file_relative_path()` (`.sawe/run-configurations.json`) for S-RUN. Adds `remote_control_settings_file()` (`~/.spk/sawe/config/remote-control.json`) for R-1. Adds `remote_control_cert_file()` / `remote_control_key_file()` siblings for the R-2 self-signed TLS cert + key (persisted across restarts so fingerprint pinning stays stable). | rebrand / `run_config` (S-RUN) / `remote_control` (R-1 / R-2) |
 | `crates/gpui_tokio/src/gpui_tokio.rs` | Adds `Tokio::try_handle(cx) -> Option<tokio::runtime::Handle>` — the non-panicking analogue of `Tokio::handle`, used by `remote_control::store::start_listener_async` to short-circuit when the runtime isn't installed (rather than panic deep in the bootstrap path). | `remote_control` (R-2) |
 | `assets/keymaps/default-*.json` | Default shortcuts for Solutions / sessions. Adds `alt-shift-f10` → `run_config::Run`, `alt-shift-f9` → `run_config::Debug`, `alt-shift-f2` → `run_config::Stop` (Workspace context; IntelliJ-style — `alt-shift` variants chosen because `shift-f10`/`shift-f9`/`ctrl-f2` are already bound in Editor context). | `solutions_ui` / `run_config_ui` |
@@ -1497,7 +1497,9 @@ History tab is deleted outright, and the git graph's inline right-hand commit-de
 Selecting a commit in the graph opens a closable **Commit** tab carrying the full commit message, a
 `short hash · author · date` row, whole-commit +/− totals and a changed-files tree; double-clicking a file there opens
 that file's diff **for that commit** in the centre pane (`CommitView::open_file_diff`, reused verbatim — its doc comment
-already named the graph's changed-files list as its caller). A multi-row graph selection renders a bare "N commits
+already named the graph's changed-files list as its caller). **The gesture and the tab identity changed on 2026-09-01 —
+see #125**: double click now summons one shared diff into the pane's preview slot and single click retargets it, and
+`open_file_diff`'s only caller is the Commit tab (the doc comment's graph attribution was stale and is corrected). A multi-row graph selection renders a bare "N commits
 selected" and loads nothing. The sidebar's building blocks — the changed-files tree, the commit-message split, the
 markdown style, the client-side +/− fold — were **relocated, not rebuilt**, into `crates/git_ui/src/git_panel/commit_tab.rs`.
 
@@ -2236,3 +2238,200 @@ deliberately no `-o ControlPath=none` beside it: those arguments are handed to t
 transport, which appends its own `-o ControlPath=<temp socket>` after them, and `ssh`
 keeps the **first** value it obtains for an option, so ours would win and disable the
 transport's own multiplexing.
+
+### 120. The right dock's toggles paint at the trailing edge of the project toolbar, and only the leading groups gate the divider
+
+What: `ProjectToolbar` builds one `workspace::dock::PanelButtons` per dock (left, bottom,
+right). All three used to render together at the row's leading edge. The **right** dock's
+group now renders as the row's **last** child, after the run-config strip, flush against
+`pr_1p5`; left and bottom stay leading. `has_dock_buttons` became
+`has_leading_dock_buttons` and no longer counts the right group, or the divider that
+separates the dock cluster from the project tabs would draw with nothing to its left on a
+workspace whose only buttoned panel is in the right dock.
+
+Why: the panels those buttons open — git panel, outline panel — open on the **right**, and
+the maintainer asked for the control to sit on the side the thing appears. The property
+that makes this a small change rather than a filter is that each `PanelButtons` is bound to
+a `Dock` **entity**, not to a list of panels: `Panel::position` is re-read from settings
+every frame, and `Dock::add_panel`'s `SettingsStore` observer physically moves the panel
+between docks. So dragging a panel from the right dock to the left makes its button move
+groups with no extra code. **Do not replace this with a per-panel predicate.**
+
+How to apply: the array stays three entries even though no panel in this fork accepts
+`DockPosition::Bottom` — `structure_node` and its order test hard-code the three-element
+shape, and the array is what makes the dynamic property above work. `structure_node`'s
+contract is that its children are emitted **in painted order**; reordering `render` without
+reordering it lies to every agent reading `workspace.dump_visual_structure`, and
+`the_toolbar_structure_node_lists_its_row_in_painted_order` is the only thing that catches
+it. Note also `crates/workspace/src/dock.rs`'s `PanelButtons` comment about upstream's
+right-dock button *reversal*: this fork dropped it because the buttons had moved to the
+leading edge, and that premise is now gone — reinstating the reversal is an open question,
+not a settled one.
+
+### 121. The Solution band's utility buttons live in the status bar's right group
+
+What: `solution_agent::utility_buttons::UtilityButtons` — the terminal / git-graph /
+debugger switches for the Solution band's utility half — moved from `add_left_item` to
+`add_right_item`, registered **before** `remote_control_status` so they paint outboard of
+it, hard against the window edge.
+
+Why: the band's utility half is the last child of a `w_full` row, i.e. genuinely flush to
+the window's right edge, and the maintainer's rule is that the control belongs on the side
+the panel appears — *"it's still a panel pinned to the right edge, so the buttons that open
+it should be pinned to the right edge too."*
+
+How to apply: **the right group paints in reverse registration order** (`render_right_tools`
+iterates `.rev()`), so "register first" means "paint rightmost" — the opposite of the left
+group. `UtilityButtons` is one composite entity rendering three buttons, so the group-level
+reversal cannot scramble terminal/graph/debug among themselves. The move also *improves* on
+the rationale it replaced: the old comment argued the buttons had to lead the left group so
+that group's `overflow_x_hidden` would clip something else, because these icons are the only
+mouse path to the git graph; in the `flex_shrink_0` right group they cannot be clipped at
+all. The cost is ~70px off the left group's budget, whose first casualties are the activity
+indicator, the conflict indicator and the active file name — readouts, not destinations.
+`workspace.dump_visual_structure` emits **no** status-bar children by design, so this is
+invisible to structural verification; `test_utility_buttons_sit_at_the_outer_end_of_the_right_status_bar_group`
+is what pins it.
+
+### 122. The Commit tab paints files above the message, and its message is the Changes tab's commit typography
+
+What: the git panel's Commit tab now paints **changed-files header → file tree → message →
+identity → branches**, mirroring the Changes tab, where the file list is on top and the
+commit message at the bottom. The message renders with `git_commit_text_style` — the buffer
+font at `git_commit_buffer_font_size` on `buffer_line_height` — the same typography the
+Changes tab's commit editor uses, instead of the UI font it inherited before.
+
+Why: the maintainer asked for both, and they turned out not to conflict. This fork ships
+`"git_commit_buffer_font_size": 12`, so aligning to the Changes tab *is* the smaller font;
+upstream's 15px default is never reached.
+
+How to apply, and the bug that makes it work at all: `detail_text_style` set the size only
+on `MarkdownStyle::base_text_style` and left `container_style` empty, while the comment
+beside it insisted the container needed it too. **The comment was right.** Markdown lowers
+every span through `TextStyle::to_run`, and a `TextRun` carries family, weight, colour and
+decorations but **no font size and no line height**; `TextLayout::layout` reads both off the
+*ambient* style, which only `container_style` refines. So the old code painted at the window
+UI size and merely coincided with `TextSize::Default` because both are 14px, and any size
+change here would have been a silent no-op. Both metrics are now set on the container.
+
+Two things this does **not** change, deliberately. Reordering siblings in a `v_flex` does not
+touch the height arithmetic — flexbox clamps by `min_h`/`max_h`, not DOM order — so the
+message keeps its shrinkable `min_h`/`max_h` + `overflow_y_scroll` and is **not** pinned the
+way the Changes tab pins its editor; that tab can afford a hard height because its file list
+has no floor and is allowed to collapse to zero, and the Commit tab's tree has a documented
+72px floor. And `COMMIT_TAB_SECTIONS` is a real constant the renderer loops over, not
+documentation — `test_commit_tab_paints_files_above_message` is load-bearing only because of
+that.
+
+### 123. The Commit tab shows containing branches again, with a clickable expander
+
+What: an IDEA-shaped line under the identity row — `In 1 branch: main` /
+`In 7 branches: a, b, c, d, e` plus a **`Show all`** button, and `Show less` back. This
+reverses half of the ruling at `docs/plans/2026-08-30-git-panel-commit-tab.md` that dropped
+it; the **ref-chips half of that ruling stands**, since decoration is not containment.
+
+Why the reversal: the deleted `format_branches_containing` printed `and N more` as plain
+**text**, so on a busy repo it announced that information existed and refused to show it.
+That, not the line itself, is what made it droppable. The tail is a button now.
+
+How to apply: `BRANCHES_CONTAINING_DEBOUNCE` (150 ms) is not optional and is the reason the
+original had one — the Commit tab is driven by graph selection *including arrow-key
+movement*, so an undebounced query queues one `git branch --contains` per row **ahead of the
+diff the surface shows first**. The task awaits the timer before touching the repository, and
+re-assigning the task handle cancels a pending one. Staleness uses the same
+`commit_tab_sha()` re-check as the tab's other two loads. A remote/collab repository returns
+`Ok(vec![])` — `Repository::branches_containing` has no proto path — which renders as
+**nothing**, never `In 0 branches:`; an unreachable commit and a collab repo are
+indistinguishable here and the function says so. Expanded, the text wraps inside a 64px
+`overflow_y_scroll` block with the toggle *outside* it, so `Show less` cannot scroll out of
+reach and a commit on 300 branches cannot eat the file tree.
+
+### 124. A server-side branch delete pushes a fully-qualified refspec, and fetch prunes
+
+What: deleting a branch on the remote pushes `refs/heads/<branch>` rather than `<branch>`;
+`RealGitRepository::fetch` passes `--prune`; `Repository::fetch` now runs `rescan_branches`
+after a successful local fetch; and the delete's **failure** path refreshes the branch list
+before reporting, where it previously refreshed nothing at all.
+
+Why: "git has no idempotent delete-push" is **false**, and believing it produces a much worse
+fix. The failure is client-side *name resolution*, not a server refusal — a short destination
+makes git resolve the name against the remote's advertised refs and abort, a qualified one
+needs no resolution:
+
+```
+git push origin :absent                     → exit 1  "unable to delete 'absent': remote ref does not exist"
+git push origin --delete absent             → exit 1
+git push origin :refs/heads/absent          → exit 0  "remote: warning: deleting a non-existent ref"
+```
+
+Verified on git 2.43.0 over both the local-path shortcut and `file://`, and the qualified form
+still deletes a ref that exists. So the fix is one `format!`, with no locale dependence, no
+`ls-remote` probe and no credential prompt before the confirmation dialog. Tags were never
+affected — both tag paths already spell `refs/tags/<name>`.
+
+How to apply: an error-text classifier (`is_remote_ref_already_absent_error`) remains as a
+**fallback** for a git that still refuses the qualified form; it follows the existing
+`BRANCH_DELETE_FORCE_DELETE_PROMPTS` shape, matching a lowercased haystack built from both
+`format_git_error_toast_message(error)` and `error.to_string()` so collab-wrapped `RpcError`
+payloads match too, and it degrades to today's modal under a translated git.
+**Never prune on an arbitrary failure** — a network or auth refusal says nothing about
+whether the branch still exists. Separately, `LocalBranchInfo.upstream_gone` (from
+`UpstreamTracking::is_gone()`) now disables the "Delete on remote" row for a `[gone]` upstream
+rather than offering an action that cannot work. Note `--prune` on fetch is a behaviour change
+for every Fetch and every toolbar "Update Project", and its one real cost is a user who keeps
+a stale `origin/x` as a deliberate marker.
+
+### 125. The Commit tab's file diffs share the pane's preview slot: double click summons, single click retargets
+
+What: double-clicking a file in the Commit tab opens its diff into the pane's **preview
+slot** and leaves it a preview; single-clicking another file **retargets that same tab**, but
+only if the slot already holds a single-file `CommitView` — it never summons a diff from
+nothing. Opening uses `focus_item = false`, so clicking down a file list keeps focus in the
+git panel. This reverses the ruling that made single click selection-only.
+
+Why: the ruling's own justification was anti-tab-spray, and it did not hold — the dedupe key
+was `(sha, file)`, so double-clicking N files still produced N tabs. The machinery needed
+already existed in this crate (`SoloDiffView`, FORK.md #54) and the Changes tab already
+behaves this way; the Commit tab was simply never wired to it.
+
+How to apply: **double click must not pin.** Pinning would promote the item out of the preview
+slot, after which single clicks would stop retargeting and would open a *second* preview —
+exactly the complaint. This inverts the Changes tab's mapping, where double click means
+`Permanent`, and it is the correction a later reader will "fix" back. The guard mirrors
+`GitPanel::move_diff_to_entry` and type-checks the slot's occupant, so the two surfaces cannot
+retarget each other's item even though they share one slot per pane. Also fixed here: the
+dedupe in `CommitView::open_internal` found the *index* by `(sha, single_file)` but the item
+to remove by **sha alone** and then `.unwrap()`ed it, so re-opening a file could close a full
+commit view open to its left; both halves now come from one `find_map`, and an already-open
+tab is **activated** rather than destroyed and rebuilt, which used to re-run the async load
+and drop scroll position. Known edge, not fought: Zed's own promotion gestures (double-click
+on the *tab*, `TogglePreviewTab`, editing a preview) pin the item behind your back, after
+which single clicks stop retargeting until it is summoned again.
+
+### 126. The Solution tab's AI badge counts what the chat strip can draw
+
+What: `SolutionAgentStore::visible_session_count` now also requires
+`SolutionSession::can_be_active_dialog()`, the predicate the chat strip, MCP
+`list_sessions`, `workspace.snapshot` and the lifecycle deltas all already use. It was the
+only user-visible surface that did not.
+
+Why: it counted everything hydration indexes under the Solution — `closed_at IS NULL`,
+tabbed or not. On the maintainer's database that made one Solution's badge read **30** when
+the strip showed **2** and `list_sessions` returned 2: 18 of the extras were the known
+legacy orphans (cwd under members the Solution no longer has) and 10 more had lost their
+`tab_order` without ever getting a `closed_at`. 65 such rows exist across the database and
+the badge was the only place any of them appeared — they have no tab, and the
+"Reopen Closed Chat" picker is `closed_at IS NOT NULL`. Sub-agents were **not** a factor:
+`parent_session_id IS NOT NULL` matches zero rows database-wide, because teammate tabs live
+in `solution_session_background_agent` and are not sessions.
+
+How to apply: the doc comment this replaced argued the old behaviour was intentional, so
+read it before re-widening. Its fear was real but aimed at a different filter — it was
+guarding against excluding `is_cold()`, which would blank the badge for restored-but-tabbed
+chats. That property survives, because hydration stamps `tab_order` back from
+`list_open_tabs`. **Never layer `is_cold()` on top.** Keep the `live_supervisor_session_ids`
+filter as well: `can_be_active_dialog` subsumes it for production judges and auditors (which
+are ephemeral *and* untabbed), but the handle maps are the authoritative in-flight record and
+cannot be missed by a future create path that forgets a flag. This changes only what is
+counted — **no session rows are deleted**, and the standing instruction not to clean up the
+legacy orphans is untouched.
