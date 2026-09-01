@@ -54,6 +54,17 @@ pub enum FakeCommitDataEntry {
     Fail(CommitData),
 }
 
+/// One recorded [`GitRepository::push`] call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakePush {
+    /// Local side of the refspec. Empty means "delete the remote ref".
+    pub branch: String,
+    /// Destination side of the refspec, exactly as passed.
+    pub remote_branch: String,
+    pub remote: String,
+    pub options: Option<PushOptions>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FakeGitRepositoryState {
     pub commit_history: Vec<FakeCommitSnapshot>,
@@ -76,6 +87,16 @@ pub struct FakeGitRepositoryState {
     pub branches_requiring_force_delete: HashSet<String>,
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
+    /// Every push the fake has been asked to run, in order. Lets a test
+    /// assert the exact refspec that would have gone over the wire —
+    /// notably that a branch delete spells its destination fully
+    /// qualified, which is what makes the delete idempotent.
+    pub pushes: Vec<FakePush>,
+    /// When set, every push records itself and then fails with this
+    /// stderr, standing in for a real `git push` rejection.
+    pub simulated_push_error: Option<String>,
+    /// How many fetches the fake has been asked to run.
+    pub fetch_count: usize,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
@@ -96,6 +117,9 @@ impl FakeGitRepositoryState {
             simulated_create_worktree_error: Default::default(),
             simulated_graph_error: None,
             branches_requiring_force_delete: Default::default(),
+            pushes: Default::default(),
+            simulated_push_error: Default::default(),
+            fetch_count: 0,
             worktrees_requiring_force_delete: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
             merge_base_contents: Default::default(),
@@ -1076,15 +1100,31 @@ impl GitRepository for FakeGitRepository {
 
     fn push(
         &self,
-        _branch: String,
-        _remote_branch: String,
-        _remote: String,
-        _options: Option<PushOptions>,
+        branch: String,
+        remote_branch: String,
+        remote: String,
+        options: Option<PushOptions>,
         _askpass: AskPassDelegate,
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        self.with_state_async(true, move |state| {
+            // Recorded before the simulated failure so a test can assert
+            // the refspec of a push that was rejected, too.
+            state.pushes.push(FakePush {
+                branch,
+                remote_branch,
+                remote,
+                options,
+            });
+            if let Some(stderr) = state.simulated_push_error.clone() {
+                bail!("{stderr}");
+            }
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        })
     }
 
     fn pull(
@@ -1099,6 +1139,12 @@ impl GitRepository for FakeGitRepository {
         unimplemented!()
     }
 
+    /// There is no remote behind a [`FakeFs`], so a fetch can only
+    /// succeed and change nothing. A test that wants to model what a real
+    /// `git fetch --prune` did to `refs/remotes/**` edits
+    /// [`FakeGitRepositoryState::branches`] directly, with the git event
+    /// suppressed — which is also how git behaves, the fs watcher not
+    /// reporting ref-store changes.
     fn fetch(
         &self,
         _fetch_options: FetchOptions,
@@ -1106,7 +1152,13 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        self.with_state_async(false, move |state| {
+            state.fetch_count += 1;
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        })
     }
 
     fn get_all_remotes(&self) -> BoxFuture<'_, Result<Vec<Remote>>> {

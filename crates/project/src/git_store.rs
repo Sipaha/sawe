@@ -7384,22 +7384,44 @@ impl Repository {
         &mut self,
         fetch_options: FetchOptions,
         askpass: AskPassDelegate,
-        _cx: &mut App,
+        cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
         let askpass_delegates = self.askpass_delegates.clone();
         let askpass_id = util::post_inc(&mut self.latest_askpass_id);
         let id = self.id;
 
+        let updates_tx = self.downstream_updates_tx(cx);
+        let this = cx.weak_entity();
         self.send_job(
             "fetch",
             Some("git fetch".into()),
-            move |git_repo, cx| async move {
+            move |git_repo, mut cx| async move {
                 match git_repo {
                     RepositoryState::Local(LocalRepositoryState {
                         backend,
                         environment,
                         ..
-                    }) => backend.fetch(fetch_options, askpass, environment, cx).await,
+                    }) => {
+                        let result = backend
+                            .fetch(fetch_options, askpass, environment, cx.clone())
+                            .await;
+                        if result.is_ok() {
+                            // A fetch only moves `refs/remotes/**` — and
+                            // with `--prune`, deletes entries there —
+                            // which the fs watcher does not report. See
+                            // [`Repository::refresh_branches`]: without
+                            // this the branch list, the ahead/behind
+                            // counts and the graph's ref chips keep their
+                            // pre-fetch values until something else
+                            // happens to rescan. A rescan failure is not
+                            // a reason to report the fetch as failed, so
+                            // it is logged rather than propagated.
+                            rescan_branches(&this, &backend, updates_tx, &mut cx)
+                                .await
+                                .log_err();
+                        }
+                        result
+                    }
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                         askpass_delegates.lock().insert(askpass_id, askpass);
                         let _defer = util::defer(|| {
@@ -10020,6 +10042,60 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    /// A fetch moves `refs/remotes/**` — and with `--prune`, deletes
+    /// entries there — which the fs watcher does not report. Without an
+    /// explicit rescan the published branch list keeps its pre-fetch
+    /// value, so the graph goes on painting a ref chip for a branch the
+    /// fetch just pruned.
+    #[gpui::test]
+    async fn test_fetch_republishes_the_branch_list(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), json!({ ".git": {} })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .expect("fake project should expose a repository");
+        cx.run_until_parked();
+
+        let published_refs = |cx: &mut TestAppContext| {
+            repository.read_with(cx, |repository, _| {
+                repository
+                    .branch_list
+                    .iter()
+                    .map(|branch| branch.ref_name.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // Stands in for what a real fetch does to the ref store: the
+        // event is suppressed because git does not produce one either.
+        fs.with_git_state(Path::new("/project/.git"), false, |state| {
+            state.branches.insert("origin/fetched".to_string());
+        })
+        .expect("fake repository should exist");
+        assert!(
+            !published_refs(cx).contains(&"refs/remotes/origin/fetched".to_string()),
+            "the ref must be invisible until something rescans — otherwise this test proves nothing"
+        );
+
+        let askpass = AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
+        let fetch = repository.update(cx, |repository, cx| {
+            repository.fetch(FetchOptions::All, askpass, cx)
+        });
+        fetch
+            .await
+            .expect("fetch was canceled")
+            .expect("fetch failed");
+        cx.run_until_parked();
+
+        assert!(
+            published_refs(cx).contains(&"refs/remotes/origin/fetched".to_string()),
+            "fetch must republish the branch list, or the UI keeps its pre-fetch view"
+        );
     }
 
     #[gpui::test]

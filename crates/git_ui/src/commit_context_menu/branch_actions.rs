@@ -23,6 +23,7 @@ use zed_actions::NewWorktreeBranchTarget;
 use crate::handlers::askpass::askpass_delegate;
 use crate::handlers::branch::{
     FORCE_DELETE_BRANCH_ANSWER, ForceDeleteDecision, force_delete_decision,
+    is_remote_ref_already_absent_error,
 };
 use crate::handlers::{compare, merge, protection, rebase, reset};
 
@@ -533,6 +534,27 @@ pub(super) fn run_delete_branch(
 /// [`NotificationId`].
 pub(super) struct RemoteBranchDeletedToast;
 
+/// Re-read the branch list so the graph's ref chips match reality again.
+///
+/// Every arm of the remote delete needs one of these: the fs watcher does
+/// not report `refs/remotes/**`, so neither the delete-push nor the
+/// tracking-ref prune repaints anything on its own.
+async fn refresh_branches_after_remote_delete(
+    repository: &Entity<Repository>,
+    cx: &mut AsyncWindowContext,
+) {
+    match repository
+        .update(cx, |repo, cx| repo.refresh_branches(cx))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("branch rescan after a remote delete failed: {error}"),
+        Err(_) => {
+            log::warn!("branch rescan after a remote delete was dropped before it ran")
+        }
+    }
+}
+
 /// "Delete on \<remote\>…" — the server-side delete of a remote branch.
 ///
 /// Spelled as a push of an empty source refspec (`git push <remote>
@@ -602,56 +624,95 @@ pub(super) fn run_delete_remote_branch(
         })?;
         let push = repository.update(cx, |repo, cx| {
             // Empty local side of the refspec == delete the remote ref.
+            //
+            // The destination is spelled fully qualified on purpose. A
+            // *short* destination makes git resolve the name against the
+            // remote's advertised refs and abort with "unable to delete
+            // '<branch>': remote ref does not exist" when the branch is
+            // already gone — the maintainer's bug. `refs/heads/<branch>`
+            // needs no resolution, so the delete succeeds whether or not
+            // the ref is still there, and still deletes it when it is.
+            // That is what makes this idempotent without an `ls-remote`
+            // probe, which would cost a network round trip (and possibly
+            // a credential prompt) on every delete and still be racy.
             repo.push(
                 SharedString::default(),
-                branch.clone(),
+                SharedString::from(format!("refs/heads/{branch}")),
                 remote.clone(),
                 None,
                 askpass,
                 cx,
             )
         });
-        match push.await {
-            Ok(Ok(_output)) => {
-                // The branch is gone on the server, but this clone's
-                // `refs/remotes/<remote>/<branch>` survives until a
-                // pruning fetch — leaving the ref chip painted on the
-                // row, which reads as "the delete didn't work". Drop it
-                // here; failing to is a cosmetic problem, not a reason
-                // to report the delete as failed.
-                let tracking_ref = format!("{remote}/{branch}");
-                match repository
-                    .update(cx, |repo, _| repo.delete_branch(true, tracking_ref, false))
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        log::warn!(
-                            "deleted {branch} on {remote}, but the tracking ref remains: {error}"
-                        )
-                    }
-                    Err(_) => log::warn!(
-                        "deleted {branch} on {remote}, but the tracking-ref prune was dropped \
-                         before it ran; the ref remains"
-                    ),
-                }
-                workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<RemoteBranchDeletedToast>(),
-                                format!("Deleted “{branch}” on “{remote}”."),
-                            )
-                            .autohide(),
-                            cx,
-                        );
-                    })
-                    .ok();
-                anyhow::Ok(())
+        let was_already_absent = match push.await {
+            Ok(Ok(_output)) => false,
+            // Safety net for a git that refuses the qualified refspec
+            // too: the requested end state is the actual one, so this is
+            // a success, not a failure to report.
+            Ok(Err(error)) if is_remote_ref_already_absent_error(&error) => true,
+            Ok(Err(error)) => {
+                // The push failed for a reason we cannot interpret. Do
+                // NOT prune the tracking ref — a network, auth or
+                // protected-branch refusal says nothing about whether
+                // the branch is still on the server, and dropping the
+                // ref would hide a branch that really does exist. Only
+                // re-read the branch list, so the graph behind the
+                // failure modal shows whatever the truth now is.
+                refresh_branches_after_remote_delete(&repository, cx).await;
+                return Err(error);
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(anyhow::anyhow!("delete on {remote} was canceled")),
+            Err(_) => return Err(anyhow::anyhow!("delete on {remote} was canceled")),
+        };
+
+        // The branch is gone on the server, but this clone's
+        // `refs/remotes/<remote>/<branch>` survives until a pruning
+        // fetch — leaving the ref chip painted on the row, which reads
+        // as "the delete didn't work". Drop it here; failing to is a
+        // cosmetic problem, not a reason to report the delete as failed.
+        let tracking_ref = format!("{remote}/{branch}");
+        match repository
+            .update(cx, |repo, _| repo.delete_branch(true, tracking_ref, false))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::warn!("deleted {branch} on {remote}, but the tracking ref remains: {error}")
+            }
+            Err(_) => log::warn!(
+                "deleted {branch} on {remote}, but the tracking-ref prune was dropped \
+                 before it ran; the ref remains"
+            ),
         }
+        // `Repository::push` rescans the branch list itself, but from
+        // inside the push job — i.e. before the prune above ran, so that
+        // rescan still sees the dangling tracking ref. The prune's own
+        // write under `.git` does eventually schedule a snapshot
+        // recompute, so this second rescan is belt and braces rather
+        // than the only thing that repaints; it makes the republish
+        // immediate instead of waiting on a debounced fs event.
+        refresh_branches_after_remote_delete(&repository, cx).await;
+
+        workspace
+            .update(cx, |workspace, cx| {
+                let message = if was_already_absent {
+                    format!(
+                        "“{branch}” was already gone on “{remote}”. \
+                         Removed this clone's “{remote}/{branch}” tracking ref."
+                    )
+                } else {
+                    format!("Deleted “{branch}” on “{remote}”.")
+                };
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<RemoteBranchDeletedToast>(),
+                        message,
+                    )
+                    .autohide(),
+                    cx,
+                );
+            })
+            .ok();
+        anyhow::Ok(())
     });
     task.detach_and_prompt_err("Delete on remote failed", window, cx, |e, _, _| {
         Some(format!("{e}"))
@@ -700,8 +761,12 @@ pub(super) fn run_delete_tag(
 
 /// IDEA-style: after a local tag is deleted, drop a toast offering to
 /// delete the tag on `origin` too. The remote may not actually have the
-/// tag — in that case `git push --delete` errors and the error surfaces
-/// through the toast handler's log (no notification, to avoid noise).
+/// tag, which is harmless: `delete_remote_tag` spells the destination
+/// `refs/tags/<tag>`, and a fully-qualified delete refspec needs no
+/// resolution against the remote's advertised refs, so git exits 0 with
+/// a `deleting a non-existent ref` warning rather than failing. Genuine
+/// failures surface through the toast handler's log (no notification, to
+/// avoid noise).
 pub(super) fn offer_remote_tag_delete(
     workspace: WeakEntity<Workspace>,
     repo: Entity<Repository>,
@@ -866,6 +931,7 @@ mod tests {
         ctx.local_branches = vec![LocalBranchInfo {
             name: branch.into(),
             upstream: None,
+            upstream_gone: false,
             ahead: 0,
         }];
 
@@ -888,6 +954,7 @@ mod tests {
         LocalBranchInfo {
             name: name.into(),
             upstream: upstream.map(Into::into),
+            upstream_gone: false,
             ahead,
         }
     }
@@ -896,6 +963,7 @@ mod tests {
         RemoteBranchRef {
             full: full.into(),
             split: split.map(|(remote, branch)| (remote.into(), branch.into())),
+            gone: false,
         }
     }
 
@@ -1037,6 +1105,167 @@ mod tests {
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         assert!(!cx.has_pending_prompt());
+    }
+
+    /// Refspecs the fake repository has been asked to push, as
+    /// `(local side, destination, remote)`.
+    fn recorded_pushes(fs: &FakeFs) -> Vec<(String, String, String)> {
+        fs.with_git_state(path!("/dir/.git").as_ref(), false, |state| {
+            state
+                .pushes
+                .iter()
+                .map(|push| {
+                    (
+                        push.branch.clone(),
+                        push.remote_branch.clone(),
+                        push.remote.clone(),
+                    )
+                })
+                .collect()
+        })
+        .expect("fake repository should exist")
+    }
+
+    /// The branch list as the *UI* currently sees it — the snapshot the
+    /// graph paints its ref chips from, which only a rescan updates.
+    fn published_branch_refs(ctx: &CommitContext, cx: &mut VisualTestContext) -> Vec<String> {
+        ctx.repository
+            .read_with(cx, |repo, _| {
+                repo.branch_list
+                    .iter()
+                    .map(|branch| branch.ref_name.to_string())
+                    .collect::<Vec<_>>()
+            })
+    }
+
+    /// Drive a confirmed "Delete on origin…" against a clone that still
+    /// has the `origin/feature-auth` tracking ref, with `push` either
+    /// succeeding or failing with `push_error`.
+    async fn run_confirmed_remote_delete(
+        push_error: Option<&str>,
+        cx: &mut TestAppContext,
+    ) -> (Arc<FakeFs>, CommitContext, VisualTestContext) {
+        let (fs, ctx, mut cx) = init_commit_context_test(cx).await;
+
+        let push_error = push_error.map(str::to_string);
+        fs.with_git_state(path!("/dir/.git").as_ref(), true, |state| {
+            state.branches.insert("origin/feature-auth".to_string());
+            state.simulated_push_error = push_error;
+        })
+        .expect("fake repository should exist");
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            run_delete_remote_branch(
+                ctx.clone(),
+                "origin".into(),
+                "feature-auth".into(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Delete on origin");
+        cx.run_until_parked();
+
+        (fs, ctx, cx)
+    }
+
+    /// The whole of fix (a): the destination is spelled
+    /// `refs/heads/<branch>`, which git resolves without asking the
+    /// remote what it advertises — so the delete succeeds whether or not
+    /// the branch is still there, with no `ls-remote` probe.
+    #[gpui::test]
+    async fn test_delete_on_remote_pushes_a_fully_qualified_refspec(cx: &mut TestAppContext) {
+        let (fs, _ctx, _cx) = run_confirmed_remote_delete(None, cx).await;
+
+        assert_eq!(
+            recorded_pushes(&fs),
+            vec![(
+                String::new(),
+                "refs/heads/feature-auth".to_string(),
+                "origin".to_string()
+            )],
+            "a short destination makes git resolve the name against the remote's advertised \
+             refs, which is what fails when the branch is already gone"
+        );
+    }
+
+    /// After a successful delete the graph must not still paint a chip
+    /// for the branch. Guards the tracking-ref prune; it does *not*
+    /// distinguish the extra post-prune rescan, because pruning writes
+    /// under `.git` and the resulting fs event schedules a full snapshot
+    /// recompute of its own.
+    #[gpui::test]
+    async fn test_a_successful_remote_delete_republishes_the_pruned_branch_list(
+        cx: &mut TestAppContext,
+    ) {
+        let (_fs, ctx, mut cx) = run_confirmed_remote_delete(None, cx).await;
+
+        assert!(
+            !cx.has_pending_prompt(),
+            "a successful delete must not raise the failure modal"
+        );
+        assert!(
+            !published_branch_refs(&ctx, &mut cx)
+                .iter()
+                .any(|ref_name| ref_name == "refs/remotes/origin/feature-auth"),
+            "the branch list the graph paints from must no longer carry the pruned tracking ref"
+        );
+    }
+
+    /// The maintainer's bug, end to end: a git that still refuses the
+    /// qualified refspec must not dead-end on a modal — the requested
+    /// end state is the actual one.
+    #[gpui::test]
+    async fn test_an_already_absent_remote_ref_is_not_reported_as_a_failure(
+        cx: &mut TestAppContext,
+    ) {
+        let (_fs, ctx, mut cx) = run_confirmed_remote_delete(
+            Some(
+                "error: unable to delete 'feature-auth': remote ref does not exist\n\
+                 error: failed to push some refs to 'gitlab.example.com:group/repo.git'",
+            ),
+            cx,
+        )
+        .await;
+
+        assert!(
+            !cx.has_pending_prompt(),
+            "deleting a branch that is already gone on the remote is a no-op, not a failure"
+        );
+        assert!(
+            !published_branch_refs(&ctx, &mut cx)
+                .iter()
+                .any(|ref_name| ref_name == "refs/remotes/origin/feature-auth"),
+            "the stale tracking ref must be pruned, or the chip stays painted in the graph"
+        );
+    }
+
+    /// Fix (c)'s other half, and its safety limit: an uninterpretable
+    /// failure still raises the modal, and must NOT prune — a network or
+    /// auth error says nothing about whether the branch is still there.
+    #[gpui::test]
+    async fn test_an_unrelated_push_failure_keeps_the_tracking_ref(cx: &mut TestAppContext) {
+        let (_fs, ctx, mut cx) = run_confirmed_remote_delete(
+            Some(
+                "fatal: Authentication failed for 'https://gitlab.example.com/group/repo.git/'\n\
+                 error: failed to push some refs to 'origin'",
+            ),
+            cx,
+        )
+        .await;
+
+        let (title, _detail) = cx
+            .pending_prompt()
+            .expect("an uninterpretable push failure must still be reported");
+        assert_eq!(title, "Delete on remote failed");
+        assert!(
+            published_branch_refs(&ctx, &mut cx)
+                .iter()
+                .any(|ref_name| ref_name == "refs/remotes/origin/feature-auth"),
+            "a failed delete must leave the tracking ref alone — the branch may well still exist"
+        );
     }
 
     /// "Push…" confirms the exact refspec before running, so a

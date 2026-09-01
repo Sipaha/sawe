@@ -99,6 +99,12 @@ pub struct LocalBranchInfo {
     /// Remote-tracking ref this branch follows, in `%D` spelling
     /// (`origin/main`). `None` when the branch tracks nothing.
     pub upstream: Option<SharedString>,
+    /// Git still reports [`Self::upstream`] as the configured upstream
+    /// after the remote-tracking ref itself is gone — that is the
+    /// `[gone]` in `git branch -vv` — so "tracks something" and "that
+    /// something exists" are different questions, and the submenu has to
+    /// ask the second one before offering to act on the upstream.
+    pub upstream_gone: bool,
     /// Commits on this branch that [`Self::upstream`] does not have.
     /// `0` when the branch tracks nothing or the upstream ref is gone —
     /// i.e. "no known divergence", never "definitely none".

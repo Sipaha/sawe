@@ -3039,7 +3039,17 @@ impl GitRepository for RealGitRepository {
                 executor.clone(),
                 is_trusted,
             );
-            let mut command = git.build_command(&["fetch", &remote_name]);
+            // `--prune` deletes the `refs/remotes/**` entries whose
+            // branch no longer exists on the remote. Without it a branch
+            // someone deleted server-side keeps its tracking ref — and
+            // so keeps its chip painted in the graph and its row in the
+            // branch picker — for the life of the clone, because nothing
+            // else ever removes one. `solution_git`'s own fetch has
+            // pruned from the start; this makes the single-repo Fetch and
+            // "Update Project" paths agree with it. The cost is that a
+            // deliberately-kept stale `origin/x` marker is now removed by
+            // the next fetch.
+            let mut command = git.build_command(&["fetch", "--prune", &remote_name]);
             command
                 .envs(env.iter())
                 .stdout(Stdio::piped())
@@ -5463,6 +5473,87 @@ mod tests {
         //         .ok(),
         //     None
         // );
+    }
+
+    /// A plain `git fetch` leaves `refs/remotes/<remote>/<branch>` behind
+    /// after someone deletes the branch server-side, and nothing else in
+    /// this fork ever removes one — so the graph keeps painting a ref chip
+    /// for a branch that does not exist. `--prune` is what removes it.
+    #[gpui::test]
+    async fn test_fetch_prunes_refs_whose_branch_is_gone_on_the_remote(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let remote_dir = tempfile::tempdir().unwrap();
+        git_command(remote_dir.path(), ["init", "--bare", "-b", "main"]);
+
+        let origin_dir = tempfile::tempdir().unwrap();
+        git_init_repo(origin_dir.path());
+        std::fs::write(origin_dir.path().join("file.txt"), "one").unwrap();
+        git_command(origin_dir.path(), ["add", "file.txt"]);
+        git_command(origin_dir.path(), ["commit", "-m", "one"]);
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        git_command(origin_dir.path(), ["remote", "add", "origin", &remote_url]);
+        git_command(origin_dir.path(), ["push", "origin", "main", "-u"]);
+        git_command(origin_dir.path(), ["push", "origin", "main:doomed"]);
+
+        let clone_parent = tempfile::tempdir().unwrap();
+        let clone_dir = clone_parent.path().join("clone");
+        git_command(
+            clone_parent.path(),
+            [
+                "clone".to_string(),
+                remote_url.clone(),
+                clone_dir.to_string_lossy().to_string(),
+            ],
+        );
+        let repository = RealGitRepository::new(
+            &clone_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        async fn tracking_refs(repository: &RealGitRepository) -> Vec<String> {
+            repository
+                .branches()
+                .await
+                .expect("branches should scan")
+                .branches
+                .into_iter()
+                .map(|branch| branch.ref_name.to_string())
+                .collect()
+        }
+        assert!(
+            tracking_refs(&repository)
+                .await
+                .contains(&"refs/remotes/origin/doomed".to_string()),
+            "the clone must start out tracking the branch this test deletes"
+        );
+
+        // Deleted by someone else, exactly as in the bug report.
+        git_command(origin_dir.path(), ["push", "origin", ":refs/heads/doomed"]);
+
+        let askpass = AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
+        repository
+            .fetch(
+                FetchOptions::Remote(Remote {
+                    name: "origin".into(),
+                }),
+                askpass,
+                Arc::new(HashMap::default()),
+                cx.to_async(),
+            )
+            .await
+            .expect("fetch should succeed");
+
+        assert!(
+            !tracking_refs(&repository)
+                .await
+                .contains(&"refs/remotes/origin/doomed".to_string()),
+            "fetch must prune the tracking ref of a branch that is gone on the remote"
+        );
     }
 
     #[gpui::test]

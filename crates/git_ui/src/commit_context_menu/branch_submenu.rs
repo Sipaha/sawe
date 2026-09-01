@@ -79,6 +79,13 @@ pub(super) struct RemoteBranchRef {
     /// delete or a pull would go to, and guessing means hitting the
     /// wrong one.
     pub(super) split: Option<(SharedString, SharedString)>,
+    /// This clone no longer has the ref — git's `[gone]` upstream state.
+    ///
+    /// Only ever `true` for a ref reached as a *local* branch's
+    /// configured upstream: a ref that decorates a commit is still in
+    /// `refs/remotes/**` by definition, that being where the decoration
+    /// came from.
+    pub(super) gone: bool,
 }
 
 pub(super) fn refs_at_commit(ctx: &CommitContext) -> RefsAtCommit {
@@ -170,6 +177,7 @@ pub(super) fn classify_branch_token(
         return Some(BranchRef::Remote(RemoteBranchRef {
             full: name.into(),
             split: Some((remote, branch)),
+            gone: false,
         }));
     }
 
@@ -187,6 +195,7 @@ pub(super) fn classify_branch_token(
     Some(BranchRef::Remote(RemoteBranchRef {
         full: name.into(),
         split: None,
+        gone: false,
     }))
 }
 
@@ -387,16 +396,18 @@ pub(super) fn plan_branch_submenu(
         BranchRef::Remote(remote) => Some(remote),
         BranchRef::Local(_) => None,
     };
-    let upstream = match branch {
+    let local_info = match branch {
         BranchRef::Local(local_name) => local_branches
             .iter()
-            .find(|info| info.name == *local_name)
-            .and_then(|info| info.upstream.clone()),
+            .find(|info| info.name == *local_name),
         BranchRef::Remote(_) => None,
     };
+    let upstream_gone = local_info.is_some_and(|info| info.upstream_gone);
+    let upstream = local_info.and_then(|info| info.upstream.clone());
     let upstream_ref = upstream.map(|upstream| RemoteBranchRef {
         split: split_remote_ref(&upstream, remotes),
         full: upstream,
+        gone: upstream_gone,
     });
 
     let mut groups: Vec<Vec<SubmenuRow>> = Vec::new();
@@ -668,6 +679,26 @@ pub(super) fn plan_delete_row(
 ) -> SubmenuRow {
     let action = match branch {
         BranchRef::Local(_) => BranchAction::Delete,
+        // Reached through a local branch's "Tracked Branch" submenu for
+        // an upstream git reports as `[gone]`: the ref this row would
+        // delete is not in this clone any more, and offering a
+        // server-side delete for it is how a row stays live for a branch
+        // that provably is not there. Nothing here proves it is gone on
+        // the *server* — that is a separate question, answered by the
+        // delete itself — so the row is disabled and says why rather
+        // than silently disappearing.
+        BranchRef::Remote(remote) if remote.gone => {
+            return SubmenuRow::unavailable(
+                BranchAction::Delete,
+                "Delete",
+                format!(
+                    "“{}” is gone from this clone — git still lists it as the configured \
+                     upstream, but the tracking ref itself has been pruned. Fetch to find out \
+                     whether it is still on the remote.",
+                    remote.full
+                ),
+            );
+        }
         BranchRef::Remote(remote) => match remote.split.clone() {
             Some((remote_name, branch_name)) => BranchAction::DeleteOnRemote {
                 remote: remote_name,
@@ -721,6 +752,7 @@ mod tests {
         BranchRef::Remote(RemoteBranchRef {
             full: full.into(),
             split: split.map(|(remote, branch)| (remote.into(), branch.into())),
+            gone: false,
         })
     }
 
@@ -843,7 +875,19 @@ mod tests {
         LocalBranchInfo {
             name: name.into(),
             upstream: upstream.map(Into::into),
+            upstream_gone: false,
             ahead,
+        }
+    }
+
+    /// A local branch git reports as `<name> [gone]`: the upstream is
+    /// still configured, the remote-tracking ref is not there any more.
+    fn local_info_with_gone_upstream(name: &str, upstream: &str) -> LocalBranchInfo {
+        LocalBranchInfo {
+            name: name.into(),
+            upstream: Some(upstream.into()),
+            upstream_gone: true,
+            ahead: 0,
         }
     }
 
@@ -851,6 +895,7 @@ mod tests {
         RemoteBranchRef {
             full: full.into(),
             split: split.map(|(remote, branch)| (remote.into(), branch.into())),
+            gone: false,
         }
     }
 
@@ -985,6 +1030,94 @@ mod tests {
                 "Delete",
                 "deleting protected branch 'master' is forbidden",
             ))
+        );
+    }
+
+    /// Re-enter the planner the way `build_branch_ref_submenu` does for
+    /// a "Tracked Branch '<upstream>'" row: the nested submenu is this
+    /// same function called with `BranchRef::Remote(upstream)`.
+    fn tracked_branch_submenu(rows: &[SubmenuRow], remotes: &[SharedString]) -> Vec<SubmenuRow> {
+        let upstream = rows
+            .iter()
+            .find_map(|row| match row {
+                SubmenuRow::Row {
+                    action: BranchAction::TrackedBranch { upstream },
+                    ..
+                } => Some(upstream.clone()),
+                _ => None,
+            })
+            .expect("a tracking local branch must offer a Tracked Branch row");
+        plan_branch_submenu(
+            &BranchRef::Remote(upstream),
+            Some(&"master222".into()),
+            &[],
+            remotes,
+            None,
+        )
+    }
+
+    /// The direct route to the server-side delete: the upstream ref is
+    /// really there, so the row is live.
+    #[test]
+    fn test_a_live_upstream_offers_delete_on_remote() {
+        let remotes = strings(&["origin"]);
+        let rows = plan_branch_submenu(
+            &BranchRef::Local("feature".into()),
+            Some(&"master222".into()),
+            &[local_info("feature", Some("origin/feature"), 0)],
+            &remotes,
+            None,
+        );
+        assert_eq!(
+            tracked_branch_submenu(&rows, &remotes).last(),
+            Some(&SubmenuRow::enabled(
+                BranchAction::DeleteOnRemote {
+                    remote: "origin".into(),
+                    branch: "feature".into(),
+                },
+                "Delete",
+            ))
+        );
+    }
+
+    /// Git keeps reporting the configured upstream as `[gone]` after a
+    /// pruning fetch removed the tracking ref, so "tracks origin/feature"
+    /// alone would leave a live Delete row for a branch this clone
+    /// provably no longer has.
+    #[test]
+    fn test_a_gone_upstream_withholds_delete_on_remote() {
+        let remotes = strings(&["origin"]);
+        let rows = plan_branch_submenu(
+            &BranchRef::Local("feature".into()),
+            Some(&"master222".into()),
+            &[local_info_with_gone_upstream("feature", "origin/feature")],
+            &remotes,
+            None,
+        );
+        let delete_row = tracked_branch_submenu(&rows, &remotes)
+            .last()
+            .cloned()
+            .expect("the submenu always ends in a Delete row");
+        let SubmenuRow::Row {
+            action,
+            label,
+            unavailable,
+        } = delete_row
+        else {
+            panic!("expected a Delete row, got a separator");
+        };
+        assert_eq!(label, "Delete");
+        assert_ne!(
+            action,
+            BranchAction::DeleteOnRemote {
+                remote: "origin".into(),
+                branch: "feature".into(),
+            },
+            "a [gone] upstream must not carry a server-side delete action"
+        );
+        assert!(
+            unavailable.is_some_and(|reason| reason.contains("gone from this clone")),
+            "the disabled row must say why it is disabled"
         );
     }
 

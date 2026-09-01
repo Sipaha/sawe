@@ -88,6 +88,43 @@ fn branch_delete_error_haystack(error: &anyhow::Error) -> String {
     haystack.to_lowercase()
 }
 
+/// Substrings git prints — on one line — when a delete-push names a ref
+/// the remote does not advertise:
+///
+/// ```text
+/// error: unable to delete 'feature/X': remote ref does not exist
+/// error: failed to push some refs to 'git@host:group/repo.git'
+/// ```
+///
+/// All of them must be present. The second line alone ("failed to push
+/// some refs") is what *every* rejected push prints, so matching on it
+/// would swallow auth and non-fast-forward failures too.
+const REMOTE_REF_ALREADY_ABSENT_SUBSTRINGS: &[&str] =
+    &["unable to delete", "remote ref does not exist"];
+
+/// Did this delete-push fail *because the ref is already gone on the
+/// remote*, i.e. is the requested end state already the actual one?
+///
+/// This is a safety net, not the primary defence: the delete path spells
+/// its refspec fully qualified (`:refs/heads/<branch>`), which git
+/// resolves without consulting the remote's advertised refs and which
+/// therefore succeeds whether or not the ref is there. Only a git that
+/// still refuses the qualified form reaches this classifier.
+///
+/// Like [`force_delete_prompt_for_branch_delete_error`] above, git only
+/// reports the condition through localized stderr — under a translated
+/// git the match simply fails and the caller falls back to surfacing the
+/// raw error, which is the pre-existing behaviour rather than a worse
+/// one. There is no locale-independent signal to use instead:
+/// `--porcelain` emits nothing here because the failure happens before
+/// any per-ref status line is produced.
+pub fn is_remote_ref_already_absent_error(error: &anyhow::Error) -> bool {
+    let haystack = branch_delete_error_haystack(error);
+    REMOTE_REF_ALREADY_ABSENT_SUBSTRINGS
+        .iter()
+        .all(|substring| haystack.contains(substring))
+}
+
 // Git only reports these cases via localized stderr, so this best-effort
 // check may miss some locales and fall back to the raw error toast.
 pub fn force_delete_prompt_for_branch_delete_error(
@@ -301,6 +338,74 @@ mod tests {
                     .to_string(),
             }
         );
+    }
+
+    /// Verbatim stderr from the bug report — both lines, as
+    /// `run_git_command` hands them to the UI.
+    fn already_absent_error(branch: &str) -> anyhow::Error {
+        anyhow!(
+            "error: unable to delete '{branch}': remote ref does not exist\n\
+             error: failed to push some refs to \
+             'gitlab.citeck.ru:ecos-community/ecos-data.git'"
+        )
+    }
+
+    #[test]
+    fn detects_an_already_deleted_remote_ref() {
+        assert!(is_remote_ref_already_absent_error(&already_absent_error(
+            "feature/COREDEV-445-unbounded-range"
+        )));
+    }
+
+    /// The haystack is lowercased before matching, so a git that
+    /// capitalises its diagnostics still classifies.
+    #[test]
+    fn already_deleted_detection_is_case_insensitive() {
+        let error = anyhow!(
+            "Error: Unable To Delete 'feature/x': Remote Ref Does Not Exist\n\
+             Error: failed to push some refs to 'origin'"
+        );
+        assert!(is_remote_ref_already_absent_error(&error));
+    }
+
+    #[test]
+    fn detects_an_already_deleted_remote_ref_inside_an_rpc_error() {
+        let rpc_error = proto::RpcError::from_proto(
+            &proto::Error {
+                message: "error: unable to delete 'feature/x': remote ref does not exist"
+                    .to_string(),
+                code: proto::ErrorCode::Internal as i32,
+                tags: Default::default(),
+            },
+            "Push",
+        );
+        let wrapped = rpc_error.context("deleting branch on remote");
+
+        assert!(
+            is_remote_ref_already_absent_error(&wrapped),
+            "collab-wrapped git stderr must still classify as already-absent"
+        );
+    }
+
+    /// Every one of these ends in "failed to push some refs", which is
+    /// exactly why that line alone must not be the match.
+    #[test]
+    fn other_push_failures_are_not_classified_as_already_absent() {
+        for stderr in [
+            "fatal: unable to access 'https://host/repo.git/': Could not resolve host: host",
+            " ! [rejected]        main -> main (non-fast-forward)\n\
+             error: failed to push some refs to 'origin'",
+            "remote: HTTP Basic: Access denied\n\
+             fatal: Authentication failed for 'https://host/repo.git/'\n\
+             error: failed to push some refs to 'origin'",
+            "remote: GitLab: You are not allowed to delete protected branches\n\
+             error: failed to push some refs to 'origin'",
+        ] {
+            assert!(
+                !is_remote_ref_already_absent_error(&anyhow!("{stderr}")),
+                "must not classify as already-absent: {stderr}"
+            );
+        }
     }
 
     #[test]

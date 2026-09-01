@@ -3048,6 +3048,8 @@ impl GitGraph {
                     upstream: upstream
                         .and_then(|upstream| upstream.stripped_ref_name())
                         .map(|ref_name| SharedString::from(ref_name.to_string())),
+                    upstream_gone: upstream
+                        .is_some_and(|upstream| upstream.tracking.is_gone()),
                     ahead: upstream
                         .and_then(|upstream| upstream.tracking.status())
                         .map_or(0, |status| status.ahead),
