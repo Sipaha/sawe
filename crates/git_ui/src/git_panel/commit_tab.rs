@@ -60,6 +60,69 @@ const COMMIT_MESSAGE_MIN_HEIGHT: f32 = 44.0;
 /// zero pixels on a git panel at its shipped dock height.
 const COMMIT_FILE_TREE_MIN_HEIGHT: f32 = 72.0;
 
+/// Cap on the expanded containing-branches list.
+///
+/// Collapsed, the line is one truncating row and costs the changed-files tree
+/// nothing it was not already paying for the identity row above it. Expanded it
+/// wraps, and a commit on a busy repository can be contained in hundreds of
+/// branches — without a cap the tree would be pushed to its own floor by a
+/// single click. Four wrapped rows of `LabelSize::Small` is enough to read a
+/// dozen branch names; past that the block scrolls internally, which is the
+/// same bargain the message block above it makes.
+const COMMIT_BRANCHES_EXPANDED_MAX_HEIGHT: f32 = 64.0;
+
+/// Settle time before the Commit tab asks git which branches contain the
+/// selected commit.
+///
+/// The tab is driven by the git graph's selection, arrow-key movement from row
+/// to row included. Without a debounce, holding an arrow key queues one
+/// `git branch --contains` per row onto the repository's job queue — ahead of
+/// the commit diff, which is the thing the tab actually paints first. Dropping
+/// the task on the next selection cancels the pending query before it is ever
+/// sent, so only the row the user stops on costs a git invocation.
+pub(super) const BRANCHES_CONTAINING_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// How many branch names the "In N branches" line spells out before it hides
+/// the rest behind `Show all`.
+const MAX_LISTED_BRANCHES: usize = 5;
+
+/// One of the stacked regions of the Commit tab body.
+///
+/// The order is a constant rather than the shape of `render_commit_tab`'s
+/// statements because it is the one thing about the tab's layout that a unit
+/// test can hold onto: the renderer returns an opaque `AnyElement` and needs a
+/// live workspace to build, so a reorder is otherwise unguarded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommitTabSection {
+    /// The changed-files header and tree, or the placeholder standing in for
+    /// them while the diff loads or after it failed.
+    Diff,
+    /// The commit message and the identity line under it, or the placeholder
+    /// standing in for them while the details load or after they failed.
+    Message,
+    /// IDEA's `In N branches: …` line. Renders nothing at all until the
+    /// branches are loaded and non-empty — see [`format_branches_containing`].
+    Branches,
+}
+
+/// Painted top-to-bottom order of the Commit tab body.
+///
+/// Files above, message below — mirroring the Changes tab, where the file list
+/// is on top and the commit editor sits under it. The tab's single horizontal
+/// rule follows from this order: it hangs off the *message*, the section
+/// painted directly under the tree, so that it always separates the two.
+///
+/// Containment comes last because it is metadata about the commit of the same
+/// class as the identity row the message section ends with — IDEA puts it under
+/// the sha/author/date line for the same reason — and because it is the one
+/// section that can render nothing, which at the bottom costs no rule and no
+/// gap.
+const COMMIT_TAB_SECTIONS: [CommitTabSection; 3] = [
+    CommitTabSection::Diff,
+    CommitTabSection::Message,
+    CommitTabSection::Branches,
+];
+
 /// What a changed-files row does when the user acts on it, supplied by the
 /// host as `&mut App` closures built from its own weak handle rather than the
 /// rows naming a concrete view. The indirection dates from the tree having two
@@ -137,6 +200,34 @@ impl ChangedFileEntry {
         );
     }
 
+    /// The diff half of a left click on this row (the selection half is the
+    /// caller's [`ChangedFileRowHandlers::select_file`]).
+    ///
+    /// Double click *summons* the shared single-file diff tab; a plain single
+    /// click only *retargets* it, and does nothing when it is not open — the
+    /// same "never open a diff from nothing" rule `GitPanel::move_diff_to_entry`
+    /// applies to the Changes tab, so mouse-walking the list still cannot spray
+    /// tabs across the pane.
+    ///
+    /// Both gestures open as a *preview*. Pinning on double click (which is
+    /// what the Changes tab's double click does) would look right and break the
+    /// feature: the tab would leave the preview slot, the guard below would go
+    /// false, and the next single click would summon a *second* tab — exactly
+    /// the one-tab-per-file behaviour this replaced.
+    fn handle_row_click(
+        &self,
+        click_count: usize,
+        commit_sha: &SharedString,
+        repository: &WeakEntity<Repository>,
+        workspace: &WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if click_count >= 2 || CommitView::preview_holds_single_file_diff(workspace, cx) {
+            self.open_file_diff(commit_sha, repository, workspace, window, cx);
+        }
+    }
+
     /// Full repo-relative path, used for tooltips and the copy-path menu.
     fn display_path(&self) -> SharedString {
         if self.dir_path.is_empty() {
@@ -194,23 +285,21 @@ impl ChangedFileEntry {
                         let meta = full_path;
                         move |_, cx| Tooltip::with_meta("Open Diff", None, meta.clone(), cx)
                     })
-                    // Single click only selects; the diff opens on double
-                    // click, so walking the file list with the mouse does not
-                    // spray tabs across the pane.
+                    // Every click selects; the diff half is
+                    // `handle_row_click`, which documents the gesture split.
                     .on_click({
                         let entry = self.clone();
                         let handlers = handlers_for_click;
                         move |event: &ClickEvent, window, cx| {
                             (handlers.select_file)(&entry.repo_path, window, cx);
-                            if event.click_count() >= 2 {
-                                entry.open_file_diff(
-                                    &commit_sha,
-                                    &repository,
-                                    &workspace,
-                                    window,
-                                    cx,
-                                );
-                            }
+                            entry.handle_row_click(
+                                event.click_count(),
+                                &commit_sha,
+                                &repository,
+                                &workspace,
+                                window,
+                                cx,
+                            );
                         }
                     }),
             )
@@ -390,6 +479,67 @@ fn commit_identity(
     }
 }
 
+/// The containing-branches line, split at the seam where prose stops and the
+/// expand affordance begins.
+///
+/// The two halves are separate because the tail is a *button*: the deleted
+/// `git_graph` version wrote `… and 3 more` as plain text, which told the user
+/// there were more branches and then gave them no way to see them. That is the
+/// gap this line exists to close, so the count and the control cannot be one
+/// formatted string.
+struct BranchesContaining {
+    /// `In 1 branch: main` / `In 12 branches: a, b, c, d, e`. The count is
+    /// always the *total*, never the number of names actually listed.
+    line: SharedString,
+    /// Label of the toggle that swaps the truncated list for the full one, or
+    /// `None` when every branch already fits and there is nothing to expand.
+    toggle: Option<SharedString>,
+}
+
+/// IDEA's `In 1 branch: main` / `In 12 branches: a, b, c, d, e` + `Show all`.
+///
+/// `None` when the commit is on no branch, and the line is then omitted rather
+/// than rendered as `In 0 branches:`. That covers two cases that are worth
+/// keeping indistinguishable here: a genuinely unreachable commit, and a
+/// *remote* repository, where `Repository::branches_containing` answers with an
+/// empty list because containment has no proto message (see its doc comment).
+/// On a collab repo the line is therefore simply absent.
+fn format_branches_containing(
+    branches: &[SharedString],
+    expanded: bool,
+) -> Option<BranchesContaining> {
+    if branches.is_empty() {
+        return None;
+    }
+    let truncated = branches.len() > MAX_LISTED_BRANCHES;
+    let listed = if expanded {
+        branches.len()
+    } else {
+        branches.len().min(MAX_LISTED_BRANCHES)
+    };
+    let prefix = if branches.len() == 1 {
+        "In 1 branch: ".to_string()
+    } else {
+        format!("In {} branches: ", branches.len())
+    };
+    let names = branches
+        .iter()
+        .take(listed)
+        .map(|branch| branch.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(BranchesContaining {
+        line: format!("{prefix}{names}").into(),
+        toggle: truncated.then(|| {
+            if expanded {
+                SharedString::new_static("Show less")
+            } else {
+                SharedString::new_static("Show all")
+            }
+        }),
+    })
+}
+
 /// The line's three pieces share one style; a helper keeps them provably
 /// identical rather than repeating the builder chain three times.
 fn identity_label(text: SharedString) -> Label {
@@ -440,33 +590,42 @@ fn format_detail_timestamp(timestamp: i64) -> String {
     format_with(timestamp, detail_timestamp_format())
 }
 
-/// Style for the selectable single-line text fields of the Commit tab,
-/// matching what the equivalent [`Label`] rendered before.
-fn detail_text_style(
-    text_size: TextSize,
-    color: Color,
-    weight: Option<gpui::FontWeight>,
-    window: &Window,
-    cx: &App,
-) -> MarkdownStyle {
-    let refinement = TextStyleRefinement {
-        font_size: Some(text_size.rems(cx).into()),
+/// Style for the Commit tab's selectable message text.
+///
+/// Built on [`git_commit_text_style`], the Changes tab's commit editor
+/// typography, so that a commit message the user is *reading* here is the same
+/// text as one they are *writing* over there. Before this it started from
+/// `window.text_style()` and so rendered in the UI font, which is the whole of
+/// why the two tabs disagreed.
+fn detail_text_style(color: Color, weight: Option<gpui::FontWeight>, cx: &App) -> MarkdownStyle {
+    let mut base_text_style = git_commit_text_style(
+        ThemeSettings::get_global(cx).git_commit_buffer_font_size(cx),
+        cx,
+    );
+    let font_size = base_text_style.font_size;
+    let line_height = base_text_style.line_height;
+    base_text_style.refine(&TextStyleRefinement {
         color: Some(color.color(cx)),
         font_weight: weight,
         ..Default::default()
-    };
-    let mut base_text_style = window.text_style();
-    base_text_style.refine(&refinement);
+    });
 
-    let container_style = StyleRefinement::default();
+    // `base_text_style` alone is NOT enough for the two metrics below. Markdown
+    // lowers its text to `TextRun`s (`markdown.rs::Renderer::push_text` →
+    // `TextStyle::to_run`), and a `TextRun` carries font family / weight /
+    // style / colour but neither a size nor a line height; `StyledText` reads
+    // both from `window.text_style()` at layout time
+    // (`gpui/src/elements/text.rs::TextLayout::layout`), i.e. from whatever the
+    // containing div inherits. So those two have to be set on the container as
+    // well — which is exactly what `MarkdownStyle::with_preview_overrides`
+    // does. Without this the glyphs silently lay out at the window's UI size
+    // and only the family, weight and colour take effect.
+    let mut container_style = StyleRefinement::default();
+    container_style.text.font_size = Some(font_size);
+    container_style.text.line_height = Some(line_height);
 
     MarkdownStyle {
         base_text_style,
-        // `base_text_style` alone is NOT enough: markdown's text runs carry
-        // `HighlightStyle`, which has no font size, so the glyphs are laid out
-        // at whatever size the containing div inherits — the window's UI size.
-        // Setting the size on the container too is what actually shrinks the
-        // text, and is what `MarkdownStyle::with_preview_overrides` does.
         container_style,
         selection_background_color: cx.theme().colors().element_selection_background,
         link: TextStyleRefinement {
@@ -577,12 +736,22 @@ pub(super) struct CommitTabState {
     pub(super) selection: CommitSelection,
     pub(super) details: LoadState<CommitDetails>,
     pub(super) diff: LoadState<LoadedCommitDiff>,
+    /// Branches containing the commit. `Loading` covers the debounce window as
+    /// well as the query itself, and `Loaded(vec![])` is both "on no branch"
+    /// and "remote repository" — all three render nothing, so the distinction
+    /// exists only for tests and for [`Self::retry_failed_commit_loads`].
+    pub(super) branches: LoadState<Vec<SharedString>>,
+    /// Whether the containing-branches line is spelling out every branch.
+    /// Lives here, so re-pointing the tab at another commit resets it with the
+    /// rest of the state.
+    branches_expanded: bool,
     text: Option<CommitDetailText>,
     pub(super) collapsed_dirs: HashSet<SharedString>,
     scroll_handle: UniformListScrollHandle,
     selected_file: Option<RepoPath>,
     _details_task: Option<Task<()>>,
     _diff_task: Option<Task<()>>,
+    _branches_task: Option<Task<()>>,
 }
 
 impl CommitTabState {
@@ -591,12 +760,15 @@ impl CommitTabState {
             selection,
             details: LoadState::Idle,
             diff: LoadState::Idle,
+            branches: LoadState::Idle,
+            branches_expanded: false,
             text: None,
             collapsed_dirs: HashSet::default(),
             scroll_handle: UniformListScrollHandle::new(),
             selected_file: None,
             _details_task: None,
             _diff_task: None,
+            _branches_task: None,
         }
     }
 }
@@ -685,6 +857,7 @@ impl GitPanel {
         if is_single_commit {
             self.load_commit_tab_details(sha, &repository, cx);
             self.load_commit_tab_diff(sha, &repository, cx);
+            self.load_commit_tab_branches(sha, &repository, cx);
         }
 
         if source == CommitSelectionSource::UserGesture {
@@ -716,11 +889,18 @@ impl GitPanel {
         let repository = state.selection.repository.clone();
         let retry_details = matches!(state.details, LoadState::Failed(_));
         let retry_diff = matches!(state.diff, LoadState::Failed(_));
+        let retry_branches = matches!(state.branches, LoadState::Failed(_));
         if retry_details {
             self.load_commit_tab_details(sha, &repository, cx);
         }
         if retry_diff {
             self.load_commit_tab_diff(sha, &repository, cx);
+        }
+        // A remote repository answers with an *empty* list rather than an
+        // error, so this retry cannot loop on collab; only a real
+        // `git branch --contains` failure reaches it.
+        if retry_branches {
+            self.load_commit_tab_branches(sha, &repository, cx);
         }
     }
 
@@ -828,6 +1008,63 @@ impl GitPanel {
         if let Some(state) = self.commit_tab.as_mut() {
             state.diff = LoadState::Loading;
             state._diff_task = Some(task);
+        }
+    }
+
+    /// Load the branches containing the commit into the open Commit tab, after
+    /// [`BRANCHES_CONTAINING_DEBOUNCE`].
+    ///
+    /// Unlike the tab's other two loads this one cannot ask the repository up
+    /// front — the whole point of the debounce is that the job is not queued
+    /// until the selection has settled — so the task carries a *weak* handle
+    /// and re-acquires it on the far side of the timer, rather than keeping a
+    /// repository the user has since navigated away from alive for 150ms.
+    fn load_commit_tab_branches(
+        &mut self,
+        sha: Oid,
+        repository: &Entity<Repository>,
+        cx: &mut Context<Self>,
+    ) {
+        let repository = repository.downgrade();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(BRANCHES_CONTAINING_DEBOUNCE)
+                .await;
+            let Ok(branches) = repository.update(cx, |repository, _| {
+                repository.branches_containing(sha.to_string())
+            }) else {
+                return;
+            };
+            let loaded = branches.await;
+            this.update(cx, |this, cx| {
+                // Same guard as the other two loads: a response that resolved
+                // after the selection moved on describes a commit that is no
+                // longer on screen.
+                if this.commit_tab_sha() != Some(sha) {
+                    return;
+                }
+                let loaded = match loaded {
+                    Ok(Ok(branches)) => LoadState::Loaded(branches),
+                    Ok(Err(error)) => LoadState::Failed(SharedString::from(format!(
+                        "Couldn't list the branches containing commit {}: {error:#}",
+                        sha.display_short()
+                    ))),
+                    Err(_) => LoadState::Failed(SharedString::from(format!(
+                        "Listing the branches containing commit {} was cancelled.",
+                        sha.display_short()
+                    ))),
+                };
+                if let Some(state) = this.commit_tab.as_mut() {
+                    state.branches = loaded;
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(state) = self.commit_tab.as_mut() {
+            state.branches = LoadState::Loading;
+            state.branches_expanded = false;
+            state._branches_task = Some(task);
         }
     }
 
@@ -998,10 +1235,10 @@ impl GitPanel {
         }
     }
 
-    /// The Commit tab body, in spec §5's order: the commit message, the
-    /// `<short sha> <author> <email> on <date>` identity line, then the
-    /// changed-files tree under a header carrying the file count and the
-    /// commit's +/− totals.
+    /// The Commit tab body, in [`COMMIT_TAB_SECTIONS`] order: the changed-files
+    /// tree under a header carrying the file count and the commit's +/− totals,
+    /// then the commit message with the
+    /// `<short sha> <author> <email> on <date>` identity line under it.
     pub(super) fn render_commit_tab(
         &self,
         window: &mut Window,
@@ -1033,172 +1270,271 @@ impl GitPanel {
 
         let mut body = v_flex().flex_1().size_full().min_h_0().overflow_hidden();
 
-        body = match (&state.details, &state.text) {
-            (LoadState::Loaded(details), Some(text)) => {
-                // The message matches the log rows beside it —
-                // `TextSize::Default`. The identity line stays small: it is
-                // metadata about the commit, not the commit.
-                let subject_style = detail_text_style(
-                    TextSize::Default,
-                    Color::Default,
-                    Some(gpui::FontWeight::SEMIBOLD),
-                    window,
-                    cx,
-                );
-                let body_style =
-                    detail_text_style(TextSize::Default, Color::Default, None, window, cx);
-                let has_body = !text.body.read(cx).source().is_empty();
+        let border = cx.theme().colors().border;
+        // The tab's one horizontal rule belongs to the section painted second,
+        // so it separates the two — but only when the first section actually
+        // put something above it. `Idle` (a diff that was never asked for)
+        // renders nothing, and a rule against the top of the body would then be
+        // separating the message from the tab bar.
+        let message_carries_rule = !matches!(state.diff, LoadState::Idle);
 
-                let author_email =
-                    (!details.author_email.is_empty()).then(|| details.author_email.clone());
-                let remote = commit_remote(&state.selection.repository, cx);
-                let avatar = CommitAvatar::new(&full_sha, author_email, remote.as_ref())
-                    .size(px(16.))
-                    .render(window, cx);
-
-                body.child(
-                    // Shrinkable between its floor and its cap rather than
-                    // pinned at the cap: on a dock-height panel the tab body
-                    // has ~282px to spend, and a fixed 200px message left the
-                    // changed-files tree nothing. Flex does the arithmetic, so
-                    // nothing here has to read the available height — which it
-                    // could only do from layout, where a `cx.notify()` would be
-                    // discarded and a re-derive-and-notify would spin.
-                    div()
-                        .id("commit-tab-message")
-                        .min_h(px(COMMIT_MESSAGE_MIN_HEIGHT))
-                        .max_h(px(COMMIT_MESSAGE_MAX_HEIGHT))
-                        .overflow_y_scroll()
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .px_2()
-                                .py_1p5()
-                                .gap_1p5()
-                                .child(div().min_w_0().child(MarkdownElement::new(
-                                    text.subject.clone(),
-                                    subject_style,
-                                )))
-                                .children(has_body.then(|| {
-                                    div()
-                                        .min_w_0()
-                                        .child(MarkdownElement::new(text.body.clone(), body_style))
-                                })),
-                        ),
-                )
-                // One line, always: only the author is allowed to shrink, and
-                // it truncates rather than wrapping. A wrapped identity row is
-                // vertical budget taken from the changed-files tree below it.
-                .child(
-                    h_flex()
-                        .id("commit-tab-identity")
-                        .flex_shrink_0()
-                        .w_full()
-                        .px_2()
-                        .pb_1p5()
-                        .gap_1()
-                        .items_center()
-                        .child(div().flex_shrink_0().child(avatar))
-                        .child(identity_label(text.identity.short_sha.clone()))
-                        .children(text.identity.author.clone().map(|author| {
-                            h_flex()
-                                .min_w_0()
-                                .gap_1()
-                                .child(identity_separator())
-                                .child(identity_label(author).truncate())
-                        }))
-                        .children(text.identity.date.clone().map(|date| {
+        for section in COMMIT_TAB_SECTIONS {
+            body = match section {
+                CommitTabSection::Diff => match &state.diff {
+                    LoadState::Loaded(loaded) => {
+                        let file_count = loaded.diff.files.len();
+                        body.child(
                             h_flex()
                                 .flex_shrink_0()
+                                .w_full()
+                                .px_2()
+                                .py_1()
                                 .gap_1()
-                                .child(identity_separator())
-                                .child(identity_label(date))
-                        }))
-                        .tooltip({
-                            let identity = text.identity.tooltip.clone();
-                            move |_, cx| Tooltip::simple(identity.clone(), cx)
-                        }),
-                )
-            }
-            (LoadState::Failed(error), _) => body.child(
-                div().px_2().py_1p5().child(
-                    Label::new(error.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
-                ),
-            ),
-            _ => body.child(
-                div().px_2().py_1p5().child(
-                    Label::new("Loading commit…")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-            ),
-        };
-
-        let border = cx.theme().colors().border;
-        body = match &state.diff {
-            LoadState::Loaded(loaded) => {
-                let file_count = loaded.diff.files.len();
-                body.child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .w_full()
-                        .px_2()
-                        .py_1()
-                        .gap_1()
-                        .justify_between()
-                        .border_t_1()
-                        .border_color(border)
-                        .child(
-                            Label::new(format!(
-                                "{file_count} Changed {}",
-                                if file_count == 1 { "File" } else { "Files" }
-                            ))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                                .justify_between()
+                                .child(
+                                    Label::new(format!(
+                                        "{file_count} Changed {}",
+                                        if file_count == 1 { "File" } else { "Files" }
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
+                                // `ui::DiffStat`, fully qualified: `use super::*`
+                                // brings `git::status::DiffStat`, the data type,
+                                // into scope under the same bare name.
+                                .child(ui::DiffStat::new(
+                                    "commit-tab-diff-stat",
+                                    loaded.lines_added,
+                                    loaded.lines_removed,
+                                )),
                         )
-                        // `ui::DiffStat`, fully qualified: `use super::*`
-                        // brings `git::status::DiffStat`, the data type, into
-                        // scope under the same bare name.
-                        .child(ui::DiffStat::new(
-                            "commit-tab-diff-stat",
-                            loaded.lines_added,
-                            loaded.lines_removed,
-                        )),
-                )
-                .child(self.render_commit_file_tree(state, loaded, full_sha, window, cx))
-            }
-            LoadState::Failed(error) => body.child(
-                div()
-                    .flex_shrink_0()
-                    .px_2()
-                    .py_1p5()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        Label::new(error.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Error),
+                        .child(self.render_commit_file_tree(
+                            state,
+                            loaded,
+                            full_sha.clone(),
+                            window,
+                            cx,
+                        ))
+                    }
+                    LoadState::Failed(error) => body.child(
+                        div().flex_shrink_0().px_2().py_1p5().child(
+                            Label::new(error.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        ),
                     ),
-            ),
-            LoadState::Loading => body.child(
-                div()
-                    .flex_shrink_0()
-                    .px_2()
-                    .py_1p5()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        Label::new("Loading changed files…")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                    LoadState::Loading => body.child(
+                        div().flex_shrink_0().px_2().py_1p5().child(
+                            Label::new("Loading changed files…")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
                     ),
-            ),
-            LoadState::Idle => body,
-        };
+                    LoadState::Idle => body,
+                },
+                CommitTabSection::Message => match (&state.details, &state.text) {
+                    (LoadState::Loaded(details), Some(text)) => {
+                        // The two tabs' commit messages must look like the
+                        // same kind of text, with the Changes tab as the
+                        // reference: `detail_text_style` is now built on the
+                        // buffer font at `git_commit_buffer_font_size`, the
+                        // typography that tab's commit editor uses, rather than
+                        // on the UI font this one used to inherit.
+                        //
+                        // `SEMIBOLD` stays on the subject. The Changes tab has
+                        // no subject/body split to copy a weight from — it is
+                        // one plain editor — so there is nothing here to match,
+                        // and dropping it would flatten the subject into both
+                        // the body below it and the `LabelSize::Small` /
+                        // `Color::Muted` identity line and files header, which
+                        // is the only hierarchy this block has left.
+                        let subject_style =
+                            detail_text_style(Color::Default, Some(gpui::FontWeight::SEMIBOLD), cx);
+                        let body_style = detail_text_style(Color::Default, None, cx);
+                        let has_body = !text.body.read(cx).source().is_empty();
+
+                        let author_email = (!details.author_email.is_empty())
+                            .then(|| details.author_email.clone());
+                        let remote = commit_remote(&state.selection.repository, cx);
+                        let avatar = CommitAvatar::new(&full_sha, author_email, remote.as_ref())
+                            .size(px(16.))
+                            .render(window, cx);
+
+                        body.child(
+                            // Shrinkable between its floor and its cap rather
+                            // than pinned at the cap: on a dock-height panel the
+                            // tab body has ~282px to spend, and a fixed 200px
+                            // message left the changed-files tree nothing. Flex
+                            // distributes by factor and clamps by min/max, not
+                            // by order, so this arithmetic is the same whether
+                            // the block is painted above the tree or below it.
+                            div()
+                                .id("commit-tab-message")
+                                .min_h(px(COMMIT_MESSAGE_MIN_HEIGHT))
+                                .max_h(px(COMMIT_MESSAGE_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .when(message_carries_rule, |this| {
+                                    this.border_t_1().border_color(border)
+                                })
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .px_2()
+                                        .py_1p5()
+                                        .gap_1p5()
+                                        .child(div().min_w_0().child(MarkdownElement::new(
+                                            text.subject.clone(),
+                                            subject_style,
+                                        )))
+                                        .children(has_body.then(|| {
+                                            div().min_w_0().child(MarkdownElement::new(
+                                                text.body.clone(),
+                                                body_style,
+                                            ))
+                                        })),
+                                ),
+                        )
+                        // One line, always: only the author is allowed to
+                        // shrink, and it truncates rather than wrapping. A
+                        // wrapped identity row is vertical budget taken from the
+                        // changed-files tree above it.
+                        .child(
+                            h_flex()
+                                .id("commit-tab-identity")
+                                .flex_shrink_0()
+                                .w_full()
+                                .px_2()
+                                .pb_1p5()
+                                .gap_1()
+                                .items_center()
+                                .child(div().flex_shrink_0().child(avatar))
+                                .child(identity_label(text.identity.short_sha.clone()))
+                                .children(text.identity.author.clone().map(|author| {
+                                    h_flex()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(identity_separator())
+                                        .child(identity_label(author).truncate())
+                                }))
+                                .children(text.identity.date.clone().map(|date| {
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .gap_1()
+                                        .child(identity_separator())
+                                        .child(identity_label(date))
+                                }))
+                                .tooltip({
+                                    let identity = text.identity.tooltip.clone();
+                                    move |_, cx| Tooltip::simple(identity.clone(), cx)
+                                }),
+                        )
+                    }
+                    (LoadState::Failed(error), _) => body.child(
+                        div()
+                            .flex_shrink_0()
+                            .px_2()
+                            .py_1p5()
+                            .when(message_carries_rule, |this| {
+                                this.border_t_1().border_color(border)
+                            })
+                            .child(
+                                Label::new(error.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Error),
+                            ),
+                    ),
+                    _ => body.child(
+                        div()
+                            .flex_shrink_0()
+                            .px_2()
+                            .py_1p5()
+                            .when(message_carries_rule, |this| {
+                                this.border_t_1().border_color(border)
+                            })
+                            .child(
+                                Label::new("Loading commit…")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    ),
+                },
+                CommitTabSection::Branches => {
+                    let expanded = state.branches_expanded;
+                    let formatted = match &state.branches {
+                        LoadState::Loaded(branches) => {
+                            format_branches_containing(branches, expanded)
+                        }
+                        // Nothing is painted while the query is in flight or
+                        // after it failed: reserving a row for a line that may
+                        // never arrive would cost the changed-files tree the
+                        // same height whether the commit is on a branch or not.
+                        _ => None,
+                    };
+                    match formatted {
+                        Some(formatted) => {
+                            body.child(self.render_commit_branches_line(formatted, expanded, cx))
+                        }
+                        None => body,
+                    }
+                }
+            };
+        }
 
         body.into_any_element()
+    }
+
+    /// IDEA's containment line, under the identity row.
+    ///
+    /// Collapsed it is one row that truncates rather than wrapping, for the
+    /// reason the identity row above it gives: a wrapped row is vertical budget
+    /// taken from the changed-files tree. Expanded it wraps and scrolls inside
+    /// [`COMMIT_BRANCHES_EXPANDED_MAX_HEIGHT`], so `Show all` can never push the
+    /// tree past its floor however many branches contain the commit. The toggle
+    /// sits outside the scrolling block so that `Show less` stays reachable
+    /// without scrolling back up to it.
+    fn render_commit_branches_line(
+        &self,
+        formatted: BranchesContaining,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = Label::new(formatted.line)
+            .size(LabelSize::Small)
+            .color(Color::Muted);
+        let label = if expanded { label } else { label.truncate() };
+
+        h_flex()
+            .flex_shrink_0()
+            .w_full()
+            .px_2()
+            .pb_1p5()
+            .gap_1()
+            .when(expanded, |this| this.items_start())
+            .child(
+                div()
+                    .id("commit-tab-branches")
+                    .min_w_0()
+                    .when(expanded, |this| {
+                        this.max_h(px(COMMIT_BRANCHES_EXPANDED_MAX_HEIGHT))
+                            .overflow_y_scroll()
+                    })
+                    .child(label),
+            )
+            .children(formatted.toggle.map(|toggle| {
+                div().flex_shrink_0().child(
+                    Button::new("commit-tab-branches-toggle", toggle)
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .color(Color::Accent)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(state) = this.commit_tab.as_mut() {
+                                state.branches_expanded = !state.branches_expanded;
+                                cx.notify();
+                            }
+                        })),
+                )
+            }))
+            .into_any_element()
     }
 
     /// The commit's changed files, grouped by directory.
@@ -1300,6 +1636,99 @@ impl GitPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{UpdateGlobal as _, VisualTestContext};
+
+    #[test]
+    fn test_commit_tab_paints_files_above_message() {
+        let position = |wanted: CommitTabSection| {
+            COMMIT_TAB_SECTIONS
+                .iter()
+                .position(|section| *section == wanted)
+                .expect("every section must be painted exactly once")
+        };
+
+        assert_eq!(
+            COMMIT_TAB_SECTIONS.len(),
+            3,
+            "a further section would need its own place in the rule's ordering"
+        );
+        assert_eq!(
+            position(CommitTabSection::Message),
+            position(CommitTabSection::Diff) + 1,
+            "the changed-files tree must be painted above the commit message, \
+             mirroring the Changes tab, and directly above it: \
+             `message_carries_rule` in `render_commit_tab` hangs the tab's one \
+             horizontal rule off the message to separate the two"
+        );
+        assert_eq!(
+            position(CommitTabSection::Branches),
+            COMMIT_TAB_SECTIONS.len() - 1,
+            "the containing-branches line is metadata of the same class as the \
+             identity row the message section ends with, and IDEA puts it under \
+             that row; it is also the one section that can render nothing, \
+             which is only free at the bottom"
+        );
+    }
+
+    #[test]
+    fn test_format_branches_containing() {
+        assert!(
+            format_branches_containing(&[], false).is_none(),
+            "a commit on no branch — which is also every commit on a remote \
+             repository — renders no line at all, never `In 0 branches:`"
+        );
+
+        let single = format_branches_containing(&["main".into()], false)
+            .expect("one branch still gets a line");
+        assert_eq!(single.line.as_ref(), "In 1 branch: main");
+        assert_eq!(
+            single.toggle, None,
+            "nothing is hidden, so there is nothing to expand"
+        );
+
+        let at_threshold: Vec<SharedString> = (0..MAX_LISTED_BRANCHES)
+            .map(|index| SharedString::from(format!("b{index}")))
+            .collect();
+        let at_threshold = format_branches_containing(&at_threshold, false)
+            .expect("the threshold itself yields a line");
+        assert_eq!(
+            at_threshold.line.as_ref(),
+            "In 5 branches: b0, b1, b2, b3, b4"
+        );
+        assert_eq!(
+            at_threshold.toggle, None,
+            "a list that exactly fits is not truncated, so it gets no toggle"
+        );
+
+        let many: Vec<SharedString> = (0..8)
+            .map(|index| SharedString::from(format!("b{index}")))
+            .collect();
+        let collapsed =
+            format_branches_containing(&many, false).expect("a long list still yields a line");
+        assert_eq!(
+            collapsed.line.as_ref(),
+            "In 8 branches: b0, b1, b2, b3, b4",
+            "a commit on a busy branch must not spell out every branch name, \
+             but the count stays the total"
+        );
+        assert_eq!(
+            collapsed.toggle.as_deref(),
+            Some("Show all"),
+            "the hidden branches have to be reachable — the tail is a button, \
+             not the `and N more` text the git graph's version printed"
+        );
+
+        let expanded = format_branches_containing(&many, true).expect("expanding keeps the line");
+        assert_eq!(
+            expanded.line.as_ref(),
+            "In 8 branches: b0, b1, b2, b3, b4, b5, b6, b7"
+        );
+        assert_eq!(
+            expanded.toggle.as_deref(),
+            Some("Show less"),
+            "expanding must offer a way back"
+        );
+    }
 
     #[test]
     fn test_split_commit_message() {
@@ -1421,6 +1850,221 @@ mod tests {
                 "dir[key=docs/plans, label=docs/plans, 2]".to_string(),
             ],
             "a collapsed directory hides its files but keeps its count"
+        );
+    }
+
+    /// Drives `ChangedFileEntry::handle_row_click` — the diff half of a Commit
+    /// tab file row's click handler — against a real workspace pane.
+    ///
+    /// The row's `on_click` closure itself cannot be driven here: it is built
+    /// from the panel's weak handle inside `GitPanel::render` and may only be
+    /// invoked from an event callback, so a test that called it during a
+    /// `VisualTestContext` draw would prove nothing about the real lease
+    /// anyway. Everything below the selection call is `handle_row_click`.
+    struct CommitTabClickHarness {
+        workspace: Entity<Workspace>,
+        repository: WeakEntity<Repository>,
+        sha: SharedString,
+    }
+
+    impl CommitTabClickHarness {
+        fn click(&self, entry: &ChangedFileEntry, count: usize, cx: &mut VisualTestContext) {
+            let workspace = self.workspace.downgrade();
+            let repository = self.repository.clone();
+            let sha = self.sha.clone();
+            let entry = entry.clone();
+            cx.update(move |window, cx| {
+                entry.handle_row_click(count, &sha, &repository, &workspace, window, cx);
+            });
+            cx.run_until_parked();
+        }
+
+        fn open_single_file_diffs(&self, cx: &mut VisualTestContext) -> Vec<RepoPath> {
+            self.workspace.update_in(cx, |workspace, _window, cx| {
+                workspace
+                    .items_of_type::<CommitView>(cx)
+                    .filter_map(|view| view.read(cx).single_file().cloned())
+                    .collect()
+            })
+        }
+    }
+
+    async fn commit_tab_click_harness(
+        cx: &mut gpui::TestAppContext,
+    ) -> (CommitTabClickHarness, VisualTestContext) {
+        crate::git_panel::tests::init_test(cx);
+
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            util::path!("/project"),
+            serde_json::json!({
+                ".git": {},
+                "a.rs": "a\n",
+                "b.rs": "b\n",
+            }),
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [std::path::Path::new(util::path!("/project"))],
+            cx,
+        )
+        .await;
+        let window_handle = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("the test window holds a workspace");
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+
+        let repository = workspace
+            .update_in(&mut cx, |workspace, _window, cx| {
+                workspace.project().read(cx).active_repository(cx)
+            })
+            .expect("the fake project exposes its repository")
+            .downgrade();
+
+        (
+            CommitTabClickHarness {
+                workspace,
+                repository,
+                // A full sha: `open_file_diff` forwards it verbatim to git.
+                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+            cx,
+        )
+    }
+
+    #[gpui::test]
+    async fn test_single_click_retargets_the_shared_diff_tab(cx: &mut gpui::TestAppContext) {
+        let (harness, mut cx) = commit_tab_click_harness(cx).await;
+        let a = changed_file_entry("a.rs");
+        let b = changed_file_entry("b.rs");
+
+        harness.click(&a, 2, &mut cx);
+        assert_eq!(
+            harness.open_single_file_diffs(&mut cx),
+            vec![a.repo_path.clone()],
+            "a double click summons the shared diff tab, showing the clicked file"
+        );
+
+        harness.click(&b, 1, &mut cx);
+        assert_eq!(
+            harness.open_single_file_diffs(&mut cx),
+            vec![b.repo_path.clone()],
+            "a single click retargets that same tab instead of opening a second one"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_single_click_opens_nothing_when_no_diff_tab_is_showing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (harness, mut cx) = commit_tab_click_harness(cx).await;
+        let a = changed_file_entry("a.rs");
+
+        harness.click(&a, 1, &mut cx);
+        assert_eq!(
+            harness.open_single_file_diffs(&mut cx),
+            Vec::<RepoPath>::new(),
+            "a single click never summons a diff from nothing"
+        );
+    }
+
+    /// With previews turned off there is no shared slot to retarget, so the
+    /// gestures fall back to what the tab did before: double click opens a
+    /// permanent tab, single click only selects. Doing nothing at all would
+    /// leave the tab with no way to open a diff.
+    #[gpui::test]
+    async fn test_previews_disabled_falls_back_to_permanent_tabs(cx: &mut gpui::TestAppContext) {
+        let (harness, mut cx) = commit_tab_click_harness(cx).await;
+        cx.update(|_window, cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.preview_tabs.get_or_insert_default().enabled = Some(false);
+                });
+            });
+        });
+
+        let a = changed_file_entry("a.rs");
+        let b = changed_file_entry("b.rs");
+
+        harness.click(&a, 2, &mut cx);
+        assert_eq!(
+            harness.open_single_file_diffs(&mut cx),
+            vec![a.repo_path.clone()],
+            "double click still opens the file's diff with previews off"
+        );
+
+        harness.click(&b, 1, &mut cx);
+        assert_eq!(
+            harness.open_single_file_diffs(&mut cx),
+            vec![a.repo_path.clone()],
+            "with no preview slot to retarget, a single click only selects"
+        );
+
+        harness.click(&b, 2, &mut cx);
+        assert_eq!(
+            harness.open_single_file_diffs(&mut cx),
+            vec![a.repo_path.clone(), b.repo_path.clone()],
+            "each double click gets its own permanent tab — the pre-preview behaviour"
+        );
+    }
+
+    /// Regression guard for the tab-identity bug this path used to carry: the
+    /// "which item do I replace" lookup keyed off the sha alone, so re-opening
+    /// a whole-commit view closed whichever tab for that commit came first —
+    /// including a single-file diff sitting to its left.
+    #[gpui::test]
+    async fn test_reopening_the_commit_view_spares_the_file_diff_tab(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (harness, mut cx) = commit_tab_click_harness(cx).await;
+        let a = changed_file_entry("a.rs");
+        harness.click(&a, 2, &mut cx);
+
+        for _ in 0..2 {
+            let workspace = harness.workspace.downgrade();
+            let repository = harness.repository.clone();
+            let sha = harness.sha.to_string();
+            cx.update(move |window, cx| {
+                CommitView::open(sha, repository, workspace, None, None, window, cx);
+            });
+            cx.run_until_parked();
+        }
+
+        let views = harness
+            .workspace
+            .update_in(&mut cx, |workspace, _window, cx| {
+                workspace
+                    .items_of_type::<CommitView>(cx)
+                    .map(|view| view.read(cx).single_file().cloned())
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(
+            views,
+            vec![Some(a.repo_path.clone()), None],
+            "re-opening the whole-commit view replaces itself, not the \
+             single-file diff tab that happens to precede it"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_repeated_double_clicks_reuse_the_shared_diff_tab(cx: &mut gpui::TestAppContext) {
+        let (harness, mut cx) = commit_tab_click_harness(cx).await;
+        let a = changed_file_entry("a.rs");
+        let b = changed_file_entry("b.rs");
+
+        harness.click(&a, 2, &mut cx);
+        harness.click(&b, 2, &mut cx);
+        assert_eq!(
+            harness.open_single_file_diffs(&mut cx),
+            vec![b.repo_path.clone()],
+            "double clicking a second file replaces the preview rather than \
+             pinning the first tab and opening a second"
         );
     }
 }

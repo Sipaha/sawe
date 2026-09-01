@@ -53,7 +53,7 @@ use workspace::item::TabTooltipContent;
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
-    item::{ItemEvent, TabContentParams},
+    item::{ItemEvent, PreviewTabsSettings, TabContentParams},
     notifications::NotifyTaskExt,
     pane::SaveIntent,
     searchable::SearchableItemHandle,
@@ -258,6 +258,7 @@ impl CommitView {
             stash,
             file_filter,
             false,
+            false,
             window,
             cx,
         );
@@ -266,7 +267,11 @@ impl CommitView {
     /// Open a focused diff of a single file's changes in `commit_sha`
     /// (its content at the commit vs. at the parent) — no commit
     /// metadata chrome, tab titled with the file name. Used by the
-    /// changed-files list in the git-graph commit-detail panel.
+    /// changed-files list of the git panel's Commit tab.
+    ///
+    /// Opens into the pane's *preview* slot, so picking file after file
+    /// retargets one shared diff tab instead of accumulating one tab per
+    /// file, and keeps keyboard focus in the git panel.
     pub fn open_file_diff(
         commit_sha: String,
         repo: WeakEntity<Repository>,
@@ -282,9 +287,37 @@ impl CommitView {
             None,
             Some(file),
             true,
+            true,
             window,
             cx,
         );
+    }
+
+    /// Whether the pane's preview slot is currently occupied by a
+    /// single-file [`CommitView`] — i.e. whether a
+    /// [`Self::open_file_diff`] tab is standing by to be retargeted.
+    ///
+    /// Same shape as `GitPanel::move_diff_to_entry`'s guard for the Changes
+    /// tab's `SoloDiffView` preview: both views compete for the pane's one
+    /// preview slot, so each gesture must confirm the slot holds *its own*
+    /// view type before retargeting it.
+    pub fn preview_holds_single_file_diff(workspace: &WeakEntity<Workspace>, cx: &App) -> bool {
+        let Some(workspace) = workspace.upgrade() else {
+            return false;
+        };
+        let workspace = workspace.read(cx);
+        let Some(preview_id) = workspace.active_pane().read(cx).preview_item_id() else {
+            return false;
+        };
+        workspace
+            .items_of_type::<CommitView>(cx)
+            .any(|view| view.entity_id() == preview_id && view.read(cx).single_file.is_some())
+    }
+
+    /// The file this view is filtered to, when it was opened as a single-file
+    /// diff. `None` for a whole-commit view.
+    pub fn single_file(&self) -> Option<&RepoPath> {
+        self.single_file.as_ref()
     }
 
     /// IDEA's "Compare Versions": diff two selected commits against each
@@ -373,6 +406,7 @@ impl CommitView {
         stash: Option<usize>,
         file_filter: Option<RepoPath>,
         single_file_mode: bool,
+        preview: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -427,21 +461,30 @@ impl CommitView {
 
                         let pane = workspace.active_pane();
                         pane.update(cx, |pane, cx| {
-                            let ix = pane.items().position(|item| {
-                                let commit_view = item.downcast::<CommitView>();
-                                commit_view.is_some_and(|view| {
+                            // Both halves of the match must key off the same
+                            // (sha, single_file) pair: keying the lookup off the
+                            // sha alone used to close a whole-commit tab sitting
+                            // to the left of the single-file tab being replaced.
+                            let existing = pane.items().enumerate().find_map(|(ix, item)| {
+                                let view = item.downcast::<CommitView>()?;
+                                let matches = {
                                     let view = view.read(cx);
                                     view.commit.sha == commit_sha && view.single_file == single_file
-                                })
+                                };
+                                matches.then(|| (ix, view.item_id()))
                             });
-                            if let Some(ix) = ix {
-                                let existing = pane
-                                    .items()
-                                    .filter_map(|item| item.downcast::<CommitView>())
-                                    .find(|view| view.read(cx).commit.sha == commit_sha)
-                                    .unwrap();
 
-                                pane.remove_item(existing.item_id(), false, false, window, cx);
+                            if preview {
+                                // An already-open tab for this exact file is
+                                // reused rather than rebuilt: rebuilding would
+                                // re-run `load_commit_diff` and throw away the
+                                // user's scroll position for no visible gain.
+                                if let Some((ix, _)) = existing {
+                                    pane.activate_item(ix, true, false, window, cx);
+                                    return;
+                                }
+                            } else if let Some((ix, existing_id)) = existing {
+                                pane.remove_item(existing_id, false, false, window, cx);
                                 pane.add_item(
                                     Box::new(commit_view),
                                     true,
@@ -450,9 +493,27 @@ impl CommitView {
                                     window,
                                     cx,
                                 );
-                            } else {
-                                pane.add_item(Box::new(commit_view), true, true, None, window, cx);
+                                return;
                             }
+
+                            let item: Box<dyn ItemHandle> = Box::new(commit_view);
+                            // FORK.md #54: there is no `allow_preview` flag on
+                            // `add_item`; claiming the preview slot means
+                            // replacing its current occupant and reusing the
+                            // index it vacated.
+                            let preview_slot =
+                                preview && PreviewTabsSettings::get_global(cx).enabled;
+                            let destination_index = if preview_slot {
+                                pane.replace_preview_item_id(item.item_id(), window, cx)
+                            } else {
+                                None
+                            };
+                            // A preview open leaves focus where it was (the git
+                            // panel), so the next click keeps landing on file
+                            // rows. With previews disabled there is no shared
+                            // slot to keep clicking into, so the tab is a
+                            // deliberate permanent open and takes focus.
+                            pane.add_item(item, true, !preview_slot, destination_index, window, cx);
                         })
                     })
                     .log_err()

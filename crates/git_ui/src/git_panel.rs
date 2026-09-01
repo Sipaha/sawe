@@ -6426,22 +6426,35 @@ pub fn panel_editor_container(_window: &mut Window, cx: &mut App) -> Div {
         .bg(cx.theme().colors().editor_background)
 }
 
-pub(crate) fn git_commit_editor_style(font_size: gpui::Pixels, cx: &App) -> EditorStyle {
+/// The typography of a commit message in the git panel: the buffer font, at
+/// the git-commit font size, on the buffer line height.
+///
+/// Split out of [`git_commit_editor_style`] so the Commit tab can render the
+/// message of an *existing* commit in the same text the Changes tab composes a
+/// new one in — the two tabs' commit messages are the same kind of text and
+/// were reading as two different ones, the Commit tab having inherited the UI
+/// font from `window.text_style()`. The Commit tab wants only this, not the
+/// surrounding [`EditorStyle`]: it paints markdown, not an editor.
+pub(crate) fn git_commit_text_style(font_size: gpui::Pixels, cx: &App) -> TextStyle {
     let settings = ThemeSettings::get_global(cx);
 
+    TextStyle {
+        color: cx.theme().colors().text,
+        font_family: settings.buffer_font.family.clone(),
+        font_fallbacks: settings.buffer_font.fallbacks.clone(),
+        font_features: settings.buffer_font.features.clone(),
+        font_size: AbsoluteLength::from(font_size),
+        font_weight: settings.buffer_font.weight,
+        line_height: (font_size * settings.buffer_line_height.value()).into(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn git_commit_editor_style(font_size: gpui::Pixels, cx: &App) -> EditorStyle {
     EditorStyle {
         background: cx.theme().colors().editor_background,
         local_player: cx.theme().players().local(),
-        text: TextStyle {
-            color: cx.theme().colors().text,
-            font_family: settings.buffer_font.family.clone(),
-            font_fallbacks: settings.buffer_font.fallbacks.clone(),
-            font_features: settings.buffer_font.features.clone(),
-            font_size: AbsoluteLength::from(font_size),
-            font_weight: settings.buffer_font.weight,
-            line_height: (font_size * settings.buffer_line_height.value()).into(),
-            ..Default::default()
-        },
+        text: git_commit_text_style(font_size, cx),
         syntax: cx.theme().syntax().clone(),
         ..Default::default()
     }
@@ -8969,6 +8982,89 @@ mod tests {
             assert!(
                 matches!(state.diff, commit_tab::LoadState::Loading),
                 "the first commit's changed files were pasted onto the second"
+            );
+        });
+    }
+
+    /// The containing-branches query must not be queued until the selection has
+    /// settled: the graph drives this tab with the arrow keys, and one
+    /// `git branch --contains` per row travelled would sit on the repository's
+    /// job queue ahead of the diff the tab paints first.
+    #[gpui::test]
+    async fn test_commit_tab_debounces_the_branches_query(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let sha = test_sha("823a3f8a");
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![sha]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert!(
+                matches!(state.branches, commit_tab::LoadState::Loading),
+                "the branches query fired without waiting out the debounce"
+            );
+        });
+
+        cx.executor()
+            .advance_clock(commit_tab::BRANCHES_CONTAINING_DEBOUNCE);
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert!(
+                matches!(state.branches, commit_tab::LoadState::Loaded(_)),
+                "the branches query never fired once the debounce elapsed"
+            );
+        });
+    }
+
+    /// The debounce widens the window in which the selection can move under an
+    /// in-flight branches query, so the same staleness guard the other two loads
+    /// carry matters more here, not less.
+    #[gpui::test]
+    async fn test_commit_tab_drops_a_stale_branches_load(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let first = test_sha("823a3f8a");
+        let second = test_sha("1a2b3c4d");
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![first]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        cx.update_window_entity(&panel, |panel, _window, _cx| {
+            panel
+                .commit_tab
+                .as_mut()
+                .expect("the tab is open")
+                .selection
+                .shas = vec![second];
+        });
+        cx.executor()
+            .advance_clock(commit_tab::BRANCHES_CONTAINING_DEBOUNCE);
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert!(
+                matches!(state.branches, commit_tab::LoadState::Loading),
+                "the first commit's branches were pasted onto the second"
             );
         });
     }
