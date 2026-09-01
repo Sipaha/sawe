@@ -13,12 +13,16 @@
 //!     solution is highlighted as the active tab.
 //!   * `SolutionStore::solutions()` for the displayed name and to count
 //!     closed solutions for the `+` button branching.
-//!   * `SolutionAgentStore::visible_session_count(&id)` for the AI session
-//!     count badge on each tab. It counts every session indexed under the
-//!     Solution, cold restored transcripts included — so the badge is
-//!     non-zero at startup, before any subprocess exists — minus the
-//!     ephemeral supervisor judge/auditor sessions, so an idle wake-up never
-//!     ticks it. See that function's docs before assuming "live".
+//!   * `SolutionAgentStore::visible_session_count(&id, cx)` for the AI
+//!     session count badge on each tab. It counts the Solution's sessions
+//!     that `SolutionSession::can_be_active_dialog` admits — the same set
+//!     `session_tab_strip` draws tabs for — so the badge and the chat strip
+//!     can never disagree. Cold restored transcripts are included (they get
+//!     their `tab_order` back from hydration), so the badge is non-zero at
+//!     startup, before any subprocess exists; live ephemeral supervisor
+//!     judge/auditor sessions are subtracted, so an idle wake-up never ticks
+//!     it. See that function's docs before assuming "live" or "every chat on
+//!     disk".
 //!
 //! Re-render triggers (registered in [`SolutionTabStrip::new`]):
 //!   * `SolutionStoreEvent` — covers solution add/remove/rename and
@@ -148,7 +152,7 @@ impl Render for SolutionTabStrip {
             let is_active = active_solution_id.as_ref() == Some(&sol_id);
             let ai_count = agent_store
                 .as_ref()
-                .map(|s| s.read(cx).visible_session_count(&sol_id))
+                .map(|s| s.read(cx).visible_session_count(&sol_id, cx))
                 .unwrap_or(0);
             tabs.push((
                 sol_id,

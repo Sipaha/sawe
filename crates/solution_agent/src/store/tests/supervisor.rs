@@ -16,6 +16,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// module doc used to say "live AI", which reads as an invitation to filter
 /// `is_cold()` out — that would blank the badge for every Solution at startup,
 /// where the restored tab strip shows a tab per chat.
+///
+/// The `tab_order` below is what hydration stamps back onto a restored tab from
+/// `list_open_tabs`, and it is what admits these two under
+/// `can_be_active_dialog` — the predicate the badge now shares with the strip.
+/// Coldness is orthogonal to that predicate, which is precisely the property
+/// this test holds: keep the `is_cold` precondition, or the test stops
+/// distinguishing "cold still counts" from "anything with a tab counts".
 #[gpui::test]
 fn visible_session_count_includes_cold_restored_sessions(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());
@@ -27,8 +34,9 @@ fn visible_session_count_includes_cold_restored_sessions(cx: &mut TestAppContext
             let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
             let ids = [SolutionSessionId::new(), SolutionSessionId::new()];
-            for id in ids {
-                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+            for (order, id) in ids.into_iter().enumerate() {
+                let session = insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+                session.update(cx, |session, _| session.tab_order = Some(order as i64));
             }
             for id in ids {
                 assert!(
@@ -38,7 +46,62 @@ fn visible_session_count_includes_cold_restored_sessions(cx: &mut TestAppContext
                     "precondition: these stand in for hydrated transcripts, not live threads"
                 );
             }
-            assert_eq!(store.visible_session_count(&sol), 2);
+            assert_eq!(store.visible_session_count(&sol, cx), 2);
+        });
+    });
+}
+
+/// The defect this filter exists for. `by_solution` holds every session
+/// hydration restored from a `closed_at IS NULL` row, tabbed or not — it appends
+/// the untabbed ones deliberately, because other readers need them — and a real
+/// database accumulates rows that lost their strip slot without ever being
+/// closed. Counting those made the badge read 30 for a Solution whose chat strip
+/// drew 2 tabs and whose `solution_agent.list_sessions` returned 2: a number no
+/// other surface could corroborate and no click could reach, since an untabbed
+/// non-closed row is absent from the strip AND from the Reopen-Closed-Chat
+/// picker (which offers only `closed_at IS NOT NULL`).
+#[gpui::test]
+fn visible_session_count_excludes_untabbed_sessions(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let sol = SolutionId(1);
+            let agent = SharedString::from("claude-acp");
+
+            let tabbed = [SolutionSessionId::new(), SolutionSessionId::new()];
+            for (order, id) in tabbed.into_iter().enumerate() {
+                let session = insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+                session.update(cx, |session, _| session.tab_order = Some(order as i64));
+            }
+            let untabbed = [
+                SolutionSessionId::new(),
+                SolutionSessionId::new(),
+                SolutionSessionId::new(),
+            ];
+            for id in untabbed {
+                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+            }
+
+            // The rows stay indexed and reachable — this fix narrows the badge,
+            // it does not purge anything.
+            assert_eq!(store.sessions_for(&sol).len(), 5);
+            assert_eq!(
+                store.visible_session_count(&sol, cx),
+                2,
+                "badge must count only what the chat strip can draw a tab for"
+            );
+
+            // Handing one of them a slot back brings it into the count, which is
+            // what makes this a `tab_order` filter rather than an insertion-order
+            // or a cold/live one.
+            store
+                .session(untabbed[0])
+                .expect("session was just inserted")
+                .update(cx, |session, _| session.tab_order = Some(2));
+            assert_eq!(store.visible_session_count(&sol, cx), 3);
         });
     });
 }
@@ -54,17 +117,22 @@ fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
             let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
 
-            // Two ordinary user sessions + one judge child session.
+            // Two ordinary user sessions + one judge child session. All three
+            // are given a `tab_order` on purpose: a production judge is also
+            // stamped `is_supervisor_ephemeral` and left untabbed, so
+            // `can_be_active_dialog` would drop it on its own and this test
+            // would no longer be exercising the handle-map filter at all.
             let supervised = SolutionSessionId::new();
             let other = SolutionSessionId::new();
             let judge = SolutionSessionId::new();
-            for id in [supervised, other, judge] {
-                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+            for (order, id) in [supervised, other, judge].into_iter().enumerate() {
+                let session = insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+                session.update(cx, |session, _| session.tab_order = Some(order as i64));
             }
 
             // Before the judge is registered, all three count.
             assert_eq!(store.sessions_for(&sol).len(), 3);
-            assert_eq!(store.visible_session_count(&sol), 3);
+            assert_eq!(store.visible_session_count(&sol, cx), 3);
 
             // Register the judge handle (as `spawn_judge` does once create
             // resolves): supervised_id -> JudgeHandle { judge_id }.
@@ -81,7 +149,7 @@ fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
             // The live judge is now excluded from the badge count, but the
             // raw session list is unchanged (judge is still reachable).
             assert_eq!(store.sessions_for(&sol).len(), 3);
-            assert_eq!(store.visible_session_count(&sol), 2);
+            assert_eq!(store.visible_session_count(&sol, cx), 2);
 
             // A judge handle whose create has not resolved yet (judge_id None)
             // excludes nothing.
@@ -95,7 +163,7 @@ fn visible_session_count_excludes_live_judges(cx: &mut TestAppContext) {
                     _task: Task::ready(()),
                 },
             );
-            assert_eq!(store.visible_session_count(&sol), 3);
+            assert_eq!(store.visible_session_count(&sol, cx), 3);
         });
     });
 }
@@ -2342,15 +2410,20 @@ fn visible_session_count_excludes_live_auditors(cx: &mut TestAppContext) {
             let sol = SolutionId(1);
             let agent = SharedString::from("claude-acp");
 
-            // Two ordinary user sessions + one auditor child session.
+            // Two ordinary user sessions + one auditor child session. Tabbed
+            // for the same reason as the judge test above: without a
+            // `tab_order` the auditor would be dropped by
+            // `can_be_active_dialog` and the handle-map filter would go
+            // untested here.
             let supervised = SolutionSessionId::new();
             let other = SolutionSessionId::new();
             let auditor = SolutionSessionId::new();
-            for id in [supervised, other, auditor] {
-                insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+            for (order, id) in [supervised, other, auditor].into_iter().enumerate() {
+                let session = insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
+                session.update(cx, |session, _| session.tab_order = Some(order as i64));
             }
 
-            assert_eq!(store.visible_session_count(&sol), 3);
+            assert_eq!(store.visible_session_count(&sol, cx), 3);
 
             // Register a live AUDITOR handle (separate map from judges); it
             // must be excluded from the badge count exactly like a judge.
@@ -2363,7 +2436,7 @@ fn visible_session_count_excludes_live_auditors(cx: &mut TestAppContext) {
                     _task: Task::ready(()),
                 },
             );
-            assert_eq!(store.visible_session_count(&sol), 2);
+            assert_eq!(store.visible_session_count(&sol, cx), 2);
             assert!(store.live_supervisor_session_ids().contains(&auditor));
 
             // Auditor whose create hasn't resolved (judge_id None) excludes nothing.
@@ -2377,7 +2450,7 @@ fn visible_session_count_excludes_live_auditors(cx: &mut TestAppContext) {
                     _task: Task::ready(()),
                 },
             );
-            assert_eq!(store.visible_session_count(&sol), 3);
+            assert_eq!(store.visible_session_count(&sol, cx), 3);
         });
     });
 }

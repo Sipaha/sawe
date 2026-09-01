@@ -1573,32 +1573,62 @@ impl SolutionAgentStore {
             .unwrap_or_default()
     }
 
-    /// Count behind the Solution tab's Sparkle badge: everything indexed under
-    /// `solution_id` in `by_solution` — i.e. [`sessions_for`](Self::sessions_for)
-    /// — minus the live ephemeral supervisor sessions.
+    /// Count behind the Solution tab's Sparkle badge: how many of `solution_id`'s
+    /// sessions the desktop can actually put in front of the user — the ones
+    /// [`SolutionSession::can_be_active_dialog`] admits (not `is_ephemeral`, not
+    /// `is_supervisor_ephemeral`, and holding a `tab_order`) — minus the live
+    /// ephemeral supervisor sessions.
     ///
-    /// "Live" is NOT part of that definition any more, whatever the badge's
-    /// name suggests. Cold hydration indexes restored transcripts into
-    /// `by_solution`, so on a real database a fresh start counts every chat the
-    /// Solution has on disk (~18, not 0) before a single subprocess exists.
-    /// That is the intended reading — the badge answers "how many chats does
-    /// this Solution carry", which is what the restored tab strip shows too —
-    /// so do not "fix" it back to live-only.
+    /// `can_be_active_dialog` is this fork's one definition of "a chat this
+    /// Solution has", and the badge is bound to it so that it cannot disagree
+    /// with anything else the user can see: `session_tab_strip::candidates_for`
+    /// builds the strip from it, the `solution_agent.list_sessions` wire tool and
+    /// `workspace.snapshot` hand the phone the same set, and
+    /// `toggle_dialog_session` refuses to open anything it rejects.
     ///
-    /// It is not exactly the tab strip's set either, and deliberately so:
-    /// `session_tab_strip::candidates_for` additionally drops anything
-    /// `SolutionSession::can_be_active_dialog` rejects, so a user-created child
-    /// session (`parent_session_id` set via the wire `create_session` tool) or a
-    /// live `is_ephemeral` helper counts here while the strip draws no tab for
-    /// it. Only the supervisor's own judge/auditor sessions are excluded, from
-    /// the `judge_sessions` / `auditor_sessions` handle maps: a judge is spawned
-    /// on every idle wake-up and torn down seconds later by `finish_judge`, and
-    /// must not tick the badge up by 1 each time.
-    pub fn visible_session_count(&self, solution_id: &SolutionId) -> usize {
+    /// It used to count raw `by_solution` membership instead, and on the
+    /// maintainer's database that read 30 against a strip of 2. Hydration indexes
+    /// every `closed_at IS NULL` row, tabbed or not (`hydration.rs` appends the
+    /// untabbed ones deliberately, because other readers of `by_solution` need
+    /// them), and a real database accumulates rows that lost their strip slot
+    /// without ever being closed. Those are drawable nowhere — no tab, and the
+    /// Reopen-Closed-Chat picker only offers `closed_at IS NOT NULL` — so a badge
+    /// counting them reported a number no other surface could corroborate and no
+    /// click could reach. Note this makes the count a strictly narrower set than
+    /// [`sessions_for`](Self::sessions_for), which still returns everything
+    /// indexed; readers that need the untabbed rows must keep using that.
+    ///
+    /// What must NOT be layered on top: an `is_cold()` filter, whatever the
+    /// badge's name suggests about "live". Cold hydration restores real chats and
+    /// stamps their `tab_order` back on from `list_open_tabs`, so a
+    /// restored-but-not-yet-spawned chat has a tab and belongs here — the badge
+    /// is non-zero at startup, before any subprocess exists, on purpose.
+    /// Filtering cold out would blank it on every Solution the restored tab strip
+    /// is drawing tabs for. `visible_session_count_includes_cold_restored_sessions`
+    /// pins that.
+    ///
+    /// The `live_supervisor_session_ids` subtraction stays on top even though a
+    /// judge created by `spawn_judge` is stamped `is_supervisor_ephemeral` and
+    /// left untabbed, so `can_be_active_dialog` alone would already drop it. The
+    /// handle maps are the authoritative record of a judge/auditor being in
+    /// flight, and unlike the entity flags they cannot be missed by a future
+    /// create path that forgets to stamp one; a judge is spawned on every idle
+    /// wake-up and torn down seconds later by `finish_judge`, and must not tick
+    /// the badge up by 1 each time. Two tests pin each filter independently.
+    pub fn visible_session_count(&self, solution_id: &SolutionId, cx: &App) -> usize {
         let hidden_ids = self.live_supervisor_session_ids();
         self.by_solution
             .get(solution_id)
-            .map(|ids| ids.iter().filter(|id| !hidden_ids.contains(id)).count())
+            .map(|ids| {
+                ids.iter()
+                    .filter(|id| !hidden_ids.contains(id))
+                    .filter(|id| {
+                        self.sessions
+                            .get(*id)
+                            .is_some_and(|session| session.read(cx).can_be_active_dialog())
+                    })
+                    .count()
+            })
             .unwrap_or(0)
     }
 
