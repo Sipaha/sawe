@@ -369,5 +369,7 @@ From the final whole-branch review, which found **nothing that must be fixed bef
   `file_filter` owns all three.
 - **The LSP Logs toolbar changed** as a side effect of `has_files_to_collapse` — the leading
   group's lone collapse chevron is gone and the bar no longer holds `PrimaryLeft` while
-  dismissed. The button was never functional there; recorded in FORK.md #137 so the next
-  person does not read it as a regression.
+  dismissed. The button was inert in the RPC trace (raw wire frames, nothing indented to
+  fold) and one-way in Server Info (which *is* indented, but the icon could never flip back
+  to "Expand All Files"); both fold directions remain on `ctrl-k ctrl-0` / `ctrl-k ctrl-j`.
+  FORK.md #137 has the mechanism, so the next person does not read this as a regression.

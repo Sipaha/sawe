@@ -2644,18 +2644,32 @@ shape (`MultiBuffer::singleton` over a live project buffer vs
 blame base, and the tab's identity (used both for dedupe in `resolve_gesture` and for the git
 panel's open-diff mark, `OpenDiff::from_active_item`). Those four must not be able to
 disagree, and a bool has nowhere to hang the sha that two of them need. Everything the modes
-**capability** differs about is a method on the source — `is_editable`, `matches`,
-`blame_base`, `tab_icon`, `tab_title` — so nothing can be half-configured for one mode. The
-**presentation** differences are not, and deliberately so: `git_toolbar_content`,
-`tab_tooltip_text` and `tab_tooltip_content` still match the variant inline, two of them
-inside `impl Item`, because what they produce is a rendered value rather than a rule the rest
-of the view depends on. `configure_editor_for_source` matches it once for the editor's hunk
-controls, and `new` matches it once for the multibuffer shape and once for the permalink
-remote. Keep that boundary: a new *capability* belongs on `DiffSource`; a new label does not
-have to. `SoloDiffView::new` also carries a
-`debug_assert!` that the `DiffSource` and the `LoadedDiff` handed to it are the same variant,
-because a mismatched pair builds a view that is read-only in one respect and editable in
+differ about is derived from the source, but through two mechanisms, and the line between them
+is **not** capability versus presentation — `tab_icon` and `tab_title` are presentation and are
+methods on the source. The line is whether the answer is available from the source *alone*:
+
+- **A method on `DiffSource`** when it is: `is_editable`, `matches`, `blame_base`, `tab_icon`,
+  `tab_title`. These are the ones nothing else may re-derive, which is what keeps the view from
+  being half-configured for one mode.
+- **An inline match on the variant** when it is not, because the answer needs state the source
+  does not carry, or is applied rather than asked: `git_toolbar_content` (reads either the
+  repository's working-tree status or the multibuffer's own line counts), `tab_tooltip_text`
+  (its working-tree arm reads the buffer's `File` for an absolute path; its commit arm has
+  none to read), `tab_tooltip_content` (returns a rendered two-line element for a commit and a
+  plain string otherwise) — two of those three inside `impl Item` — and
+  `configure_editor_for_source`, which applies settings to a `&mut SplittableEditor` rather
+  than answering anything.
+
+`SoloDiffView::new` is the third case and is worth counting exactly, because it is easy to
+miscount: it branches **once** on `DiffSource` (the permalink remote) and **three times** on
+`LoadedDiff` (the `CommitFileFacts`, the multibuffer shape, and the excerpt install). Those are
+two different types, and the `debug_assert!` at the top of `new` — that the `DiffSource` and
+the `LoadedDiff` handed to it are the same variant — is the only thing making them agree.
+Without it a mismatched pair builds a view that is read-only in one respect and editable in
 another.
+
+The rule to keep: put a difference on `DiffSource` when it is answerable from the source alone,
+and match inline when it needs the loaded buffers or a live handle.
 
 **There are exactly two essential differences, and blame is not one of them.** Editability and
 hunk staging both follow from the single fact that the right-hand side is a live project
@@ -2758,18 +2772,32 @@ collapse chevron that sat in `PrimaryLeft` even while dismissed. Its editor is
 `Editor::multi_line` → `MultiBuffer::singleton`, so `has_files_to_collapse` now answers
 `false` and the bar drops to `Secondary` on `ctrl-f` / `Hidden` on Escape.
 
-Be precise about what was broken there, because "it did nothing" is the wrong summary and
-would make this look like a regression. The **fold worked**: `fold_all` takes the singleton
-branch, and `crease_for_buffer_row` falls back to **indent-based** folding whenever
-`use_lsp_folding_ranges` is false — and that flag is `!lsp_folding_crease_ids.is_empty()`,
-false for a log buffer — while `starts_indent` needs no language at all. The RPC-trace view
-also sets the **JSON** language on its buffer, and both it and Server Info are
-`serde_json::to_string_pretty` output, i.e. heavily indented. So the chevron did collapse the
-log. What never worked is the **return trip through this button**: `has_any_buffer_folded`
-hard-returns `false` for a singleton, so the icon could never flip to "Expand All Files" and
-clicking it again just folded the log a second time. Losing a one-way button is an improvement,
-and both directions were always on the keyboard anyway — `editor::FoldAll` (`ctrl-k ctrl-0`)
-and `editor::UnfoldAll` (`ctrl-k ctrl-j`), neither of which this change touches.
+Be precise about what was broken there, because both "it folded nothing" and "it worked" are
+wrong, in different views. The fold mechanism is real and needs no language:
+`fold_all` takes the singleton branch, and `crease_for_buffer_row` falls back to
+**indent-based** folding whenever `use_lsp_folding_ranges` is false — and that flag is
+`!lsp_folding_crease_ids.is_empty()`, false for a log buffer — while `starts_indent` asks only
+about indentation. So what the button did depended entirely on whether the view's text is
+indented, and the two views differ:
+
+- **Server Info is where it genuinely worked.** `editor_for_server_info` is a flat `format!`
+  template that *embeds* `serde_json::to_string_pretty` for `CAPABILITIES` and `CONFIGURATION`
+  (and `{:#?}` for the binary), so most of the buffer is indented and foldable.
+- **In the RPC trace it did nothing at all** — which matters, because that is the view that
+  looks most like it should fold. The buffer is `log_contents` over
+  `RpcMessage { message: message.trim().to_owned() }`, i.e. **raw LSP wire frames** joined by
+  newlines; nothing re-indents them, and Zed's own outgoing frames are `serde_json::to_string`,
+  compact and single-line. Every row starts at column 0, `starts_indent` is false for all of
+  them, and `fold_all` collects zero creases. Setting the **JSON** language on that buffer
+  (`editor_for_logs` does) changes nothing here — the fallback path this uses is the one taken
+  when there are no LSP folding ranges, and it reads indentation, not syntax.
+
+What never worked in **either** view is the **return trip through this button**:
+`has_any_buffer_folded` hard-returns `false` for a singleton, so the icon could never flip to
+"Expand All Files" and clicking again just folded a second time. Losing a button that was
+inert in one view and one-way in the other is an improvement, and both directions were always
+on the keyboard regardless — `editor::FoldAll` (`ctrl-k ctrl-0`) and `editor::UnfoldAll`
+(`ctrl-k ctrl-j`), neither of which this change touches.
 
 Deliberate scope widening, recorded because it is user-visible: `file_diff_view` now shows the
 quartet, which it never had. It is the only `SplittableEditor` consumer affected, its sibling
