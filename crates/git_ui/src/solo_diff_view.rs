@@ -272,6 +272,13 @@ fn configure_editor_for_source(
             editor.fold_buffers([buffer_id], cx);
         });
     }
+    // Hunk navigation and Unified/Split are painted by
+    // `SoloDiffStyleToolbar`, which sits in the same `PrimaryLeft` slot as
+    // `BufferSearchBar`'s copy of the same four buttons. Without this the
+    // commit source draws both sets side by side — the working-tree source
+    // escapes only because its multibuffer is a singleton, which is a
+    // coincidence rather than a reason.
+    editor.set_style_controls_painted_by_consumer(true);
     editor.set_lhs_blame_base(source.blame_base(), cx);
     editor.rhs_editor().update(cx, |editor, cx| {
         editor.set_should_serialize(false, cx);
@@ -2241,6 +2248,70 @@ mod tests {
         assert!(blame, "and the source's blame base re-applied");
         assert_eq!(hunks.0, hunks.1, "so it counts the same hunks");
         assert!(hunks.0 > 0, "and actually has excerpts to count");
+    }
+
+    /// `SoloDiffStyleToolbar` and `BufferSearchBar` both live in
+    /// `PrimaryLeft` and both know how to paint hunk navigation and
+    /// Unified/Split. The view has to tell its editor which one is doing it,
+    /// or a commit diff draws two identical pairs side by side — the
+    /// working-tree source escapes only because its multibuffer is a
+    /// singleton, which `BufferSearchBar` gates on for unrelated reasons.
+    #[gpui::test]
+    async fn test_neither_source_lets_the_search_bar_paint_the_style_controls(
+        cx: &mut TestAppContext,
+    ) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let working_tree = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        for view in [&working_tree, &commit] {
+            assert!(
+                view.read_with(&cx, |view, cx| view
+                    .editor
+                    .read(cx)
+                    .style_controls_painted_by_consumer()),
+                "this view has a style toolbar of its own"
+            );
+        }
+
+        // And a split pane's clone, which builds a second editor from scratch.
+        let pane = context
+            .workspace
+            .read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        let new_pane = context
+            .workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.activate_item(&commit, true, false, window, cx);
+                workspace.split_and_clone(pane, SplitDirection::Right, window, cx)
+            })
+            .await
+            .expect("a splittable item produces a second pane");
+        cx.run_until_parked();
+        let clone = new_pane
+            .read_with(&cx, |pane, _| {
+                pane.active_item()
+                    .and_then(|item| item.downcast::<SoloDiffView>())
+            })
+            .expect("the new pane holds the cloned diff");
+        assert!(
+            clone.read_with(&cx, |view, cx| view
+                .editor
+                .read(cx)
+                .style_controls_painted_by_consumer()),
+            "the clone is served by the same toolbar as the original"
+        );
     }
 
     #[gpui::test]

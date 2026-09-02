@@ -421,6 +421,7 @@ pub struct SplittableEditor {
     /// the decision is recorded here for anyone who needs to know whether this
     /// diff offers stage / restore buttons at all.
     diff_hunk_controls_disabled: bool,
+    style_controls_painted_by_consumer: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -492,6 +493,29 @@ impl SplittableEditor {
             editor.set_render_diff_hunk_controls(empty_controls.clone(), cx);
         });
         self.diff_hunk_controls_disabled = true;
+    }
+
+    /// Tells this editor that whoever owns it paints the diff style controls
+    /// — hunk navigation and Unified/Split — in a toolbar of its own.
+    ///
+    /// `BufferSearchBar` paints that quartet for every `SplittableEditor`
+    /// consumer, because most of them (`ProjectDiff`, `CommitView`,
+    /// `text_diff_view`, `agent_diff`) have no toolbar of their own to put it
+    /// in. A consumer that *does* have one must set this, or the two surfaces
+    /// both land in `PrimaryLeft` and the user sees two identical pairs of
+    /// hunk arrows and two Unified/Split toggles side by side. Which surface
+    /// paints them is a fact about the consumer, not about the multibuffer's
+    /// shape, so it has to be said here rather than guessed at in `search`
+    /// (which cannot depend on the crates that own these views anyway).
+    pub fn set_style_controls_painted_by_consumer(&mut self, painted_by_consumer: bool) {
+        self.style_controls_painted_by_consumer = painted_by_consumer;
+    }
+
+    /// Whether some other surface already paints this diff's hunk navigation
+    /// and Unified/Split toggle. See
+    /// [`Self::set_style_controls_painted_by_consumer`].
+    pub fn style_controls_painted_by_consumer(&self) -> bool {
+        self.style_controls_painted_by_consumer
     }
 
     /// Whether [`Self::disable_diff_hunk_controls`] is the last thing to have
@@ -622,6 +646,7 @@ impl SplittableEditor {
             last_width: None,
             lhs_blame_base: None,
             diff_hunk_controls_disabled: false,
+            style_controls_painted_by_consumer: false,
             _subscriptions: subscriptions,
         }
     }

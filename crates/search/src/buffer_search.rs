@@ -108,7 +108,15 @@ impl Render for BufferSearchBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
 
-        let has_splittable_editor = self.splittable_editor.is_some();
+        // Not merely "is there a splittable editor": a consumer that has a diff
+        // toolbar of its own already paints these four buttons, and both
+        // toolbars land in `PrimaryLeft`, so painting them here as well shows
+        // the user two identical pairs of hunk arrows side by side.
+        let has_splittable_editor = self
+            .splittable_editor
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .is_some_and(|editor| !editor.read(cx).style_controls_painted_by_consumer());
         let split_buttons = if has_splittable_editor {
             self.splittable_editor
                 .as_ref()
@@ -1129,6 +1137,10 @@ impl BufferSearchBar {
                 return false;
             }
 
+            if !self.has_files_to_collapse(cx) {
+                return false;
+            }
+
             let workspace::searchable::SearchOptions {
                 find_in_results, ..
             } = item.supported_options(cx);
@@ -1136,6 +1148,31 @@ impl BufferSearchBar {
         } else {
             false
         }
+    }
+
+    /// Whether "Collapse All Files" has any files to collapse.
+    ///
+    /// `buffer_kind` alone does not answer this: a single-file diff built on
+    /// `MultiBuffer::without_headers` plus one excerpt is not a `Singleton`,
+    /// but it shows one file with no header, so folding it collapses the only
+    /// thing on screen under a label that names a plural that isn't there.
+    /// The two things that make the button mean something are a multibuffer
+    /// that paints per-file headers, or one that spans more than one buffer —
+    /// the second covers the headerless multi-file case (`CommitView`'s
+    /// compare-range mode).
+    fn has_files_to_collapse(&self, cx: &App) -> bool {
+        let Some(editor) = self
+            .active_searchable_item
+            .as_ref()
+            .and_then(|item| item.act_as_type(TypeId::of::<Editor>(), cx))
+            .and_then(|item| item.downcast::<Editor>().ok())
+        else {
+            // Not an editor at all: leave the existing behaviour alone rather
+            // than hiding a button from a consumer this reasoning is not about.
+            return true;
+        };
+        let snapshot = editor.read(cx).buffer().read(cx).read(cx);
+        snapshot.show_headers() || snapshot.all_buffer_ids().take(2).count() > 1
     }
 
     fn toggle_fold_all(&mut self, _: &ToggleFoldAll, window: &mut Window, cx: &mut Context<Self>) {
@@ -2093,6 +2130,74 @@ mod tests {
         let cx = VisualTestContext::from_window(*window, cx).into_mut();
 
         (editor.unwrap(), search_bar, cx)
+    }
+
+    /// `needs_expand_collapse_option` gates the toolbar's "Collapse All
+    /// Files" button (and, before it was pulled out, the diff style controls
+    /// beside it). `buffer_kind != Singleton` was the wrong question: a
+    /// single-file diff built on `MultiBuffer::without_headers` plus one
+    /// excerpt answers `Multibuffer` while showing exactly one headerless
+    /// file, so the button offered to collapse the only thing on screen.
+    #[gpui::test]
+    fn test_collapse_all_files_needs_files_to_collapse(cx: &mut TestAppContext) {
+        init_globals(cx);
+
+        fn multibuffer_with(
+            headers: bool,
+            buffer_count: usize,
+            cx: &mut TestAppContext,
+        ) -> Entity<MultiBuffer> {
+            let buffers = (0..buffer_count)
+                .map(|index| cx.new(|cx| Buffer::local(format!("line {index}\nnext\n"), cx)))
+                .collect::<Vec<_>>();
+            cx.new(|cx| {
+                let mut multibuffer = if headers {
+                    MultiBuffer::new(language::Capability::ReadWrite)
+                } else {
+                    MultiBuffer::without_headers(language::Capability::ReadWrite)
+                };
+                for (index, buffer) in buffers.into_iter().enumerate() {
+                    multibuffer.set_excerpts_for_path(
+                        PathKey::sorted(index as u64),
+                        buffer,
+                        [Point::new(0, 0)..Point::new(1, 0)],
+                        0,
+                        cx,
+                    );
+                }
+                multibuffer
+            })
+        }
+
+        let cases = [
+            // One file, but the multibuffer paints a header for it, so
+            // "Collapse All Files" collapses something the user can see:
+            // a `ProjectDiff` or a whole-commit `CommitView` of a one-file
+            // change, which is the everyday case for both.
+            (true, 1, true),
+            (true, 2, true),
+            // Headerless but multi-file — `CommitView`'s compare-range mode.
+            (false, 2, true),
+            // Headerless and single-file — the unified single-file commit
+            // diff. Nothing to collapse.
+            (false, 1, false),
+        ];
+
+        for (headers, buffer_count, expected) in cases {
+            let multibuffer = multibuffer_with(headers, buffer_count, cx);
+            let window = cx.add_window(|window, cx| {
+                let editor = cx.new(|cx| Editor::for_multibuffer(multibuffer, None, window, cx));
+                let mut search_bar = BufferSearchBar::new(None, window, cx);
+                search_bar.set_active_pane_item(Some(&editor), window, cx);
+                search_bar
+            });
+            let actual = window
+                .update(cx, |search_bar, _window, cx| {
+                    search_bar.needs_expand_collapse_option(cx)
+                })
+                .expect("the test window is alive");
+            assert_eq!(actual, expected, "headers={headers} buffers={buffer_count}");
+        }
     }
 
     fn init_test(
