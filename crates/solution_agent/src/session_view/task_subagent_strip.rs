@@ -115,6 +115,13 @@ pub(super) fn render_task_subagent_strip(
     let mut row = h_flex()
         .id("task-subagent-strip")
         .w_full()
+        // Stays rigid while the transcript and the compose box negotiate the
+        // band's height between them (`session_view::MIN_TRANSCRIPT_HEIGHT`).
+        // Its 24px of pill plus padding is a fixed navigation affordance: it
+        // cannot reflow, so shrinking it clips the pill labels — and it is the
+        // only way back to Main from a teammate or shell view, so the one row
+        // in this column that must never become unreadable is this one. The
+        // ~33px it costs comes out of the transcript, which is scrollable.
         .flex_none()
         .gap_1()
         .px_2()

@@ -103,6 +103,51 @@ const MIN_COMPOSE_HEIGHT: f32 = 56.0;
 /// Upper bound — past this the conversation starts feeling cramped on
 /// reasonable bottom-dock heights.
 const MAX_COMPOSE_HEIGHT: f32 = 400.0;
+/// Height of the compose block's drag strip, in logical pixels. Named because
+/// it is added to `compose_height` at both compose arms' preferred height and
+/// at both of their floors, and all four must agree or the enabled↔shell swap
+/// jumps.
+const COMPOSE_HANDLE_HEIGHT: f32 = 3.0;
+/// The transcript height below which the compose row starts giving ground.
+/// Carried as the transcript's `flex_basis`, so it is a *priority threshold*,
+/// not a reservation.
+///
+/// Above it the band's `+/-` is entirely the transcript's: the transcript is
+/// the column's only grow item, so all positive free space lands there and the
+/// compose sits at exactly `compose_height`, untouched, whatever the band
+/// height. Below it the sign flips and the compose becomes the absorber (see
+/// [`COMPOSE_YIELD_PRIORITY`]) down to [`MIN_COMPOSE_HEIGHT`].
+///
+/// Sized so "the dialog is still there" means a couple of message bubbles
+/// rather than one clipped line. Deliberately *larger* than a
+/// [`crate::model::MIN_BAND_HEIGHT`] band can honour alongside the compose
+/// floor and the status row (120 + 56 + 3 + 28 = 207 > 140) — which is exactly
+/// why it must not be a hard `min_h`. A hard floor would freeze the transcript
+/// at 120 and leave the residual deficit nowhere to go, so the compose block —
+/// last child of the column — would be pushed off the bottom of the band,
+/// drag handle and all, leaving no input and no way to drag it back. At a band
+/// this short the transcript gives up the remainder instead and the compose
+/// survives at its floor.
+const MIN_TRANSCRIPT_HEIGHT: f32 = 120.0;
+/// The compose block's flex-shrink factor, against the transcript's 1.
+///
+/// Ratios, not absolutes: the shrink pass divides a deficit by
+/// `factor * flex_basis`, so at this factor the compose eats
+/// `1024 * compose_height` for every `120` the transcript eats — the compose
+/// takes ~99.8 % of any shortfall and the transcript holds its threshold to
+/// well within a pixel. Once the compose bottoms out at
+/// [`MIN_COMPOSE_HEIGHT`] it freezes and the transcript, still unfrozen,
+/// absorbs whatever is left.
+///
+/// The obvious dual — shrink 0 (or a fraction) on the transcript and 1 on the
+/// compose — does NOT work, and the difference is not cosmetic. CSS Flexbox
+/// §9.7 step 4b: *"if the sum of the unfrozen items' flex factors is less than
+/// one, multiply the initial free space by that sum"*. A frozen or
+/// sub-1-factored transcript therefore absorbs (almost) nothing on the pass
+/// after the compose freezes, and the column overflows instead — measured, at
+/// a 140px band, as the whole compose block landing 61px below the band.
+/// Keep the transcript at a plain 1 and put the lopsidedness here.
+const COMPOSE_YIELD_PRIORITY: f32 = 1024.0;
 
 pub struct SolutionSessionView {
     session_id: SolutionSessionId,
@@ -1150,7 +1195,8 @@ impl SolutionSessionView {
         div()
             .id("solution-session-compose-resize")
             .flex_none()
-            .h(px(3.0))
+            .h(px(COMPOSE_HANDLE_HEIGHT))
+            .debug_selector(|| "solution-session-compose-handle".into())
             .w_full()
             .cursor_row_resize()
             .bg(cx.theme().colors().border)
@@ -1666,8 +1712,39 @@ impl Render for SolutionSessionView {
                 div()
                     .flex()
                     .flex_col()
-                    .flex_1()
+                    // Transcript-over-compose priority. Two regimes, and the
+                    // threshold between them is `MIN_TRANSCRIPT_HEIGHT`:
+                    //
+                    // * Slack (band taller than threshold + compose + chrome).
+                    //   This is the column's only grow item, so *all* the free
+                    //   space lands here and the compose row is left at exactly
+                    //   the height the user dragged its handle to — dragging
+                    //   the band up and down does not move it by a pixel.
+                    // * Deficit. The shrink pass divides by `factor * basis`;
+                    //   ours is `1 * 120`, the compose block's is
+                    //   `COMPOSE_YIELD_PRIORITY * compose_height`, so the
+                    //   compose absorbs ~all of the shortfall down to its own
+                    //   floor and only the residual past that comes out here.
+                    //
+                    // Do NOT "simplify" this into a proportional split, a
+                    // percentage basis, or a plain `flex_1` (basis 0, so this
+                    // yields nothing and the compose yields nothing either —
+                    // that is the bug where a stretched compose was the only
+                    // thing left in the band). The asymmetry is the feature.
+                    .flex_grow(1.)
+                    // Plain 1, deliberately: see `COMPOSE_YIELD_PRIORITY` for
+                    // why a smaller factor here silently stops working.
+                    .flex_shrink(1.)
+                    .flex_basis(px(MIN_TRANSCRIPT_HEIGHT))
+                    // Not `min_h(MIN_TRANSCRIPT_HEIGHT)`: the transcript is
+                    // what gives when even a floored compose row does not fit,
+                    // so it must be allowed all the way down rather than
+                    // overflowing the column and shoving the compose off it.
                     .min_h_0()
+                    // Read back by the layout-priority tests through
+                    // `VisualTestContext::debug_bounds`; compiles away outside
+                    // test builds.
+                    .debug_selector(|| "solution-session-transcript".into())
                     // Belt-and-suspenders clip: the navigator's panel
                     // body wrapper already adds `overflow_hidden`, but
                     // a path that hosts this view *outside* the
@@ -1791,17 +1868,28 @@ impl Render for SolutionSessionView {
                 div()
                     .flex()
                     .flex_col()
-                    .flex_none()
-                    // Same total height as the enabled arm (handle 3px +
+                    // Same geometry as the enabled arm — preferred height,
+                    // floor and shrink priority all identical (handle +
                     // compose_height) so switching Main↔shell doesn't jump.
-                    .h(self.compose_height + px(3.0))
+                    // `.h()` is a *preferred* height, not a lock: this block is
+                    // the designated absorber once the transcript is down to
+                    // `MIN_TRANSCRIPT_HEIGHT`.
+                    .h(self.compose_height + px(COMPOSE_HANDLE_HEIGHT))
+                    .min_h(px(MIN_COMPOSE_HEIGHT + COMPOSE_HANDLE_HEIGHT))
+                    .flex_shrink(COMPOSE_YIELD_PRIORITY)
+                    .debug_selector(|| "solution-session-compose".into())
                     .child(self.render_compose_resize_handle(cx))
                     .child(
                         h_flex()
                             .id("compose-row-disabled")
                             .w_full()
-                            .flex_none()
-                            .h(self.compose_height)
+                            // Fills whatever the block above was granted,
+                            // minus the `flex_none` handle. Basis 0 + grow,
+                            // rather than `.h(compose_height)`, so a shrunk
+                            // block clips nothing off its own bottom.
+                            .flex_1()
+                            .min_h_0()
+                            .debug_selector(|| "solution-session-compose-inner".into())
                             .px_3()
                             .items_center()
                             .bg(cx.theme().colors().panel_background)
@@ -1821,17 +1909,28 @@ impl Render for SolutionSessionView {
                 // below it lives the original flex_row with editor +
                 // buttons. Wrapping them as one block stops the handle
                 // from getting pushed off the panel by flex math when
-                // the panel is short.
+                // the panel is short. That still holds now the block is
+                // shrinkable: the handle is `flex_none` and first, and
+                // `compose_inner` below is basis-0-and-grow, so the pair
+                // always fits exactly inside whatever height the block
+                // was granted — the inner row absorbs the shrink, never
+                // the handle.
                 let compose_row = div()
                     .flex()
                     .flex_col()
-                    .flex_none()
-                    .h(self.compose_height + px(3.0))
+                    // Preferred height, not a lock (see the shell arm):
+                    // `flex_none` here is what let a stretched compose box
+                    // squeeze the transcript to nothing.
+                    .h(self.compose_height + px(COMPOSE_HANDLE_HEIGHT))
+                    .min_h(px(MIN_COMPOSE_HEIGHT + COMPOSE_HANDLE_HEIGHT))
+                    .flex_shrink(COMPOSE_YIELD_PRIORITY)
+                    .debug_selector(|| "solution-session-compose".into())
                     .child(self.render_compose_resize_handle(cx));
                 let compose_inner = div()
                     .flex()
-                    .flex_none()
-                    .h(self.compose_height)
+                    .flex_1()
+                    .min_h_0()
+                    .debug_selector(|| "solution-session-compose-inner".into())
                     .p_2()
                     .gap_2()
                     // Match the editor's own background colour so the

@@ -679,3 +679,247 @@ async fn a_consumed_turn_failure_does_not_restore_the_draft(cx: &mut gpui::TestA
         "the toast must stay broad — every send failure surfaces, consumed or not"
     );
 }
+
+/// Vertical priority inside the session column: the transcript outranks the
+/// compose box.
+///
+/// Three regimes, driven through the real `Render` in a real window so the
+/// assertions come out of taffy's flex pass rather than out of a hand-written
+/// model of it (a model would only ever restate its own definition):
+///
+/// 1. Slack — the band is taller than the transcript floor plus the compose
+///    box. The compose box must sit at *exactly* `compose_height`, and must
+///    still be at exactly that height at a different large band height. Two
+///    sizes, one number: that is the assertion a proportional split fails.
+/// 2. Tight — the transcript is at its floor and the compose box is the sole
+///    absorber of the shortfall.
+/// 3. Impossible — both floors together exceed the band. The compose box wins
+///    (it keeps `MIN_COMPOSE_HEIGHT` + its handle) and the transcript gives up
+///    the residual, because the alternative is the compose box being pushed
+///    off the bottom of the band with no way to drag it back.
+#[gpui::test]
+async fn the_compose_box_yields_to_the_transcript_as_the_band_shrinks(
+    cx: &mut gpui::TestAppContext,
+) {
+    use super::{
+        COMPOSE_HANDLE_HEIGHT, DEFAULT_COMPOSE_HEIGHT, MIN_COMPOSE_HEIGHT, MIN_TRANSCRIPT_HEIGHT,
+    };
+    use crate::store::SolutionAgentStore;
+    use gpui::{VisualTestContext, px, size};
+    use std::sync::Arc;
+
+    /// Resize the window and read back what the flex pass gave the two
+    /// competing blocks, as (transcript, compose-including-handle).
+    fn measure_at(vcx: &mut VisualTestContext, band_height: f32) -> (f32, f32) {
+        vcx.simulate_resize(size(px(900.), px(band_height)));
+        vcx.run_until_parked();
+        let transcript = vcx
+            .debug_bounds("solution-session-transcript")
+            .expect("transcript block painted");
+        let compose = vcx
+            .debug_bounds("solution-session-compose")
+            .expect("compose block painted");
+        (
+            f32::from(transcript.size.height),
+            f32::from(compose.size.height),
+        )
+    }
+
+    let (solution_id, _tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
+    cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let workspace_window =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| {
+        workspace_window
+            .root(cx)
+            .expect("workspace window alive")
+            .downgrade()
+    });
+    let session = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            crate::store::tests::insert_cold_session(
+                session_id,
+                solution_id,
+                SharedString::from("mock-agent"),
+                None,
+                Some(project.clone()),
+                store,
+                cx,
+            )
+        })
+    });
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(
+            session_id,
+            session.clone(),
+            workspace_weak.clone(),
+            window,
+            cx,
+        )
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.run_until_parked();
+
+    let composed_default = DEFAULT_COMPOSE_HEIGHT + COMPOSE_HANDLE_HEIGHT;
+
+    // 1. Slack. Two band heights 200px apart; every one of those 200px is the
+    //    transcript's, and the compose box does not move.
+    let (tall_transcript, tall_compose) = measure_at(vcx, 800.0);
+    let (mid_transcript, mid_compose) = measure_at(vcx, 600.0);
+    assert_eq!(
+        tall_compose, composed_default,
+        "with room to spare the compose box sits at exactly the height its handle was left at"
+    );
+    assert_eq!(
+        mid_compose, composed_default,
+        "a 200px shorter band must not move the compose box by a pixel — all of the \
+         difference belongs to the transcript"
+    );
+    assert_eq!(
+        tall_transcript - mid_transcript,
+        200.0,
+        "the transcript absorbs the whole band delta"
+    );
+
+    // A compose box dragged nearly to its maximum: still inert while the
+    // transcript has slack. This is the shape from the bug report.
+    view_window
+        .update(vcx, |view, _window, cx| {
+            view.compose_height = px(300.0);
+            cx.notify();
+        })
+        .unwrap();
+    let composed_tall = 300.0 + COMPOSE_HANDLE_HEIGHT;
+    let (_, stretched_compose) = measure_at(vcx, 800.0);
+    assert_eq!(
+        stretched_compose, composed_tall,
+        "a stretched compose box is honoured in full while the transcript has room"
+    );
+
+    // 2. Tight. The band no longer fits floor + compose, so the compose box —
+    //    not the transcript — is what gives.
+    let (tight_transcript, tight_compose) = measure_at(vcx, 400.0);
+    assert!(
+        tight_compose < composed_tall,
+        "past the transcript floor the compose box must yield, got {tight_compose}"
+    );
+    assert!(
+        (tight_transcript - MIN_TRANSCRIPT_HEIGHT).abs() < 1.0,
+        "the transcript holds its floor while the compose box still has slack, got \
+         {tight_transcript}"
+    );
+
+    // 3. Impossible: a band at `MIN_BAND_HEIGHT` cannot seat a 120px transcript,
+    //    a 56px compose box and the status row at once (120 + 59 + 29 > 140).
+    let (crushed_transcript, crushed_compose) =
+        measure_at(vcx, crate::model::MIN_BAND_HEIGHT);
+    assert_eq!(
+        crushed_compose,
+        MIN_COMPOSE_HEIGHT + COMPOSE_HANDLE_HEIGHT,
+        "the compose box bottoms out at its own floor and is still fully on the band — \
+         it must never be pushed off, or there is no handle left to drag it back"
+    );
+    assert!(
+        crushed_transcript > 0.0 && crushed_transcript < MIN_TRANSCRIPT_HEIGHT,
+        "the transcript, not the compose box, absorbs what is left over past both \
+         floors, got {crushed_transcript}"
+    );
+
+    // …and the whole compose block, drag handle included, is still inside the
+    // band at that size. The handle is the `flex_none` first child of a block
+    // whose second child is basis-0-and-grow, so the shrink lands on the input
+    // row and the handle keeps its 3px wherever the block ends up.
+    let compose_box = vcx
+        .debug_bounds("solution-session-compose")
+        .expect("compose block painted");
+    let handle = vcx
+        .debug_bounds("solution-session-compose-handle")
+        .expect("resize handle painted");
+    let inner = vcx
+        .debug_bounds("solution-session-compose-inner")
+        .expect("compose input row painted");
+    assert_eq!(
+        f32::from(handle.size.height),
+        COMPOSE_HANDLE_HEIGHT,
+        "the drag handle keeps its full height at the smallest band"
+    );
+    assert_eq!(
+        handle.origin.y, compose_box.origin.y,
+        "the handle sits at the very top of the compose block, not pushed off it"
+    );
+    assert!(
+        f32::from(compose_box.bottom()) <= crate::model::MIN_BAND_HEIGHT,
+        "the compose block must stay inside the band, got bottom {}",
+        f32::from(compose_box.bottom())
+    );
+    assert!(
+        inner.bottom() <= compose_box.bottom(),
+        "the input row fills the shrunk block instead of overflowing its bottom, got {} vs {}",
+        f32::from(inner.bottom()),
+        f32::from(compose_box.bottom())
+    );
+
+    // The view-only shell arm swaps a different element into the same slot. Its
+    // geometry must be indistinguishable, or flipping the pill between Main and
+    // a shell makes the transcript jump.
+    // The stream has to exist on the session before either half of this
+    // comparison: `Render` snaps the selection back to Main every frame for a
+    // stream that has gone away (so a bare `selected_stream` write would
+    // silently measure the enabled arm twice), and its presence also adds the
+    // teammate/shell pill strip — which must be there for *both* measurements
+    // or the comparison is really measuring the strip.
+    let shell_stream = StreamId::Shell(crate::background_shell::BackgroundShellId::new("shell-1"));
+    session.update(vcx, |session, _| {
+        session
+            .streams
+            .insert(shell_stream.clone(), shell_stream_for_test(&shell_stream));
+    });
+    let enabled_arm = [
+        measure_at(vcx, 800.0),
+        measure_at(vcx, 400.0),
+        measure_at(vcx, crate::model::MIN_BAND_HEIGHT),
+    ];
+    view_window
+        .update(vcx, |view, _window, cx| {
+            view.selected_stream = shell_stream.clone();
+            assert!(
+                view.compose_disabled(cx),
+                "the shell arm must actually be the one rendering"
+            );
+            cx.notify();
+        })
+        .unwrap();
+    let shell_arm = [
+        measure_at(vcx, 800.0),
+        measure_at(vcx, 400.0),
+        measure_at(vcx, crate::model::MIN_BAND_HEIGHT),
+    ];
+    assert_eq!(
+        enabled_arm, shell_arm,
+        "the shell arm must resolve to the same transcript/compose split as the enabled \
+         arm at every band height"
+    );
+}
+
+/// A minimal live `Shell` stream, enough for `Render` to keep a
+/// `StreamId::Shell` selected (it snaps back to Main for any stream missing
+/// from `session.streams`).
+fn shell_stream_for_test(id: &StreamId) -> crate::stream::Stream {
+    use crate::stream::{Stream, StreamKind, StreamSource, StreamState};
+    Stream {
+        id: id.clone(),
+        kind: StreamKind::Shell,
+        label: SharedString::from("shell-1\u{b7}cmd"),
+        entries: Vec::new(),
+        seq: 0,
+        state: StreamState::Live,
+        source: StreamSource::FileTail(std::path::PathBuf::from("/dev/null")),
+    }
+}
