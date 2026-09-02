@@ -108,15 +108,7 @@ impl Render for BufferSearchBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
 
-        // Not merely "is there a splittable editor": a consumer that has a diff
-        // toolbar of its own already paints these four buttons, and both
-        // toolbars land in `PrimaryLeft`, so painting them here as well shows
-        // the user two identical pairs of hunk arrows side by side.
-        let has_splittable_editor = self
-            .splittable_editor
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
-            .is_some_and(|editor| !editor.read(cx).style_controls_painted_by_consumer());
+        let has_splittable_editor = self.paints_diff_style_controls(cx);
         let split_buttons = if has_splittable_editor {
             self.splittable_editor
                 .as_ref()
@@ -1148,6 +1140,22 @@ impl BufferSearchBar {
         } else {
             false
         }
+    }
+
+    /// Whether this bar paints the diff style controls — hunk navigation and
+    /// Unified/Split — for the active item.
+    ///
+    /// It does for every `SplittableEditor` consumer *except* the ones that
+    /// paint them in a toolbar of their own. Both surfaces sit in
+    /// `PrimaryLeft`, so two painters means the user sees two identical
+    /// quartets side by side. Public because the consumers that opt out live
+    /// in crates above this one — `search` cannot name them — so this is where
+    /// the wiring is testable end to end.
+    pub fn paints_diff_style_controls(&self, cx: &App) -> bool {
+        self.splittable_editor
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .is_some_and(|editor| !editor.read(cx).style_controls_painted_by_consumer())
     }
 
     /// Whether "Collapse All Files" has any files to collapse.

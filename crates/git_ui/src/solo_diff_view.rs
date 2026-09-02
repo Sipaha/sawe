@@ -1396,6 +1396,7 @@ mod tests {
     use git::status::{FileStatus, StageStatus, StatusCode, TrackedStatus};
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
     use project::FakeFs;
+    use search::BufferSearchBar;
     use settings::SettingsStore;
     use std::path::Path;
     use util::path;
@@ -2276,6 +2277,11 @@ mod tests {
             .expect("the commit's file opens")
             .expect("the gesture opened a view");
 
+        // The far end of the wiring, not just the flag: a real
+        // `BufferSearchBar` told about this item must decline to paint the
+        // quartet `SoloDiffStyleToolbar` is already painting.
+        let search_bar =
+            cx.update(|window, cx| cx.new(|cx| BufferSearchBar::new(None, window, cx)));
         for view in [&working_tree, &commit] {
             assert!(
                 view.read_with(&cx, |view, cx| view
@@ -2283,6 +2289,14 @@ mod tests {
                     .read(cx)
                     .style_controls_painted_by_consumer()),
                 "this view has a style toolbar of its own"
+            );
+            let item: Box<dyn ItemHandle> = Box::new(view.clone());
+            assert!(
+                !search_bar.update_in(&mut cx, |search_bar, window, cx| {
+                    search_bar.set_active_pane_item(Some(item.as_ref()), window, cx);
+                    search_bar.paints_diff_style_controls(cx)
+                }),
+                "the search bar must leave the style controls to that toolbar"
             );
         }
 
