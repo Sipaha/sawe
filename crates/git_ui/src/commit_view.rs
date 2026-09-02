@@ -320,6 +320,14 @@ impl CommitView {
         self.single_file.as_ref()
     }
 
+    /// The commit being shown. Read by the git panel to tell two commits'
+    /// single-file diffs apart: [`Self::single_file`] alone would let the
+    /// Commit tab mark a row for a diff belonging to a different commit that
+    /// happens to touch the same path.
+    pub fn sha(&self) -> &SharedString {
+        &self.commit.sha
+    }
+
     /// IDEA's "Compare Versions": diff two selected commits against each
     /// other (`base` older, `head` newer) rather than a commit against its
     /// parent. Opens a bare diff tab titled `base..head`.

@@ -26,13 +26,38 @@ use time::OffsetDateTime;
 use ui::{CopyButton, Divider, prelude::*, tooltip_container};
 use workspace::Workspace;
 
-const GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED: usize = 20;
+/// Ceiling on the author column, in monospace columns. Only 7 of the 1931
+/// author names in this repository's history reach it once shortened, so it is
+/// a guard against a pathological handle rather than a routine truncation.
+const GIT_BLAME_MAX_AUTHOR_COLUMNS: usize = 20;
+
+/// Columns the fixed-width date takes, e.g. `21 Mar 2019`.
+const GIT_BLAME_DATE_COLUMNS: usize = "21 Mar 2019".len();
+
+/// Columns for the gap inside the row and the margin after it. Both are
+/// pixel-sized (8px each) and a column is wider than that at every font size
+/// the editor uses, so rounding up to whole columns keeps the reservation an
+/// upper bound.
+const GIT_BLAME_SPACING_COLUMNS: usize = 2;
+
+/// Columns the avatar and the second gap it introduces take when
+/// `git.blame.show_avatar` is on.
+const GIT_BLAME_AVATAR_COLUMNS: usize = 3;
 
 pub struct GitBlameRenderer;
 
 impl BlameRenderer for GitBlameRenderer {
-    fn max_author_length(&self) -> usize {
-        GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED
+    fn max_author_columns(&self) -> usize {
+        GIT_BLAME_MAX_AUTHOR_COLUMNS
+    }
+
+    fn gutter_fixed_columns(&self, cx: &App) -> usize {
+        let avatar_columns = if ProjectSettings::get_global(cx).git.blame.show_avatar {
+            GIT_BLAME_AVATAR_COLUMNS
+        } else {
+            0
+        };
+        GIT_BLAME_DATE_COLUMNS + GIT_BLAME_SPACING_COLUMNS + avatar_columns
     }
 
     fn render_blame_entry(
@@ -86,14 +111,11 @@ impl BlameRenderer for GitBlameRenderer {
             return Some(render_muted_blame_entry(style, ix, cx));
         }
 
-        let timestamp = if options.absolute_dates {
-            blame_entry_absolute_timestamp(&blame_entry)
-        } else {
-            blame_entry_relative_timestamp(&blame_entry)
-        };
-        let short_commit_id = blame_entry.sha.display_short();
-        let author_name = blame_entry.author.as_deref().unwrap_or("<no name>");
-        let name = util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED);
+        let date = blame_entry_gutter_date(&blame_entry);
+        let name = truncate_to_columns(
+            ::git::blame::display_author(blame_entry.author.as_deref()),
+            GIT_BLAME_MAX_AUTHOR_COLUMNS,
+        );
 
         let resolved_color = match options.color_mode {
             ColorMode::None => sha_color,
@@ -141,19 +163,22 @@ impl BlameRenderer for GitBlameRenderer {
                     h_flex()
                         .id(("blame", ix))
                         .w_full()
+                        // The row is sized to fit the column the editor
+                        // reserved for it, but clipping is the backstop that
+                        // keeps a mis-measured name off the line numbers
+                        // instead of painting over them.
+                        .overflow_x_hidden()
                         .gap_2()
-                        .justify_between()
                         .font(style.font())
                         .line_height(style.line_height)
                         .text_color(cx.theme().status().hint)
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(div().text_color(resolved_color).child(short_commit_id))
-                                .children(avatar)
-                                .child(name),
-                        )
-                        .child(timestamp)
+                        .child(date)
+                        .children(avatar)
+                        // Coloured per commit (or per author / per age, under
+                        // the other colour modes), which is what carries the
+                        // "these lines came from one commit" cue now that the
+                        // SHA it used to tint is gone.
+                        .child(div().text_color(resolved_color).child(name))
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
                         .cursor_pointer()
                         .on_mouse_down(MouseButton::Right, {
@@ -560,20 +585,42 @@ fn render_muted_blame_entry(style: &TextStyle, ix: usize, cx: &mut App) -> AnyEl
         .into_any()
 }
 
-fn blame_entry_absolute_timestamp(blame_entry: &BlameEntry) -> String {
-    match blame_entry.author_offset_date_time() {
-        Ok(timestamp) => {
-            let local_offset =
-                time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-            time_format::format_localized_timestamp(
-                timestamp,
-                time::OffsetDateTime::now_utc(),
-                local_offset,
-                time_format::TimestampFormat::MediumAbsolute,
-            )
-        }
-        Err(_) => "Error parsing date".to_string(),
+/// The gutter shows an absolute date rather than "1 year, 10 months ago": it
+/// is shorter, it is fixed-width — which is what lets the gutter reserve an
+/// exact number of columns — and it is more precise than the relative form it
+/// replaces.
+fn blame_entry_gutter_date(blame_entry: &BlameEntry) -> String {
+    match blame_entry.author_time {
+        Some(author_time) => crate::format_compact_date(author_time),
+        None => String::new(),
     }
+}
+
+/// Shortens `text` to at most `max_columns` monospace columns, counting a CJK
+/// glyph as the two columns it actually occupies. `util::truncate_and_trailoff`
+/// counts `char`s instead, which would let a name twice as wide as the gutter
+/// reserved for it through.
+fn truncate_to_columns(text: &str, max_columns: usize) -> String {
+    use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
+
+    if text.width() <= max_columns {
+        return text.to_string();
+    }
+
+    // The ellipsis itself occupies the last column.
+    let budget = max_columns.saturating_sub(1);
+    let mut truncated = String::new();
+    let mut columns = 0;
+    for character in text.chars() {
+        let character_columns = character.width().unwrap_or(0);
+        if columns + character_columns > budget {
+            break;
+        }
+        truncated.push(character);
+        columns += character_columns;
+    }
+    truncated.push('\u{2026}');
+    truncated
 }
 
 fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {
@@ -589,5 +636,69 @@ fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {
             )
         }
         Err(_) => "Error parsing date".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gutter reserves exactly `GIT_BLAME_DATE_COLUMNS` for the date, so a
+    /// date that formats wider than that would push the author name over the
+    /// line numbers — the collision this layout exists to remove.
+    #[test]
+    fn compact_date_never_exceeds_its_reserved_columns() {
+        use unicode_width::UnicodeWidthStr as _;
+
+        let timestamps = [
+            0,             // 1970-01-01
+            1_553_126_400, // 2019-03-21, the date in the reference screenshot
+            1_000_000_000,
+            4_102_444_800,   // 2100-01-01
+            253_402_300_799, // 9999-12-31
+        ];
+        for timestamp in timestamps {
+            let formatted = crate::format_compact_date(timestamp);
+            assert_eq!(
+                formatted.width(),
+                GIT_BLAME_DATE_COLUMNS,
+                "{timestamp} formatted as {formatted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_to_columns_counts_columns_not_chars() {
+        // Nothing to do when it already fits.
+        assert_eq!(truncate_to_columns("Taushkanov", 20), "Taushkanov");
+        assert_eq!(truncate_to_columns("", 20), "");
+        assert_eq!(truncate_to_columns("exactly-ten", 11), "exactly-ten");
+
+        // One column over the budget: the ellipsis takes the last column.
+        assert_eq!(truncate_to_columns("exactly-ten", 10), "exactly-t\u{2026}");
+        assert_eq!(
+            truncate_to_columns("bangbangsheshotmedown", 20),
+            "bangbangsheshotmedo\u{2026}"
+        );
+
+        // A CJK glyph occupies two columns, so half as many of them fit as a
+        // `char`-counting truncation would allow.
+        assert_eq!(
+            truncate_to_columns("\u{5f20}\u{5c0f}\u{767d}", 6),
+            "\u{5f20}\u{5c0f}\u{767d}"
+        );
+        assert_eq!(
+            truncate_to_columns("\u{5f20}\u{5c0f}\u{767d}", 5),
+            "\u{5f20}\u{5c0f}\u{2026}"
+        );
+        assert_eq!(
+            truncate_to_columns("\u{5f20}\u{5c0f}\u{767d}", 4),
+            "\u{5f20}\u{2026}"
+        );
+
+        // A zero-width character costs nothing, so it cannot push the name out
+        // of its column budget. Names carrying these really do occur in this
+        // repository's history.
+        assert_eq!(truncate_to_columns("Ha\u{200b}yes", 5), "Ha\u{200b}yes");
     }
 }

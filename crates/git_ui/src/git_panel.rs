@@ -27,13 +27,13 @@ use git::repository::{
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
-use git_conflict_ui::{InProgressOp, OpenConflictResolver, detect_in_progress_op};
 use git::{Amend, Commit, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
 use git::{
     ExpandCommitEditor, GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
     StashAll, StashApply, StashPop, ToggleFillCommitEditor, TrashUntrackedFiles, UnstageAll,
     parse_git_remote_url,
 };
+use git_conflict_ui::{InProgressOp, OpenConflictResolver, detect_in_progress_op};
 use gpui::{
     AbsoluteLength, Action, Anchor, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, DismissEvent,
     DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyContext,
@@ -82,7 +82,7 @@ use workspace::{
 use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
 
 mod changes_list;
-mod commit_tab;
+pub(crate) mod commit_tab;
 
 pub use commit_tab::{CommitSelection, CommitSelectionSource};
 
@@ -449,6 +449,79 @@ const INDENT_GUIDE_LEFT_OFFSET: f32 = ROW_LEFT_PADDING + SECTION_CONTENT_INDENT 
 const SELECTED_BG_ALPHA: f32 = 0.08;
 const MARKED_BG_ALPHA: f32 = 0.12;
 const STATE_OPACITY_STEP: f32 = 0.04;
+
+/// The diff the centre pane is showing right now, as far as this panel can
+/// name it.
+///
+/// Derived from the active pane item, never from a click: "the row I last
+/// clicked" and "the diff I am looking at" diverge the moment the user
+/// activates another tab, and it is the second one the panel has to mark.
+/// Neither of the two views can be identified through
+/// `Item::active_project_path` — `SoloDiffView` does not implement it and
+/// `CommitView`'s buffers are `DiskState::Historic`, so `Buffer::project_path`
+/// is `None` — hence the typed downcast.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OpenDiff {
+    /// A working-copy diff, the kind the Changes tab opens.
+    Working {
+        repository_id: RepositoryId,
+        repo_path: RepoPath,
+    },
+    /// A commit's diff, the kind the Commit tab opens. `file` is `None` for a
+    /// whole-commit view, which no single file row can claim.
+    Commit {
+        sha: SharedString,
+        file: Option<RepoPath>,
+    },
+}
+
+impl OpenDiff {
+    fn from_active_item(item: Option<&dyn workspace::ItemHandle>, cx: &App) -> Option<Self> {
+        let item = item?;
+        if let Some(solo_diff) = item.downcast::<SoloDiffView>() {
+            let solo_diff = solo_diff.read(cx);
+            return Some(Self::Working {
+                repository_id: solo_diff.repository_id(),
+                repo_path: solo_diff.repo_path().clone(),
+            });
+        }
+        if let Some(commit_view) = item.downcast::<CommitView>() {
+            let commit_view = commit_view.read(cx);
+            return Some(Self::Commit {
+                sha: commit_view.sha().clone(),
+                file: commit_view.single_file().cloned(),
+            });
+        }
+        None
+    }
+
+    /// The working-copy file this diff shows, when it belongs to
+    /// `repository_id`. A second repository in the same window can hold the
+    /// same relative path, so the id has to agree before a Changes row claims
+    /// the mark.
+    fn working_file(&self, repository_id: RepositoryId) -> Option<&RepoPath> {
+        match self {
+            Self::Working {
+                repository_id: open_repository_id,
+                repo_path,
+            } if *open_repository_id == repository_id => Some(repo_path),
+            _ => None,
+        }
+    }
+
+    /// The file of `sha` this diff shows. `None` for a different commit:
+    /// otherwise the Commit tab would mark its own row for a diff that belongs
+    /// to some other commit which happens to touch the same path.
+    fn commit_file(&self, sha: &str) -> Option<&RepoPath> {
+        match self {
+            Self::Commit {
+                sha: open_sha,
+                file: Some(file),
+            } if open_sha.as_ref() == sha => Some(file),
+            _ => None,
+        }
+    }
+}
 
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -922,7 +995,20 @@ pub struct GitPanel {
     scroll_handle: UniformListScrollHandle,
     max_width_item_index: Option<usize>,
     selected_entry: Option<usize>,
-    marked_entries: Vec<usize>,
+    /// Which diff the centre pane is currently showing — the panel's single
+    /// source of truth for the "you are looking at this file" mark that both
+    /// tabs render. Written only from the `ActiveItemChanged` subscription.
+    ///
+    /// Deliberately *not* an index into `entries`, which is rebuilt on every
+    /// status refresh and would leave the mark pointing at whatever row
+    /// inherited the index (this is why the dead `marked_entries: Vec<usize>`
+    /// it replaces could never have worked). Deliberately *not* on
+    /// `CommitTabState` either, which is rebuilt on every commit-selection
+    /// push — the same reason `commit_message_height` lives out here.
+    ///
+    /// It reflects the pane and never drives it: feeding it back into which
+    /// diff *opens* would close a loop with the preview-slot retargeting.
+    open_diff: Option<OpenDiff>,
     tracked_count: usize,
     tracked_staged_count: usize,
     update_visible_entries_task: Task<()>,
@@ -1113,6 +1199,28 @@ impl GitPanel {
             )
             .detach();
 
+            // Track which diff the centre pane is showing, so both tabs can
+            // mark the file the user is actually looking at. Same shape as the
+            // outline panel's: re-derive from the active item on every change
+            // and clear when it is not one of ours.
+            cx.subscribe_in(
+                &workspace
+                    .weak_handle()
+                    .upgrade()
+                    .expect("have a &mut Workspace"),
+                window,
+                |this, workspace, event, _window, cx| {
+                    if matches!(event, workspace::Event::ActiveItemChanged) {
+                        let open_diff = {
+                            let active_item = workspace.read(cx).active_item(cx);
+                            OpenDiff::from_active_item(active_item.as_deref(), cx)
+                        };
+                        this.set_open_diff(open_diff, cx);
+                    }
+                },
+            )
+            .detach();
+
             // Re-pick the active repository whenever the solution-wide active
             // member flips so the panel tracks the newly-selected project.
             // (`try_global`: tests and non-Solution contexts have no store —
@@ -1160,7 +1268,7 @@ impl GitPanel {
                 scroll_handle,
                 max_width_item_index: None,
                 selected_entry: None,
-                marked_entries: Vec::new(),
+                open_diff: OpenDiff::from_active_item(workspace.active_item(cx).as_deref(), cx),
                 tracked_count: 0,
                 tracked_staged_count: 0,
                 update_visible_entries_task: Task::ready(()),
@@ -1192,6 +1300,31 @@ impl GitPanel {
 
     pub fn entry_by_path(&self, path: &RepoPath) -> Option<usize> {
         self.entries_indices.get(path).copied()
+    }
+
+    fn set_open_diff(&mut self, open_diff: Option<OpenDiff>, cx: &mut Context<Self>) {
+        if self.open_diff == open_diff {
+            return;
+        }
+        self.open_diff = open_diff;
+        cx.notify();
+    }
+
+    /// Whether `repo_path` in `repository_id` is the working-copy diff the
+    /// centre pane is showing. Drives the Changes tab's mark.
+    fn is_open_working_diff(&self, repository_id: RepositoryId, repo_path: &RepoPath) -> bool {
+        self.open_diff
+            .as_ref()
+            .and_then(|open_diff| open_diff.working_file(repository_id))
+            == Some(repo_path)
+    }
+
+    /// The file of `sha` the centre pane is showing, if any. Drives the Commit
+    /// tab's mark.
+    fn open_commit_file(&self, sha: &str) -> Option<&RepoPath> {
+        self.open_diff
+            .as_ref()
+            .and_then(|open_diff| open_diff.commit_file(sha))
     }
 
     /// Move the Changes list's selection onto `path`, expanding whatever
@@ -7462,14 +7595,15 @@ mod tests {
             staging: StageStatus::Unstaged,
             diff_stat: None,
         };
-        let disabled = entry_context_menu_items(&deleted, false)
-            .iter()
-            .find_map(|item| match item {
-                EntryMenuItem::Action {
-                    label, disabled, ..
-                } if *label == "Jump to Source" => Some(*disabled),
-                _ => None,
-            });
+        let disabled =
+            entry_context_menu_items(&deleted, false)
+                .iter()
+                .find_map(|item| match item {
+                    EntryMenuItem::Action {
+                        label, disabled, ..
+                    } if *label == "Jump to Source" => Some(*disabled),
+                    _ => None,
+                });
         assert_eq!(disabled, Some(true));
     }
 
@@ -8338,6 +8472,218 @@ mod tests {
         });
     }
 
+    /// The panel marks the diff the *pane* is showing, which is a different
+    /// question from which row was last clicked: the two come apart the moment
+    /// the user activates another tab. Every step here drives the pane and
+    /// reads the panel — no row is ever clicked.
+    #[gpui::test]
+    async fn test_open_diff_mark_tracks_the_active_pane_item(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "one.txt": "one\n",
+                "two.txt": "two\n",
+            }),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("one.txt", "old one\n".into()),
+                ("two.txt", "old two\n".into()),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+
+        cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        })
+        .await;
+        cx.run_until_parked();
+
+        let (repository, repository_id, one, two) = panel.update(cx, |panel, cx| {
+            let repository = panel
+                .active_repository
+                .clone()
+                .expect("the project has one repository");
+            let repository_id = repository.read(cx).id;
+            let mut paths = panel
+                .entries
+                .iter()
+                .filter_map(|entry| entry.status_entry())
+                .map(|entry| entry.repo_path.clone());
+            let one = paths.next().expect("two files are modified");
+            let two = paths.next().expect("two files are modified");
+            (repository, repository_id, one, two)
+        });
+
+        let one_index = panel.update(cx, |panel, _| {
+            panel.entry_by_path(&one).expect("the first file has a row")
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(one_index);
+            panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.open_diff,
+                Some(OpenDiff::Working {
+                    repository_id,
+                    repo_path: one.clone(),
+                }),
+            );
+            assert!(panel.is_open_working_diff(repository_id, &one));
+            assert!(!panel.is_open_working_diff(repository_id, &two));
+        });
+
+        let two_index = panel.update(cx, |panel, _| {
+            panel
+                .entry_by_path(&two)
+                .expect("the second file has a row")
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(two_index);
+            panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.open_diff,
+                Some(OpenDiff::Working {
+                    repository_id,
+                    repo_path: two.clone(),
+                }),
+            );
+        });
+
+        // A commit's single-file diff is a different kind of mark, and it is
+        // scoped to its own commit.
+        workspace.update_in(cx, |_workspace, window, cx| {
+            let workspace_handle = cx.weak_entity();
+            CommitView::open_file_diff(
+                "abc123".to_string(),
+                repository.downgrade(),
+                workspace_handle,
+                one.clone(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.open_diff,
+                Some(OpenDiff::Commit {
+                    sha: "abc123".into(),
+                    file: Some(one.clone()),
+                }),
+            );
+            assert_eq!(panel.open_commit_file("abc123"), Some(&one));
+            assert_eq!(
+                panel.open_commit_file("def456"),
+                None,
+                "a different commit's row must not claim the mark"
+            );
+            assert!(
+                !panel.is_open_working_diff(repository_id, &one),
+                "a commit diff is not the working-copy diff of the same path"
+            );
+        });
+
+        // Activating a tab that is already open moves the mark, even though
+        // nothing touched the panel — the case a click-driven selection gets
+        // wrong.
+        let first_diff = workspace.update(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<SoloDiffView>(cx)
+                .find(|view| view.read(cx).repo_path() == &one)
+                .expect("the first file's diff is still open")
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&first_diff, true, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.open_diff,
+                Some(OpenDiff::Working {
+                    repository_id,
+                    repo_path: one.clone(),
+                }),
+                "the mark follows the pane, not the last row acted on"
+            );
+        });
+
+        // The stacked accordion is neither view, and names no single file.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_entry = Some(one_index);
+            panel.open_accordion_diff(&menu::SecondaryConfirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, _| {
+            assert_eq!(
+                panel.open_diff, None,
+                "an active item that is neither diff view clears the mark"
+            );
+            assert!(!panel.is_open_working_diff(repository_id, &one));
+        });
+    }
+
+    /// The two cases the integration test above cannot reach through the UI:
+    /// a whole-commit view (no file to mark) and a same-path row in a second
+    /// repository open in the same window.
+    #[test]
+    fn test_open_diff_scopes_the_mark_to_its_own_commit_and_repository() {
+        let first_repository = RepositoryId(1);
+        let second_repository = RepositoryId(2);
+        let path = repo_path("src/lib.rs");
+
+        let working = OpenDiff::Working {
+            repository_id: first_repository,
+            repo_path: path.clone(),
+        };
+        assert_eq!(working.working_file(first_repository), Some(&path));
+        assert_eq!(working.working_file(second_repository), None);
+        assert_eq!(working.commit_file("abc123"), None);
+
+        let commit_file = OpenDiff::Commit {
+            sha: "abc123".into(),
+            file: Some(path.clone()),
+        };
+        assert_eq!(commit_file.commit_file("abc123"), Some(&path));
+        assert_eq!(commit_file.commit_file("def456"), None);
+        assert_eq!(commit_file.working_file(first_repository), None);
+
+        let whole_commit = OpenDiff::Commit {
+            sha: "abc123".into(),
+            file: None,
+        };
+        assert_eq!(
+            whole_commit.commit_file("abc123"),
+            None,
+            "a whole-commit view is not any one file's diff"
+        );
+    }
+
     #[test]
     fn test_file_count_label() {
         assert_eq!(file_count_label(0), "0 files");
@@ -9099,6 +9445,61 @@ mod tests {
             repository: repository.clone(),
             shas,
         }
+    }
+
+    /// `CommitTabState` is rebuilt from scratch on every selection push, so the
+    /// mark cannot live there — stepping to the next commit in the graph would
+    /// wipe the record of the diff still on screen.
+    #[gpui::test]
+    async fn test_open_diff_mark_survives_a_commit_selection_push(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        let path = repo_path("src/lib.rs");
+        panel.update(cx, |panel, cx| {
+            panel.set_open_diff(
+                Some(OpenDiff::Commit {
+                    sha: "823a3f8a".into(),
+                    file: Some(path.clone()),
+                }),
+                cx,
+            );
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        // Stepping to another commit rebuilds the tab's whole state.
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("1f2e3d4c")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.commit_tab_is_open());
+            assert_eq!(
+                panel.open_commit_file("823a3f8a"),
+                Some(&path),
+                "the rebuilt tab state must not have taken the mark with it"
+            );
+            assert_eq!(
+                panel.open_commit_file("1f2e3d4c"),
+                None,
+                "the newly selected commit's rows must not inherit the mark"
+            );
+        });
     }
 
     #[gpui::test]

@@ -94,6 +94,7 @@ ztracing.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
 unicode-script.workspace = true
+unicode-width.workspace = true
 unindent = { workspace = true, optional = true }
 ui.workspace = true
 ui_input.workspace = true

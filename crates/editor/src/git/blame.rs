@@ -43,10 +43,6 @@ pub struct BlameOptions {
     pub follow_renames: bool,
     pub color_mode: ColorMode,
     pub author_filter: AuthorFilter,
-    /// When `true`, render the per-line date as an absolute timestamp;
-    /// otherwise relative ("3d ago"). Configurable via the gutter
-    /// toolbar.
-    pub absolute_dates: bool,
 }
 
 /// Tells [`GitBlame`] how to annotate a buffer that is not a project file.
@@ -127,7 +123,16 @@ pub struct GitBlame {
 }
 
 pub trait BlameRenderer {
-    fn max_author_length(&self) -> usize;
+    /// The widest author name the gutter will draw, in monospace columns.
+    /// Names wider than this are truncated by the renderer, so the gutter's
+    /// width reservation can clamp to it.
+    fn max_author_columns(&self) -> usize;
+
+    /// Monospace columns the gutter row spends on everything that is not the
+    /// author name — the date, any avatar, the gaps between them. The
+    /// renderer owns the row's layout, so it is the only thing that can
+    /// answer this; the editor just adds it to the author budget.
+    fn gutter_fixed_columns(&self, cx: &App) -> usize;
 
     fn render_blame_entry(
         &self,
@@ -207,7 +212,11 @@ pub trait BlameRenderer {
 }
 
 impl BlameRenderer for () {
-    fn max_author_length(&self) -> usize {
+    fn max_author_columns(&self) -> usize {
+        0
+    }
+
+    fn gutter_fixed_columns(&self, _: &App) -> usize {
         0
     }
 
@@ -450,26 +459,28 @@ impl GitBlame {
         })
     }
 
-    pub fn max_author_length(&mut self, cx: &mut App) -> usize {
-        let mut max_author_length = 0;
+    /// How many monospace columns the widest author name in the file needs
+    /// once the gutter has shortened it.
+    ///
+    /// Columns, not bytes and not `char`s: the gutter reserves
+    /// `columns * ch_advance` pixels, so measuring the name any other way
+    /// makes the reservation wrong — under for a wide CJK glyph, and roughly
+    /// double for Cyrillic, whose letters are two bytes and one column.
+    pub fn max_author_display_columns(&mut self, cx: &mut App) -> usize {
         self.sync_all(cx);
 
+        let mut max_columns = 0;
         for buffer in self.buffers.values() {
             for entry in buffer.entries.iter() {
-                let author_len = entry
-                    .blame
-                    .as_ref()
-                    .and_then(|entry| entry.author.as_ref())
-                    .map(|author| author.len());
-                if let Some(author_len) = author_len
-                    && author_len > max_author_length
-                {
-                    max_author_length = author_len;
-                }
+                let Some(blame_entry) = entry.blame.as_ref() else {
+                    continue;
+                };
+                let author = ::git::blame::display_author(blame_entry.author.as_deref());
+                max_columns = max_columns.max(unicode_width::UnicodeWidthStr::width(author));
             }
         }
 
-        max_author_length
+        max_columns
     }
 
     pub fn blur(&mut self, _: &mut Context<Self>) {

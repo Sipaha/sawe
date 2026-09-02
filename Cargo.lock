@@ -7964,6 +7964,7 @@ dependencies = [
  "tracing",
  "ui",
  "ui_input",
+ "unicode-width",
  "unindent",
  "util",
  "uuid",

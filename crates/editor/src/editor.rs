@@ -1220,7 +1220,7 @@ pub struct EditorSnapshot {
     show_breakpoints: Option<bool>,
     show_bookmarks: Option<bool>,
     split_side: Option<SplitSide>,
-    git_blame_gutter_max_author_length: Option<usize>,
+    git_blame_gutter_max_author_columns: Option<usize>,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_display_snapshot: Option<DisplaySnapshot>,
     is_focused: bool,
@@ -2958,13 +2958,13 @@ impl Editor {
     }
 
     pub fn snapshot(&self, window: &Window, cx: &mut App) -> EditorSnapshot {
-        let git_blame_gutter_max_author_length = self
+        let git_blame_gutter_max_author_columns = self
             .render_git_blame_gutter(cx)
             .then(|| {
                 if let Some(blame) = self.blame.as_ref() {
-                    let max_author_length =
-                        blame.update(cx, |blame, cx| blame.max_author_length(cx));
-                    Some(max_author_length)
+                    let max_author_columns =
+                        blame.update(cx, |blame, cx| blame.max_author_display_columns(cx));
+                    Some(max_author_columns)
                 } else {
                     None
                 }
@@ -2986,7 +2986,7 @@ impl Editor {
             show_bookmarks: self.show_bookmarks,
             show_breakpoints: self.show_breakpoints,
             split_side: self.split_side,
-            git_blame_gutter_max_author_length,
+            git_blame_gutter_max_author_columns,
             scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
             display_snapshot,
             placeholder_display_snapshot: self
@@ -11548,21 +11548,20 @@ impl EditorSnapshot {
             let show_breakpoints = self.show_breakpoints.unwrap_or(gutter_settings.breakpoints);
             let show_bookmarks = self.show_bookmarks.unwrap_or(gutter_settings.bookmarks);
 
+            // The reservation has to be an upper bound on what the renderer
+            // actually draws, or the blame text paints over the line numbers.
+            // It used to guess the date at "60 minutes ago", seven columns
+            // short of the "1 year, 10 months ago" a real repository produces,
+            // and that is exactly what collided; the renderer now draws a
+            // fixed-width date and reports its own fixed cost.
             let git_blame_entries_width =
-                self.git_blame_gutter_max_author_length
-                    .map(|max_author_length| {
+                self.git_blame_gutter_max_author_columns
+                    .map(|max_author_columns| {
                         let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
-                        const MAX_RELATIVE_TIMESTAMP: &str = "60 minutes ago";
+                        let columns = max_author_columns.min(renderer.max_author_columns())
+                            + renderer.gutter_fixed_columns(cx);
 
-                        /// The number of characters to dedicate to gaps and margins.
-                        const SPACING_WIDTH: usize = 4;
-
-                        let max_char_count = max_author_length.min(renderer.max_author_length())
-                            + ::git::SHORT_SHA_LENGTH
-                            + MAX_RELATIVE_TIMESTAMP.len()
-                            + SPACING_WIDTH;
-
-                        ch_advance * max_char_count
+                        ch_advance * columns
                     });
 
             // A split diff's two panes must reserve identical columns or they

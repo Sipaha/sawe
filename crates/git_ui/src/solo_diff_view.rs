@@ -268,6 +268,18 @@ impl SoloDiffView {
         self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
     }
 
+    /// The repository this diff belongs to. Read by the git panel to decide
+    /// whether one of *its* rows is the diff the pane is showing; the same
+    /// relative path can exist in a second repository in the window.
+    pub fn repository_id(&self) -> RepositoryId {
+        self.repository_id
+    }
+
+    /// The working-copy file this diff is showing.
+    pub fn repo_path(&self) -> &RepoPath {
+        &self.repo_path
+    }
+
     /// Number of diff hunks in this file's diff. Also gates the prev/next-hunk
     /// buttons: with a single hunk there is nowhere to navigate to.
     fn hunk_count(&self, cx: &App) -> usize {

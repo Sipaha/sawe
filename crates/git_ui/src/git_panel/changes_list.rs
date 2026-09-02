@@ -26,6 +26,7 @@
 //! `visible_indices`, `section_counts`) remain declared on `GitPanel`.
 
 use super::*;
+use gpui::FontWeight;
 
 /// Left padding of a section header row (`Changes` / `Untracked` /
 /// `Conflicts`). Headers are the outermost level, so they get the bare row
@@ -44,6 +45,46 @@ fn header_row_padding() -> Pixels {
 /// space rather than inheriting a row's padding.
 fn content_row_padding(depth: usize) -> Pixels {
     px(ROW_LEFT_PADDING + SECTION_CONTENT_INDENT + depth as f32 * TREE_INDENT)
+}
+
+/// Resting / hover / active backgrounds for a changed-file row, given the two
+/// states it can be in at once: `selected` is the keyboard cursor, and
+/// `open_in_pane` is "this is the diff the centre pane is showing". The open
+/// row's wash is the stronger of the two — it is the one the eye is hunting
+/// for — and a row that is both sums them.
+///
+/// A free function rather than a `GitPanel` method because the Commit tab's
+/// file rows render outside the panel's own `impl` and must paint the same two
+/// states the same way; the wash is the shared half of that vocabulary, the
+/// bold file name is the other half.
+pub(super) fn row_background_colors(
+    selected: bool,
+    open_in_pane: bool,
+    cx: &App,
+) -> (Hsla, Hsla, Hsla) {
+    let info_color = cx.theme().status().info;
+    let colors = cx.theme().colors();
+
+    let base_bg = match (selected, open_in_pane) {
+        (true, true) => info_color.alpha(SELECTED_BG_ALPHA + MARKED_BG_ALPHA),
+        (true, false) => info_color.alpha(SELECTED_BG_ALPHA),
+        (false, true) => info_color.alpha(MARKED_BG_ALPHA),
+        (false, false) => colors.ghost_element_background,
+    };
+
+    if selected {
+        (
+            base_bg,
+            info_color.alpha(SELECTED_BG_ALPHA + STATE_OPACITY_STEP),
+            info_color.alpha(SELECTED_BG_ALPHA + STATE_OPACITY_STEP * 2.0),
+        )
+    } else {
+        (
+            base_bg,
+            colors.ghost_element_hover,
+            colors.ghost_element_active,
+        )
+    }
 }
 
 /// Height of one row of a changed-files list. A free function rather than a
@@ -494,32 +535,6 @@ impl GitPanel {
             .into_any_element()
     }
 
-    fn row_background_colors(&self, selected: bool, marked: bool, cx: &App) -> (Hsla, Hsla, Hsla) {
-        let info_color = cx.theme().status().info;
-        let colors = cx.theme().colors();
-
-        let base_bg = match (selected, marked) {
-            (true, true) => info_color.alpha(SELECTED_BG_ALPHA + MARKED_BG_ALPHA),
-            (true, false) => info_color.alpha(SELECTED_BG_ALPHA),
-            (false, true) => info_color.alpha(MARKED_BG_ALPHA),
-            (false, false) => colors.ghost_element_background,
-        };
-
-        if selected {
-            (
-                base_bg,
-                info_color.alpha(SELECTED_BG_ALPHA + STATE_OPACITY_STEP),
-                info_color.alpha(SELECTED_BG_ALPHA + STATE_OPACITY_STEP * 2.0),
-            )
-        } else {
-            (
-                base_bg,
-                colors.ghost_element_hover,
-                colors.ghost_element_active,
-            )
-        }
-    }
-
     pub(super) fn render_list_header(
         &self,
         ix: usize,
@@ -538,7 +553,7 @@ impl GitPanel {
         let expanded = !self.collapsed_sections.contains(&section);
         let count = self.section_counts.get(&section).copied().unwrap_or(0);
         let selected = self.selected_entry == Some(ix);
-        let (base_bg, hover_bg, active_bg) = self.row_background_colors(selected, false, cx);
+        let (base_bg, hover_bg, active_bg) = row_background_colors(selected, false, cx);
 
         h_flex()
             .id(id)
@@ -637,7 +652,9 @@ impl GitPanel {
         let display_name = entry.display_name(path_style);
 
         let selected = self.selected_entry == Some(ix);
-        let marked = self.marked_entries.contains(&ix);
+        // Not the same thing as `selected`: the cursor is where the keyboard
+        // is, this is what the centre pane is showing. One row can be both.
+        let open_in_pane = self.is_open_working_diff(repo.id, &entry.repo_path);
         let status_style = settings.status_style;
         let status = entry.status;
         let file_icon = if settings.file_icons {
@@ -704,7 +721,7 @@ impl GitPanel {
 
         let handle = cx.weak_entity();
 
-        let (base_bg, hover_bg, active_bg) = self.row_background_colors(selected, marked, cx);
+        let (base_bg, hover_bg, active_bg) = row_background_colors(selected, open_in_pane, cx);
 
         let name_row = h_flex()
             .min_w_0()
@@ -732,6 +749,7 @@ impl GitPanel {
                 if tree_view {
                     this.child(
                         self.entry_label(display_name, label_color)
+                            .when(open_in_pane, |label| label.weight(FontWeight::BOLD))
                             .when(status.is_deleted(), Label::strikethrough)
                             .truncate(),
                     )
@@ -744,6 +762,7 @@ impl GitPanel {
                         path_style,
                         git_path_style,
                         status.is_deleted(),
+                        open_in_pane,
                     ))
                 }
             });
@@ -877,7 +896,7 @@ impl GitPanel {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        // TODO: Have not yet plugged in self.marked_entries. Not sure when and why we need that
+        // Directory rows never carry the open-diff mark: the pane shows a file.
         let selected = self.selected_entry == Some(ix);
         let label_color = Color::Muted;
 
@@ -887,7 +906,7 @@ impl GitPanel {
         let checkbox_wrapper_id: ElementId =
             ElementId::Name(format!("dir_checkbox_wrapper_{}_{}", entry.name, ix).into());
 
-        let (base_bg, hover_bg, active_bg) = self.row_background_colors(selected, false, cx);
+        let (base_bg, hover_bg, active_bg) = row_background_colors(selected, false, cx);
 
         let settings = GitPanelSettings::get_global(cx);
         // Same lookup and the same (default) icon size the project panel uses
@@ -997,6 +1016,7 @@ impl GitPanel {
         path_style: PathStyle,
         git_path_style: GitPathStyle,
         strikethrough: bool,
+        bold_file_name: bool,
     ) -> Div {
         let file_name_first = git_path_style == GitPathStyle::FileNameFirst;
         let file_path_first = git_path_style == GitPathStyle::FilePathFirst;
@@ -1010,6 +1030,7 @@ impl GitPanel {
             .child(
                 div().flex_none().child(
                     self.entry_label(file_name, label_color)
+                        .when(bold_file_name, |label| label.weight(FontWeight::BOLD))
                         .when(strikethrough, Label::strikethrough),
                 ),
             )

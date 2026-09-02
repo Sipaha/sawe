@@ -429,6 +429,24 @@ pub fn git_status_icon(status: FileStatus) -> impl IntoElement {
     GitStatusIcon::new(status)
 }
 
+/// The fork's compact absolute commit date, e.g. `21 Mar 2019`.
+///
+/// Deliberately carries no time of day: it is the half of the timestamp
+/// someone scanning a commit list or a blame gutter is actually reading, and
+/// both of those columns are narrow. Shared so the Commit tab's identity line
+/// and the blame gutter cannot drift into spelling the same date differently.
+///
+/// The format is fixed-width for any four-digit year, which is what lets the
+/// blame gutter reserve an exact number of columns for it.
+pub(crate) fn format_compact_date(timestamp: i64) -> String {
+    static FORMAT: std::sync::OnceLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
+        std::sync::OnceLock::new();
+    let format = FORMAT.get_or_init(|| {
+        time::format_description::parse("[day] [month repr:short] [year]").unwrap_or_default()
+    });
+    crate::git_panel::commit_tab::format_with(timestamp, format)
+}
+
 fn soft_wrap_icon(is_soft_wrap_enabled: bool) -> IconName {
     if is_soft_wrap_enabled {
         IconName::TextUnwrap

@@ -564,7 +564,7 @@ pub struct InlineBlameSettings {
 pub struct BlameSettings {
     /// Whether to show the avatar of the author of the commit.
     ///
-    /// Default: true
+    /// Default: false
     pub show_avatar: bool,
 }
 

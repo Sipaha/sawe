@@ -16,7 +16,9 @@ use super::*;
 
 use git::repository::{CommitDetails, CommitDiff, CommitFile};
 use git::status::{StatusCode, TrackedStatus};
-use gpui::{AnyElement, ClipboardItem, StyleRefinement, TextStyleRefinement, UnderlineStyle};
+use gpui::{
+    AnyElement, ClipboardItem, FontWeight, StyleRefinement, TextStyleRefinement, UnderlineStyle,
+};
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use std::rc::Rc;
@@ -255,6 +257,19 @@ struct ChangedFileRowHandlers {
     toggle_directory: Rc<dyn Fn(&SharedString, &mut Window, &mut App)>,
 }
 
+/// The two independent highlight states a changed-file row can be in.
+///
+/// They are different questions and a row can answer yes to both: `cursor` is
+/// the row the user last put the pointer on, `open_in_pane` is the row whose
+/// diff the centre pane is showing. Clicking a row only *retargets* an already
+/// open single-file diff, so the two genuinely come apart — and activating an
+/// unrelated tab moves `open_in_pane` without touching `cursor`.
+#[derive(Clone, Copy)]
+struct ChangedFileRowMarks {
+    cursor: bool,
+    open_in_pane: bool,
+}
+
 #[derive(Clone)]
 struct ChangedFileEntry {
     status: FileStatus,
@@ -373,16 +388,24 @@ impl ChangedFileEntry {
         repository: WeakEntity<Repository>,
         workspace: WeakEntity<Workspace>,
         handlers: ChangedFileRowHandlers,
-        is_selected: bool,
+        marks: ChangedFileRowMarks,
+        cx: &App,
     ) -> AnyElement {
         let file_name = self.file_name.clone();
         let full_path = self.display_path();
 
         let handlers_for_click = handlers.clone();
+        // The two states a Changes row can also be in, painted from the same
+        // helper so the two tabs speak one visual language: a wash for the
+        // click cursor, a stronger wash plus a bold name for the diff the
+        // centre pane is actually showing.
+        let (base_bg, _, _) =
+            changes_list::row_background_colors(marks.cursor, marks.open_in_pane, cx);
 
         div()
             .w_full()
             .pl(indent)
+            .bg(base_bg)
             .on_mouse_down(MouseButton::Right, {
                 let repo_path = self.repo_path.clone();
                 move |event: &MouseDownEvent, window, cx| {
@@ -393,7 +416,6 @@ impl ChangedFileEntry {
             .child(
                 ButtonLike::new(("changed-file", ix))
                     .height(changes_list::list_item_height().into())
-                    .toggle_state(is_selected)
                     .child(
                         h_flex()
                             .min_w_0()
@@ -413,7 +435,13 @@ impl ChangedFileEntry {
                                     .flex_1()
                                     .gap_1()
                                     .child(git_status_icon(self.status))
-                                    .child(Label::new(file_name).truncate()),
+                                    .child(
+                                        Label::new(file_name)
+                                            .when(marks.open_in_pane, |label| {
+                                                label.weight(FontWeight::BOLD)
+                                            })
+                                            .truncate(),
+                                    ),
                             )
                             .children(self.stat.map(|stat| {
                                 div().flex_shrink_0().child(ui::DiffStat::new(
@@ -634,7 +662,7 @@ fn commit_identity(
     CommitIdentity {
         short_sha: short_sha.to_string().into(),
         author: (!author_name.is_empty()).then(|| author_name.to_string().into()),
-        date: timestamp.map(|timestamp| format_identity_date(timestamp).into()),
+        date: timestamp.map(|timestamp| crate::format_compact_date(timestamp).into()),
         tooltip: tooltip.into(),
     }
 }
@@ -774,15 +802,6 @@ fn identity_separator() -> Label {
     identity_label("·".into())
 }
 
-/// The line's date carries no time of day: it is the half of the timestamp a
-/// user scanning a commit list is actually reading, and the panel is narrow.
-fn identity_date_format() -> &'static [BorrowedFormatItem<'static>] {
-    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
-    FORMAT.get_or_init(|| {
-        time::format_description::parse("[day] [month repr:short] [year]").unwrap_or_default()
-    })
-}
-
 /// `on <date> at <time>` reads better with the two halves separated, so the
 /// tooltip spells the time out instead of reusing the log column's compact
 /// `[day] [month] [year] [hour]:[minute]`.
@@ -794,20 +813,19 @@ fn detail_timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
     })
 }
 
-fn format_with(timestamp: i64, format: &[BorrowedFormatItem<'static>]) -> String {
+pub(crate) fn format_with(timestamp: i64, format: &[BorrowedFormatItem<'static>]) -> String {
     let Ok(datetime) = OffsetDateTime::from_unix_timestamp(timestamp) else {
         return "Unknown".to_string();
     };
 
     let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    // `to_offset` panics rather than saturating when the shift would leave the
+    // representable range, which a timestamp at either end of the epoch does.
     datetime
-        .to_offset(local_offset)
+        .checked_to_offset(local_offset)
+        .unwrap_or(datetime)
         .format(format)
         .unwrap_or_default()
-}
-
-fn format_identity_date(timestamp: i64) -> String {
-    format_with(timestamp, identity_date_format())
 }
 
 fn format_detail_timestamp(timestamp: i64) -> String {
@@ -1863,9 +1881,7 @@ impl GitPanel {
                                 icon: None,
                                 formatted,
                                 expanded,
-                                toggle: |state| {
-                                    state.branches_expanded = !state.branches_expanded
-                                },
+                                toggle: |state| state.branches_expanded = !state.branches_expanded,
                             },
                             cx,
                         )),
@@ -2024,6 +2040,11 @@ impl GitPanel {
         let repository = state.selection.repository.downgrade();
         let workspace = self.workspace.clone();
         let selected_file = state.selected_file.clone();
+        // Resolved once for the whole list rather than per row: the mark is
+        // keyed by path, so it survives the tab's state being rebuilt on the
+        // next commit selection, and it is only ever *read* here — never fed
+        // back into which diff opens.
+        let open_file = self.open_commit_file(&commit_sha).cloned();
         let scroll_handle = state.scroll_handle.clone();
         let handlers = self.commit_file_row_handlers(cx);
 
@@ -2038,7 +2059,7 @@ impl GitPanel {
                 uniform_list(
                     "commit-tab-files-list",
                     row_count,
-                    move |range, _window, _cx| {
+                    move |range, _window, cx| {
                         range
                             .filter_map(|ix| {
                                 let row = rows.get(ix)?;
@@ -2063,7 +2084,13 @@ impl GitPanel {
                                         repository.clone(),
                                         workspace.clone(),
                                         handlers.clone(),
-                                        selected_file.as_ref() == Some(&entry.repo_path),
+                                        ChangedFileRowMarks {
+                                            cursor: selected_file.as_ref()
+                                                == Some(&entry.repo_path),
+                                            open_in_pane: open_file.as_ref()
+                                                == Some(&entry.repo_path),
+                                        },
+                                        cx,
                                     ),
                                 })
                             })
@@ -2727,8 +2754,7 @@ mod tests {
                 .selection
                 .shas = vec![second];
         });
-        cx.executor()
-            .advance_clock(BRANCHES_CONTAINING_DEBOUNCE);
+        cx.executor().advance_clock(BRANCHES_CONTAINING_DEBOUNCE);
         cx.run_until_parked();
 
         panel.read_with(cx, |panel, _| {
@@ -2749,9 +2775,7 @@ mod tests {
     /// `tags_containing` on the trait's empty default, so a loader that asked
     /// the containment question would leave the row empty.
     #[gpui::test]
-    async fn test_the_tag_row_loads_the_tags_pointing_at_the_commit(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn test_the_tag_row_loads_the_tags_pointing_at_the_commit(cx: &mut gpui::TestAppContext) {
         let (panel, repository, fs, mut cx) = commit_tab_panel(cx).await;
         let cx = &mut cx;
 

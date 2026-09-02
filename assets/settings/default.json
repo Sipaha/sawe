@@ -1757,8 +1757,13 @@
       // The minimum column number to show the inline blame information at
       "min_column": 0,
     },
+    // The blame gutter sits beside code, so it is kept narrow: a fixed-width
+    // date and the shortest part of the author's name that still tells people
+    // apart. The avatar is off by default because it is one more column in
+    // that gutter and, without a remote that serves avatars, it is only a
+    // generic person icon.
     "blame": {
-      "show_avatar": true,
+      "show_avatar": false,
     },
     // Control which information is shown in the branch picker.
     "branch_picker": {
