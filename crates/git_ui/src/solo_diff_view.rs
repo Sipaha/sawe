@@ -338,6 +338,10 @@ pub struct SoloDiffView {
     buffer: Entity<Buffer>,
     multibuffer: Entity<MultiBuffer>,
     editor: Entity<SplittableEditor>,
+    /// Held rather than read back off the workspace: `clone_on_split` runs
+    /// inside `Workspace::split_and_clone`, i.e. while the workspace entity is
+    /// already being updated, and reading it there panics.
+    project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     hunk_count_cache: HunkCountCache,
     /// `Some` exactly when the source is [`DiffSource::Commit`].
@@ -695,6 +699,7 @@ impl SoloDiffView {
             buffer,
             multibuffer,
             editor,
+            project,
             workspace: workspace.downgrade(),
             hunk_count_cache: HunkCountCache::default(),
             commit_file,
@@ -999,7 +1004,7 @@ impl Item for SoloDiffView {
         let Some(workspace) = self.workspace.upgrade() else {
             return Task::ready(None);
         };
-        let project = workspace.read(cx).project().clone();
+        let project = self.project.clone();
         let diff_view_style = self.editor.read(cx).diff_view_style();
         // The same multibuffer, not a second one built from the same buffers:
         // the excerpts, the expanded-hunk state and the diff all live on it,
@@ -1039,6 +1044,7 @@ impl Item for SoloDiffView {
                 buffer,
                 multibuffer: self.multibuffer.clone(),
                 editor,
+                project: self.project.clone(),
                 workspace: self.workspace.clone(),
                 // Deliberately not shared: the memo is a `Cell` keyed on the
                 // multibuffer's own summaries, so the clone repopulates it on
@@ -1386,7 +1392,7 @@ mod tests {
     use settings::SettingsStore;
     use std::path::Path;
     use util::path;
-    use workspace::MultiWorkspace;
+    use workspace::{MultiWorkspace, SplitDirection};
 
     /// Two full shas — `load_commit_file_blob` shortens them itself, so a
     /// stub-length sha would not exercise the same code.
@@ -2173,10 +2179,84 @@ mod tests {
     }
 
     /// Splitting the pane was a gesture the commit source had through
-    /// `CommitView`. Both sources keep it, and the clone has to be configured
-    /// for the same source rather than for the default.
+    /// `CommitView` and the working-tree source never had at all. Both keep
+    /// it, and the clone has to be configured for its own source rather than
+    /// for the default.
+    ///
+    /// One source per test, deliberately: a *second* split in the same
+    /// workspace narrows the panes enough to unsplit one of the diffs, and
+    /// unsplitting a clone that shares its multibuffer trips a debug assertion
+    /// in `editor::display_map`. That is not this task's bug — an untouched
+    /// `CommitView`, split twice, hits the same assertion — but there is no
+    /// reason for these tests to walk into it.
+    async fn assert_splits_into_a_working_clone(
+        context: &DiffTestContext,
+        view: &Entity<SoloDiffView>,
+        cx: &mut VisualTestContext,
+    ) {
+        assert!(view.read_with(cx, |view, _| Item::can_split(view)));
+        let pane = context
+            .workspace
+            .read_with(cx, |workspace, _| workspace.active_pane().clone());
+        // Through `Workspace::split_and_clone`, never `clone_on_split`
+        // directly: the real gesture calls it *while the workspace entity is
+        // being updated*, so a clone that read anything back off the workspace
+        // would double-lease and panic. Calling it directly from a test is
+        // exactly the shape that hides that — it took a live editor to find.
+        let new_pane = context
+            .workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.activate_item(view, true, false, window, cx);
+                workspace.split_and_clone(pane, SplitDirection::Right, window, cx)
+            })
+            .await
+            .expect("a splittable item produces a second pane");
+        cx.run_until_parked();
+        let clone = new_pane
+            .read_with(cx, |pane, _| {
+                pane.active_item()
+                    .and_then(|item| item.downcast::<SoloDiffView>())
+            })
+            .expect("the new pane holds the cloned diff");
+
+        let (source_matches, same_multibuffer, distinct_editor, controls, blame, hunks) = cx
+            .update(|_window, cx| {
+                let original = view.read(cx);
+                let clone = clone.read(cx);
+                (
+                    clone.source().matches(original.source(), cx),
+                    clone.multibuffer == original.multibuffer,
+                    clone.editor != original.editor,
+                    clone.editor.read(cx).diff_hunk_controls_disabled()
+                        == original.editor.read(cx).diff_hunk_controls_disabled(),
+                    clone.editor.read(cx).lhs_blame_base().cloned()
+                        == original.editor.read(cx).lhs_blame_base().cloned(),
+                    (clone.hunk_count(cx), original.hunk_count(cx)),
+                )
+            });
+        assert!(source_matches, "the clone shows what the original showed");
+        assert!(same_multibuffer, "over the very same multibuffer");
+        assert!(distinct_editor, "through an editor of its own");
+        assert!(controls, "with the source's hunk-control rule re-applied");
+        assert!(blame, "and the source's blame base re-applied");
+        assert_eq!(hunks.0, hunks.1, "so it counts the same hunks");
+        assert!(hunks.0 > 0, "and actually has excerpts to count");
+    }
+
     #[gpui::test]
-    async fn test_either_source_splits_into_a_working_second_view(cx: &mut TestAppContext) {
+    async fn test_a_working_tree_diff_splits_into_a_second_view(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+
+        let view = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+
+        assert_splits_into_a_working_clone(&context, &view, &mut cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_a_commit_diff_splits_into_a_second_view(cx: &mut TestAppContext) {
         let (context, mut cx) = diff_test_context(cx).await;
         set_commit(
             &context,
@@ -2184,48 +2264,12 @@ mod tests {
             vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
         );
 
-        let working_tree = open_working_tree(&context, "a.rs", &mut cx)
-            .await
-            .expect("the working-tree file opens")
-            .expect("the gesture opened a view");
-        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+        let view = open_commit(&context, SHA, "src/lib.rs", &mut cx)
             .await
             .expect("the commit's file opens")
             .expect("the gesture opened a view");
 
-        for view in [&working_tree, &commit] {
-            assert!(view.read_with(&cx, |view, _| Item::can_split(view)));
-            let clone = view
-                .update_in(&mut cx, |view, window, cx| {
-                    view.clone_on_split(None, window, cx)
-                })
-                .await
-                .expect("a splittable view produces a clone");
-            cx.run_until_parked();
-
-            let (source_matches, same_multibuffer, distinct_editor, controls, blame, hunks) = cx
-                .update(|_window, cx| {
-                    let original = view.read(cx);
-                    let clone = clone.read(cx);
-                    (
-                        clone.source().matches(original.source(), cx),
-                        clone.multibuffer == original.multibuffer,
-                        clone.editor != original.editor,
-                        clone.editor.read(cx).diff_hunk_controls_disabled()
-                            == original.editor.read(cx).diff_hunk_controls_disabled(),
-                        clone.editor.read(cx).lhs_blame_base().cloned()
-                            == original.editor.read(cx).lhs_blame_base().cloned(),
-                        (clone.hunk_count(cx), original.hunk_count(cx)),
-                    )
-                });
-            assert!(source_matches, "the clone shows what the original showed");
-            assert!(same_multibuffer, "over the very same multibuffer");
-            assert!(distinct_editor, "through an editor of its own");
-            assert!(controls, "with the source's hunk-control rule re-applied");
-            assert!(blame, "and the source's blame base re-applied");
-            assert_eq!(hunks.0, hunks.1, "so it counts the same hunks");
-            assert!(hunks.0 > 0, "and actually has excerpts to count");
-        }
+        assert_splits_into_a_working_clone(&context, &view, &mut cx).await;
     }
 
     /// `SoloDiffView` used to install its own `SettingsStore` observer on top
