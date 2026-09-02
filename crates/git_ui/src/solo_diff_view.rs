@@ -444,7 +444,7 @@ impl SoloDiffView {
             .any(|view| view.entity_id() == preview_id)
     }
 
-    /// Steps 1 and 2 of the one open algorithm both git-panel tabs run —
+    /// The prologue of the one open algorithm both git-panel tabs run —
     /// everything that can be decided before the source is loaded.
     ///
     /// Nothing here pins: `unpreview_item_if_preview` would promote the shared
@@ -458,6 +458,18 @@ impl SoloDiffView {
         window: &mut Window,
         cx: &mut App,
     ) -> GestureOutcome {
+        // The guard comes before the reuse search, and the order matters: a
+        // retarget with no shared diff tab open must do *nothing*, not quietly
+        // activate a matching view that happens to be pinned somewhere. That
+        // is what the pre-unification code did — the Changes tab checked the
+        // preview slot in `move_diff_to_entry` and never reached the open call
+        // at all — and it is the difference between arrow-stepping down the
+        // list and arrow-stepping down the list while a pane jumps to a pinned
+        // diff and never jumps back.
+        if mode == DiffOpen::Retarget && !Self::preview_holds_a_diff(workspace, cx) {
+            return GestureOutcome::Declined;
+        }
+
         // A duplicate tab for the same source is never what the user asked
         // for, whichever gesture got them here — and the search is
         // workspace-wide, so a diff parked in another pane is found too.
@@ -476,9 +488,6 @@ impl SoloDiffView {
             return GestureOutcome::Reused(existing);
         }
 
-        if mode == DiffOpen::Retarget && !Self::preview_holds_a_diff(workspace, cx) {
-            return GestureOutcome::Declined;
-        }
         GestureOutcome::Load
     }
 
@@ -1499,6 +1508,40 @@ mod tests {
                 view.editor.read(cx).diff_hunk_controls_disabled(),
                 "a commit's hunks have nothing to stage or restore"
             );
+        });
+    }
+
+    /// The flag behind [`SplittableEditor::diff_hunk_controls_disabled`] must
+    /// track the renderer, not merely the first call: a view that disables the
+    /// controls at construction and installs its own later still paints them.
+    #[gpui::test]
+    async fn test_installing_a_renderer_undoes_disabled_hunk_controls(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        commit.update(&mut cx, |view, cx| {
+            view.editor.update(cx, |editor, cx| {
+                assert!(editor.diff_hunk_controls_disabled());
+                editor.set_render_diff_hunk_controls(
+                    Arc::new(|_, _: &_, _, _, _, _: &_, _: &mut _, _: &mut _| {
+                        gpui::Empty.into_any_element()
+                    }),
+                    cx,
+                );
+                assert!(
+                    !editor.diff_hunk_controls_disabled(),
+                    "a renderer installed after the fact takes the controls back"
+                );
+            });
         });
     }
 

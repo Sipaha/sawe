@@ -92,7 +92,7 @@ impl AgentDiffPane {
         let project = thread.read(cx).project().clone();
         let editor = cx.new(|cx| {
             let workspace_entity = workspace.upgrade().expect("workspace must exist");
-            let diff_display_editor = SplittableEditor::new(
+            let mut diff_display_editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
                 multibuffer.clone(),
                 project.clone(),

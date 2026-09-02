@@ -470,13 +470,18 @@ impl SplittableEditor {
     }
 
     pub fn set_render_diff_hunk_controls(
-        &self,
+        &mut self,
         render_diff_hunk_controls: RenderDiffHunkControlsFn,
         cx: &mut Context<Self>,
     ) {
         self.update_editors(cx, |editor, cx| {
             editor.set_render_diff_hunk_controls(render_diff_hunk_controls.clone(), cx);
         });
+        // Installing a real renderer undoes `disable_diff_hunk_controls`, so
+        // the flag has to come back down with it: a view that disabled the
+        // controls at construction and installed its own later would otherwise
+        // keep reporting them as gone while painting them.
+        self.diff_hunk_controls_disabled = false;
     }
 
     pub fn disable_diff_hunk_controls(&mut self, cx: &mut Context<Self>) {
@@ -489,8 +494,10 @@ impl SplittableEditor {
         self.diff_hunk_controls_disabled = true;
     }
 
-    /// Whether [`Self::disable_diff_hunk_controls`] has taken the stage /
-    /// restore buttons away from this diff's hunks.
+    /// Whether [`Self::disable_diff_hunk_controls`] is the last thing to have
+    /// set this diff's hunk-control renderer — i.e. whether its hunks offer
+    /// stage / restore buttons at all right now. Installing a renderer through
+    /// [`Self::set_render_diff_hunk_controls`] puts it back to `false`.
     pub fn diff_hunk_controls_disabled(&self) -> bool {
         self.diff_hunk_controls_disabled
     }

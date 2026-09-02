@@ -8630,6 +8630,80 @@ mod tests {
                 workspace.active_pane().read(cx).preview_item_id()
             })
         }
+
+        fn active_item_id(&self, cx: &mut VisualTestContext) -> Option<gpui::EntityId> {
+            self.workspace.update_in(cx, |workspace, _window, cx| {
+                workspace.active_item(cx).map(|item| item.item_id())
+            })
+        }
+
+        fn diff_for(&self, path: &RepoPath, cx: &mut VisualTestContext) -> Entity<SoloDiffView> {
+            self.workspace.update_in(cx, |workspace, _window, cx| {
+                workspace
+                    .items_of_type::<SoloDiffView>(cx)
+                    .find(|view| view.read(cx).repo_path() == path)
+                    .expect("a diff for this file is open")
+            })
+        }
+
+        /// Promote a diff out of the pane's preview slot — what the editor's
+        /// own double-click-on-the-tab gesture does, and the only route to a
+        /// pinned diff now that no git-panel gesture pins.
+        fn pin(&self, view: &Entity<SoloDiffView>, cx: &mut VisualTestContext) {
+            self.workspace.update_in(cx, |workspace, _window, cx| {
+                workspace.active_pane().update(cx, |pane, _cx| {
+                    pane.unpreview_item_if_preview(view.entity_id());
+                });
+            });
+        }
+    }
+
+    /// A retarget may change what the shared diff tab shows, and nothing else.
+    /// With no shared tab in the preview slot it must not reach for a matching
+    /// diff pinned elsewhere either: arrow-stepping down the Changes list would
+    /// then make the pane jump to that pinned tab on the way past, and never
+    /// jump back. The pre-unification code could not do this — the Changes tab
+    /// checked the preview slot in `move_diff_to_entry` and never reached the
+    /// open call at all.
+    #[gpui::test]
+    async fn test_a_retarget_does_not_activate_a_pinned_diff(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let one = fixture.one.clone();
+        let two = fixture.two.clone();
+
+        fixture.click(&one, 2, &mut cx);
+        let first_diff = fixture.diff_for(&one, &mut cx);
+        fixture.pin(&first_diff, &mut cx);
+        fixture.click(&two, 2, &mut cx);
+        let second_diff = fixture.diff_for(&two, &mut cx);
+        fixture.pin(&second_diff, &mut cx);
+
+        assert_eq!(
+            fixture.preview_item_id(&mut cx),
+            None,
+            "both diffs are pinned, so there is no shared tab to retarget"
+        );
+        let active = fixture.active_item_id(&mut cx);
+        assert_eq!(active, Some(second_diff.entity_id()));
+
+        fixture.click(&one, 1, &mut cx);
+        assert_eq!(
+            fixture.active_item_id(&mut cx),
+            active,
+            "a single click must not activate the pinned diff of the file it \
+             landed on"
+        );
+
+        fixture.select(&two, &mut cx);
+        fixture.panel.update_in(&mut cx, |panel, window, cx| {
+            panel.previous_entry(&PreviousEntry, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fixture.active_item_id(&mut cx),
+            active,
+            "and neither must an arrow step onto it"
+        );
     }
 
     /// A single click in the Changes tab retargets the shared diff tab and
