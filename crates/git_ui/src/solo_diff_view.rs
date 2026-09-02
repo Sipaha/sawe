@@ -11,7 +11,10 @@ use editor::{
     multibuffer_context_lines,
 };
 use fs::Fs;
-use git::repository::RepoPath;
+use git::{
+    BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
+    parse_git_remote_url, repository::RepoPath, status::FileStatus,
+};
 use gpui::{
     Action, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, Render, Task, WeakEntity, Window,
@@ -241,6 +244,56 @@ impl DiffSource {
     }
 }
 
+/// Everything a freshly-built [`SplittableEditor`] needs on top of
+/// [`SplittableEditor::new`] to be the editor this source calls for.
+///
+/// [`SoloDiffView::new`] and `SoloDiffView::clone_on_split` both build one
+/// over the same multibuffer, and a split pane that staged hunks the original
+/// would not — or blamed a revision the original would not — is exactly the
+/// drift this shared helper exists to prevent. The excerpts are *not* here:
+/// they belong to the multibuffer, so the clone already has them.
+fn configure_editor_for_source(
+    editor: &mut SplittableEditor,
+    source: &DiffSource,
+    commit_file: Option<&CommitFileFacts>,
+    cx: &mut Context<SplittableEditor>,
+) {
+    if let DiffSource::Commit { .. } = source {
+        // History has nothing to stage or revert.
+        editor.disable_diff_hunk_controls(cx);
+        editor.rhs_editor().update(cx, |editor, cx| {
+            editor.set_show_diff_review_button(true, cx);
+        });
+    }
+    if let Some(buffer_id) = commit_file.and_then(|facts| facts.binary_buffer_id) {
+        // The excerpt is a "(binary file not shown)" placeholder; folding it
+        // says so without pretending to be a diff.
+        editor.rhs_editor().update(cx, |editor, cx| {
+            editor.fold_buffers([buffer_id], cx);
+        });
+    }
+    editor.set_lhs_blame_base(source.blame_base(), cx);
+    editor.rhs_editor().update(cx, |editor, cx| {
+        editor.set_should_serialize(false, cx);
+    });
+}
+
+/// The repository's hosting provider, as `CommitView` parses it: the upstream
+/// remote if there is one, otherwise `origin`.
+fn parse_repository_remote(repository: &Entity<Repository>, cx: &mut App) -> Option<GitRemote> {
+    let snapshot = repository.read(cx).snapshot();
+    let remote_url = snapshot
+        .remote_upstream_url
+        .as_ref()
+        .or(snapshot.remote_origin_url.as_ref())?;
+    let provider_registry = GitHostingProviderRegistry::default_global(cx);
+    parse_git_remote_url(provider_registry, remote_url).map(|(host, parsed)| GitRemote {
+        host,
+        owner: parsed.owner.into(),
+        repo: parsed.repo.into(),
+    })
+}
+
 /// The buffers a [`DiffSource`] resolves to, as produced by whichever entry
 /// point loaded it. Kept apart from [`DiffSource`] because the two shapes are
 /// genuinely different: a working-tree file is one project buffer plus its
@@ -263,13 +316,36 @@ impl LoadedDiff {
     }
 }
 
+/// What the commit-file loader worked out that the view still needs once the
+/// `CommitFile` itself is gone.
+#[derive(Clone)]
+struct CommitFileFacts {
+    /// Whether the commit added, modified or deleted the file. The toolbar's
+    /// status icon has to come from here rather than from
+    /// `Repository::status_for_path`, which answers about the *working tree*
+    /// and would happily describe an unrelated uncommitted edit to the same
+    /// path.
+    status: FileStatus,
+    /// `Some` when the excerpt is the "(binary file not shown)" placeholder.
+    /// Folding is per-editor state, so a second editor over the same
+    /// multibuffer has to fold it again for itself.
+    binary_buffer_id: Option<language::BufferId>,
+}
+
 pub struct SoloDiffView {
     source: DiffSource,
     repository_id: RepositoryId,
     buffer: Entity<Buffer>,
+    multibuffer: Entity<MultiBuffer>,
     editor: Entity<SplittableEditor>,
     workspace: WeakEntity<Workspace>,
     hunk_count_cache: HunkCountCache,
+    /// `Some` exactly when the source is [`DiffSource::Commit`].
+    commit_file: Option<CommitFileFacts>,
+    /// The repository's hosting provider, parsed once at construction the way
+    /// `CommitView` does it, for the "View on <provider>" permalink. `None`
+    /// for a working-tree diff, which has no commit to link to.
+    remote: Option<GitRemote>,
 }
 
 impl SoloDiffView {
@@ -541,6 +617,17 @@ impl SoloDiffView {
         );
         let repository_id = source.repository().read(cx).id;
         let buffer = loaded.buffer().clone();
+        let commit_file = match &loaded {
+            LoadedDiff::WorkingTree { .. } => None,
+            LoadedDiff::Commit(blob) => Some(CommitFileFacts {
+                status: blob.status,
+                binary_buffer_id: blob.is_binary.then(|| blob.buffer.read(cx).remote_id()),
+            }),
+        };
+        let remote = match &source {
+            DiffSource::WorkingTree { .. } => None,
+            DiffSource::Commit { repository, .. } => parse_repository_remote(repository, cx),
+        };
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = match &loaded {
                 LoadedDiff::WorkingTree { buffer, diff } => {
@@ -561,19 +648,18 @@ impl SoloDiffView {
         let editor = cx.new(|cx| {
             let mut editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
-                multibuffer,
+                multibuffer.clone(),
                 project.clone(),
                 workspace.clone(),
                 window,
                 cx,
             );
 
+            // The excerpts have to exist before the source's configuration is
+            // applied: `sync_lhs_blame_sources` drops entries whose base
+            // buffer is not excerpted. A clone skips this step — the excerpts
+            // belong to the multibuffer, which it shares.
             if let LoadedDiff::Commit(blob) = &loaded {
-                // History has nothing to stage or revert.
-                editor.disable_diff_hunk_controls(cx);
-                editor.rhs_editor().update(cx, |editor, cx| {
-                    editor.set_show_diff_review_button(true, cx);
-                });
                 editor.update_excerpts_for_path(
                     blob.path_key.clone(),
                     blob.buffer.clone(),
@@ -582,22 +668,10 @@ impl SoloDiffView {
                     blob.diff.clone(),
                     cx,
                 );
-                if blob.is_binary {
-                    // The excerpt is a "(binary file not shown)" placeholder;
-                    // folding it says so without pretending to be a diff.
-                    let buffer_id = blob.buffer.read(cx).remote_id();
-                    editor.rhs_editor().update(cx, |editor, cx| {
-                        editor.fold_buffers([buffer_id], cx);
-                    });
-                }
             }
-
-            // After the excerpts exist: `sync_lhs_blame_sources` drops entries
-            // whose base buffer is not excerpted.
-            editor.set_lhs_blame_base(source.blame_base(), cx);
+            configure_editor_for_source(&mut editor, &source, commit_file.as_ref(), cx);
 
             editor.rhs_editor().update(cx, |editor, cx| {
-                editor.set_should_serialize(false, cx);
                 let snapshot = editor.snapshot(window, cx);
                 editor.go_to_hunk_before_or_after_position(
                     &snapshot,
@@ -619,9 +693,12 @@ impl SoloDiffView {
             source,
             repository_id,
             buffer,
+            multibuffer,
             editor,
             workspace: workspace.downgrade(),
             hunk_count_cache: HunkCountCache::default(),
+            commit_file,
+            remote,
         }
     }
 
@@ -651,6 +728,66 @@ impl SoloDiffView {
         self.hunk_count_cache.count(&snapshot)
     }
 
+    /// Everything [`SoloDiffGitToolbar`] paints about *what* this view is
+    /// showing, resolved without a frame so the per-source rules can be
+    /// tested without asserting on rendered elements.
+    pub(crate) fn git_toolbar_content(&self, cx: &App) -> GitToolbarContent {
+        let hunk_count = self.hunk_count(cx);
+        match &self.source {
+            DiffSource::WorkingTree {
+                repository,
+                repo_path,
+            } => {
+                // Read fresh on every render, with no subscription of our own:
+                // the toolbar is repainted because the pane repaints it, so a
+                // status that changed while this tab sat in the background is
+                // only as fresh as the next repaint. That was already true
+                // before this task; the commit branch below deliberately reads
+                // nothing that can go stale.
+                let status_entry = repository.read(cx).status_for_path(repo_path);
+                GitToolbarContent {
+                    status: status_entry.as_ref().map(|entry| entry.status),
+                    diff_stat: status_entry.and_then(|entry| entry.diff_stat),
+                    hunk_count,
+                    commit: None,
+                }
+            }
+            DiffSource::Commit { sha, .. } => {
+                // Not `status_for_path`: the working tree may have its own,
+                // unrelated change to this path, and describing a historic
+                // diff with it would be a lie rather than merely stale.
+                let (added, deleted) = self.multibuffer.read(cx).snapshot(cx).total_changed_lines();
+                GitToolbarContent {
+                    status: self.commit_file.as_ref().map(|facts| facts.status),
+                    diff_stat: Some(git::status::DiffStat { added, deleted }),
+                    hunk_count,
+                    commit: Some(CommitToolbarInfo {
+                        sha: sha.clone(),
+                        short_sha: sha
+                            .get(0..git::SHORT_SHA_LENGTH)
+                            .unwrap_or(sha)
+                            .to_string()
+                            .into(),
+                        permalink: self.remote.as_ref().map(|remote| {
+                            let parsed_remote = ParsedGitRemote {
+                                owner: remote.owner.as_ref().into(),
+                                repo: remote.repo.as_ref().into(),
+                            };
+                            let url = remote
+                                .host
+                                .build_commit_permalink(
+                                    &parsed_remote,
+                                    BuildCommitPermalinkParams { sha },
+                                )
+                                .to_string();
+                            (remote.host.name().into(), url)
+                        }),
+                    }),
+                }
+            }
+        }
+    }
+
     fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut App) {
         self.focus_handle(cx).focus(window, cx);
         let action = action.boxed_clone();
@@ -658,6 +795,32 @@ impl SoloDiffView {
             cx.dispatch_action(action.as_ref());
         });
     }
+}
+
+/// What [`SoloDiffGitToolbar`] shows, resolved from a [`SoloDiffView`].
+///
+/// The status and the `+N −M` figures are the same two slots for either
+/// source but are read from completely different places, and only a commit
+/// source contributes [`Self::commit`]. Keeping that as data rather than as
+/// branches inside `render` is what makes it testable.
+pub(crate) struct GitToolbarContent {
+    pub(crate) status: Option<FileStatus>,
+    pub(crate) diff_stat: Option<git::status::DiffStat>,
+    pub(crate) hunk_count: usize,
+    pub(crate) commit: Option<CommitToolbarInfo>,
+}
+
+/// The part of the toolbar only a [`DiffSource::Commit`] has.
+pub(crate) struct CommitToolbarInfo {
+    /// The full sha, which is what `git_panel::OpenAtCommit` and the
+    /// permalink need — a short one finds nothing.
+    pub(crate) sha: SharedString,
+    /// The abbreviated sha, so the user can see *which* commit they are
+    /// reading; the tab title carries only the file's basename.
+    pub(crate) short_sha: SharedString,
+    /// `(provider name, permalink)`, absent when the repository has no remote
+    /// this fork recognises a hosting provider for.
+    pub(crate) permalink: Option<(SharedString, String)>,
 }
 
 impl EventEmitter<EditorEvent> for SoloDiffView {}
@@ -818,6 +981,73 @@ impl Item for SoloDiffView {
                 editor.added_to_workspace(workspace, window, cx)
             })
         });
+    }
+
+    fn can_split(&self) -> bool {
+        true
+    }
+
+    fn clone_on_split(
+        &self,
+        _workspace_id: Option<workspace::WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Self>>>
+    where
+        Self: Sized,
+    {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Task::ready(None);
+        };
+        let project = workspace.read(cx).project().clone();
+        let diff_view_style = self.editor.read(cx).diff_view_style();
+        // The same multibuffer, not a second one built from the same buffers:
+        // the excerpts, the expanded-hunk state and the diff all live on it,
+        // and a clone that rebuilt them would drift from the original the
+        // moment either side changed.
+        let multibuffer = self.multibuffer.clone();
+        let source = self.source.clone();
+        let commit_file = self.commit_file.clone();
+        let repository_id = self.repository_id;
+        let buffer = self.buffer.clone();
+        let remote = self.remote.clone();
+
+        Task::ready(Some(cx.new(|cx| {
+            let editor = cx.new({
+                let source = source.clone();
+                let commit_file = commit_file.clone();
+                // Reborrow `window` so the `move` closure consumes the
+                // reborrow (which ends when `cx.new` returns) rather than the
+                // caller's `&mut Window`.
+                let window = &mut *window;
+                move |cx| {
+                    let mut editor = SplittableEditor::new(
+                        diff_view_style,
+                        multibuffer,
+                        project,
+                        workspace,
+                        window,
+                        cx,
+                    );
+                    configure_editor_for_source(&mut editor, &source, commit_file.as_ref(), cx);
+                    editor
+                }
+            });
+            Self {
+                source,
+                repository_id,
+                buffer,
+                multibuffer: self.multibuffer.clone(),
+                editor,
+                workspace: self.workspace.clone(),
+                // Deliberately not shared: the memo is a `Cell` keyed on the
+                // multibuffer's own summaries, so the clone repopulates it on
+                // its first render and the two views never write to one cell.
+                hunk_count_cache: HunkCountCache::default(),
+                commit_file,
+                remote,
+            }
+        })))
     }
 
     fn can_save(&self, cx: &App) -> bool {
@@ -1047,15 +1277,7 @@ impl Render for SoloDiffGitToolbar {
         let Some(solo_diff) = self.solo_diff() else {
             return div();
         };
-        let solo_diff = solo_diff.read(cx);
-        let hunk_count = solo_diff.hunk_count(cx);
-        let status_entry = solo_diff
-            .source
-            .repository()
-            .read(cx)
-            .status_for_path(solo_diff.source.repo_path());
-        let status = status_entry.as_ref().map(|entry| entry.status);
-        let diff_stat = status_entry.and_then(|entry| entry.diff_stat);
+        let content = solo_diff.read(cx).git_toolbar_content(cx);
 
         h_group_xl()
             .my_neg_1()
@@ -1063,15 +1285,80 @@ impl Render for SoloDiffGitToolbar {
             .items_center()
             .flex_wrap()
             .justify_between()
-            .children(status.map(|status| git_status_icon(status).into_any_element()))
-            .children(diff_stat.map(|stat| {
+            .children(
+                content
+                    .status
+                    .map(|status| git_status_icon(status).into_any_element()),
+            )
+            .children(content.diff_stat.map(|stat| {
                 DiffStat::new("solo-diff-stat", stat.added as usize, stat.deleted as usize)
                     .into_any_element()
             }))
             .child(
-                Label::new(difference_count_label(hunk_count))
+                Label::new(difference_count_label(content.hunk_count))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
+            )
+            .children(content.commit.as_ref().map(|commit| {
+                Label::new(commit.short_sha.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element()
+            }))
+            .child(vertical_divider())
+            // Buffer search is offered for *either* source: `as_searchable`
+            // already returns this view's editor whatever it is showing, so
+            // the button is an affordance for something both sources can
+            // already do, and one shared tab whose search button blinked out
+            // whenever a click retargeted it from an uncommitted change to a
+            // commit's file would be the exact chrome drift this refactor is
+            // undoing. (`QuickActionBar`, which offers this button for a plain
+            // editor, downcasts to `Editor` and so is hidden here.)
+            .child(
+                IconButton::new("solo-diff-buffer-search", IconName::MagnifyingGlass)
+                    .icon_size(IconSize::Small)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action(
+                            "Buffer Search",
+                            &zed_actions::buffer_search::Deploy::find(),
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(zed_actions::buffer_search::Deploy::find()),
+                            cx,
+                        );
+                    }),
+            )
+            .children(content.commit.as_ref().map(|commit| {
+                let sha = commit.sha.to_string();
+                IconButton::new("solo-diff-show-in-git-graph", IconName::GitGraph)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Show in Git Graph"))
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(crate::git_panel::OpenAtCommit { sha: sha.clone() }),
+                            cx,
+                        );
+                    })
+                    .into_any_element()
+            }))
+            .children(
+                content
+                    .commit
+                    .as_ref()
+                    .and_then(|commit| commit.permalink.clone())
+                    .map(|(provider_name, url)| {
+                        IconButton::new(
+                            "solo-diff-view-on-provider",
+                            crate::get_provider_icon(&provider_name),
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text(format!("View on {provider_name}")))
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .into_any_element()
+                    }),
             )
             .child(div().w_1())
     }
@@ -1136,7 +1423,24 @@ mod tests {
     /// A one-repository workspace whose `a.rs` has an uncommitted change, so
     /// both entry points have something real to open.
     async fn diff_test_context(cx: &mut TestAppContext) -> (DiffTestContext, VisualTestContext) {
+        diff_test_context_with_remote(cx, None).await
+    }
+
+    /// The same fixture, with `origin` pointed at `remote_url` before the
+    /// project is built — `SoloDiffView::new` parses the remote once, so it
+    /// has to be in place before the view exists.
+    async fn diff_test_context_with_remote(
+        cx: &mut TestAppContext,
+        remote_url: Option<&str>,
+    ) -> (DiffTestContext, VisualTestContext) {
         init_test(cx);
+        if remote_url.is_some() {
+            cx.update(|cx| {
+                git::GitHostingProviderRegistry::default_global(cx).register_hosting_provider(
+                    Arc::new(git_hosting_providers::Github::public_instance()),
+                );
+            });
+        }
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree(
@@ -1151,6 +1455,9 @@ mod tests {
             path!("/project/.git").as_ref(),
             &[("a.rs", "one\ntwo\nthree\n".into())],
         );
+        if let Some(remote_url) = remote_url {
+            fs.set_remote_for_repo(path!("/project/.git").as_ref(), "origin", remote_url);
+        }
 
         let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
         let window_handle =
@@ -1586,6 +1893,339 @@ mod tests {
             1,
             "and reuses the one tab rather than adding a second"
         );
+    }
+
+    /// Both toolbars key off `act_as::<SoloDiffView>`, which resolves through
+    /// `Item::act_as_type` — so a source that stopped answering there would
+    /// silently lose its whole toolbar rather than fail to compile.
+    #[gpui::test]
+    async fn test_both_toolbars_claim_either_source_and_nothing_else(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let working_tree = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+        let unrelated: Box<dyn ItemHandle> =
+            Box::new(cx.update(|window, cx| cx.new(|cx| Editor::single_line(window, cx))));
+
+        let git_toolbar = cx.update(|_window, cx| cx.new(SoloDiffGitToolbar::new));
+        let style_toolbar = cx.update(|_window, cx| cx.new(SoloDiffStyleToolbar::new));
+
+        for (source_name, view) in [("working tree", &working_tree), ("commit", &commit)] {
+            let item: Box<dyn ItemHandle> = Box::new(view.clone());
+            assert_eq!(
+                git_toolbar.update_in(&mut cx, |toolbar, window, cx| {
+                    toolbar.set_active_pane_item(Some(item.as_ref()), window, cx)
+                }),
+                ToolbarItemLocation::PrimaryRight,
+                "the git toolbar must serve a {source_name} diff"
+            );
+            assert_eq!(
+                style_toolbar.update_in(&mut cx, |toolbar, window, cx| {
+                    toolbar.set_active_pane_item(Some(item.as_ref()), window, cx)
+                }),
+                ToolbarItemLocation::PrimaryLeft,
+                "the style toolbar must serve a {source_name} diff"
+            );
+        }
+
+        assert_eq!(
+            git_toolbar.update_in(&mut cx, |toolbar, window, cx| {
+                toolbar.set_active_pane_item(Some(unrelated.as_ref()), window, cx)
+            }),
+            ToolbarItemLocation::Hidden,
+        );
+        assert_eq!(
+            style_toolbar.update_in(&mut cx, |toolbar, window, cx| {
+                toolbar.set_active_pane_item(Some(unrelated.as_ref()), window, cx)
+            }),
+            ToolbarItemLocation::Hidden,
+        );
+    }
+
+    /// An uncommitted diff describes the working tree: the status icon and the
+    /// `+N −M` figures come from the repository's status entry, and there is
+    /// no revision to name or link to.
+    #[gpui::test]
+    async fn test_the_git_toolbar_describes_the_working_tree(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+
+        let view = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+
+        view.read_with(&cx, |view, cx| {
+            let content = view.git_toolbar_content(cx);
+            let status_entry = context
+                .repository
+                .read(cx)
+                .status_for_path(&repo_path("a.rs"))
+                .expect("a.rs is modified in the working tree");
+            assert_eq!(content.status, Some(status_entry.status));
+            assert_eq!(content.diff_stat, status_entry.diff_stat);
+            assert_eq!(
+                content.diff_stat,
+                Some(git::status::DiffStat {
+                    added: 3,
+                    deleted: 3
+                }),
+                "the repository's numstat — the view's own diff of a.rs is one \
+                 changed line, so these figures could not have come from it"
+            );
+            assert_eq!(content.hunk_count, view.hunk_count(cx));
+            assert!(
+                content.commit.is_none(),
+                "a working-tree diff has no revision to name, jump to or link to"
+            );
+        });
+    }
+
+    /// A commit's diff describes the commit: the status is the one the commit
+    /// gave the file, the `+N −M` figures are the view's own, and the short
+    /// sha plus the git-graph jump are present.
+    #[gpui::test]
+    async fn test_the_git_toolbar_describes_the_commit(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", None, Some("one\ntwo\n"))],
+        );
+
+        let view = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        view.read_with(&cx, |view, cx| {
+            let content = view.git_toolbar_content(cx);
+            assert_eq!(
+                content.status,
+                Some(FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Added,
+                    worktree_status: StatusCode::Unmodified,
+                })),
+                "the commit created this file, so the icon must say added"
+            );
+            assert_eq!(
+                content.diff_stat,
+                Some(git::status::DiffStat {
+                    added: 2,
+                    deleted: 0
+                }),
+                "the figures are the view's own diff, not any numstat"
+            );
+            let commit = content.commit.expect("a commit source names its revision");
+            assert_eq!(
+                commit.sha.as_ref(),
+                SHA,
+                "the graph jump needs the full sha"
+            );
+            assert_eq!(
+                commit.short_sha.as_ref(),
+                &SHA[0..git::SHORT_SHA_LENGTH],
+                "but the label is the abbreviated one"
+            );
+            assert_eq!(
+                commit.permalink, None,
+                "this fixture's repository has no remote"
+            );
+        });
+    }
+
+    /// The regression this task exists to close: before it, the toolbar read
+    /// `status_for_path` for *every* source, so a commit's diff of a path that
+    /// also has an uncommitted change described the uncommitted change.
+    #[gpui::test]
+    async fn test_the_commit_toolbar_ignores_a_dirty_working_tree(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        // The very path the working tree has modified, at a commit that
+        // *deleted* it — so the two answers cannot be confused for each other.
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("a.rs", Some("gone\n"), None)],
+        );
+
+        let view = open_commit(&context, SHA, "a.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        view.read_with(&cx, |view, cx| {
+            let working_tree_status = context
+                .repository
+                .read(cx)
+                .status_for_path(&repo_path("a.rs"))
+                .expect("a.rs is also modified in the working tree");
+            let content = view.git_toolbar_content(cx);
+            assert_eq!(
+                content.status,
+                Some(FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Deleted,
+                    worktree_status: StatusCode::Unmodified,
+                })),
+                "the commit deleted the file; the working tree merely modified it"
+            );
+            assert_ne!(
+                content.status,
+                Some(working_tree_status.status),
+                "the two answers must not be the same one"
+            );
+            assert_ne!(
+                content.diff_stat, working_tree_status.diff_stat,
+                "and neither must the figures beside them"
+            );
+        });
+    }
+
+    /// The "View on <provider>" permalink is built from the repository's
+    /// parsed remote, the way `CommitViewToolbar` built it.
+    #[gpui::test]
+    async fn test_a_commit_with_a_recognised_remote_gets_a_permalink(cx: &mut TestAppContext) {
+        let (context, mut cx) =
+            diff_test_context_with_remote(cx, Some("https://github.com/owner/repo.git")).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+        let working_tree = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+
+        commit.read_with(&cx, |view, cx| {
+            let commit = view
+                .git_toolbar_content(cx)
+                .commit
+                .expect("a commit source names its revision");
+            assert_eq!(
+                commit.permalink,
+                Some((
+                    "GitHub".into(),
+                    format!("https://github.com/owner/repo/commit/{SHA}")
+                )),
+            );
+        });
+        working_tree.read_with(&cx, |view, cx| {
+            assert!(
+                view.git_toolbar_content(cx).commit.is_none(),
+                "an uncommitted change has no commit to permalink to"
+            );
+        });
+    }
+
+    /// `CommitViewToolbar` recounted every hunk on every render. The unified
+    /// toolbar must not carry that over for the source it inherited.
+    #[gpui::test]
+    async fn test_the_hunk_count_is_memoised_for_a_commit_source(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file(
+                "src/lib.rs",
+                Some("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"),
+                Some("1 changed\n2\n3\n4\n5\n6\n7\n8\n9\n10 changed\n"),
+            )],
+        );
+
+        let view = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        view.read_with(&cx, |view, cx| {
+            let counted = view.hunk_count(cx);
+            assert_eq!(counted, 2, "the fixture's commit has two hunks");
+            let (key, cached) = view
+                .hunk_count_cache
+                .0
+                .get()
+                .expect("the first count populates the memo");
+            assert_eq!(cached, counted);
+            // Plant a value the walk could never produce: a second call that
+            // still returns it never walked the multibuffer again.
+            view.hunk_count_cache.0.set(Some((key, counted + 100)));
+            assert_eq!(
+                view.hunk_count(cx),
+                counted + 100,
+                "a commit source's hunk count must be memoised, not recounted"
+            );
+        });
+    }
+
+    /// Splitting the pane was a gesture the commit source had through
+    /// `CommitView`. Both sources keep it, and the clone has to be configured
+    /// for the same source rather than for the default.
+    #[gpui::test]
+    async fn test_either_source_splits_into_a_working_second_view(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let working_tree = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        for view in [&working_tree, &commit] {
+            assert!(view.read_with(&cx, |view, _| Item::can_split(view)));
+            let clone = view
+                .update_in(&mut cx, |view, window, cx| {
+                    view.clone_on_split(None, window, cx)
+                })
+                .await
+                .expect("a splittable view produces a clone");
+            cx.run_until_parked();
+
+            let (source_matches, same_multibuffer, distinct_editor, controls, blame, hunks) = cx
+                .update(|_window, cx| {
+                    let original = view.read(cx);
+                    let clone = clone.read(cx);
+                    (
+                        clone.source().matches(original.source(), cx),
+                        clone.multibuffer == original.multibuffer,
+                        clone.editor != original.editor,
+                        clone.editor.read(cx).diff_hunk_controls_disabled()
+                            == original.editor.read(cx).diff_hunk_controls_disabled(),
+                        clone.editor.read(cx).lhs_blame_base().cloned()
+                            == original.editor.read(cx).lhs_blame_base().cloned(),
+                        (clone.hunk_count(cx), original.hunk_count(cx)),
+                    )
+                });
+            assert!(source_matches, "the clone shows what the original showed");
+            assert!(same_multibuffer, "over the very same multibuffer");
+            assert!(distinct_editor, "through an editor of its own");
+            assert!(controls, "with the source's hunk-control rule re-applied");
+            assert!(blame, "and the source's blame base re-applied");
+            assert_eq!(hunks.0, hunks.1, "so it counts the same hunks");
+            assert!(hunks.0 > 0, "and actually has excerpts to count");
+        }
     }
 
     /// `SoloDiffView` used to install its own `SettingsStore` observer on top

@@ -635,17 +635,17 @@ impl SplittableEditor {
     /// revision of the right pane's path and blaming it would be misleading.
     /// Passing `None` turns left-pane blame back off, e.g. when a view
     /// switches to a diff base that has no single commit-ish.
+    pub fn set_lhs_blame_base(&mut self, revision: Option<SharedString>, cx: &mut Context<Self>) {
+        self.lhs_blame_base = revision;
+        let paths = self.diff_paths(cx);
+        self.sync_lhs_blame_sources(&paths, cx);
+    }
+
     /// The revision the left-hand pane is being blamed against, if any. A
     /// consumer's blame base is derived from what it is showing, so this is
     /// how a test pins that derivation without reaching into blame itself.
     pub fn lhs_blame_base(&self) -> Option<&SharedString> {
         self.lhs_blame_base.as_ref()
-    }
-
-    pub fn set_lhs_blame_base(&mut self, revision: Option<SharedString>, cx: &mut Context<Self>) {
-        self.lhs_blame_base = revision;
-        let paths = self.diff_paths(cx);
-        self.sync_lhs_blame_sources(&paths, cx);
     }
 
     /// Tells the left-hand editor how to blame each detached base-text buffer.
