@@ -540,15 +540,20 @@ impl Render for BufferSearchBar {
                 ))
             });
 
+        // Still needed below: the replace/close rows pad themselves to line up
+        // under whatever the leading group put in the first column.
         let has_collapse_button = collapse_expand_button.is_some();
 
         let search_line = h_flex()
             .w_full()
             .gap_2()
             .when(find_in_results, |el| el.child(alignment_element()))
-            .when(!find_in_results && has_collapse_button, |el| {
-                el.pl_0p5().child(collapse_expand_button.expect("button"))
-            })
+            .when_some(
+                (!find_in_results)
+                    .then_some(collapse_expand_button)
+                    .flatten(),
+                |el, collapse_expand_button| el.pl_0p5().child(collapse_expand_button),
+            )
             .child(query_column)
             .child(mode_column);
 
@@ -781,12 +786,7 @@ impl ToolbarItemView for BufferSearchBar {
             let is_project_search = searchable_item_handle.supported_options(cx).find_in_results;
             self.active_searchable_item = Some(searchable_item_handle);
             drop(self.update_matches(true, false, window, cx));
-            // Either group is reason enough to take the slot. Both predicates
-            // are asked here rather than only the collapse one, because a diff
-            // that has style controls but nothing to collapse would otherwise
-            // be told to hide, and nothing recomputes the location afterwards:
-            // the `_splittable_editor_subscription` only notifies.
-            if self.needs_expand_collapse_option(cx) || self.paints_diff_style_controls(cx) {
+            if self.keeps_primary_left(cx) {
                 return ToolbarItemLocation::PrimaryLeft;
             } else if !self.is_dismissed() {
                 if is_project_search {
@@ -1010,7 +1010,7 @@ impl BufferSearchBar {
             }
         }
 
-        let needs_collapse_expand = self.needs_expand_collapse_option(cx);
+        let keeps_primary_left = self.keeps_primary_left(cx);
 
         if let Some(active_editor) = self.active_searchable_item.as_mut() {
             self.selection_search_enabled = None;
@@ -1021,7 +1021,7 @@ impl BufferSearchBar {
             self.focus(&handle, window, cx);
         }
 
-        if needs_collapse_expand {
+        if keeps_primary_left {
             cx.emit(Event::UpdateLocation);
             cx.emit(ToolbarItemEvent::ChangeLocation(
                 ToolbarItemLocation::PrimaryLeft,
@@ -1122,7 +1122,7 @@ impl BufferSearchBar {
         cx.notify();
         cx.emit(Event::UpdateLocation);
         cx.emit(ToolbarItemEvent::ChangeLocation(
-            if self.needs_expand_collapse_option(cx) {
+            if self.keeps_primary_left(cx) {
                 ToolbarItemLocation::PrimaryLeft
             } else {
                 ToolbarItemLocation::Secondary
@@ -1183,6 +1183,19 @@ impl BufferSearchBar {
             .as_ref()
             .and_then(|weak| weak.upgrade())
             .is_some_and(|editor| !editor.read(cx).style_controls_painted_by_consumer())
+    }
+
+    /// Whether the bar's leading group has anything in it, and therefore
+    /// whether the bar belongs in `PrimaryLeft` rather than `Secondary` /
+    /// `Hidden`.
+    ///
+    /// Three places emit the location independently — `set_active_pane_item`,
+    /// [`Self::show`] and [`Self::dismiss`] — and nothing recomputes it
+    /// afterwards, so a diff that answered `PrimaryLeft` when its tab opened
+    /// and something else on the first `ctrl-f` would lose its style controls
+    /// until the user switched tabs and back. They all ask this.
+    fn keeps_primary_left(&self, cx: &App) -> bool {
+        self.needs_expand_collapse_option(cx) || self.paints_diff_style_controls(cx)
     }
 
     /// Whether "Collapse All Files" has any files to collapse.

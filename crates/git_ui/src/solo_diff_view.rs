@@ -1400,6 +1400,7 @@ mod tests {
     use settings::SettingsStore;
     use std::path::Path;
     use util::path;
+    use workspace::ToolbarItemEvent;
     use workspace::{MultiWorkspace, SplitDirection};
 
     /// Two full shas — `load_commit_file_blob` shortens them itself, so a
@@ -2258,7 +2259,87 @@ mod tests {
                 "and it has to take the slot even with nothing to collapse \
                  (headerless={headerless})"
             );
+
+            // The slot has to survive a search, too. `show` and `dismiss`
+            // re-emit the location themselves and nothing recomputes it
+            // afterwards, so a bar that answered differently there would drop
+            // the controls on the first ctrl-f and never bring them back.
+            let mut events = cx.events::<ToolbarItemEvent, BufferSearchBar>(&search_bar);
+            search_bar.update_in(&mut cx, |search_bar, window, cx| {
+                search_bar.show(window, cx);
+            });
+            assert_eq!(
+                events.try_recv().expect("show emits a location"),
+                ToolbarItemEvent::ChangeLocation(ToolbarItemLocation::PrimaryLeft),
+                "ctrl-f must not evict the diff controls (headerless={headerless})"
+            );
+            search_bar.update_in(&mut cx, |search_bar, window, cx| {
+                search_bar.dismiss(&search::buffer_search::Dismiss, window, cx);
+            });
+            assert_eq!(
+                events.try_recv().expect("dismiss emits a location"),
+                ToolbarItemEvent::ChangeLocation(ToolbarItemLocation::PrimaryLeft),
+                "and neither must escaping out of it (headerless={headerless})"
+            );
         }
+    }
+
+    /// `set_active_pane_item` saying `PrimaryLeft` is not the same claim as
+    /// the bar actually painting the four buttons — the two were gated
+    /// separately, and that gap is what shipped the compare-range regression.
+    /// So assert the painted element tree: `IconButton` registers a
+    /// `debug_selector` of `ICON-{icon:?}`, which `VisualTestContext::
+    /// debug_bounds` can look up after a draw.
+    #[gpui::test]
+    async fn test_the_search_bar_paints_the_style_controls_and_nothing_else(
+        cx: &mut TestAppContext,
+    ) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        let project = context
+            .workspace
+            .read_with(&cx, |workspace, _| workspace.project().clone());
+        let workspace = context.workspace.clone();
+
+        // Headerless and empty — a compare-range `CommitView` at `add_item`.
+        let editor = cx.update(|window, cx| {
+            let multibuffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadOnly));
+            cx.new(|cx| {
+                SplittableEditor::new(
+                    DiffViewStyle::Split,
+                    multibuffer,
+                    project,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        let search_bar =
+            cx.update(|window, cx| cx.new(|cx| BufferSearchBar::new(None, window, cx)));
+        let item: Box<dyn ItemHandle> = Box::new(editor);
+        search_bar.update_in(&mut cx, |search_bar, window, cx| {
+            search_bar.set_active_pane_item(Some(item.as_ref()), window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(1200.), gpui::px(60.)),
+            |_window, _cx| search_bar.clone().into_any_element(),
+        );
+
+        for icon in ["ICON-ArrowUp", "ICON-ArrowDown", "ICON-DiffUnified"] {
+            assert!(
+                cx.debug_bounds(icon).is_some(),
+                "{icon} must actually be painted, not merely permitted"
+            );
+        }
+        assert!(
+            cx.debug_bounds("ICON-ChevronDownUp").is_none(),
+            "and there is nothing here to collapse, so no chevron beside them"
+        );
     }
 
     /// Splitting the pane was a gesture the commit source had through
