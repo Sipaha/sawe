@@ -8,6 +8,7 @@
 //! follow-ups alongside.
 
 mod branch_popover;
+mod filter_cursor;
 mod path_popover;
 mod user_popover;
 
@@ -897,5 +898,27 @@ impl Render for DateFilterPopover {
             .border_color(cx.theme().colors().border)
             .rounded_md()
             .child(body)
+    }
+}
+
+/// Scaffolding shared by the three filter popovers' tests: each of them needs
+/// the same global init plus a real window to hand `Editor::single_line` a
+/// `Window`, and the popover modules are siblings, so the helper lives here in
+/// their common parent rather than being copied three times.
+#[cfg(test)]
+mod test_support {
+    use gpui::TestAppContext;
+    use settings::SettingsStore;
+
+    pub(super) fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            git_ui::init(cx);
+            project_panel::init(cx);
+            crate::init(cx);
+        });
     }
 }

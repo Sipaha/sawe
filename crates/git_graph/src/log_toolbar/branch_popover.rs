@@ -14,13 +14,14 @@ use editor::Editor;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use git::repository::Branch;
 use gpui::{
-    Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window,
-    rems, uniform_list,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, Task, WeakEntity, Window, rems, uniform_list,
 };
 use project::git_store::Repository;
 use ui::{Checkbox, Divider, HighlightedLabel, ListItem, ListItemSpacing, ToggleState, prelude::*};
 
+use super::filter_cursor::FilterCursor;
 use crate::GitGraph;
 
 pub(super) const POPOVER_WIDTH_REMS: f32 = 24.0;
@@ -56,6 +57,9 @@ pub struct BranchFilterPopover {
     selected: BTreeSet<SharedString>,
     query: Entity<Editor>,
     rows: Vec<Row>,
+    /// Keyboard cursor into `rows` — where Enter will toggle. Orthogonal to
+    /// `selected`, which is the checked set `Apply` commits.
+    cursor: FilterCursor,
     match_task: Option<Task<()>>,
     cancel_flag: Arc<AtomicBool>,
     focus_handle: FocusHandle,
@@ -108,12 +112,18 @@ impl BranchFilterPopover {
             selected: active.into_iter().collect(),
             query,
             rows: Vec::new(),
+            cursor: FilterCursor::new(),
             match_task: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             focus_handle,
             _subscriptions: subscriptions,
         };
         this.refresh_matches(cx);
+        // `PopoverMenu::show_menu` focuses `Focusable::focus_handle` two frames
+        // later, and that now resolves to the query editor, so this call only
+        // covers hosts that focus the view at construction time. It cannot race
+        // the deferred one — they aim at the same handle.
+        this.query.focus_handle(cx).focus(window, cx);
         this
     }
 
@@ -204,6 +214,13 @@ impl BranchFilterPopover {
             }
         }
         self.rows = rows;
+        let rows = &self.rows;
+        self.cursor
+            .reset(rows.len(), |ix| Self::is_actionable(rows, ix));
+    }
+
+    fn is_actionable(rows: &[Row], index: usize) -> bool {
+        matches!(rows.get(index), Some(Row::Branch { .. }))
     }
 
     fn toggle_branch(&mut self, ref_name: SharedString, cx: &mut Context<Self>) {
@@ -211,6 +228,83 @@ impl BranchFilterPopover {
             self.selected.insert(ref_name);
         }
         cx.notify();
+    }
+
+    /// Enter toggles the cursored row's checkbox and leaves the popover open —
+    /// the same thing a click on that row does. Applying and closing here would
+    /// make the checkboxes unreachable from the keyboard, since the popover
+    /// stages a whole set behind an explicit Apply button.
+    fn confirm(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(Row::Branch { index, .. }) = self.rows.get(self.cursor.index()) else {
+            return;
+        };
+        let Some(ref_name) = self
+            .branches
+            .get(*index)
+            .map(|entry| entry.ref_name.clone())
+        else {
+            return;
+        };
+        self.toggle_branch(ref_name, cx);
+    }
+
+    /// `ctrl-enter` — the keyboard route to the Apply button.
+    fn secondary_confirm(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply(cx);
+    }
+
+    fn handle_cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        self.cancel(cx);
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        let rows = &self.rows;
+        if self
+            .cursor
+            .select_next(rows.len(), |ix| Self::is_actionable(rows, ix))
+        {
+            cx.notify();
+        }
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = &self.rows;
+        if self
+            .cursor
+            .select_previous(|ix| Self::is_actionable(rows, ix))
+        {
+            cx.notify();
+        }
+    }
+
+    fn select_first(&mut self, _: &menu::SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+        let rows = &self.rows;
+        if self
+            .cursor
+            .select_first(rows.len(), |ix| Self::is_actionable(rows, ix))
+        {
+            cx.notify();
+        }
+    }
+
+    fn select_last(&mut self, _: &menu::SelectLast, _: &mut Window, cx: &mut Context<Self>) {
+        let rows = &self.rows;
+        if self
+            .cursor
+            .select_last(rows.len(), |ix| Self::is_actionable(rows, ix))
+        {
+            cx.notify();
+        }
     }
 
     fn apply(&mut self, cx: &mut Context<Self>) {
@@ -244,8 +338,14 @@ impl BranchFilterPopover {
 impl EventEmitter<DismissEvent> for BranchFilterPopover {}
 
 impl Focusable for BranchFilterPopover {
-    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        // Hand out the query editor's handle, not the container's: this is what
+        // `PopoverMenu::show_menu` focuses (two frames after opening), so
+        // returning the container would leave the caret nowhere and force a
+        // click into the field before typing. The container element still
+        // declares the key_context and the `on_action` handlers, and it is an
+        // ancestor of the focused editor, so menu actions still reach it.
+        self.query.focus_handle(cx)
     }
 }
 
@@ -322,6 +422,11 @@ impl Render for BranchFilterPopover {
                                         .inset(true)
                                         .spacing(ListItemSpacing::Sparse)
                                         .toggle_state(is_selected)
+                                        // Checked rows get the selected
+                                        // background; the keyboard cursor is a
+                                        // focus border, so the two states stay
+                                        // tellable apart on the same row.
+                                        .focused(ix == this.cursor.index())
                                         .start_slot(
                                             Checkbox::new(
                                                 SharedString::from(format!(
@@ -333,6 +438,12 @@ impl Render for BranchFilterPopover {
                                         )
                                         .child(HighlightedLabel::new(entry.display_name, positions))
                                         .on_click(cx.listener(move |this, _, _, cx| {
+                                            // Keep the keyboard cursor on the
+                                            // row the mouse just acted on, so a
+                                            // following arrow key continues
+                                            // from there rather than jumping
+                                            // back to the top match.
+                                            this.cursor.move_to(ix);
                                             this.toggle_branch(ref_name_for_click.clone(), cx);
                                         }))
                                         .into_any_element()
@@ -342,6 +453,7 @@ impl Render for BranchFilterPopover {
                     },
                 ),
             )
+            .track_scroll(self.cursor.scroll_handle())
             // See user_popover: `uniform_list` needs a concrete height in this
             // unbounded popover column or it collapses.
             .h(list_height)
@@ -373,6 +485,13 @@ impl Render for BranchFilterPopover {
         v_flex()
             .key_context("GitGraphBranchFilterPopover")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_confirm))
+            .on_action(cx.listener(Self::handle_cancel))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
             .w(rems(POPOVER_WIDTH_REMS))
             .p_2()
             .gap_2()
@@ -390,5 +509,252 @@ impl Render for BranchFilterPopover {
                     .child(footer_left)
                     .child(footer_right),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_toolbar::test_support::init_test;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::Project;
+    use std::{cell::Cell, rc::Rc};
+
+    fn entry(display_name: &str, is_remote: bool) -> BranchEntry {
+        let ref_name = if is_remote {
+            format!("refs/remotes/{display_name}")
+        } else {
+            format!("refs/heads/{display_name}")
+        };
+        BranchEntry {
+            ref_name: SharedString::from(ref_name),
+            display_name: SharedString::from(display_name.to_string()),
+            is_remote,
+        }
+    }
+
+    /// The `ref_name` of the row the keyboard cursor is parked on, or `None`
+    /// when it is on a header / out of range.
+    fn cursored(popover: &BranchFilterPopover) -> Option<SharedString> {
+        match popover.rows.get(popover.cursor.index()) {
+            Some(Row::Branch { index, .. }) => {
+                popover.branches.get(*index).map(|b| b.ref_name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    #[gpui::test]
+    async fn test_branch_filter_popover_keyboard_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+
+        let popover = window
+            .update(cx, |_, window, cx| {
+                let popover = cx.new(|cx| {
+                    BranchFilterPopover::new(
+                        WeakEntity::<GitGraph>::new_invalid(),
+                        None,
+                        Vec::new(),
+                        window,
+                        cx,
+                    )
+                });
+                // Bug #2: opening the popover must land the caret in the search
+                // field. `PopoverMenu::show_menu` focuses whatever
+                // `Focusable::focus_handle` returns, so that has to resolve to
+                // the query editor and not the container.
+                let query_handle = popover.read(cx).query.focus_handle(cx);
+                assert_eq!(
+                    popover.focus_handle(cx),
+                    query_handle,
+                    "the popover must hand `PopoverMenu` the query editor's focus handle"
+                );
+                assert!(
+                    query_handle.is_focused(window),
+                    "the search field must be focused as soon as the popover opens"
+                );
+                popover
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        let dismissed = Rc::new(Cell::new(false));
+        let _dismiss_subscription = cx.update(|cx| {
+            let dismissed = dismissed.clone();
+            cx.subscribe(&popover, move |_, _: &DismissEvent, _| dismissed.set(true))
+        });
+
+        // rows: 0 Header(Local) | 1 feature | 2 main | 3 Header(Remote) | 4 origin/main
+        window
+            .update(cx, |_, _window, cx| {
+                popover.update(cx, |popover, cx| {
+                    popover.branches = vec![
+                        entry("main", false),
+                        entry("feature", false),
+                        entry("origin/main", true),
+                    ];
+                    popover.refresh_matches(cx);
+                });
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        popover.update(cx, |popover, _| {
+            assert_eq!(popover.rows.len(), 5, "two headers plus three branches");
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("refs/heads/feature"),
+                "the cursor must start on the first matching row, not the header"
+            );
+        });
+
+        let press = |action: &'static str, cx: &mut TestAppContext| {
+            window
+                .update(cx, |_, window, cx| {
+                    popover.update(cx, |popover, cx| match action {
+                        "next" => popover.select_next(&menu::SelectNext, window, cx),
+                        "previous" => popover.select_previous(&menu::SelectPrevious, window, cx),
+                        "confirm" => popover.confirm(&menu::Confirm, window, cx),
+                        "cancel" => popover.handle_cancel(&menu::Cancel, window, cx),
+                        _ => popover.secondary_confirm(&menu::SecondaryConfirm, window, cx),
+                    });
+                })
+                .expect("window is open");
+        };
+
+        press("next", cx);
+        popover.update(cx, |popover, _| {
+            assert_eq!(cursored(popover).as_deref(), Some("refs/heads/main"));
+        });
+        press("next", cx);
+        popover.update(cx, |popover, _| {
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("refs/remotes/origin/main"),
+                "select_next must step over the Remote header"
+            );
+        });
+        press("next", cx);
+        popover.update(cx, |popover, _| {
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("refs/remotes/origin/main"),
+                "the cursor must not run off the end of the list"
+            );
+        });
+
+        press("previous", cx);
+        press("previous", cx);
+        popover.update(cx, |popover, _| {
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("refs/heads/feature"),
+                "select_previous must step back over the Remote header"
+            );
+        });
+        press("previous", cx);
+        popover.update(cx, |popover, _| {
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("refs/heads/feature"),
+                "the cursor must not run off the front of the list"
+            );
+        });
+
+        // Confirm toggles the cursored checkbox and leaves the popover open.
+        press("confirm", cx);
+        popover.update(cx, |popover, _| {
+            assert!(
+                popover
+                    .selected
+                    .contains(&SharedString::from("refs/heads/feature")),
+                "Confirm must check the cursored branch"
+            );
+        });
+        assert!(
+            !dismissed.get(),
+            "Confirm must not dismiss the popover — Apply is a separate, explicit step"
+        );
+        press("confirm", cx);
+        popover.update(cx, |popover, _| {
+            assert!(
+                popover.selected.is_empty(),
+                "a second Confirm on the same row must uncheck it"
+            );
+        });
+
+        // Narrowing the query rebuilds the list under the cursor: it must land
+        // back on the first match rather than dangling past the shorter list.
+        press("next", cx);
+        press("next", cx);
+
+        // A query that still matches everything: the list keeps its length, so
+        // the old index stays in range and merely clamping it would be enough.
+        // The cursor must still snap back to the first match — after a rebuild
+        // the rows are a different ranking, so the old index means nothing.
+        window
+            .update(cx, |_, window, cx| {
+                popover.read(cx).query.clone().update(cx, |editor, cx| {
+                    editor.set_text("a", window, cx);
+                });
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+        popover.update(cx, |popover, _| {
+            assert_eq!(popover.rows.len(), 5, "every entry still matches \"a\"");
+            assert_eq!(
+                popover.cursor.index(),
+                1,
+                "rebuilding the rows must re-park the cursor on the first match, \
+                 not leave it wherever it happened to be"
+            );
+        });
+
+        window
+            .update(cx, |_, window, cx| {
+                popover.read(cx).query.clone().update(cx, |editor, cx| {
+                    editor.set_text("origin", window, cx);
+                });
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        popover.update(cx, |popover, _| {
+            assert_eq!(popover.rows.len(), 2, "one Remote header plus one match");
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("refs/remotes/origin/main"),
+                "a narrowed list must re-park the cursor on the first match"
+            );
+        });
+        press("confirm", cx);
+        popover.update(cx, |popover, _| {
+            assert!(
+                popover
+                    .selected
+                    .contains(&SharedString::from("refs/remotes/origin/main")),
+                "Confirm after narrowing must toggle the row now under the cursor"
+            );
+        });
+
+        // Cancel (escape) dismisses — none of these popovers had that route.
+        assert!(!dismissed.get());
+        press("cancel", cx);
+        assert!(dismissed.get(), "Cancel must dismiss the popover");
+        dismissed.set(false);
+
+        // SecondaryConfirm (ctrl-enter) is the keyboard route to Apply, which
+        // commits the staged set and closes.
+        press("apply", cx);
+        assert!(
+            dismissed.get(),
+            "SecondaryConfirm must apply and dismiss the popover"
+        );
     }
 }
