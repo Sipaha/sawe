@@ -106,6 +106,11 @@ pub struct FakeGitRepositoryState {
     pub tags_pointing_at: HashMap<String, Vec<SharedString>>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
+    /// Per-commit file diffs, keyed by the sha the caller asks for. A sha with
+    /// no entry answers with an empty diff — the fake's original behaviour, and
+    /// what a caller filtering for one file has to treat as "this commit does
+    /// not touch it".
+    pub commit_diffs: HashMap<String, git::repository::CommitDiff>,
     pub stash_entries: GitStash,
 }
 
@@ -135,6 +140,7 @@ impl FakeGitRepositoryState {
             remotes: HashMap::default(),
             graph_commits: Vec::new(),
             commit_data: Default::default(),
+            commit_diffs: Default::default(),
             commit_history: Vec::new(),
             stash_entries: Default::default(),
         }
@@ -230,10 +236,17 @@ impl GitRepository for FakeGitRepository {
 
     fn load_commit(
         &self,
-        _commit: String,
+        commit: String,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
-        async { Ok(git::repository::CommitDiff { files: Vec::new() }) }.boxed()
+        self.with_state_async(false, move |state| {
+            Ok(state
+                .commit_diffs
+                .get(&commit)
+                .cloned()
+                .unwrap_or(git::repository::CommitDiff { files: Vec::new() }))
+        })
+        .boxed()
     }
 
     fn set_index_text(
@@ -1171,7 +1184,11 @@ impl GitRepository for FakeGitRepository {
 
     fn tags_pointing_at(&self, sha: String) -> BoxFuture<'_, Result<Vec<SharedString>>> {
         self.with_state_async(false, move |state| {
-            Ok(state.tags_pointing_at.get(&sha).cloned().unwrap_or_default())
+            Ok(state
+                .tags_pointing_at
+                .get(&sha)
+                .cloned()
+                .unwrap_or_default())
         })
     }
 

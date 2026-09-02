@@ -524,7 +524,7 @@ pub struct CommitDetails {
     pub author_name: SharedString,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CommitDiff {
     pub files: Vec<CommitFile>,
 }
@@ -541,7 +541,7 @@ pub enum CommitFileStatus {
     Deleted,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CommitFile {
     pub path: RepoPath,
     pub old_text: Option<String>,

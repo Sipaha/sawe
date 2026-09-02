@@ -1,22 +1,28 @@
-use crate::{git_panel::GitStatusEntry, git_status_icon, soft_wrap_button};
-use anyhow::Result;
+use crate::{
+    commit_blob::{LoadedBlob, load_commit_file_blob},
+    git_panel::GitStatusEntry,
+    git_status_icon, soft_wrap_button,
+};
+use anyhow::{Context as _, Result};
+use buffer_diff::BufferDiff;
 use editor::{
     Direction, Editor, EditorEvent, EditorSettings, SplittableEditor, ToggleSplitDiff,
     actions::{GoToHunk, GoToPreviousHunk, ToggleSoftWrap},
+    multibuffer_context_lines,
 };
 use fs::Fs;
 use git::repository::RepoPath;
 use gpui::{
     Action, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, Render, Subscription, Task, WeakEntity, Window,
+    Focusable, IntoElement, Render, Task, WeakEntity, Window,
 };
-use language::{Buffer, HighlightedText};
+use language::{Buffer, Capability, HighlightedText};
 use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
 use project::{
     Project,
     git_store::{Repository, RepositoryId},
 };
-use settings::{DiffViewStyle, Settings, SettingsStore, update_settings_file};
+use settings::{DiffViewStyle, Settings, update_settings_file};
 use std::{
     any::{Any, TypeId},
     cell::Cell,
@@ -30,7 +36,7 @@ use util::paths::{PathExt as _, PathStyle};
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
-    item::{ItemEvent, PreviewTabsSettings, SaveOptions, TabContentParams},
+    item::{ItemEvent, PreviewTabsSettings, SaveOptions, TabContentParams, TabTooltipContent},
     searchable::SearchableItemHandle,
 };
 
@@ -89,15 +95,155 @@ pub enum SoloDiffOpen {
     Permanent,
 }
 
+/// What a [`SoloDiffView`] is showing, and therefore what it can do.
+///
+/// Every difference between the two modes is derived from this value, so the
+/// view can never end up half-configured for one of them.
+#[derive(Clone)]
+pub enum DiffSource {
+    /// Uncommitted changes to a file in the working tree. The right-hand side
+    /// is the live project buffer, so the view is editable and its hunks can
+    /// be staged.
+    WorkingTree {
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+    },
+    /// A file as of `sha`, diffed against its parent. Both sides are detached
+    /// historic blobs: read-only, no staging.
+    Commit {
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        sha: SharedString,
+    },
+}
+
+impl DiffSource {
+    pub fn repository(&self) -> &Entity<Repository> {
+        match self {
+            Self::WorkingTree { repository, .. } | Self::Commit { repository, .. } => repository,
+        }
+    }
+
+    pub fn repo_path(&self) -> &RepoPath {
+        match self {
+            Self::WorkingTree { repo_path, .. } | Self::Commit { repo_path, .. } => repo_path,
+        }
+    }
+
+    /// The commit this diff is taken from, or `None` for a working-tree diff.
+    pub fn sha(&self) -> Option<&SharedString> {
+        match self {
+            Self::WorkingTree { .. } => None,
+            Self::Commit { sha, .. } => Some(sha),
+        }
+    }
+
+    /// Whether the right-hand side is a file the user can edit and save.
+    fn is_editable(&self) -> bool {
+        matches!(self, Self::WorkingTree { .. })
+    }
+
+    /// Whether two views show the same thing, and so should be one tab.
+    ///
+    /// A working-tree diff is identified by its repository — the same relative
+    /// path can exist in a second repository in the window — and a commit diff
+    /// by its sha, so the same file at two revisions gets two tabs.
+    fn matches(&self, other: &Self, cx: &App) -> bool {
+        match (self, other) {
+            (
+                Self::WorkingTree {
+                    repository,
+                    repo_path,
+                },
+                Self::WorkingTree {
+                    repository: other_repository,
+                    repo_path: other_repo_path,
+                },
+            ) => {
+                repository.read(cx).id == other_repository.read(cx).id
+                    && repo_path == other_repo_path
+            }
+            (
+                Self::Commit { sha, repo_path, .. },
+                Self::Commit {
+                    sha: other_sha,
+                    repo_path: other_repo_path,
+                    ..
+                },
+            ) => sha == other_sha && repo_path == other_repo_path,
+            _ => false,
+        }
+    }
+
+    /// The revision `git blame` should annotate the left-hand pane's text
+    /// with, or `None` to leave left-pane blame off.
+    fn blame_base(&self) -> Option<SharedString> {
+        match self {
+            // The left pane holds the file's content at HEAD.
+            Self::WorkingTree { .. } => Some("HEAD".into()),
+            // Deliberately unwired, not merely unset: the left pane's text is
+            // a detached historic blob, and `SplittableEditor::
+            // sync_lhs_blame_sources` resolves the `(repository, repo_path)`
+            // to blame through `repository_and_path_for_buffer_id` on the
+            // *right-hand* buffer id. A blob that is not in the project's
+            // buffer store cannot answer that, so every source it builds is
+            // dropped. Wiring it needs an explicit repository override on
+            // `SplittableEditor`.
+            Self::Commit { .. } => None,
+        }
+    }
+
+    fn tab_icon(&self) -> IconName {
+        match self {
+            Self::WorkingTree { .. } => IconName::Diff,
+            Self::Commit { .. } => IconName::GitCommit,
+        }
+    }
+
+    /// The file's basename, which is what the tab is titled with for either
+    /// source. Falls back to the whole path for a path with no last component.
+    fn tab_title(&self) -> SharedString {
+        let repo_path = self.repo_path();
+        match repo_path.file_name() {
+            Some(file_name) => file_name.to_string().into(),
+            None => repo_path
+                .as_ref()
+                .display(PathStyle::local())
+                .into_owned()
+                .into(),
+        }
+    }
+}
+
+/// The buffers a [`DiffSource`] resolves to, as produced by whichever entry
+/// point loaded it. Kept apart from [`DiffSource`] because the two shapes are
+/// genuinely different: a working-tree file is one project buffer plus its
+/// uncommitted diff, while a commit file is a pair of detached blobs that also
+/// carry the excerpt ranges and the binary flag the loader worked out.
+enum LoadedDiff {
+    WorkingTree {
+        buffer: Entity<Buffer>,
+        diff: Entity<BufferDiff>,
+    },
+    Commit(LoadedBlob),
+}
+
+impl LoadedDiff {
+    fn buffer(&self) -> &Entity<Buffer> {
+        match self {
+            Self::WorkingTree { buffer, .. } => buffer,
+            Self::Commit(blob) => &blob.buffer,
+        }
+    }
+}
+
 pub struct SoloDiffView {
-    repository: Entity<Repository>,
+    source: DiffSource,
     repository_id: RepositoryId,
-    repo_path: RepoPath,
     buffer: Entity<Buffer>,
     editor: Entity<SplittableEditor>,
     workspace: WeakEntity<Workspace>,
     hunk_count_cache: HunkCountCache,
-    _settings_subscription: Subscription,
 }
 
 impl SoloDiffView {
@@ -113,25 +259,13 @@ impl SoloDiffView {
             return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
         };
 
-        let existing = workspace_entity
-            .read(cx)
-            .items_of_type::<SoloDiffView>(cx)
-            .find(|item| item.read(cx).matches(&repository, &entry.repo_path, cx));
-        if let Some(existing) = existing {
-            let focus_item = mode == SoloDiffOpen::Permanent;
-            workspace_entity.update(cx, |workspace, cx| {
-                workspace.activate_item(&existing, true, focus_item, window, cx);
-                // A deliberate "open" pins an existing preview; a preview gesture
-                // never demotes an already-pinned tab.
-                if mode == SoloDiffOpen::Permanent {
-                    workspace.active_pane().update(cx, |pane, _cx| {
-                        pane.unpreview_item_if_preview(existing.item_id());
-                    });
-                }
-            });
-            if focus_item {
-                existing.focus_handle(cx).focus(window, cx);
-            }
+        let source = DiffSource::WorkingTree {
+            repository: repository.clone(),
+            repo_path: entry.repo_path.clone(),
+        };
+        if let Some(existing) =
+            Self::activate_existing(&workspace_entity, &source, mode, window, cx)
+        {
             return Task::ready(Ok(existing));
         }
 
@@ -146,7 +280,6 @@ impl SoloDiffView {
         };
 
         let project = workspace_entity.read(cx).project().clone();
-        let repo_path = entry.repo_path;
         window.spawn(cx, async move |cx| {
             let buffer = project
                 .update(cx, |project, cx| {
@@ -164,49 +297,181 @@ impl SoloDiffView {
                 let view = cx.new(|cx| {
                     Self::new(
                         project,
-                        repository,
-                        repo_path,
-                        buffer,
-                        diff,
+                        source,
+                        LoadedDiff::WorkingTree { buffer, diff },
                         workspace_handle,
                         window,
                         cx,
                     )
                 });
-
-                let item: Box<dyn ItemHandle> = Box::new(view.clone());
-                let focus_item = mode == SoloDiffOpen::Permanent;
-                workspace.active_pane().update(cx, |pane, cx| {
-                    // A preview opens into (and replaces) the pane's single
-                    // preview slot; a permanent open appends its own tab.
-                    let destination_index = if mode == SoloDiffOpen::Preview
-                        && PreviewTabsSettings::get_global(cx).enabled
-                    {
-                        pane.replace_preview_item_id(item.item_id(), window, cx)
-                    } else {
-                        None
-                    };
-                    pane.add_item(item, true, focus_item, destination_index, window, cx);
-                });
+                Self::add_to_pane(workspace, &view, mode, window, cx);
                 view
             })
         })
     }
 
-    fn new(
-        project: Entity<Project>,
+    /// Open a read-only diff of `repo_path` as of `sha`, against its parent.
+    ///
+    /// Reuses an already-open view of the same `(sha, repo_path)` rather than
+    /// loading the commit a second time.
+    pub fn open_commit_file(
+        sha: SharedString,
         repository: Entity<Repository>,
         repo_path: RepoPath,
-        buffer: Entity<Buffer>,
-        diff: Entity<buffer_diff::BufferDiff>,
+        workspace: WeakEntity<Workspace>,
+        mode: SoloDiffOpen,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        let Some(workspace_entity) = workspace.upgrade() else {
+            return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
+        };
+
+        let source = DiffSource::Commit {
+            repository: repository.clone(),
+            repo_path: repo_path.clone(),
+            sha: sha.clone(),
+        };
+        if let Some(existing) =
+            Self::activate_existing(&workspace_entity, &source, mode, window, cx)
+        {
+            return Task::ready(Ok(existing));
+        }
+
+        let project = workspace_entity.read(cx).project().clone();
+        let language_registry = project.read(cx).languages().clone();
+        // A file the commit deleted has no project path to resolve, so the
+        // loader needs a worktree to attach its synthetic file to.
+        let fallback_worktree_id = project
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).id());
+        let commit_diff = repository.update(cx, |repository, _| {
+            repository.load_commit_diff(sha.to_string())
+        });
+
+        window.spawn(cx, async move |cx| {
+            let commit_diff = commit_diff
+                .await
+                .context("loading the commit's diff was cancelled")??;
+            let file = commit_diff
+                .files
+                .into_iter()
+                .find(|file| file.path == repo_path)
+                .with_context(|| {
+                    format!(
+                        "commit {sha} does not contain {}",
+                        repo_path.as_ref().display(PathStyle::local())
+                    )
+                })?;
+            let blob = load_commit_file_blob(
+                file,
+                &sha,
+                &repository,
+                fallback_worktree_id,
+                &language_registry,
+                cx,
+            )
+            .await?;
+
+            workspace_entity.update_in(cx, |workspace, window, cx| {
+                let workspace_handle = cx.entity();
+                let view = cx.new(|cx| {
+                    Self::new(
+                        project,
+                        source,
+                        LoadedDiff::Commit(blob),
+                        workspace_handle,
+                        window,
+                        cx,
+                    )
+                });
+                Self::add_to_pane(workspace, &view, mode, window, cx);
+                view
+            })
+        })
+    }
+
+    /// Activate an already-open view of `source`, if the workspace has one.
+    /// Shared by both entry points: a duplicate tab for the same source is
+    /// never what the user asked for, whichever gesture got them here.
+    fn activate_existing(
+        workspace: &Entity<Workspace>,
+        source: &DiffSource,
+        mode: SoloDiffOpen,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Entity<Self>> {
+        let existing = workspace
+            .read(cx)
+            .items_of_type::<SoloDiffView>(cx)
+            .find(|item| item.read(cx).source.matches(source, cx))?;
+
+        let focus_item = mode == SoloDiffOpen::Permanent;
+        workspace.update(cx, |workspace, cx| {
+            workspace.activate_item(&existing, true, focus_item, window, cx);
+            // A deliberate "open" pins an existing preview; a preview gesture
+            // never demotes an already-pinned tab.
+            if mode == SoloDiffOpen::Permanent {
+                workspace.active_pane().update(cx, |pane, _cx| {
+                    pane.unpreview_item_if_preview(existing.item_id());
+                });
+            }
+        });
+        if focus_item {
+            existing.focus_handle(cx).focus(window, cx);
+        }
+        Some(existing)
+    }
+
+    /// Put a freshly-built view into the active pane.
+    fn add_to_pane(
+        workspace: &mut Workspace,
+        view: &Entity<Self>,
+        mode: SoloDiffOpen,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let item: Box<dyn ItemHandle> = Box::new(view.clone());
+        let focus_item = mode == SoloDiffOpen::Permanent;
+        workspace.active_pane().update(cx, |pane, cx| {
+            // A preview opens into (and replaces) the pane's single preview
+            // slot; a permanent open appends its own tab.
+            let destination_index =
+                if mode == SoloDiffOpen::Preview && PreviewTabsSettings::get_global(cx).enabled {
+                    pane.replace_preview_item_id(item.item_id(), window, cx)
+                } else {
+                    None
+                };
+            pane.add_item(item, true, focus_item, destination_index, window, cx);
+        });
+    }
+
+    fn new(
+        project: Entity<Project>,
+        source: DiffSource,
+        loaded: LoadedDiff,
         workspace: Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let repository_id = repository.read(cx).id;
+        let repository_id = source.repository().read(cx).id;
+        let buffer = loaded.buffer().clone();
         let multibuffer = cx.new(|cx| {
-            let mut multibuffer = MultiBuffer::singleton(buffer.clone(), cx);
-            multibuffer.add_diff(diff, cx);
+            let mut multibuffer = match &loaded {
+                LoadedDiff::WorkingTree { buffer, diff } => {
+                    // A live project buffer brings its own capability, which is
+                    // what makes this side editable.
+                    let mut multibuffer = MultiBuffer::singleton(buffer.clone(), cx);
+                    multibuffer.add_diff(diff.clone(), cx);
+                    multibuffer
+                }
+                // Read-only-ness lives here, not on the buffer: the historic
+                // blob itself is built `ReadWrite`. The file's name is already
+                // in the tab, so a path header would be redundant chrome.
+                LoadedDiff::Commit(_) => MultiBuffer::without_headers(Capability::ReadOnly),
+            };
             multibuffer.set_all_diff_hunks_expanded(cx);
             multibuffer
         });
@@ -219,9 +484,35 @@ impl SoloDiffView {
                 window,
                 cx,
             );
-            // This view shows uncommitted changes, so the left pane's text is
-            // the file's content at HEAD.
-            editor.set_lhs_blame_base(Some("HEAD".into()), cx);
+
+            if let LoadedDiff::Commit(blob) = &loaded {
+                // History has nothing to stage or revert.
+                editor.disable_diff_hunk_controls(cx);
+                editor.rhs_editor().update(cx, |editor, cx| {
+                    editor.set_show_diff_review_button(true, cx);
+                });
+                editor.update_excerpts_for_path(
+                    blob.path_key.clone(),
+                    blob.buffer.clone(),
+                    blob.excerpt_ranges.clone(),
+                    multibuffer_context_lines(cx),
+                    blob.diff.clone(),
+                    cx,
+                );
+                if blob.is_binary {
+                    // The excerpt is a "(binary file not shown)" placeholder;
+                    // folding it says so without pretending to be a diff.
+                    let buffer_id = blob.buffer.read(cx).remote_id();
+                    editor.rhs_editor().update(cx, |editor, cx| {
+                        editor.fold_buffers([buffer_id], cx);
+                    });
+                }
+            }
+
+            // After the excerpts exist: `sync_lhs_blame_sources` drops entries
+            // whose base buffer is not excerpted.
+            editor.set_lhs_blame_base(source.blame_base(), cx);
+
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_should_serialize(false, cx);
                 let snapshot = editor.snapshot(window, cx);
@@ -237,35 +528,24 @@ impl SoloDiffView {
             editor
         });
 
-        let mut previous_diff_view_style = EditorSettings::get_global(cx).diff_view_style;
-        let settings_subscription =
-            cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
-                let diff_view_style = EditorSettings::get_global(cx).diff_view_style;
-                if diff_view_style != previous_diff_view_style {
-                    this.editor.update(cx, |editor, cx| {
-                        if editor.diff_view_style() != diff_view_style {
-                            editor.toggle_split(&ToggleSplitDiff, window, cx);
-                        }
-                    });
-                    previous_diff_view_style = diff_view_style;
-                    cx.notify();
-                }
-            });
-
+        // No `SettingsStore` observer here: `SplittableEditor::new` installs
+        // one that toggles the split whenever the setting stops matching the
+        // editor's own style, which is strictly what a second one here could
+        // do.
         Self {
-            repository,
+            source,
             repository_id,
-            repo_path,
             buffer,
             editor,
             workspace: workspace.downgrade(),
             hunk_count_cache: HunkCountCache::default(),
-            _settings_subscription: settings_subscription,
         }
     }
 
-    fn matches(&self, repository: &Entity<Repository>, repo_path: &RepoPath, cx: &App) -> bool {
-        self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
+    /// What this view is showing. Callers that need to tell a working-tree
+    /// diff from a commit's diff branch on this rather than on the tab title.
+    pub fn source(&self) -> &DiffSource {
+        &self.source
     }
 
     /// The repository this diff belongs to. Read by the git panel to decide
@@ -275,9 +555,9 @@ impl SoloDiffView {
         self.repository_id
     }
 
-    /// The working-copy file this diff is showing.
+    /// The file this diff is showing, relative to the repository root.
     pub fn repo_path(&self) -> &RepoPath {
-        &self.repo_path
+        self.source.repo_path()
     }
 
     /// Number of diff hunks in this file's diff. Also gates the prev/next-hunk
@@ -309,7 +589,7 @@ impl Item for SoloDiffView {
     type Event = EditorEvent;
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::Diff).color(Color::Muted))
+        Some(Icon::new(self.source.tab_icon()).color(Color::Muted))
     }
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
@@ -322,41 +602,53 @@ impl Item for SoloDiffView {
             .into_any_element()
     }
 
-    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        self.buffer
-            .read(cx)
-            .file()
-            .and_then(|file| {
-                Some(
-                    file.full_path(cx)
-                        .file_name()?
-                        .to_string_lossy()
-                        .to_string(),
-                )
-            })
-            .unwrap_or_else(|| {
-                self.repo_path
-                    .as_ref()
-                    .display(PathStyle::local())
-                    .into_owned()
-            })
-            .into()
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.source.tab_title()
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
-        Some(
-            self.buffer
+        let repo_relative = || {
+            self.source
+                .repo_path()
+                .as_ref()
+                .display(PathStyle::local())
+                .into_owned()
+        };
+        Some(match &self.source {
+            // The working tree's file is on disk, so name it the way the rest
+            // of the editor does: an absolute path with `~` folded back in.
+            DiffSource::WorkingTree { .. } => self
+                .buffer
                 .read(cx)
                 .file()
                 .map(|file| file.full_path(cx).compact().to_string_lossy().into_owned())
-                .unwrap_or_else(|| {
-                    self.repo_path
-                        .as_ref()
-                        .display(PathStyle::local())
-                        .into_owned()
-                })
+                .unwrap_or_else(repo_relative)
                 .into(),
-        )
+            // A commit's file has no location on disk to name.
+            DiffSource::Commit { .. } => repo_relative().into(),
+        })
+    }
+
+    fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
+        let text = self.tab_tooltip_text(cx)?;
+        let DiffSource::Commit { sha, .. } = &self.source else {
+            return Some(TabTooltipContent::Text(text));
+        };
+        // Which revision the file is from is the whole point of this tab, and
+        // the title carries only the basename — so say it on a second line.
+        let sha = sha.get(0..16).unwrap_or(sha).to_string();
+        Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
+            move |_, _| {
+                v_flex()
+                    .child(Label::new(text.clone()))
+                    .child(
+                        Label::new(format!("at {sha}"))
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    )
+                    .into_any_element()
+            },
+        ))))
     }
 
     fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
@@ -446,7 +738,9 @@ impl Item for SoloDiffView {
     }
 
     fn can_save(&self, cx: &App) -> bool {
-        self.editor.read(cx).rhs_editor().read(cx).can_save(cx)
+        // A commit's file is history: both sides are detached blobs, with
+        // nowhere on disk to write back to.
+        self.source.is_editable() && self.editor.read(cx).rhs_editor().read(cx).can_save(cx)
     }
 
     fn save(
@@ -456,6 +750,9 @@ impl Item for SoloDiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if !self.source.is_editable() {
+            return Task::ready(Ok(()));
+        }
         self.editor.save(options, project, window, cx)
     }
 }
@@ -670,9 +967,10 @@ impl Render for SoloDiffGitToolbar {
         let solo_diff = solo_diff.read(cx);
         let hunk_count = solo_diff.hunk_count(cx);
         let status_entry = solo_diff
-            .repository
+            .source
+            .repository()
             .read(cx)
-            .status_for_path(&solo_diff.repo_path);
+            .status_for_path(solo_diff.source.repo_path());
         let status = status_entry.as_ref().map(|entry| entry.status);
         let diff_stat = status_entry.and_then(|entry| entry.diff_stat);
 
@@ -710,7 +1008,20 @@ pub(crate) fn difference_count_label(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::difference_count_label;
+    use super::*;
+    use git::repository::{CommitDiff, CommitFile, repo_path};
+    use git::status::{FileStatus, StageStatus, StatusCode, TrackedStatus};
+    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
+    use project::FakeFs;
+    use settings::SettingsStore;
+    use std::path::Path;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    /// Two full shas — `load_commit_file_blob` shortens them itself, so a
+    /// stub-length sha would not exercise the same code.
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
 
     #[test]
     fn difference_count_label_is_singular_only_at_one() {
@@ -718,5 +1029,405 @@ mod tests {
         assert_eq!(difference_count_label(1), "1 difference");
         assert_eq!(difference_count_label(2), "2 differences");
         assert_eq!(difference_count_label(17), "17 differences");
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+            let store = solutions::SolutionStore::for_test(std::path::PathBuf::new(), cx);
+            solutions::install_global_for_test(store, cx);
+        });
+    }
+
+    struct DiffTestContext {
+        workspace: Entity<Workspace>,
+        repository: Entity<Repository>,
+        fs: Arc<FakeFs>,
+    }
+
+    /// A one-repository workspace whose `a.rs` has an uncommitted change, so
+    /// both entry points have something real to open.
+    async fn diff_test_context(cx: &mut TestAppContext) -> (DiffTestContext, VisualTestContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            serde_json::json!({
+                ".git": {},
+                "a.rs": "one\nTWO\nthree\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("a.rs", "one\ntwo\nthree\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("the test window holds a workspace");
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+
+        let repository = workspace
+            .update_in(&mut cx, |workspace, _window, cx| {
+                workspace.project().read(cx).active_repository(cx)
+            })
+            .expect("the fake project exposes its repository");
+
+        (
+            DiffTestContext {
+                workspace,
+                repository,
+                fs,
+            },
+            cx,
+        )
+    }
+
+    fn commit_file(path: &str, old_text: Option<&str>, new_text: Option<&str>) -> CommitFile {
+        CommitFile {
+            path: repo_path(path),
+            old_text: old_text.map(str::to_string),
+            new_text: new_text.map(str::to_string),
+            is_binary: false,
+        }
+    }
+
+    fn set_commit(context: &DiffTestContext, sha: &str, files: Vec<CommitFile>) {
+        context
+            .fs
+            .set_commit_diff(path!("/project/.git").as_ref(), sha, CommitDiff { files });
+    }
+
+    async fn open_commit_with(
+        context: &DiffTestContext,
+        sha: &str,
+        path: &str,
+        mode: SoloDiffOpen,
+        cx: &mut VisualTestContext,
+    ) -> Result<Entity<SoloDiffView>> {
+        let open = cx.update(|window, cx| {
+            SoloDiffView::open_commit_file(
+                sha.into(),
+                context.repository.clone(),
+                repo_path(path),
+                context.workspace.downgrade(),
+                mode,
+                window,
+                cx,
+            )
+        });
+        let view = open.await;
+        cx.run_until_parked();
+        view
+    }
+
+    async fn open_commit(
+        context: &DiffTestContext,
+        sha: &str,
+        path: &str,
+        cx: &mut VisualTestContext,
+    ) -> Result<Entity<SoloDiffView>> {
+        open_commit_with(context, sha, path, SoloDiffOpen::Preview, cx).await
+    }
+
+    async fn open_working_tree(
+        context: &DiffTestContext,
+        path: &str,
+        cx: &mut VisualTestContext,
+    ) -> Result<Entity<SoloDiffView>> {
+        let entry = GitStatusEntry {
+            repo_path: repo_path(path),
+            status: FileStatus::Tracked(TrackedStatus {
+                index_status: StatusCode::Unmodified,
+                worktree_status: StatusCode::Modified,
+            }),
+            staging: StageStatus::Unstaged,
+            diff_stat: None,
+        };
+        let open = cx.update(|window, cx| {
+            SoloDiffView::open_or_focus(
+                entry,
+                context.repository.clone(),
+                context.workspace.downgrade(),
+                SoloDiffOpen::Preview,
+                window,
+                cx,
+            )
+        });
+        let view = open.await;
+        cx.run_until_parked();
+        view
+    }
+
+    fn open_view_count(context: &DiffTestContext, cx: &mut VisualTestContext) -> usize {
+        context.workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.items_of_type::<SoloDiffView>(cx).count()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_a_commit_source_opens_a_read_only_view(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file(
+                "src/lib.rs",
+                Some("one\ntwo\nthree\n"),
+                Some("one\nTWO\nthree\n"),
+            )],
+        );
+
+        let view = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens");
+
+        view.read_with(&cx, |view, cx| {
+            assert!(matches!(view.source(), DiffSource::Commit { .. }));
+            assert_eq!(view.source().sha().map(SharedString::as_ref), Some(SHA));
+            assert_eq!(view.tab_content_text(0, cx), "lib.rs");
+            assert_eq!(view.source().tab_icon(), IconName::GitCommit);
+            assert_eq!(
+                view.tab_tooltip_text(cx).as_deref(),
+                Some("src/lib.rs"),
+                "a commit's file has no on-disk path, so the tooltip names the \
+                 repo-relative one"
+            );
+            assert!(
+                matches!(
+                    view.tab_tooltip_content(cx),
+                    Some(TabTooltipContent::Custom(_))
+                ),
+                "the commit tooltip is two lines — the path and the revision"
+            );
+            assert!(
+                !view.can_save(cx),
+                "a commit's file has nowhere on disk to be saved back to"
+            );
+            assert!(
+                view.editor
+                    .read(cx)
+                    .rhs_editor()
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .read_only(),
+                "the commit source's multibuffer must be read-only"
+            );
+            assert_eq!(
+                view.hunk_count(cx),
+                1,
+                "the loaded blob's excerpts must actually reach the editor"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_working_tree_source_stays_editable(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+
+        let view = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens");
+
+        view.read_with(&cx, |view, cx| {
+            assert!(matches!(view.source(), DiffSource::WorkingTree { .. }));
+            assert_eq!(view.source().sha(), None);
+            assert_eq!(view.tab_content_text(0, cx), "a.rs");
+            assert_eq!(view.source().tab_icon(), IconName::Diff);
+            assert!(
+                matches!(
+                    view.tab_tooltip_content(cx),
+                    Some(TabTooltipContent::Text(_))
+                ),
+                "a working-tree diff has no revision to name on a second line"
+            );
+            assert!(view.can_save(cx), "an uncommitted diff stays saveable");
+            assert!(
+                !view
+                    .editor
+                    .read(cx)
+                    .rhs_editor()
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .read_only(),
+                "the working-tree source's multibuffer must stay writable"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_the_same_commit_file_reuses_one_view(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let first = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens");
+        let second = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the second open resolves");
+
+        assert_eq!(first, second, "the same (sha, path) is one tab");
+        assert_eq!(open_view_count(&context, &mut cx), 1);
+    }
+
+    #[gpui::test]
+    async fn test_a_second_sha_opens_a_second_view(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+        set_commit(
+            &context,
+            OTHER_SHA,
+            vec![commit_file("src/lib.rs", Some("two\n"), Some("three\n"))],
+        );
+
+        // Permanent, not Preview: two preview opens would share the pane's one
+        // preview slot and the second would evict the first, which says
+        // nothing about whether the two sources are considered distinct.
+        let first = open_commit_with(
+            &context,
+            SHA,
+            "src/lib.rs",
+            SoloDiffOpen::Permanent,
+            &mut cx,
+        )
+        .await
+        .expect("the first commit's file opens");
+        let second = open_commit_with(
+            &context,
+            OTHER_SHA,
+            "src/lib.rs",
+            SoloDiffOpen::Permanent,
+            &mut cx,
+        )
+        .await
+        .expect("the second commit's file opens");
+
+        assert_ne!(
+            first, second,
+            "the same file at two revisions is two different diffs"
+        );
+        assert_eq!(open_view_count(&context, &mut cx), 2);
+    }
+
+    #[gpui::test]
+    async fn test_a_commit_that_does_not_touch_the_path_is_an_error(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/other.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let error = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect_err("a file the commit never touched cannot be shown");
+
+        assert!(
+            error.to_string().contains("src/lib.rs"),
+            "the error must name the file that was asked for, got {error}"
+        );
+        assert_eq!(
+            open_view_count(&context, &mut cx),
+            0,
+            "a failed open must not leave an empty tab behind"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_the_blame_base_follows_the_source(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let working_tree = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens");
+        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens");
+
+        working_tree.read_with(&cx, |view, cx| {
+            assert_eq!(
+                view.editor
+                    .read(cx)
+                    .lhs_blame_base()
+                    .map(SharedString::as_ref),
+                Some("HEAD"),
+                "the left pane of an uncommitted diff is the file at HEAD"
+            );
+        });
+        commit.read_with(&cx, |view, cx| {
+            assert_eq!(
+                view.editor.read(cx).lhs_blame_base(),
+                None,
+                "commit-mode blame is deliberately unwired"
+            );
+        });
+    }
+
+    /// `SoloDiffView` used to install its own `SettingsStore` observer on top
+    /// of the one `SplittableEditor::new` already has. Removing ours must
+    /// leave the unified/split toggle following the setting.
+    #[gpui::test]
+    async fn test_the_diff_view_style_setting_still_drives_the_split(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+
+        let view = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens");
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(
+                view.editor.read(cx).diff_view_style(),
+                DiffViewStyle::Split,
+                "this fork defaults to a side-by-side diff"
+            );
+            assert!(view.editor.read(cx).is_split());
+        });
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.diff_view_style = Some(DiffViewStyle::Unified);
+                })
+            });
+        });
+        cx.run_until_parked();
+
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(
+                view.editor.read(cx).diff_view_style(),
+                DiffViewStyle::Unified,
+                "the setting must still reach the editor with no observer of our own"
+            );
+            assert!(
+                !view.editor.read(cx).is_split(),
+                "and actually collapse the second pane"
+            );
+        });
     }
 }

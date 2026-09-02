@@ -2291,6 +2291,17 @@ impl FakeFs {
         .unwrap();
     }
 
+    /// Teach the fake repository what [`GitRepository::load_commit`] should
+    /// answer for `sha`. Without this every commit reads as touching no files
+    /// at all, which is indistinguishable from a commit that really doesn't
+    /// touch the path a caller is asking about.
+    pub fn set_commit_diff(&self, dot_git: &Path, sha: &str, diff: git::repository::CommitDiff) {
+        self.with_git_state(dot_git, true, |state| {
+            state.commit_diffs.insert(sha.to_owned(), diff);
+        })
+        .unwrap();
+    }
+
     pub fn set_commit_data(
         &self,
         dot_git: &Path,

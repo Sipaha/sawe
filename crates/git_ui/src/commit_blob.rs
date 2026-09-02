@@ -26,9 +26,14 @@ use project::{WorktreeId, git_store::Repository};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 
-/// Sort prefix for the file excerpts of a commit. The commit-message
-/// excerpt sorts ahead of them on prefix 0, so every file namespace shares
-/// this one and orders among itself by path.
+/// Sort prefix for the file excerpts of a commit. Every file shares this one
+/// prefix, so the multibuffer orders the files among themselves by path.
+///
+/// The value is `1` rather than `0` only for historical reasons: upstream
+/// reserved prefix 0 for a commit-message excerpt that sorted ahead of the
+/// files. This fork has no such excerpt — the commit message is rendered by
+/// the commit view's header, not by the multibuffer — so nothing occupies
+/// prefix 0 and the exact value is arbitrary.
 pub(crate) const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
 
 /// A file inside a commit: it has a repo-relative path and a revision, but
@@ -447,9 +452,9 @@ mod tests {
         assert_eq!(blob.status, tracked(StatusCode::Deleted));
         let text = blob.buffer.read_with(&cx, |buffer, _| buffer.text());
         assert_eq!(text, "");
-        let was_deleted = blob.buffer.read_with(&cx, |buffer, _| {
-            buffer.file().map(|file| file.disk_state())
-        });
+        let was_deleted = blob
+            .buffer
+            .read_with(&cx, |buffer, _| buffer.file().map(|file| file.disk_state()));
         assert_eq!(was_deleted, Some(DiskState::Historic { was_deleted: true }));
     }
 
