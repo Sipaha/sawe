@@ -44,6 +44,7 @@ use crate::{commit_view::CommitView, git_panel::GitPanel, text_diff_view::TextDi
 
 mod askpass_modal;
 pub mod branch_picker;
+pub(crate) mod commit_blob;
 mod commit_modal;
 pub mod commit_tooltip;
 pub mod commit_view;

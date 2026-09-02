@@ -15,15 +15,14 @@ mod parents_bar;
 mod refs_bar;
 
 use anyhow::{Context as _, Result};
-use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, MultiBuffer, SplittableEditor,
     multibuffer_context_lines,
 };
 use futures_lite::future::yield_now;
-use git::repository::{CommitDetails, CommitDiff, RepoPath, is_binary_content};
-use git::status::{FileStatus, StatusCode, TrackedStatus};
+use git::repository::{CommitDetails, CommitDiff, RepoPath};
+use git::status::FileStatus;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
     parse_git_remote_url,
@@ -33,12 +32,8 @@ use gpui::{
     FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, PromptLevel, Render,
     Styled, Task, WeakEntity, Window, actions,
 };
-use language::{
-    Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
-    ReplicaId, Rope, TextBuffer,
-};
-use multi_buffer::PathKey;
-use project::{Project, ProjectPath, WorktreeId, git_store::Repository};
+use language::Capability;
+use project::{Project, ProjectPath, git_store::Repository};
 use settings::{DiffViewStyle, Settings};
 use std::{
     any::{Any, TypeId},
@@ -48,7 +43,7 @@ use std::{
 };
 use theme::ActiveTheme;
 use ui::{ContextMenu, DiffStat, Divider, Tooltip, prelude::*};
-use util::{ResultExt, paths::PathStyle, rel_path::RelPath, truncate_and_trailoff};
+use util::{ResultExt, truncate_and_trailoff};
 use workspace::item::TabTooltipContent;
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
@@ -59,6 +54,7 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
+use crate::commit_blob::{LoadedBlob, load_commit_file_blob};
 use crate::commit_view::affected_files::CommitAffectedFiles;
 use crate::commit_view::contains_panel::CommitContainsPanel;
 use crate::git_panel::GitPanel;
@@ -169,14 +165,6 @@ pub struct CommitView {
     compare_range: Option<(SharedString, SharedString)>,
 }
 
-struct GitBlob {
-    path: RepoPath,
-    worktree_id: WorktreeId,
-    is_deleted: bool,
-    is_binary: bool,
-    display_name: String,
-}
-
 struct CommitDiffAddon {
     file_statuses: HashMap<language::BufferId, FileStatus>,
     commit_view: WeakEntity<CommitView>,
@@ -234,8 +222,6 @@ impl Addon for CommitDiffAddon {
         })
     }
 }
-
-const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
 
 fn short_sha(sha: &str) -> &str {
     sha.get(0..7).unwrap_or(sha)
@@ -593,108 +579,27 @@ impl CommitView {
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
 
             for file in commit_diff.files {
-                let is_created = file.old_text.is_none();
-                let is_deleted = file.new_text.is_none();
-                let raw_new_text = file.new_text.unwrap_or_default();
-                let raw_old_text = file.old_text;
-
-                let is_binary = file.is_binary
-                    || is_binary_content(raw_new_text.as_bytes())
-                    || raw_old_text
-                        .as_ref()
-                        .is_some_and(|text| is_binary_content(text.as_bytes()));
-
-                let new_text = if is_binary {
-                    "(binary file not shown)".to_string()
-                } else {
-                    raw_new_text
-                };
-                let old_text = if is_binary { None } else { raw_old_text };
-                let worktree_id = repository_clone
-                    .update(cx, |repository, cx| {
-                        repository
-                            .repo_path_to_project_path(&file.path, cx)
-                            .map(|path| path.worktree_id)
-                            .or(first_worktree_id)
-                    })
-                    .context("project has no worktrees")?;
-                let short_sha = commit_sha
-                    .get(0..git::SHORT_SHA_LENGTH)
-                    .unwrap_or(&commit_sha);
-                let file_name = file
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string())
-                    .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
-                let display_name = format!("{short_sha} - {file_name}");
-
-                let file = Arc::new(GitBlob {
-                    path: file.path.clone(),
-                    is_deleted,
-                    is_binary,
-                    worktree_id,
-                    display_name,
-                }) as Arc<dyn language::File>;
-
-                let buffer = build_buffer(new_text, file, &language_registry, cx).await?;
-                let buffer_id = cx.update(|_, cx| buffer.read(cx).remote_id())?;
-
-                let status_code = if is_created {
-                    StatusCode::Added
-                } else if is_deleted {
-                    StatusCode::Deleted
-                } else {
-                    StatusCode::Modified
-                };
-                file_statuses.insert(
-                    buffer_id,
-                    FileStatus::Tracked(TrackedStatus {
-                        index_status: status_code,
-                        worktree_status: StatusCode::Unmodified,
-                    }),
-                );
-
-                if is_binary {
+                let blob = load_commit_file_blob(
+                    file,
+                    &commit_sha,
+                    &repository_clone,
+                    first_worktree_id,
+                    &language_registry,
+                    cx,
+                )
+                .await?;
+                let buffer_id = cx.update(|_, cx| blob.buffer.read(cx).remote_id())?;
+                file_statuses.insert(buffer_id, blob.status);
+                if blob.is_binary {
                     binary_buffer_ids.insert(buffer_id);
                 }
-
-                let buffer_diff = if is_binary {
-                    cx.update(|_, cx| {
-                        let snapshot = buffer.read(cx).snapshot();
-                        cx.new(|cx| {
-                            BufferDiff::new_unchanged(
-                                &snapshot,
-                                snapshot.language().cloned(),
-                                Some(language_registry.clone()),
-                                cx,
-                            )
-                        })
-                    })?
-                } else {
-                    build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
-                };
-
-                let (excerpt_ranges, path) = cx.update(|_, cx| {
-                    let snapshot = buffer.read(cx).snapshot();
-                    let path = PathKey::with_sort_prefix(
-                        FILE_NAMESPACE_SORT_PREFIX,
-                        snapshot.file().unwrap().path().clone(),
-                    );
-                    let ranges = if is_binary {
-                        vec![language::Point::zero()..snapshot.max_point()]
-                    } else {
-                        let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
-                        let mut hunks = diff_snapshot.hunks(&snapshot).peekable();
-                        if hunks.peek().is_none() {
-                            vec![language::Point::zero()..snapshot.max_point()]
-                        } else {
-                            hunks
-                                .map(|hunk| hunk.buffer_range.to_point(&snapshot))
-                                .collect::<Vec<_>>()
-                        }
-                    };
-                    (ranges, path)
-                })?;
+                let LoadedBlob {
+                    buffer,
+                    diff: buffer_diff,
+                    excerpt_ranges,
+                    path_key: path,
+                    ..
+                } = blob;
 
                 // Batch the insertion of excerpts and yield between batches, to avoid blocking the main thread when a single file has many hunks.
                 const EXCERPT_BATCH_SIZE: usize = 10;
@@ -1316,117 +1221,6 @@ async fn load_commit_metadata(
         ref_names,
         extra_committer,
     })
-}
-
-impl language::File for GitBlob {
-    fn as_local(&self) -> Option<&dyn language::LocalFile> {
-        None
-    }
-
-    fn disk_state(&self) -> DiskState {
-        DiskState::Historic {
-            was_deleted: self.is_deleted,
-        }
-    }
-
-    fn path_style(&self, _: &App) -> PathStyle {
-        PathStyle::local()
-    }
-
-    fn path(&self) -> &Arc<RelPath> {
-        self.path.as_ref()
-    }
-
-    fn full_path(&self, _: &App) -> PathBuf {
-        self.path.as_std_path().to_path_buf()
-    }
-
-    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
-        self.display_name.as_ref()
-    }
-
-    fn worktree_id(&self, _: &App) -> WorktreeId {
-        self.worktree_id
-    }
-
-    fn to_proto(&self, _cx: &App) -> language::proto::File {
-        // Synthetic CommitView buffers never travel over the collab wire —
-        // collab is disabled in this fork (.rules § "What's disabled"), so
-        // `to_proto` is unreachable. If collab is ever re-enabled,
-        // CommitView's read-only synthetic blobs would need a real
-        // serialization shape; until then `unreachable!` is correct.
-        unreachable!("CommitView synthetic File never serializes — collab disabled")
-    }
-
-    fn is_private(&self) -> bool {
-        false
-    }
-
-    fn can_open(&self) -> bool {
-        !self.is_binary
-    }
-}
-
-async fn build_buffer(
-    mut text: String,
-    blob: Arc<dyn File>,
-    language_registry: &Arc<language::LanguageRegistry>,
-    cx: &mut AsyncWindowContext,
-) -> Result<Entity<Buffer>> {
-    let line_ending = LineEnding::detect(&text);
-    LineEnding::normalize(&mut text);
-    let text = Rope::from(text);
-    let language =
-        cx.update(|_, cx| language_registry.language_for_file(&blob, Some(&text), cx))?;
-    let language = if let Some(language) = language {
-        language_registry
-            .load_language(&language)
-            .await
-            .ok()
-            .and_then(|e| e.log_err())
-    } else {
-        None
-    };
-    let buffer = cx.new(|cx| {
-        let buffer = TextBuffer::new_normalized(
-            ReplicaId::LOCAL,
-            cx.entity_id().as_non_zero_u64().into(),
-            line_ending,
-            text,
-        );
-        let mut buffer = Buffer::build(buffer, Some(blob), Capability::ReadWrite);
-        buffer.set_language_async(language, cx);
-        buffer
-    });
-    Ok(buffer)
-}
-
-async fn build_buffer_diff(
-    mut old_text: Option<String>,
-    buffer: &Entity<Buffer>,
-    language_registry: &Arc<LanguageRegistry>,
-    cx: &mut AsyncWindowContext,
-) -> Result<Entity<BufferDiff>> {
-    if let Some(old_text) = &mut old_text {
-        LineEnding::normalize(old_text);
-    }
-
-    let language = cx.update(|_, cx| buffer.read(cx).language().cloned())?;
-    let buffer = cx.update(|_, cx| buffer.read(cx).snapshot())?;
-
-    let diff =
-        cx.new(|cx| BufferDiff::new(&buffer.text, language, Some(language_registry.clone()), cx));
-
-    diff.update(cx, |diff, cx| {
-        diff.set_base_text(
-            old_text.map(|old_text| Arc::from(old_text.as_str())),
-            buffer.text.clone(),
-            cx,
-        )
-    })
-    .await;
-
-    Ok(diff)
 }
 
 impl EventEmitter<EditorEvent> for CommitView {}
