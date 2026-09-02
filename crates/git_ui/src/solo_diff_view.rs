@@ -2186,6 +2186,62 @@ mod tests {
         });
     }
 
+    /// The other side of the same wiring. A `SplittableEditor` whose consumer
+    /// paints no style controls of its own must get them from the search bar
+    /// — and must get them *whether or not* it has anything to collapse.
+    ///
+    /// The editor here is headerless and holds no buffers, which is not a
+    /// contrived shape: it is exactly what `CommitView` builds for a
+    /// compare-range diff, and exactly the state the pane sees, because
+    /// `add_item` runs synchronously while the commit's blobs are still
+    /// loading. Gating the quartet on "has files to collapse" made both of
+    /// those answer false and dropped the controls; nothing recomputes the
+    /// toolbar location afterwards, so they never came back.
+    #[gpui::test]
+    async fn test_a_consumer_without_its_own_toolbar_gets_the_style_controls(
+        cx: &mut TestAppContext,
+    ) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        let project = context
+            .workspace
+            .read_with(&cx, |workspace, _| workspace.project().clone());
+        let workspace = context.workspace.clone();
+
+        let editor = cx.update(|window, cx| {
+            let multibuffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadOnly));
+            cx.new(|cx| {
+                SplittableEditor::new(
+                    DiffViewStyle::Split,
+                    multibuffer,
+                    project,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            !editor.read_with(&cx, |editor, _| editor.style_controls_painted_by_consumer()),
+            "this consumer has no toolbar of its own"
+        );
+
+        let search_bar =
+            cx.update(|window, cx| cx.new(|cx| BufferSearchBar::new(None, window, cx)));
+        let item: Box<dyn ItemHandle> = Box::new(editor);
+        let (location, paints) = search_bar.update_in(&mut cx, |search_bar, window, cx| {
+            let location = search_bar.set_active_pane_item(Some(item.as_ref()), window, cx);
+            (location, search_bar.paints_diff_style_controls(cx))
+        });
+
+        assert!(paints, "so the search bar is the one that paints them");
+        assert_eq!(
+            location,
+            ToolbarItemLocation::PrimaryLeft,
+            "and it has to take the slot even with nothing to collapse"
+        );
+    }
+
     /// Splitting the pane was a gesture the commit source had through
     /// `CommitView` and the working-tree source never had at all. Both keep
     /// it, and the clone has to be configured for its own source rather than
@@ -2291,12 +2347,18 @@ mod tests {
                 "this view has a style toolbar of its own"
             );
             let item: Box<dyn ItemHandle> = Box::new(view.clone());
+            let (location, paints) = search_bar.update_in(&mut cx, |search_bar, window, cx| {
+                let location = search_bar.set_active_pane_item(Some(item.as_ref()), window, cx);
+                (location, search_bar.paints_diff_style_controls(cx))
+            });
             assert!(
-                !search_bar.update_in(&mut cx, |search_bar, window, cx| {
-                    search_bar.set_active_pane_item(Some(item.as_ref()), window, cx);
-                    search_bar.paints_diff_style_controls(cx)
-                }),
+                !paints,
                 "the search bar must leave the style controls to that toolbar"
+            );
+            assert_ne!(
+                location,
+                ToolbarItemLocation::PrimaryLeft,
+                "and must not take the slot beside it either"
             );
         }
 

@@ -269,16 +269,24 @@ impl Render for BufferSearchBar {
             None
         };
 
-        let collapse_expand_button = if self.needs_expand_collapse_option(cx) {
+        // The leading group holds two independent things: "Collapse All Files",
+        // which needs files to collapse, and the diff style controls, which
+        // need a diff whose consumer is not painting them itself. Either one
+        // on its own is reason enough to render — welding them together is
+        // what made a compare-range `CommitView` (headerless, and empty until
+        // its blobs load asynchronously) lose its hunk navigation entirely.
+        let needs_collapse_expand = self.needs_expand_collapse_option(cx);
+        let collapse_expand_button = if needs_collapse_expand || has_splittable_editor {
             let query_editor_focus = self.query_editor.focus_handle(cx);
 
-            let is_collapsed = self
-                .active_searchable_item
-                .as_ref()
-                .and_then(|item| item.act_as_type(TypeId::of::<Editor>(), cx))
-                .and_then(|item| item.downcast::<Editor>().ok())
-                .map(|editor: Entity<Editor>| editor.read(cx).has_any_buffer_folded(cx))
-                .unwrap_or_default();
+            let is_collapsed = needs_collapse_expand
+                && self
+                    .active_searchable_item
+                    .as_ref()
+                    .and_then(|item| item.act_as_type(TypeId::of::<Editor>(), cx))
+                    .and_then(|item| item.downcast::<Editor>().ok())
+                    .map(|editor: Entity<Editor>| editor.read(cx).has_any_buffer_folded(cx))
+                    .unwrap_or_default();
             let (icon, tooltip_label) = if is_collapsed {
                 (IconName::ChevronUpDown, "Expand All Files")
             } else {
@@ -286,36 +294,39 @@ impl Render for BufferSearchBar {
             };
 
             let collapse_expand_icon_button = |id| {
-                IconButton::new(id, icon)
-                    .icon_size(IconSize::Small)
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action_in(
-                            tooltip_label,
-                            &ToggleFoldAll,
-                            &query_editor_focus,
-                            cx,
-                        )
-                    })
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.toggle_fold_all(&ToggleFoldAll, window, cx);
-                    }))
+                let query_editor_focus = query_editor_focus.clone();
+                needs_collapse_expand.then(|| {
+                    IconButton::new(id, icon)
+                        .icon_size(IconSize::Small)
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action_in(
+                                tooltip_label,
+                                &ToggleFoldAll,
+                                &query_editor_focus,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.toggle_fold_all(&ToggleFoldAll, window, cx);
+                        }))
+                })
             };
 
             if self.dismissed {
                 return h_flex()
                     .pl_0p5()
                     .gap_1()
-                    .child(collapse_expand_icon_button(
+                    .children(collapse_expand_icon_button(
                         "multibuffer-collapse-expand-empty",
                     ))
-                    .when(has_splittable_editor, |this| this.children(split_buttons))
+                    .children(split_buttons)
                     .into_any_element();
             }
 
             Some(
                 h_flex()
                     .gap_1()
-                    .child(collapse_expand_icon_button("multibuffer-collapse-expand"))
+                    .children(collapse_expand_icon_button("multibuffer-collapse-expand"))
                     .children(split_buttons)
                     .into_any_element(),
             )
@@ -767,7 +778,12 @@ impl ToolbarItemView for BufferSearchBar {
             let is_project_search = searchable_item_handle.supported_options(cx).find_in_results;
             self.active_searchable_item = Some(searchable_item_handle);
             drop(self.update_matches(true, false, window, cx));
-            if self.needs_expand_collapse_option(cx) {
+            // Either group is reason enough to take the slot. Both predicates
+            // are asked here rather than only the collapse one, because a diff
+            // that has style controls but nothing to collapse would otherwise
+            // be told to hide, and nothing recomputes the location afterwards:
+            // the `_splittable_editor_subscription` only notifies.
+            if self.needs_expand_collapse_option(cx) || self.paints_diff_style_controls(cx) {
                 return ToolbarItemLocation::PrimaryLeft;
             } else if !self.is_dismissed() {
                 if is_project_search {
@@ -1151,6 +1167,14 @@ impl BufferSearchBar {
     /// quartets side by side. Public because the consumers that opt out live
     /// in crates above this one — `search` cannot name them — so this is where
     /// the wiring is testable end to end.
+    ///
+    /// This is the *only* gate on those four buttons, and on its own it is
+    /// enough to put the bar in `PrimaryLeft`: it deliberately says nothing
+    /// about [`Self::needs_expand_collapse_option`], which asks a different
+    /// question about a different button and used to suppress these as a side
+    /// effect. It is also content-independent — it reads the item's type, not
+    /// its multibuffer — so it answers the same before and after an
+    /// asynchronously-populated diff has any excerpts.
     pub fn paints_diff_style_controls(&self, cx: &App) -> bool {
         self.splittable_editor
             .as_ref()

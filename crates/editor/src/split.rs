@@ -499,9 +499,10 @@ impl SplittableEditor {
     /// — hunk navigation and Unified/Split — in a toolbar of its own.
     ///
     /// `BufferSearchBar` paints that quartet for every `SplittableEditor`
-    /// consumer, because most of them (`ProjectDiff`, `CommitView`,
-    /// `text_diff_view`, `agent_diff`) have no toolbar of their own to put it
-    /// in. A consumer that *does* have one must set this, or the two surfaces
+    /// consumer that has not set this, because most of them (`ProjectDiff`,
+    /// `CommitView`, `file_diff_view`, `text_diff_view`, `agent_diff`) have no
+    /// toolbar of their own to put it in. A consumer that *does* have one must
+    /// set this, or the two surfaces
     /// both land in `PrimaryLeft` and the user sees two identical pairs of
     /// hunk arrows and two Unified/Split toggles side by side. Which surface
     /// paints them is a fact about the consumer, not about the multibuffer's
