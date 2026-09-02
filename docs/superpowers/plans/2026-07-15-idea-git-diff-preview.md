@@ -1,6 +1,9 @@
 # Plan — IDEA-style single-file Git Diff (preview tab)
 
-**Date:** 2026-07-15 · **Status:** in progress
+**Date:** 2026-07-15 · **Status:** shipped, then **superseded by FORK.md #136** (2026-09-02) —
+the gesture model below (double-click / Enter pin; `preserve_preview` promoting on edit) is no
+longer what the code does. Nothing in the git panel pins. Read #136 before acting on this file;
+the body is kept unedited as the record of what was built.
 
 ## Problem
 Opening a git diff shows ONE tab with all changed files stacked in a single
