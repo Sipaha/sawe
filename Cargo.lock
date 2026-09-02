@@ -18074,6 +18074,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "ui_input",
  "util",
  "workspace",
  "workspace_events",
