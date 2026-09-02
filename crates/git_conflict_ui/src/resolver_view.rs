@@ -647,9 +647,8 @@ impl ConflictResolverView {
         })
     }
 
-    /// Re-run `git ls-files -u --stage` to refresh the conflicts list.
-    /// Drives the sidebar progress counter and triggers the auto-prompt
-    /// when zero files remain.
+    /// Re-run `git ls-files -u --stage` to refresh the conflicts list and
+    /// the sidebar progress counter.
     pub fn refresh_conflict_list(&mut self, cx: &mut Context<Self>) {
         let work_dir = self.work_dir.clone();
         cx.spawn(async move |this, cx| {
