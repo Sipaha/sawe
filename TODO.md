@@ -169,9 +169,12 @@ read-only and only the other one has the bug.
 Deferred because the obvious fix is a trap. The view implements
 `EventEmitter<EditorEvent>` and `to_item_events` but never subscribes to its editor and
 never emits, so **no `ItemEvent` ever reaches the pane** — and that is load-bearing: an
-`ItemEvent::Edit` would promote the shared preview tab out of the preview slot, which is
-exactly the pinning that FORK.md #136's gesture model forbids. A correct fix reports
-dirtiness without emitting a promoting event, or teaches the pane to distinguish the two.
+`ItemEvent::Edit` runs `Pane::handle_item_edit` → `unpreview_item_if_preview`
+(`crates/workspace/src/{item,pane}.rs`), promoting the shared preview tab out of the slot,
+which is exactly the pinning that FORK.md #136's gesture model forbids. That is also why
+#125's "editing a preview" is listed there as a promotion gesture this item does **not**
+have. A correct fix reports dirtiness without emitting a promoting event, or teaches the
+pane to distinguish the two.
 
 ### C8. The Commit tab's merge-parent toggle does not change the diff
 `CommitView::select_parent_index` (`crates/git_ui/src/commit_view.rs`) loads

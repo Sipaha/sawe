@@ -8157,8 +8157,10 @@ mod tests {
     /// terminal `git commit`) invalidates the loaded log and shifts every row
     /// index down by one. The Commit tab must keep describing the commit the
     /// user selected, header *and* file list together: when they drifted
-    /// apart, clicking a file asked `CommitView` for a path the displayed
-    /// commit never touched, which silently opened an empty tab.
+    /// apart, clicking a file asked for a diff of a path the displayed commit
+    /// never touched, which silently opened an empty tab. (That request went
+    /// to `CommitView` when this was written; since FORK.md #136 it is
+    /// `SoloDiffView::open_commit_file`.)
     ///
     /// This used to be a `GitGraph` invariant, back when the graph owned an
     /// inline detail sidebar; the surface moved to the panel but the pairing
@@ -8356,7 +8358,7 @@ mod tests {
     /// `git commit --amend` in a terminal rewrites the sha, so the re-anchor
     /// finds nothing and the graph ends up with no selection. The Commit tab
     /// must not be left describing the commit that no longer exists — its file
-    /// rows would ask `CommitView` for diffs of a sha git cannot resolve.
+    /// rows would ask for diffs of a sha git cannot resolve.
     #[gpui::test]
     async fn test_an_amended_commit_closes_the_commit_tab(cx: &mut TestAppContext) {
         init_test(cx);

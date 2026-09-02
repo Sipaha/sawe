@@ -76,6 +76,7 @@ One shared diff tab per pane, across **both** tabs:
 | gesture | behaviour |
 |---|---|
 | double click (either tab) | **summon** the shared diff into the pane's preview slot; never pin; focus stays in the panel |
+| — with `preview_tabs.enabled: false` | no shared slot exists, so every summon falls back to a **permanent, focused** tab (`add_to_pane`). Both halves of the row above are off under that setting, deliberately. |
 | single click (either tab) | **retarget** the shared diff if it is open; do nothing if it is not |
 | arrow-key step (Changes) | same as single click — retarget only |
 | `menu::Confirm` / Enter (Changes) | summon **and** focus the diff; still never pins |
@@ -113,9 +114,9 @@ search first; `SoloDiffView::resolve_gesture` declines first. Gating the whole c
 the pre-unification Changes tab did (`preview_is_solo_diff` in `move_diff_to_entry`), so a
 declined arrow step never reached a workspace-wide activate. Search-first lets an arrow-key
 step flip a pane onto a pinned diff and never flip back — a live regression in the
-maintainer's daily path. `Summon` keeps the workspace-wide reuse; `Retarget` does not, and
-the cost is that a single click on a file whose diff is pinned in another pane no longer
-surfaces that pinned tab.
+maintainer's daily path. The guard is the *only* mode-specific step: a `Retarget` that passes
+it reaches the same workspace-wide reuse as a `Summon` and will activate a match in any pane.
+A declined retarget never searches — which is the whole cost, and it is the intended one.
 
 ```
 1. Retarget, and the active pane's preview slot does not hold a SoloDiffView
@@ -348,3 +349,25 @@ Deliberately *not* in `TODO.md` — real, but too narrow to earn a row there:
 - `test_reopening_the_commit_view_spares_the_file_diff_tab` still reproduces the original
   pane geometry and still guards the bug, but can no longer express the original mutation
   (`single_file` dropped from the lookup key) — that mutation is unexpressible now.
+
+From the final whole-branch review, which found **nothing that must be fixed before push**
+(and six earlier ledger minors already closed by later rounds):
+
+- **Visibility that the extraction widened past its callers.** Four items in
+  `commit_blob.rs` are `pub(crate)` with no cross-module caller, and its `build_buffer_diff`
+  now name-collides with an unrelated one in `file_diff_view.rs`. `DiffSource::repository()`
+  is `pub` with a single same-file caller. `SplittableEditor::diff_hunk_controls_disabled()`
+  and `lhs_blame_base()` are `pub` `editor` API whose only callers are `git_ui` tests — real
+  API surface bought for test observability, which is a trade worth making deliberately
+  rather than by accident.
+- **`alignment_element()`'s fixed `size_5` spacer under-indents the replace row** now that
+  the leading group can be five buttons wide. Pre-existing, and only visible at that width.
+- **`CommitView::open`'s `file_filter` is dead in practice**, with two latent
+  inconsistencies behind it: `OpenDiff::from_active_item` hardcodes `file: None` for any
+  `CommitView`, and the replace-lookup dedupe keys on sha alone. Neither is reachable while
+  every caller passes `None`; both become wrong the moment one does not. Whoever revives
+  `file_filter` owns all three.
+- **The LSP Logs toolbar changed** as a side effect of `has_files_to_collapse` — the leading
+  group's lone collapse chevron is gone and the bar no longer holds `PrimaryLeft` while
+  dismissed. The button was never functional there; recorded in FORK.md #137 so the next
+  person does not read it as a regression.

@@ -177,6 +177,17 @@ impl DiffSource {
     /// A working-tree diff is identified by its repository — the same relative
     /// path can exist in a second repository in the window — and a commit diff
     /// by its sha, so the same file at two revisions gets two tabs.
+    ///
+    /// The asymmetry is deliberate, not an omission: the commit arm ignores
+    /// the repository because `(sha, path)` already identifies the *content*.
+    /// A sha is content-addressed, so two repositories that both contain it
+    /// contain the same blob at that path. The one visible consequence is in a
+    /// Solution whose members are two clones of one repository: a Commit-tab
+    /// click in member B reuses member A's open tab. The diff shown is
+    /// identical, which is why this is a dedupe win rather than a bug — but if
+    /// the tab ever grows a working-tree-relative affordance (reveal in the
+    /// project panel, "open the file at HEAD"), the repository has to join the
+    /// key at that point.
     fn matches(&self, other: &Self, cx: &App) -> bool {
         match (self, other) {
             (
