@@ -276,7 +276,10 @@ impl Render for BufferSearchBar {
         // what made a compare-range `CommitView` (headerless, and empty until
         // its blobs load asynchronously) lose its hunk navigation entirely.
         let needs_collapse_expand = self.needs_expand_collapse_option(cx);
-        let collapse_expand_button = if needs_collapse_expand || has_splittable_editor {
+        // `split_buttons.is_some()` rather than a separately-computed boolean:
+        // the row is shown exactly when it has something in it, so this
+        // condition cannot drift away from what is actually being rendered.
+        let collapse_expand_button = if needs_collapse_expand || split_buttons.is_some() {
             let query_editor_focus = self.query_editor.focus_handle(cx);
 
             let is_collapsed = needs_collapse_expand

@@ -2207,39 +2207,58 @@ mod tests {
             .read_with(&cx, |workspace, _| workspace.project().clone());
         let workspace = context.workspace.clone();
 
-        let editor = cx.update(|window, cx| {
-            let multibuffer = cx.new(|_| MultiBuffer::without_headers(Capability::ReadOnly));
-            cx.new(|cx| {
-                SplittableEditor::new(
-                    DiffViewStyle::Split,
-                    multibuffer,
-                    project,
-                    workspace,
-                    window,
-                    cx,
-                )
-            })
-        });
-        cx.run_until_parked();
-        assert!(
-            !editor.read_with(&cx, |editor, _| editor.style_controls_painted_by_consumer()),
-            "this consumer has no toolbar of its own"
-        );
-
         let search_bar =
             cx.update(|window, cx| cx.new(|cx| BufferSearchBar::new(None, window, cx)));
-        let item: Box<dyn ItemHandle> = Box::new(editor);
-        let (location, paints) = search_bar.update_in(&mut cx, |search_bar, window, cx| {
-            let location = search_bar.set_active_pane_item(Some(item.as_ref()), window, cx);
-            (location, search_bar.paints_diff_style_controls(cx))
-        });
 
-        assert!(paints, "so the search bar is the one that paints them");
-        assert_eq!(
-            location,
-            ToolbarItemLocation::PrimaryLeft,
-            "and it has to take the slot even with nothing to collapse"
-        );
+        // Both shapes that answer "nothing to collapse": a headerless
+        // multibuffer with no excerpts yet (compare-range `CommitView`, and
+        // every commit view at the instant `add_item` runs), and a singleton
+        // (`file_diff_view`, which `buffer_kind` excludes outright).
+        for headerless in [true, false] {
+            let project = project.clone();
+            let workspace = workspace.clone();
+            let editor = cx.update(|window, cx| {
+                let multibuffer = cx.new(|cx| {
+                    if headerless {
+                        MultiBuffer::without_headers(Capability::ReadOnly)
+                    } else {
+                        MultiBuffer::singleton(cx.new(|cx| Buffer::local("one\n", cx)), cx)
+                    }
+                });
+                cx.new(|cx| {
+                    SplittableEditor::new(
+                        DiffViewStyle::Split,
+                        multibuffer,
+                        project,
+                        workspace,
+                        window,
+                        cx,
+                    )
+                })
+            });
+            cx.run_until_parked();
+            assert!(
+                !editor.read_with(&cx, |editor, _| editor.style_controls_painted_by_consumer()),
+                "this consumer has no toolbar of its own"
+            );
+
+            let item: Box<dyn ItemHandle> = Box::new(editor);
+            let (location, paints) = search_bar.update_in(&mut cx, |search_bar, window, cx| {
+                let location = search_bar.set_active_pane_item(Some(item.as_ref()), window, cx);
+                (location, search_bar.paints_diff_style_controls(cx))
+            });
+
+            assert!(
+                paints,
+                "the search bar is the one that paints them (headerless={headerless})"
+            );
+            assert_eq!(
+                location,
+                ToolbarItemLocation::PrimaryLeft,
+                "and it has to take the slot even with nothing to collapse \
+                 (headerless={headerless})"
+            );
+        }
     }
 
     /// Splitting the pane was a gesture the commit source had through
