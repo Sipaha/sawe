@@ -2324,22 +2324,39 @@ mod tests {
         });
         cx.run_until_parked();
 
-        cx.draw(
-            gpui::point(gpui::px(0.), gpui::px(0.)),
-            gpui::size(gpui::px(1200.), gpui::px(60.)),
-            |_window, _cx| search_bar.clone().into_any_element(),
-        );
+        // Dismissed and shown are two different element trees — the dismissed
+        // bar returns early with just the leading group — so both have to be
+        // drawn. The shown one is what the user gets after ctrl-f, which is
+        // exactly where the controls used to disappear.
+        for shown in [false, true] {
+            if shown {
+                assert!(
+                    search_bar.update_in(&mut cx, |search_bar, window, cx| {
+                        search_bar.show(window, cx)
+                    }),
+                    "the bar opens over a diff"
+                );
+                cx.run_until_parked();
+            }
 
-        for icon in ["ICON-ArrowUp", "ICON-ArrowDown", "ICON-DiffUnified"] {
+            cx.draw(
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::size(gpui::px(1200.), gpui::px(200.)),
+                |_window, _cx| search_bar.clone().into_any_element(),
+            );
+
+            for icon in ["ICON-ArrowUp", "ICON-ArrowDown", "ICON-DiffUnified"] {
+                assert!(
+                    cx.debug_bounds(icon).is_some(),
+                    "{icon} must actually be painted, not merely permitted (shown={shown})"
+                );
+            }
             assert!(
-                cx.debug_bounds(icon).is_some(),
-                "{icon} must actually be painted, not merely permitted"
+                cx.debug_bounds("ICON-ChevronDownUp").is_none(),
+                "and there is nothing here to collapse, so no chevron beside them \
+                 (shown={shown})"
             );
         }
-        assert!(
-            cx.debug_bounds("ICON-ChevronDownUp").is_none(),
-            "and there is nothing here to collapse, so no chevron beside them"
-        );
     }
 
     /// Splitting the pane was a gesture the commit source had through
