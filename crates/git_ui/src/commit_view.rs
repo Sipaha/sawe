@@ -48,7 +48,7 @@ use workspace::item::TabTooltipContent;
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
-    item::{ItemEvent, PreviewTabsSettings, TabContentParams},
+    item::{ItemEvent, TabContentParams},
     notifications::NotifyTaskExt,
     pane::SaveIntent,
     searchable::SearchableItemHandle,
@@ -150,12 +150,6 @@ pub struct CommitView {
     explain_expanded: bool,
     explain_error: Option<SharedString>,
     _explain_task: Option<Task<()>>,
-    /// `Some` when this view was opened as a focused single-file diff
-    /// (clicking a file in the git-graph commit-detail panel) — render
-    /// only the diff editor, no metadata panel / commit-message excerpt,
-    /// and title the tab with the file name. Also keys the open-view
-    /// dedup so a single-file diff and the full commit view coexist.
-    single_file: Option<RepoPath>,
     /// `Some((base, head))` when this view is IDEA's "Compare Versions":
     /// the diff between two selected commits rather than one commit
     /// against its parent. There is no single commit to describe, so the
@@ -228,6 +222,12 @@ fn short_sha(sha: &str) -> &str {
 }
 
 impl CommitView {
+    /// The commit being shown, as a whole. A single file's diff — from either
+    /// git-panel tab — is a [`crate::solo_diff_view::SoloDiffView`] with a
+    /// `Commit` source, not this view.
+    ///
+    /// `file_filter` narrows which of the commit's files the diff shows while
+    /// keeping the whole-commit chrome; it is not a single-file mode.
     pub fn open(
         commit_sha: String,
         repo: WeakEntity<Repository>,
@@ -237,79 +237,80 @@ impl CommitView {
         window: &mut Window,
         cx: &mut App,
     ) {
-        Self::open_internal(
-            commit_sha,
-            repo,
-            workspace,
-            stash,
-            file_filter,
-            false,
-            false,
-            window,
-            cx,
-        );
-    }
+        let commit_diff = repo
+            .update(cx, |repo, _| repo.load_commit_diff(commit_sha.clone()))
+            .ok();
+        let commit_details = repo
+            .update(cx, |repo, _| repo.show(commit_sha.clone()))
+            .ok();
 
-    /// Open a focused diff of a single file's changes in `commit_sha`
-    /// (its content at the commit vs. at the parent) — no commit
-    /// metadata chrome, tab titled with the file name. Used by the
-    /// changed-files list of the git panel's Commit tab.
-    ///
-    /// Opens into the pane's *preview* slot, so picking file after file
-    /// retargets one shared diff tab instead of accumulating one tab per
-    /// file, and keeps keyboard focus in the git panel.
-    pub fn open_file_diff(
-        commit_sha: String,
-        repo: WeakEntity<Repository>,
-        workspace: WeakEntity<Workspace>,
-        file: RepoPath,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        Self::open_internal(
-            commit_sha,
-            repo,
-            workspace,
-            None,
-            Some(file),
-            true,
-            true,
-            window,
-            cx,
-        );
-    }
+        window
+            .spawn(cx, async move |cx| {
+                let commit_diff = commit_diff?;
+                let commit_details = commit_details?;
+                let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
+                let mut commit_diff = commit_diff.log_err()?.log_err()?;
+                let commit_details = commit_details.log_err()?.log_err()?;
 
-    /// Whether the pane's preview slot is currently occupied by a
-    /// single-file [`CommitView`] — i.e. whether a
-    /// [`Self::open_file_diff`] tab is standing by to be retargeted.
-    ///
-    /// Same shape as `GitPanel::move_diff_to_entry`'s guard for the Changes
-    /// tab's `SoloDiffView` preview: both views compete for the pane's one
-    /// preview slot, so each gesture must confirm the slot holds *its own*
-    /// view type before retargeting it.
-    pub fn preview_holds_single_file_diff(workspace: &WeakEntity<Workspace>, cx: &App) -> bool {
-        let Some(workspace) = workspace.upgrade() else {
-            return false;
-        };
-        let workspace = workspace.read(cx);
-        let Some(preview_id) = workspace.active_pane().read(cx).preview_item_id() else {
-            return false;
-        };
-        workspace
-            .items_of_type::<CommitView>(cx)
-            .any(|view| view.entity_id() == preview_id && view.read(cx).single_file.is_some())
-    }
+                if let Some(ref filter_path) = file_filter {
+                    commit_diff.files.retain(|f| &f.path == filter_path);
+                }
 
-    /// The file this view is filtered to, when it was opened as a single-file
-    /// diff. `None` for a whole-commit view.
-    pub fn single_file(&self) -> Option<&RepoPath> {
-        self.single_file.as_ref()
+                let repo = repo.upgrade()?;
+
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        let project = workspace.project();
+                        let workspace_entity = cx.entity();
+                        let workspace_handle = cx.weak_entity();
+                        let commit_view = cx.new(|cx| {
+                            CommitView::new(
+                                commit_details,
+                                commit_diff,
+                                repo,
+                                project.clone(),
+                                workspace_entity,
+                                workspace_handle,
+                                stash,
+                                None,
+                                window,
+                                cx,
+                            )
+                        });
+
+                        let pane = workspace.active_pane();
+                        pane.update(cx, |pane, cx| {
+                            let existing = pane.items().enumerate().find_map(|(ix, item)| {
+                                let view = item.downcast::<CommitView>()?;
+                                let matches = view.read(cx).commit.sha == commit_sha;
+                                matches.then(|| (ix, view.item_id()))
+                            });
+
+                            if let Some((ix, existing_id)) = existing {
+                                pane.remove_item(existing_id, false, false, window, cx);
+                                pane.add_item(
+                                    Box::new(commit_view),
+                                    true,
+                                    true,
+                                    Some(ix),
+                                    window,
+                                    cx,
+                                );
+                                return;
+                            }
+
+                            pane.add_item(Box::new(commit_view), true, true, None, window, cx);
+                        })
+                    })
+                    .log_err()
+            })
+            .detach();
     }
 
     /// The commit being shown. Read by the git panel to tell two commits'
-    /// single-file diffs apart: [`Self::single_file`] alone would let the
-    /// Commit tab mark a row for a diff belonging to a different commit that
-    /// happens to touch the same path.
+    /// single-file diffs apart: the path alone would let the Commit tab mark a
+    /// row for a diff belonging to a different commit that happens to touch
+    /// the same path.
     pub fn sha(&self) -> &SharedString {
         &self.commit.sha
     }
@@ -361,7 +362,6 @@ impl CommitView {
                                 workspace_entity,
                                 workspace_handle,
                                 None,
-                                None,
                                 Some(range_for_view),
                                 window,
                                 cx,
@@ -393,128 +393,6 @@ impl CommitView {
             .detach();
     }
 
-    fn open_internal(
-        commit_sha: String,
-        repo: WeakEntity<Repository>,
-        workspace: WeakEntity<Workspace>,
-        stash: Option<usize>,
-        file_filter: Option<RepoPath>,
-        single_file_mode: bool,
-        preview: bool,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let commit_diff = repo
-            .update(cx, |repo, _| repo.load_commit_diff(commit_sha.clone()))
-            .ok();
-        let commit_details = repo
-            .update(cx, |repo, _| repo.show(commit_sha.clone()))
-            .ok();
-
-        window
-            .spawn(cx, async move |cx| {
-                let commit_diff = commit_diff?;
-                let commit_details = commit_details?;
-                let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
-                let mut commit_diff = commit_diff.log_err()?.log_err()?;
-                let commit_details = commit_details.log_err()?.log_err()?;
-
-                if let Some(ref filter_path) = file_filter {
-                    commit_diff.files.retain(|f| &f.path == filter_path);
-                }
-
-                let single_file = if single_file_mode {
-                    file_filter.clone()
-                } else {
-                    None
-                };
-
-                let repo = repo.upgrade()?;
-
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        let project = workspace.project();
-                        let workspace_entity = cx.entity();
-                        let workspace_handle = cx.weak_entity();
-                        let single_file_for_view = single_file.clone();
-                        let commit_view = cx.new(|cx| {
-                            CommitView::new(
-                                commit_details,
-                                commit_diff,
-                                repo,
-                                project.clone(),
-                                workspace_entity,
-                                workspace_handle,
-                                stash,
-                                single_file_for_view,
-                                None,
-                                window,
-                                cx,
-                            )
-                        });
-
-                        let pane = workspace.active_pane();
-                        pane.update(cx, |pane, cx| {
-                            // Both halves of the match must key off the same
-                            // (sha, single_file) pair: keying the lookup off the
-                            // sha alone used to close a whole-commit tab sitting
-                            // to the left of the single-file tab being replaced.
-                            let existing = pane.items().enumerate().find_map(|(ix, item)| {
-                                let view = item.downcast::<CommitView>()?;
-                                let matches = {
-                                    let view = view.read(cx);
-                                    view.commit.sha == commit_sha && view.single_file == single_file
-                                };
-                                matches.then(|| (ix, view.item_id()))
-                            });
-
-                            if preview {
-                                // An already-open tab for this exact file is
-                                // reused rather than rebuilt: rebuilding would
-                                // re-run `load_commit_diff` and throw away the
-                                // user's scroll position for no visible gain.
-                                if let Some((ix, _)) = existing {
-                                    pane.activate_item(ix, true, false, window, cx);
-                                    return;
-                                }
-                            } else if let Some((ix, existing_id)) = existing {
-                                pane.remove_item(existing_id, false, false, window, cx);
-                                pane.add_item(
-                                    Box::new(commit_view),
-                                    true,
-                                    true,
-                                    Some(ix),
-                                    window,
-                                    cx,
-                                );
-                                return;
-                            }
-
-                            let item: Box<dyn ItemHandle> = Box::new(commit_view);
-                            // FORK.md #54: there is no `allow_preview` flag on
-                            // `add_item`; claiming the preview slot means
-                            // replacing its current occupant and reusing the
-                            // index it vacated.
-                            let preview_slot =
-                                preview && PreviewTabsSettings::get_global(cx).enabled;
-                            let destination_index = if preview_slot {
-                                pane.replace_preview_item_id(item.item_id(), window, cx)
-                            } else {
-                                None
-                            };
-                            // A preview open leaves focus where it was (the git
-                            // panel), so the next click keeps landing on file
-                            // rows. With previews disabled there is no shared
-                            // slot to keep clicking into, so the tab is a
-                            // deliberate permanent open and takes focus.
-                            pane.add_item(item, true, !preview_slot, destination_index, window, cx);
-                        })
-                    })
-                    .log_err()
-            })
-            .detach();
-    }
-
     fn new(
         commit: CommitDetails,
         commit_diff: CommitDiff,
@@ -523,20 +401,18 @@ impl CommitView {
         workspace_entity: Entity<Workspace>,
         workspace: WeakEntity<Workspace>,
         stash: Option<usize>,
-        single_file: Option<RepoPath>,
         compare_range: Option<(SharedString, SharedString)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Single-file diff mode: render only the file's diff editor — skip
-        // the commit-message excerpt (and the metadata panel, see `render`).
-        // A two-commit comparison has no commit of its own to describe, so
-        // it takes the same bare shape.
-        let compact = single_file.is_some() || compare_range.is_some();
+        // A two-commit comparison has no commit of its own to describe, so it
+        // renders only the diff editor — no metadata panel (see `render`) and
+        // no commit-message excerpt.
+        let compact = compare_range.is_some();
         let language_registry = project.read(cx).languages().clone();
         let multibuffer = cx.new(|cx| {
-            // Single-file mode shows exactly one file whose name is already in
-            // the tab — the multibuffer path header would be redundant chrome.
+            // Compare mode names both revisions in the tab, so the
+            // multibuffer's own path header would be redundant chrome.
             let mut multibuffer = if compact {
                 MultiBuffer::without_headers(Capability::ReadOnly)
             } else {
@@ -547,7 +423,7 @@ impl CommitView {
         });
 
         let editor = cx.new(|cx| {
-            let editor = SplittableEditor::new(
+            let mut editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
                 multibuffer.clone(),
                 project.clone(),
@@ -572,7 +448,7 @@ impl CommitView {
             .map(|worktree| worktree.read(cx).id());
 
         let repository_clone = repository.clone();
-        let diff_files = commit_diff.files.iter().map(clone_commit_file).collect();
+        let diff_files = commit_diff.files.iter().cloned().collect();
 
         cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
@@ -696,11 +572,10 @@ impl CommitView {
             explain_expanded: false,
             explain_error: None,
             _explain_task: None,
-            single_file,
             compare_range,
         };
         // The metadata panel (parents / refs / contains) isn't rendered in
-        // single-file diff mode, so don't pay for the git calls that fill it.
+        // compare mode, so don't pay for the git calls that fill it.
         if !compact {
             let sha_for_meta = view.commit.sha.to_string();
             view.contains_panel
@@ -899,7 +774,7 @@ impl CommitView {
         cx.spawn(async move |this, cx| {
             if let Some(diff) = task.await.log_err().and_then(|res| res.log_err()) {
                 this.update(cx, |view, cx| {
-                    view.diff_files = diff.files.iter().map(clone_commit_file).collect();
+                    view.diff_files = diff.files.iter().cloned().collect();
                     cx.notify();
                 })
                 .ok();
@@ -1147,15 +1022,6 @@ impl CommitView {
     }
 }
 
-fn clone_commit_file(file: &git::repository::CommitFile) -> git::repository::CommitFile {
-    git::repository::CommitFile {
-        path: file.path.clone(),
-        old_text: file.old_text.clone(),
-        new_text: file.new_text.clone(),
-        is_binary: file.is_binary,
-    }
-}
-
 struct LoadedCommitMetadata {
     parents: Vec<SharedString>,
     ref_names: Vec<SharedString>,
@@ -1252,13 +1118,6 @@ impl Item for CommitView {
         if let Some((base, head)) = &self.compare_range {
             return format!("{}..{}", short_sha(base), short_sha(head)).into();
         }
-        if let Some(path) = &self.single_file {
-            return path
-                .file_name()
-                .map(|name| name.to_string())
-                .unwrap_or_else(|| path.as_unix_str().to_string())
-                .into();
-        }
         let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
         let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
         format!("{short_sha} — {subject}").into()
@@ -1273,23 +1132,6 @@ impl Item for CommitView {
         }
         let short_sha = self.commit.sha.get(0..16).unwrap_or(&*self.commit.sha);
         let subject = self.commit.message.split('\n').next().unwrap();
-
-        if let Some(path) = &self.single_file {
-            let path = path.as_unix_str().to_string();
-            let short_sha = short_sha.to_string();
-            return Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
-                move |_, _| {
-                    v_flex()
-                        .child(Label::new(path.clone()))
-                        .child(
-                            Label::new(format!("at {short_sha}"))
-                                .color(Color::Muted)
-                                .size(LabelSize::Small),
-                        )
-                        .into_any_element()
-                },
-            ))));
-        }
 
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
             let subject = subject.to_string();
@@ -1418,7 +1260,7 @@ impl Item for CommitView {
         let parents = self.parents.clone();
         let ref_names = self.ref_names.clone();
         let extra_committer = self.extra_committer.clone();
-        let diff_files = self.diff_files.iter().map(clone_commit_file).collect();
+        let diff_files = self.diff_files.iter().cloned().collect();
         let lazy_threshold = self.affected_files.lazy_threshold;
         Task::ready(Some(cx.new(|cx| {
             let commit_view = cx.weak_entity();
@@ -1432,7 +1274,7 @@ impl Item for CommitView {
                 // `&mut Window`, leaving it usable afterwards.
                 let window = &mut *window;
                 move |cx| {
-                    let editor = SplittableEditor::new(
+                    let mut editor = SplittableEditor::new(
                         diff_view_style,
                         multibuffer.clone(),
                         project.clone(),
@@ -1475,7 +1317,6 @@ impl Item for CommitView {
                 explain_expanded: self.explain_expanded,
                 explain_error: self.explain_error.clone(),
                 _explain_task: None,
-                single_file: self.single_file.clone(),
                 compare_range: self.compare_range.clone(),
             }
         })))
@@ -1495,9 +1336,8 @@ impl Render for CommitView {
                 view.toggle_or_request_explain(window, cx);
             }));
 
-        // Single-file diff mode, and two-commit comparison — just the diff
-        // editor, no commit metadata.
-        if self.single_file.is_some() || self.compare_range.is_some() {
+        // A two-commit comparison — just the diff editor, no commit metadata.
+        if self.compare_range.is_some() {
             return base.when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
                 |this| this.child(div().flex_grow(1.).child(self.editor.clone())),

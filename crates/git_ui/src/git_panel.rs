@@ -7,7 +7,7 @@ use crate::pre_commit;
 use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::rollback_modal::RollbackModal;
-use crate::solo_diff_view::{SoloDiffOpen, SoloDiffView};
+use crate::solo_diff_view::{DiffOpen, DiffSource, SoloDiffView};
 use crate::{branch_picker, picker_prompt, render_remote_button};
 use crate::{git_panel_settings::GitPanelSettings, git_status_icon};
 use agent_settings::AgentSettings;
@@ -457,9 +457,11 @@ const STATE_OPACITY_STEP: f32 = 0.04;
 /// clicked" and "the diff I am looking at" diverge the moment the user
 /// activates another tab, and it is the second one the panel has to mark.
 /// Neither of the two views can be identified through
-/// `Item::active_project_path` — `SoloDiffView` does not implement it and
+/// `Item::active_project_path` — `SoloDiffView` does not implement it, and a
 /// `CommitView`'s buffers are `DiskState::Historic`, so `Buffer::project_path`
-/// is `None` — hence the typed downcast.
+/// is `None` — hence the typed downcast. Which *kind* of diff a `SoloDiffView`
+/// is showing comes from its [`DiffSource`], since one item type now serves
+/// both of the panel's tabs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenDiff {
     /// A working-copy diff, the kind the Changes tab opens.
@@ -467,8 +469,9 @@ pub(crate) enum OpenDiff {
         repository_id: RepositoryId,
         repo_path: RepoPath,
     },
-    /// A commit's diff, the kind the Commit tab opens. `file` is `None` for a
-    /// whole-commit view, which no single file row can claim.
+    /// A commit's diff. `file` is `Some` for the Commit tab's single-file
+    /// diff and `None` for a whole-commit `CommitView`, which no single file
+    /// row can claim.
     Commit {
         sha: SharedString,
         file: Option<RepoPath>,
@@ -480,16 +483,25 @@ impl OpenDiff {
         let item = item?;
         if let Some(solo_diff) = item.downcast::<SoloDiffView>() {
             let solo_diff = solo_diff.read(cx);
-            return Some(Self::Working {
-                repository_id: solo_diff.repository_id(),
-                repo_path: solo_diff.repo_path().clone(),
+            // One item type now serves both tabs, so it is the *source* that
+            // says which kind of mark this is, not the item's type.
+            return Some(match solo_diff.source() {
+                DiffSource::WorkingTree { repo_path, .. } => Self::Working {
+                    repository_id: solo_diff.repository_id(),
+                    repo_path: repo_path.clone(),
+                },
+                DiffSource::Commit { sha, repo_path, .. } => Self::Commit {
+                    sha: sha.clone(),
+                    file: Some(repo_path.clone()),
+                },
             });
         }
+        // The only `CommitView` left is the whole-commit one, which no single
+        // file row can claim.
         if let Some(commit_view) = item.downcast::<CommitView>() {
-            let commit_view = commit_view.read(cx);
             return Some(Self::Commit {
-                sha: commit_view.sha().clone(),
-                file: commit_view.single_file().cloned(),
+                sha: commit_view.read(cx).sha().clone(),
+                file: None,
             });
         }
         None
@@ -1592,22 +1604,10 @@ impl GitPanel {
                 });
             }
 
-            // If the active pane's preview slot currently holds a single-file
-            // diff, swap it to track the selection (keeps focus in the panel).
-            let preview_is_solo_diff = workspace
-                .read(cx)
-                .active_pane()
-                .read(cx)
-                .preview_item_id()
-                .is_some_and(|preview_id| {
-                    workspace
-                        .read(cx)
-                        .items_of_type::<SoloDiffView>(cx)
-                        .any(|view| view.entity_id() == preview_id)
-                });
-            if preview_is_solo_diff {
-                self.open_diff_for_selected(SoloDiffOpen::Preview, window, cx);
-            }
+            // Swap the shared diff tab to track the selection, if it is open.
+            // `DiffOpen::Retarget` *is* "do that and nothing else", so the
+            // guard lives in the one open algorithm rather than here.
+            self.open_diff_for_selected(DiffOpen::Retarget, window, cx);
 
             Some(())
         });
@@ -1672,9 +1672,13 @@ impl GitPanel {
         self.selected_entry.and_then(|i| self.entries.get(i))
     }
 
-    /// `menu::Confirm` (Enter / plain click deferred here): open the selected
-    /// file's single-file diff as a pinned tab. IntelliJ-IDEA model — one file at
-    /// a time, not the stacked accordion.
+    /// `menu::Confirm` (Enter): summon the selected file's single-file diff and
+    /// move focus into it. IntelliJ-IDEA model — one file at a time, not the
+    /// stacked accordion.
+    ///
+    /// Enter focuses but does not *pin*: pinning would promote the shared diff
+    /// out of the pane's preview slot, and the next single click would then
+    /// find the slot empty and summon a second tab.
     fn open_diff(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(GitListEntry::Directory(dir_entry)) = self
             .selected_entry
@@ -1684,7 +1688,7 @@ impl GitPanel {
             self.toggle_directory(&dir_entry.key, window, cx);
             return;
         }
-        self.open_diff_for_selected(SoloDiffOpen::Permanent, window, cx);
+        self.open_diff_for_selected(DiffOpen::Summon { focus: true }, window, cx);
     }
 
     /// `menu::SecondaryConfirm` (alt-enter / cmd-click): open the stacked
@@ -1707,20 +1711,50 @@ impl GitPanel {
         self.open_all_diffs(window, cx);
     }
 
-    /// Open the selected file's single-file diff (`SoloDiffView`). `Preview`
-    /// opens a replaceable italic tab and keeps focus in the panel; `Permanent`
-    /// pins it and moves focus into the diff.
+    /// The diff half of a left click on a Changes-tab file row (the selection
+    /// half is the row's own handler).
+    ///
+    /// Deliberately the same shape as `ChangedFileEntry::handle_row_click` on
+    /// the Commit tab: the two tabs drive one shared diff tab, and keeping the
+    /// gesture mapping in one named place per tab is what lets a test hold
+    /// them to the same model.
+    fn handle_row_click(
+        &mut self,
+        secondary: bool,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if secondary {
+            // Cmd/Ctrl-click → stacked all-files accordion.
+            self.open_all_diffs(window, cx);
+        } else if click_count > 1 {
+            // Double click → summon the shared diff tab, leaving focus in the
+            // panel. Deliberately not a *pin*: a pinned tab leaves the preview
+            // slot, and the next single click would summon a second tab
+            // instead of retargeting this one.
+            self.open_diff_for_selected(DiffOpen::Summon { focus: false }, window, cx);
+        } else {
+            // Single click → retarget the shared diff tab if it is open, and
+            // do nothing at all if it is not.
+            self.open_diff_for_selected(DiffOpen::Retarget, window, cx);
+        }
+    }
+
+    /// Open the selected file's single-file diff (`SoloDiffView`). `Summon`
+    /// opens the shared diff tab when it is not already open; `Retarget` only
+    /// changes what an already-open one is showing, and does nothing otherwise.
     ///
     /// A file whose index entry is still unmerged is routed to the conflict
     /// resolver instead: `SoloDiffView`'s base side is `git show :<path>`,
     /// which fails outright on an unmerged path, so the diff would open with no
     /// base and announce "0 differences" over the one file blocking the commit.
-    /// Only the `Permanent` gesture opens the resolver — `Preview` fires on
-    /// every arrow-key step through the list, and stepping past a conflict
-    /// should not spawn a three-pane merge view.
+    /// Only `Summon` opens the resolver — `Retarget` fires on every arrow-key
+    /// step through the list, and stepping past a conflict should not spawn a
+    /// three-pane merge view.
     fn open_diff_for_selected(
         &mut self,
-        mode: SoloDiffOpen,
+        mode: DiffOpen,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1733,7 +1767,7 @@ impl GitPanel {
             let repository = self.active_repository.clone()?;
 
             if entry.status.is_conflicted() {
-                if matches!(mode, SoloDiffOpen::Permanent) {
+                if matches!(mode, DiffOpen::Summon { .. }) {
                     window.dispatch_action(OpenConflictResolver.boxed_clone(), cx);
                 }
                 return Some(());
@@ -8472,12 +8506,21 @@ mod tests {
         });
     }
 
-    /// The panel marks the diff the *pane* is showing, which is a different
-    /// question from which row was last clicked: the two come apart the moment
-    /// the user activates another tab. Every step here drives the pane and
-    /// reads the panel — no row is ever clicked.
-    #[gpui::test]
-    async fn test_open_diff_mark_tracks_the_active_pane_item(cx: &mut TestAppContext) {
+    /// A workspace with one repository, two modified files and a booted git
+    /// panel whose entries have loaded — the setup every Changes-tab gesture
+    /// test needs before it diverges.
+    struct ChangesTabFixture {
+        workspace: Entity<Workspace>,
+        panel: Entity<GitPanel>,
+        repository: Entity<Repository>,
+        repository_id: RepositoryId,
+        one: RepoPath,
+        two: RepoPath,
+    }
+
+    async fn changes_tab_fixture(
+        cx: &mut TestAppContext,
+    ) -> (ChangesTabFixture, VisualTestContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.background_executor.clone());
@@ -8505,8 +8548,8 @@ mod tests {
         let workspace = window_handle
             .read_with(cx, |mw, _| mw.workspace().clone())
             .unwrap();
-        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
-        let panel = workspace.update_in(cx, GitPanel::new);
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
 
         cx.update_window_entity(&panel, |panel, _, _| {
             std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
@@ -8514,7 +8557,7 @@ mod tests {
         .await;
         cx.run_until_parked();
 
-        let (repository, repository_id, one, two) = panel.update(cx, |panel, cx| {
+        let (repository, repository_id, one, two) = panel.update(&mut cx, |panel, cx| {
             let repository = panel
                 .active_repository
                 .clone()
@@ -8530,11 +8573,174 @@ mod tests {
             (repository, repository_id, one, two)
         });
 
-        let one_index = panel.update(cx, |panel, _| {
-            panel.entry_by_path(&one).expect("the first file has a row")
+        (
+            ChangesTabFixture {
+                workspace,
+                panel,
+                repository,
+                repository_id,
+                one,
+                two,
+            },
+            cx,
+        )
+    }
+
+    impl ChangesTabFixture {
+        fn select(&self, path: &RepoPath, cx: &mut VisualTestContext) {
+            let index = self.panel.update(cx, |panel, _| {
+                panel.entry_by_path(path).expect("the file has a row")
+            });
+            self.panel.update(cx, |panel, _| {
+                panel.selected_entry = Some(index);
+            });
+        }
+
+        /// A plain left click on a Changes-tab file row: select it, then run
+        /// exactly what the row's `on_click` runs.
+        fn click(&self, path: &RepoPath, click_count: usize, cx: &mut VisualTestContext) {
+            self.select(path, cx);
+            self.panel.update_in(cx, |panel, window, cx| {
+                panel.handle_row_click(false, click_count, window, cx);
+            });
+            cx.run_until_parked();
+        }
+
+        /// The files the workspace's open single-file diffs are showing.
+        fn open_diffs(&self, cx: &mut VisualTestContext) -> Vec<RepoPath> {
+            self.workspace.update_in(cx, |workspace, _window, cx| {
+                workspace
+                    .items_of_type::<SoloDiffView>(cx)
+                    .map(|view| view.read(cx).repo_path().clone())
+                    .collect()
+            })
+        }
+
+        fn only_diff(&self, cx: &mut VisualTestContext) -> Entity<SoloDiffView> {
+            self.workspace.update_in(cx, |workspace, _window, cx| {
+                let mut views = workspace.items_of_type::<SoloDiffView>(cx);
+                let view = views.next().expect("a diff is open");
+                assert!(views.next().is_none(), "exactly one diff is open");
+                view
+            })
+        }
+
+        fn preview_item_id(&self, cx: &mut VisualTestContext) -> Option<gpui::EntityId> {
+            self.workspace.update_in(cx, |workspace, _window, cx| {
+                workspace.active_pane().read(cx).preview_item_id()
+            })
+        }
+    }
+
+    /// A single click in the Changes tab retargets the shared diff tab and
+    /// never summons one — the same rule the Commit tab follows. Before this,
+    /// every click and every arrow-key step opened a preview from nothing.
+    #[gpui::test]
+    async fn test_a_changes_single_click_summons_nothing(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+
+        fixture.click(&fixture.one.clone(), 1, &mut cx);
+
+        assert_eq!(
+            fixture.open_diffs(&mut cx),
+            Vec::<RepoPath>::new(),
+            "a single click with no shared diff open must open nothing"
+        );
+    }
+
+    /// Arrow-key stepping through the list follows the shared diff, and only
+    /// the shared diff: with nothing open it must not start one, or holding
+    /// `down` would spray a tab per file.
+    #[gpui::test]
+    async fn test_a_changes_arrow_step_summons_nothing(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+
+        fixture.panel.update_in(&mut cx, |panel, window, cx| {
+            panel.first_entry(&FirstEntry, window, cx);
+            panel.next_entry(&NextEntry, window, cx);
         });
+        cx.run_until_parked();
+
+        assert_eq!(
+            fixture.open_diffs(&mut cx),
+            Vec::<RepoPath>::new(),
+            "stepping the selection must not summon a diff"
+        );
+    }
+
+    /// The trap FORK.md #125 records, now extended to the Changes tab: a
+    /// double click that *pinned* would promote the diff out of the preview
+    /// slot, and the next single click would summon a second tab instead of
+    /// retargeting the first.
+    #[gpui::test]
+    async fn test_a_changes_double_click_does_not_pin(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+
+        fixture.click(&fixture.one.clone(), 2, &mut cx);
+
+        let diff = fixture.only_diff(&mut cx);
+        assert_eq!(
+            fixture.preview_item_id(&mut cx),
+            Some(diff.entity_id()),
+            "a double click leaves the diff in the pane's preview slot"
+        );
+        let focused = cx.update(|window, cx| diff.focus_handle(cx).contains_focused(window, cx));
+        assert!(
+            !focused,
+            "and leaves focus in the panel, so the next click keeps landing on rows"
+        );
+
+        fixture.click(&fixture.two.clone(), 1, &mut cx);
+        assert_eq!(
+            fixture.open_diffs(&mut cx),
+            vec![fixture.two.clone()],
+            "so the next single click retargets that tab rather than opening a second"
+        );
+    }
+
+    /// Enter is the one gesture that moves the keyboard into the diff. It
+    /// still must not pin, for the same reason a double click must not.
+    #[gpui::test]
+    async fn test_enter_focuses_the_shared_diff_without_pinning(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+
+        fixture.select(&fixture.one.clone(), &mut cx);
+        fixture.panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_diff(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+
+        let diff = fixture.only_diff(&mut cx);
+        let focused = cx.update(|window, cx| diff.focus_handle(cx).contains_focused(window, cx));
+        assert!(focused, "Enter moves the keyboard into the diff");
+        assert_eq!(
+            fixture.preview_item_id(&mut cx),
+            Some(diff.entity_id()),
+            "but the diff stays in the preview slot, so a later single click \
+             still retargets it"
+        );
+    }
+
+    /// The panel marks the diff the *pane* is showing, which is a different
+    /// question from which row was last clicked: the two come apart the moment
+    /// the user activates another tab. Every step here drives the pane and
+    /// reads the panel — no row is ever clicked.
+    #[gpui::test]
+    async fn test_open_diff_mark_tracks_the_active_pane_item(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let cx = &mut cx;
+        let ChangesTabFixture {
+            workspace,
+            panel,
+            repository,
+            repository_id,
+            one,
+            two,
+        } = &fixture;
+        let (repository_id, one, two) = (*repository_id, one.clone(), two.clone());
+
+        fixture.select(&one, cx);
         panel.update_in(cx, |panel, window, cx| {
-            panel.selected_entry = Some(one_index);
             panel.open_diff(&menu::Confirm, window, cx);
         });
         cx.run_until_parked();
@@ -8551,13 +8757,18 @@ mod tests {
             assert!(!panel.is_open_working_diff(repository_id, &two));
         });
 
-        let two_index = panel.update(cx, |panel, _| {
-            panel
-                .entry_by_path(&two)
-                .expect("the second file has a row")
+        // Pin the first diff, which stands for the user's double click on the
+        // *tab*: that is the one gesture that still promotes the shared diff
+        // out of the preview slot, and this test needs two diffs to coexist.
+        let first_diff = fixture.only_diff(cx);
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.active_pane().update(cx, |pane, _cx| {
+                pane.unpreview_item_if_preview(first_diff.entity_id());
+            });
         });
+
+        fixture.select(&two, cx);
         panel.update_in(cx, |panel, window, cx| {
-            panel.selected_entry = Some(two_index);
             panel.open_diff(&menu::Confirm, window, cx);
         });
         cx.run_until_parked();
@@ -8573,18 +8784,39 @@ mod tests {
         });
 
         // A commit's single-file diff is a different kind of mark, and it is
-        // scoped to its own commit.
-        workspace.update_in(cx, |_workspace, window, cx| {
-            let workspace_handle = cx.weak_entity();
-            CommitView::open_file_diff(
-                "abc123".to_string(),
-                repository.downgrade(),
-                workspace_handle,
+        // scoped to its own commit. It reuses the same shared tab, so it
+        // replaces the second working-tree diff in the preview slot.
+        let fs = workspace.read_with(cx, |workspace, cx| {
+            fs::Fs::as_fake(workspace.project().read(cx).fs().as_ref())
+        });
+        fs.set_commit_diff(
+            path!("/project/.git").as_ref(),
+            "abc123",
+            git::repository::CommitDiff {
+                files: vec![git::repository::CommitFile {
+                    path: one.clone(),
+                    old_text: Some("old one\n".into()),
+                    new_text: Some("one\n".into()),
+                    is_binary: false,
+                }],
+            },
+        );
+        // Outside a `workspace.update`: the open algorithm reads the
+        // workspace synchronously to look for an existing view.
+        let open = cx.update(|window, cx| {
+            SoloDiffView::open_commit_file(
+                "abc123".into(),
+                repository.clone(),
                 one.clone(),
+                workspace.downgrade(),
+                DiffOpen::Summon { focus: false },
                 window,
                 cx,
-            );
+            )
         });
+        open.await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
         cx.run_until_parked();
 
         panel.update(cx, |panel, _| {
@@ -8610,12 +8842,6 @@ mod tests {
         // Activating a tab that is already open moves the mark, even though
         // nothing touched the panel — the case a click-driven selection gets
         // wrong.
-        let first_diff = workspace.update(cx, |workspace, cx| {
-            workspace
-                .items_of_type::<SoloDiffView>(cx)
-                .find(|view| view.read(cx).repo_path() == &one)
-                .expect("the first file's diff is still open")
-        });
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.activate_item(&first_diff, true, true, window, cx);
         });
@@ -8633,8 +8859,8 @@ mod tests {
         });
 
         // The stacked accordion is neither view, and names no single file.
+        fixture.select(&one, cx);
         panel.update_in(cx, |panel, window, cx| {
-            panel.selected_entry = Some(one_index);
             panel.open_accordion_diff(&menu::SecondaryConfirm, window, cx);
         });
         cx.run_until_parked();

@@ -176,7 +176,7 @@ impl TextDiffView {
             multibuffer
         });
         let diff_editor = cx.new(|cx| {
-            let splittable = SplittableEditor::new(
+            let mut splittable = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
                 multibuffer,
                 project,

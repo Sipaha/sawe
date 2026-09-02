@@ -318,38 +318,15 @@ impl ChangedFileEntry {
         }
     }
 
-    fn open_file_diff(
-        &self,
-        commit_sha: &SharedString,
-        repository: &WeakEntity<Repository>,
-        workspace: &WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        CommitView::open_file_diff(
-            commit_sha.to_string(),
-            repository.clone(),
-            workspace.clone(),
-            self.repo_path.clone(),
-            window,
-            cx,
-        );
-    }
-
     /// The diff half of a left click on this row (the selection half is the
     /// caller's [`ChangedFileRowHandlers::select_file`]).
     ///
     /// Double click *summons* the shared single-file diff tab; a plain single
     /// click only *retargets* it, and does nothing when it is not open — the
-    /// same "never open a diff from nothing" rule `GitPanel::move_diff_to_entry`
-    /// applies to the Changes tab, so mouse-walking the list still cannot spray
-    /// tabs across the pane.
-    ///
-    /// Both gestures open as a *preview*. Pinning on double click (which is
-    /// what the Changes tab's double click does) would look right and break the
-    /// feature: the tab would leave the preview slot, the guard below would go
-    /// false, and the next single click would summon a *second* tab — exactly
-    /// the one-tab-per-file behaviour this replaced.
+    /// same rule the Changes tab follows, so mouse-walking either list cannot
+    /// spray tabs across the pane. Neither gesture pins: a pinned tab leaves
+    /// the pane's preview slot, and the next single click would then summon a
+    /// *second* tab.
     fn handle_row_click(
         &self,
         click_count: usize,
@@ -359,9 +336,26 @@ impl ChangedFileEntry {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if click_count >= 2 || CommitView::preview_holds_single_file_diff(workspace, cx) {
-            self.open_file_diff(commit_sha, repository, workspace, window, cx);
-        }
+        let Some(repository) = repository.upgrade() else {
+            return;
+        };
+        let mode = if click_count >= 2 {
+            // Focus stays in the panel, so the next click keeps landing on
+            // file rows.
+            DiffOpen::Summon { focus: false }
+        } else {
+            DiffOpen::Retarget
+        };
+        SoloDiffView::open_commit_file(
+            commit_sha.clone(),
+            repository,
+            self.repo_path.clone(),
+            workspace.clone(),
+            mode,
+            window,
+            cx,
+        )
+        .detach_and_notify_err(workspace.clone(), window, cx);
     }
 
     /// Full repo-relative path, used for tooltips and the copy-path menu.
@@ -1581,7 +1575,8 @@ impl GitPanel {
             return Empty.into_any_element();
         };
         // The FULL sha, never `display_short()`: it is forwarded verbatim to
-        // `CommitView::open_file_diff`, which opens an empty tab for a short one.
+        // `SoloDiffView::open_commit_file`, which fails to find the file in a
+        // commit named by a short one.
         let full_sha: SharedString = sha.to_string().into();
 
         let mut body = v_flex().flex_1().size_full().min_h_0().overflow_hidden();
@@ -2432,6 +2427,10 @@ mod tests {
         }
     }
 
+    fn repo_path(path: &str) -> RepoPath {
+        RepoPath::new(path).expect("valid repo path")
+    }
+
     fn changed_file_entry(path: &str) -> ChangedFileEntry {
         ChangedFileEntry::from_commit_file(
             &commit_file(path, Some("old"), Some("new"), false),
@@ -2631,13 +2630,53 @@ mod tests {
             cx.run_until_parked();
         }
 
-        fn open_single_file_diffs(&self, cx: &mut VisualTestContext) -> Vec<RepoPath> {
+        /// Every single-file diff open in the workspace, as
+        /// `(commit sha or `None` for a working-tree diff, path)`.
+        fn open_diffs(&self, cx: &mut VisualTestContext) -> Vec<(Option<SharedString>, RepoPath)> {
             self.workspace.update_in(cx, |workspace, _window, cx| {
                 workspace
-                    .items_of_type::<CommitView>(cx)
-                    .filter_map(|view| view.read(cx).single_file().cloned())
+                    .items_of_type::<SoloDiffView>(cx)
+                    .map(|view| {
+                        let source = view.read(cx).source();
+                        (source.sha().cloned(), source.repo_path().clone())
+                    })
                     .collect()
             })
+        }
+
+        /// The files the workspace's open *commit* diffs are showing.
+        fn open_commit_diffs(&self, cx: &mut VisualTestContext) -> Vec<RepoPath> {
+            self.open_diffs(cx)
+                .into_iter()
+                .filter_map(|(sha, path)| sha.map(|_| path))
+                .collect()
+        }
+
+        /// Drive the *Changes* tab's half of the shared diff tab: `Summon`
+        /// stands for a double click on a working-tree file, `Retarget` for a
+        /// single one. The Changes tab's own plumbing is exercised in
+        /// `git_panel`'s tests; here it only has to reach the same pane slot
+        /// the Commit tab's clicks reach.
+        async fn changes_click(&self, path: &str, mode: DiffOpen, cx: &mut VisualTestContext) {
+            let entry = GitStatusEntry {
+                repo_path: repo_path(path),
+                status: FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Unmodified,
+                    worktree_status: StatusCode::Modified,
+                }),
+                staging: StageStatus::Unstaged,
+                diff_stat: None,
+            };
+            let repository = self
+                .repository
+                .upgrade()
+                .expect("the fixture holds the repository alive");
+            let workspace = self.workspace.downgrade();
+            let open = cx.update(|window, cx| {
+                SoloDiffView::open_or_focus(entry, repository, workspace, mode, window, cx)
+            });
+            open.await.expect("the Changes-tab gesture resolves");
+            cx.run_until_parked();
         }
     }
 
@@ -2688,12 +2727,35 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) -> (CommitTabClickHarness, VisualTestContext) {
         let (workspace, repository, cx) = commit_tab_test_workspace(cx).await;
+        // A full sha: it is forwarded verbatim to git, which is also how the
+        // commit's files are registered below.
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        // Unlike the old `CommitView` path, opening a commit's file now fails
+        // when the commit does not contain it — so the fake repository has to
+        // actually have the commit.
+        let fs = workspace.read_with(&cx, |workspace, cx| {
+            fs::Fs::as_fake(workspace.project().read(cx).fs().as_ref())
+        });
+        fs.set_commit_diff(
+            std::path::Path::new(util::path!("/project/.git")),
+            sha,
+            CommitDiff {
+                files: ["a.rs", "b.rs"]
+                    .into_iter()
+                    .map(|path| CommitFile {
+                        path: repo_path(path),
+                        old_text: Some(format!("old {path}\n")),
+                        new_text: Some(format!("new {path}\n")),
+                        is_binary: false,
+                    })
+                    .collect(),
+            },
+        );
         (
             CommitTabClickHarness {
                 workspace,
                 repository: repository.downgrade(),
-                // A full sha: `open_file_diff` forwards it verbatim to git.
-                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                sha: sha.into(),
             },
             cx,
         )
@@ -2828,14 +2890,14 @@ mod tests {
 
         harness.click(&a, 2, &mut cx);
         assert_eq!(
-            harness.open_single_file_diffs(&mut cx),
+            harness.open_commit_diffs(&mut cx),
             vec![a.repo_path.clone()],
             "a double click summons the shared diff tab, showing the clicked file"
         );
 
         harness.click(&b, 1, &mut cx);
         assert_eq!(
-            harness.open_single_file_diffs(&mut cx),
+            harness.open_commit_diffs(&mut cx),
             vec![b.repo_path.clone()],
             "a single click retargets that same tab instead of opening a second one"
         );
@@ -2850,7 +2912,7 @@ mod tests {
 
         harness.click(&a, 1, &mut cx);
         assert_eq!(
-            harness.open_single_file_diffs(&mut cx),
+            harness.open_commit_diffs(&mut cx),
             Vec::<RepoPath>::new(),
             "a single click never summons a diff from nothing"
         );
@@ -2876,21 +2938,21 @@ mod tests {
 
         harness.click(&a, 2, &mut cx);
         assert_eq!(
-            harness.open_single_file_diffs(&mut cx),
+            harness.open_commit_diffs(&mut cx),
             vec![a.repo_path.clone()],
             "double click still opens the file's diff with previews off"
         );
 
         harness.click(&b, 1, &mut cx);
         assert_eq!(
-            harness.open_single_file_diffs(&mut cx),
+            harness.open_commit_diffs(&mut cx),
             vec![a.repo_path.clone()],
             "with no preview slot to retarget, a single click only selects"
         );
 
         harness.click(&b, 2, &mut cx);
         assert_eq!(
-            harness.open_single_file_diffs(&mut cx),
+            harness.open_commit_diffs(&mut cx),
             vec![a.repo_path.clone(), b.repo_path.clone()],
             "each double click gets its own permanent tab — the pre-preview behaviour"
         );
@@ -2900,6 +2962,11 @@ mod tests {
     /// "which item do I replace" lookup keyed off the sha alone, so re-opening
     /// a whole-commit view closed whichever tab for that commit came first —
     /// including a single-file diff sitting to its left.
+    ///
+    /// A single file's diff is now a `SoloDiffView`, so the lookup cannot
+    /// reach it at all; what this pins is that re-opening the whole-commit
+    /// view still replaces *itself* and still leaves the file diff — and its
+    /// hold on the pane's preview slot — alone.
     #[gpui::test]
     async fn test_reopening_the_commit_view_spares_the_file_diff_tab(
         cx: &mut gpui::TestAppContext,
@@ -2918,20 +2985,35 @@ mod tests {
             cx.run_until_parked();
         }
 
-        let views = harness
+        let commit_views = harness
             .workspace
             .update_in(&mut cx, |workspace, _window, cx| {
-                workspace
-                    .items_of_type::<CommitView>(cx)
-                    .map(|view| view.read(cx).single_file().cloned())
-                    .collect::<Vec<_>>()
+                workspace.items_of_type::<CommitView>(cx).count()
             });
         assert_eq!(
-            views,
-            vec![Some(a.repo_path.clone()), None],
-            "re-opening the whole-commit view replaces itself, not the \
-             single-file diff tab that happens to precede it"
+            commit_views, 1,
+            "re-opening the whole-commit view replaces itself"
         );
+        assert_eq!(
+            harness.open_commit_diffs(&mut cx),
+            vec![a.repo_path.clone()],
+            "and leaves the single-file diff tab standing"
+        );
+        harness
+            .workspace
+            .update_in(&mut cx, |workspace, _window, cx| {
+                let preview = workspace.active_pane().read(cx).preview_item_id();
+                let diff = workspace
+                    .items_of_type::<SoloDiffView>(cx)
+                    .next()
+                    .expect("the file diff is open");
+                assert_eq!(
+                    preview,
+                    Some(diff.entity_id()),
+                    "the file diff also keeps the preview slot, so the next \
+                     single click still retargets it"
+                );
+            });
     }
 
     #[gpui::test]
@@ -2943,10 +3025,48 @@ mod tests {
         harness.click(&a, 2, &mut cx);
         harness.click(&b, 2, &mut cx);
         assert_eq!(
-            harness.open_single_file_diffs(&mut cx),
+            harness.open_commit_diffs(&mut cx),
             vec![b.repo_path.clone()],
             "double clicking a second file replaces the preview rather than \
              pinning the first tab and opening a second"
+        );
+    }
+
+    /// The maintainer's model is *one* shared diff tab across both git-panel
+    /// tabs, not one per tab: «двойной клик на любом файле в changes и в commit
+    /// её открывает. Дальше любой клик на файле в changes и в commit меняет
+    /// содержимое вкладки.» Before the two views were unified each tab could
+    /// only retarget its own item type, so this could not hold.
+    #[gpui::test]
+    async fn test_the_shared_diff_tab_is_shared_across_both_tabs(cx: &mut gpui::TestAppContext) {
+        let (harness, mut cx) = commit_tab_click_harness(cx).await;
+        let a = changed_file_entry("a.rs");
+
+        harness
+            .changes_click("b.rs", DiffOpen::Summon { focus: false }, &mut cx)
+            .await;
+        assert_eq!(
+            harness.open_diffs(&mut cx),
+            vec![(None, repo_path("b.rs"))],
+            "a Changes-tab double click summons the shared diff"
+        );
+
+        harness.click(&a, 1, &mut cx);
+        assert_eq!(
+            harness.open_diffs(&mut cx),
+            vec![(Some(harness.sha.clone()), a.repo_path.clone())],
+            "a single click in the Commit tab retargets the diff the Changes \
+             tab opened, rather than opening a second tab"
+        );
+
+        harness
+            .changes_click("b.rs", DiffOpen::Retarget, &mut cx)
+            .await;
+        assert_eq!(
+            harness.open_diffs(&mut cx),
+            vec![(None, repo_path("b.rs"))],
+            "and a single click in the Changes tab retargets the diff the \
+             Commit tab opened"
         );
     }
 }

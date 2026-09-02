@@ -84,15 +84,41 @@ impl HunkCountCache {
     }
 }
 
-/// How a [`SoloDiffView`] should be placed in the pane.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SoloDiffOpen {
-    /// Replaceable preview tab (single click / selection-follow). Rendered
-    /// italic and swapped out when the next preview opens. Keeps keyboard focus
-    /// wherever it was (e.g. the git panel), so arrow-nav can keep driving it.
-    Preview,
-    /// Pinned permanent tab (double-click / Enter). Moves focus into the diff.
-    Permanent,
+/// What the user did to ask for a diff, as opposed to where the resulting tab
+/// should land.
+///
+/// The git panel's two tabs share one diff tab per pane, so the placement is
+/// never the caller's decision: a summoned diff always takes the pane's
+/// preview slot and a retarget always reuses whatever is already in it.
+/// Naming the gesture instead of the destination is what keeps the two tabs
+/// from drifting apart again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffOpen {
+    /// Double click, or Enter. Opens the shared diff if it is not open.
+    /// `focus` moves the keyboard into it, which only Enter does — a click
+    /// leaves focus in the panel so the next click keeps landing on file rows.
+    Summon { focus: bool },
+    /// Single click, or an arrow-key step through the list. Only ever changes
+    /// what an already-open shared diff is showing.
+    Retarget,
+}
+
+impl DiffOpen {
+    fn focuses(self) -> bool {
+        matches!(self, Self::Summon { focus: true })
+    }
+}
+
+/// What [`SoloDiffView::resolve_gesture`] decided about a gesture, before
+/// anything has been loaded.
+enum GestureOutcome {
+    /// A view of this exact source was already open; it has been activated.
+    Reused(Entity<SoloDiffView>),
+    /// The gesture may only retarget, and there is no shared diff tab open to
+    /// retarget. Nothing happens at all.
+    Declined,
+    /// Load the source and build a view for it.
+    Load,
 }
 
 /// What a [`SoloDiffView`] is showing, and therefore what it can do.
@@ -247,14 +273,18 @@ pub struct SoloDiffView {
 }
 
 impl SoloDiffView {
+    /// Open (or retarget) the shared diff of an uncommitted change.
+    ///
+    /// `Ok(None)` is the gesture legitimately doing nothing: a retarget with
+    /// no shared diff tab open to retarget.
     pub fn open_or_focus(
         entry: GitStatusEntry,
         repository: Entity<Repository>,
         workspace: WeakEntity<Workspace>,
-        mode: SoloDiffOpen,
+        mode: DiffOpen,
         window: &mut Window,
         cx: &mut App,
-    ) -> Task<Result<Entity<Self>>> {
+    ) -> Task<Result<Option<Entity<Self>>>> {
         let Some(workspace_entity) = workspace.upgrade() else {
             return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
         };
@@ -263,10 +293,10 @@ impl SoloDiffView {
             repository: repository.clone(),
             repo_path: entry.repo_path.clone(),
         };
-        if let Some(existing) =
-            Self::activate_existing(&workspace_entity, &source, mode, window, cx)
-        {
-            return Task::ready(Ok(existing));
+        match Self::resolve_gesture(&workspace_entity, &source, mode, window, cx) {
+            GestureOutcome::Reused(existing) => return Task::ready(Ok(Some(existing))),
+            GestureOutcome::Declined => return Task::ready(Ok(None)),
+            GestureOutcome::Load => {}
         }
 
         let Some(project_path) = repository
@@ -305,24 +335,27 @@ impl SoloDiffView {
                     )
                 });
                 Self::add_to_pane(workspace, &view, mode, window, cx);
-                view
+                Some(view)
             })
         })
     }
 
-    /// Open a read-only diff of `repo_path` as of `sha`, against its parent.
+    /// Open (or retarget) the shared diff to a read-only view of `repo_path`
+    /// as of `sha`, against its parent.
     ///
     /// Reuses an already-open view of the same `(sha, repo_path)` rather than
-    /// loading the commit a second time.
+    /// loading the commit a second time. `Ok(None)` is the gesture
+    /// legitimately doing nothing: a retarget with no shared diff tab open to
+    /// retarget.
     pub fn open_commit_file(
         sha: SharedString,
         repository: Entity<Repository>,
         repo_path: RepoPath,
         workspace: WeakEntity<Workspace>,
-        mode: SoloDiffOpen,
+        mode: DiffOpen,
         window: &mut Window,
         cx: &mut App,
-    ) -> Task<Result<Entity<Self>>> {
+    ) -> Task<Result<Option<Entity<Self>>>> {
         let Some(workspace_entity) = workspace.upgrade() else {
             return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
         };
@@ -332,10 +365,10 @@ impl SoloDiffView {
             repo_path: repo_path.clone(),
             sha: sha.clone(),
         };
-        if let Some(existing) =
-            Self::activate_existing(&workspace_entity, &source, mode, window, cx)
-        {
-            return Task::ready(Ok(existing));
+        match Self::resolve_gesture(&workspace_entity, &source, mode, window, cx) {
+            GestureOutcome::Reused(existing) => return Task::ready(Ok(Some(existing))),
+            GestureOutcome::Declined => return Task::ready(Ok(None)),
+            GestureOutcome::Load => {}
         }
 
         let project = workspace_entity.read(cx).project().clone();
@@ -388,63 +421,89 @@ impl SoloDiffView {
                     )
                 });
                 Self::add_to_pane(workspace, &view, mode, window, cx);
-                view
+                Some(view)
             })
         })
     }
 
-    /// Activate an already-open view of `source`, if the workspace has one.
-    /// Shared by both entry points: a duplicate tab for the same source is
-    /// never what the user asked for, whichever gesture got them here.
-    fn activate_existing(
+    /// Whether the active pane's preview slot holds a single-file diff — i.e.
+    /// whether there is a shared diff tab for a retarget gesture to point
+    /// somewhere else.
+    ///
+    /// One guard for both of the git panel's tabs. They summon the same item
+    /// type into the same slot, so "is the shared diff open?" is the whole
+    /// question either of them has to ask, and a Changes click retargeting a
+    /// commit's diff (or the reverse) is the point rather than an accident.
+    fn preview_holds_a_diff(workspace: &Entity<Workspace>, cx: &App) -> bool {
+        let workspace = workspace.read(cx);
+        let Some(preview_id) = workspace.active_pane().read(cx).preview_item_id() else {
+            return false;
+        };
+        workspace
+            .items_of_type::<SoloDiffView>(cx)
+            .any(|view| view.entity_id() == preview_id)
+    }
+
+    /// Steps 1 and 2 of the one open algorithm both git-panel tabs run —
+    /// everything that can be decided before the source is loaded.
+    ///
+    /// Nothing here pins: `unpreview_item_if_preview` would promote the shared
+    /// diff out of the preview slot, and the next single click would then find
+    /// the slot empty and summon a *second* tab. Pinning stays reachable
+    /// through the editor's own double-click-on-the-tab gesture.
+    fn resolve_gesture(
         workspace: &Entity<Workspace>,
         source: &DiffSource,
-        mode: SoloDiffOpen,
+        mode: DiffOpen,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Entity<Self>> {
+    ) -> GestureOutcome {
+        // A duplicate tab for the same source is never what the user asked
+        // for, whichever gesture got them here — and the search is
+        // workspace-wide, so a diff parked in another pane is found too.
         let existing = workspace
             .read(cx)
             .items_of_type::<SoloDiffView>(cx)
-            .find(|item| item.read(cx).source.matches(source, cx))?;
-
-        let focus_item = mode == SoloDiffOpen::Permanent;
-        workspace.update(cx, |workspace, cx| {
-            workspace.activate_item(&existing, true, focus_item, window, cx);
-            // A deliberate "open" pins an existing preview; a preview gesture
-            // never demotes an already-pinned tab.
-            if mode == SoloDiffOpen::Permanent {
-                workspace.active_pane().update(cx, |pane, _cx| {
-                    pane.unpreview_item_if_preview(existing.item_id());
-                });
+            .find(|item| item.read(cx).source.matches(source, cx));
+        if let Some(existing) = existing {
+            let focus = mode.focuses();
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&existing, true, focus, window, cx);
+            });
+            if focus {
+                existing.focus_handle(cx).focus(window, cx);
             }
-        });
-        if focus_item {
-            existing.focus_handle(cx).focus(window, cx);
+            return GestureOutcome::Reused(existing);
         }
-        Some(existing)
+
+        if mode == DiffOpen::Retarget && !Self::preview_holds_a_diff(workspace, cx) {
+            return GestureOutcome::Declined;
+        }
+        GestureOutcome::Load
     }
 
     /// Put a freshly-built view into the active pane.
     fn add_to_pane(
         workspace: &mut Workspace,
         view: &Entity<Self>,
-        mode: SoloDiffOpen,
+        mode: DiffOpen,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         let item: Box<dyn ItemHandle> = Box::new(view.clone());
-        let focus_item = mode == SoloDiffOpen::Permanent;
         workspace.active_pane().update(cx, |pane, cx| {
-            // A preview opens into (and replaces) the pane's single preview
-            // slot; a permanent open appends its own tab.
-            let destination_index =
-                if mode == SoloDiffOpen::Preview && PreviewTabsSettings::get_global(cx).enabled {
-                    pane.replace_preview_item_id(item.item_id(), window, cx)
-                } else {
-                    None
-                };
-            pane.add_item(item, true, focus_item, destination_index, window, cx);
+            if PreviewTabsSettings::get_global(cx).enabled {
+                // FORK.md #54: there is no `allow_preview` flag on `add_item`;
+                // claiming the shared slot means replacing its current
+                // occupant and reusing the index it vacated.
+                let destination_index = pane.replace_preview_item_id(item.item_id(), window, cx);
+                pane.add_item(item, true, mode.focuses(), destination_index, window, cx);
+            } else {
+                // With previews off there is no shared slot to keep clicking
+                // into, so every open is a deliberate permanent tab and takes
+                // focus rather than being stranded behind the panel.
+                pane.add_item(item, true, true, None, window, cx);
+            }
         });
     }
 
@@ -456,6 +515,21 @@ impl SoloDiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The pair decides the capability, the multibuffer shape and the hunk
+        // controls between them, so a mismatched pair would build a view that
+        // is read-only in one respect and editable in another. Both entry
+        // points construct the two together; this is the invariant that keeps
+        // a third one from getting it wrong.
+        debug_assert!(
+            matches!(
+                (&source, &loaded),
+                (
+                    DiffSource::WorkingTree { .. },
+                    LoadedDiff::WorkingTree { .. }
+                ) | (DiffSource::Commit { .. }, LoadedDiff::Commit(_))
+            ),
+            "a DiffSource must be built with the buffers that were loaded for it"
+        );
         let repository_id = source.repository().read(cx).id;
         let buffer = loaded.buffer().clone();
         let multibuffer = cx.new(|cx| {
@@ -1113,9 +1187,9 @@ mod tests {
         context: &DiffTestContext,
         sha: &str,
         path: &str,
-        mode: SoloDiffOpen,
+        mode: DiffOpen,
         cx: &mut VisualTestContext,
-    ) -> Result<Entity<SoloDiffView>> {
+    ) -> Result<Option<Entity<SoloDiffView>>> {
         let open = cx.update(|window, cx| {
             SoloDiffView::open_commit_file(
                 sha.into(),
@@ -1137,15 +1211,15 @@ mod tests {
         sha: &str,
         path: &str,
         cx: &mut VisualTestContext,
-    ) -> Result<Entity<SoloDiffView>> {
-        open_commit_with(context, sha, path, SoloDiffOpen::Preview, cx).await
+    ) -> Result<Option<Entity<SoloDiffView>>> {
+        open_commit_with(context, sha, path, DiffOpen::Summon { focus: false }, cx).await
     }
 
     async fn open_working_tree(
         context: &DiffTestContext,
         path: &str,
         cx: &mut VisualTestContext,
-    ) -> Result<Entity<SoloDiffView>> {
+    ) -> Result<Option<Entity<SoloDiffView>>> {
         let entry = GitStatusEntry {
             repo_path: repo_path(path),
             status: FileStatus::Tracked(TrackedStatus {
@@ -1160,7 +1234,7 @@ mod tests {
                 entry,
                 context.repository.clone(),
                 context.workspace.downgrade(),
-                SoloDiffOpen::Preview,
+                DiffOpen::Summon { focus: false },
                 window,
                 cx,
             )
@@ -1191,7 +1265,8 @@ mod tests {
 
         let view = open_commit(&context, SHA, "src/lib.rs", &mut cx)
             .await
-            .expect("the commit's file opens");
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
 
         view.read_with(&cx, |view, cx| {
             assert!(matches!(view.source(), DiffSource::Commit { .. }));
@@ -1239,7 +1314,8 @@ mod tests {
 
         let view = open_working_tree(&context, "a.rs", &mut cx)
             .await
-            .expect("the working-tree file opens");
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
 
         view.read_with(&cx, |view, cx| {
             assert!(matches!(view.source(), DiffSource::WorkingTree { .. }));
@@ -1279,10 +1355,12 @@ mod tests {
 
         let first = open_commit(&context, SHA, "src/lib.rs", &mut cx)
             .await
-            .expect("the commit's file opens");
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
         let second = open_commit(&context, SHA, "src/lib.rs", &mut cx)
             .await
-            .expect("the second open resolves");
+            .expect("the second open resolves")
+            .expect("the gesture opened a view");
 
         assert_eq!(first, second, "the same (sha, path) is one tab");
         assert_eq!(open_view_count(&context, &mut cx), 1);
@@ -1302,27 +1380,25 @@ mod tests {
             vec![commit_file("src/lib.rs", Some("two\n"), Some("three\n"))],
         );
 
-        // Permanent, not Preview: two preview opens would share the pane's one
-        // preview slot and the second would evict the first, which says
+        // Previews off, so each open gets its own tab: with the shared preview
+        // slot in play the second open would evict the first, which says
         // nothing about whether the two sources are considered distinct.
-        let first = open_commit_with(
-            &context,
-            SHA,
-            "src/lib.rs",
-            SoloDiffOpen::Permanent,
-            &mut cx,
-        )
-        .await
-        .expect("the first commit's file opens");
-        let second = open_commit_with(
-            &context,
-            OTHER_SHA,
-            "src/lib.rs",
-            SoloDiffOpen::Permanent,
-            &mut cx,
-        )
-        .await
-        .expect("the second commit's file opens");
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.preview_tabs.get_or_insert_default().enabled = Some(false);
+                });
+            });
+        });
+
+        let first = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the first commit's file opens")
+            .expect("the gesture opened a view");
+        let second = open_commit(&context, OTHER_SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the second commit's file opens")
+            .expect("the gesture opened a view");
 
         assert_ne!(
             first, second,
@@ -1366,10 +1442,12 @@ mod tests {
 
         let working_tree = open_working_tree(&context, "a.rs", &mut cx)
             .await
-            .expect("the working-tree file opens");
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
         let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
             .await
-            .expect("the commit's file opens");
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
 
         working_tree.read_with(&cx, |view, cx| {
             assert_eq!(
@@ -1390,6 +1468,83 @@ mod tests {
         });
     }
 
+    /// History has nothing to stage or restore, so a commit source must take
+    /// the hunk controls away — and a working-tree source must not.
+    #[gpui::test]
+    async fn test_only_the_commit_source_takes_the_hunk_controls_away(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+        );
+
+        let working_tree = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+        working_tree.read_with(&cx, |view, cx| {
+            assert!(
+                !view.editor.read(cx).diff_hunk_controls_disabled(),
+                "an uncommitted hunk can still be staged or restored"
+            );
+        });
+
+        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+        commit.read_with(&cx, |view, cx| {
+            assert!(
+                view.editor.read(cx).diff_hunk_controls_disabled(),
+                "a commit's hunks have nothing to stage or restore"
+            );
+        });
+    }
+
+    /// The half of the gesture model that lives in the open algorithm itself:
+    /// a retarget with no shared diff tab open is not an error and not a
+    /// summon, it is nothing at all.
+    #[gpui::test]
+    async fn test_a_retarget_with_no_open_diff_does_nothing(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![
+                commit_file("src/lib.rs", Some("one\n"), Some("two\n")),
+                commit_file("src/other.rs", Some("three\n"), Some("four\n")),
+            ],
+        );
+
+        let declined = open_commit_with(&context, SHA, "src/lib.rs", DiffOpen::Retarget, &mut cx)
+            .await
+            .expect("a declined gesture is not an error");
+        assert!(declined.is_none(), "there was nothing to retarget");
+        assert_eq!(open_view_count(&context, &mut cx), 0);
+
+        open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+        // A *different* file, so the retarget has to go through the shared
+        // slot rather than short-circuiting on the already-open view.
+        let retargeted =
+            open_commit_with(&context, SHA, "src/other.rs", DiffOpen::Retarget, &mut cx)
+                .await
+                .expect("the retarget resolves")
+                .expect("with the shared diff open, a retarget reaches it");
+        assert_eq!(
+            retargeted.read_with(&cx, |view, _| view.repo_path().clone()),
+            repo_path("src/other.rs"),
+        );
+        assert_eq!(
+            open_view_count(&context, &mut cx),
+            1,
+            "and reuses the one tab rather than adding a second"
+        );
+    }
+
     /// `SoloDiffView` used to install its own `SettingsStore` observer on top
     /// of the one `SplittableEditor::new` already has. Removing ours must
     /// leave the unified/split toggle following the setting.
@@ -1399,7 +1554,8 @@ mod tests {
 
         let view = open_working_tree(&context, "a.rs", &mut cx)
             .await
-            .expect("the working-tree file opens");
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
         view.read_with(&cx, |view, cx| {
             assert_eq!(
                 view.editor.read(cx).diff_view_style(),

@@ -416,6 +416,11 @@ pub struct SplittableEditor {
     too_narrow_for_split: bool,
     last_width: Option<Pixels>,
     lhs_blame_base: Option<LhsBlameBase>,
+    /// Set by [`Self::disable_diff_hunk_controls`]. The renderer it installs
+    /// is an opaque `Arc<dyn Fn>` that a caller cannot ask anything about, so
+    /// the decision is recorded here for anyone who needs to know whether this
+    /// diff offers stage / restore buttons at all.
+    diff_hunk_controls_disabled: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -474,13 +479,20 @@ impl SplittableEditor {
         });
     }
 
-    pub fn disable_diff_hunk_controls(&self, cx: &mut Context<Self>) {
+    pub fn disable_diff_hunk_controls(&mut self, cx: &mut Context<Self>) {
         let empty_controls = Arc::new(|_, _: &_, _, _, _, _: &_, _: &mut _, _: &mut _| {
             gpui::Empty.into_any_element()
         });
         self.update_editors(cx, |editor, cx| {
             editor.set_render_diff_hunk_controls(empty_controls.clone(), cx);
         });
+        self.diff_hunk_controls_disabled = true;
+    }
+
+    /// Whether [`Self::disable_diff_hunk_controls`] has taken the stage /
+    /// restore buttons away from this diff's hunks.
+    pub fn diff_hunk_controls_disabled(&self) -> bool {
+        self.diff_hunk_controls_disabled
     }
 
     pub fn set_render_diff_hunks_as_unstaged(&self, cx: &mut Context<Self>) {
@@ -602,6 +614,7 @@ impl SplittableEditor {
             too_narrow_for_split: false,
             last_width: None,
             lhs_blame_base: None,
+            diff_hunk_controls_disabled: false,
             _subscriptions: subscriptions,
         }
     }

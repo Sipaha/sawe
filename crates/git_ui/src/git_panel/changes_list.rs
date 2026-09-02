@@ -855,17 +855,15 @@ impl GitPanel {
                 cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.selected_entry = Some(ix);
                     cx.notify();
-                    if event.modifiers().secondary() {
-                        // Cmd/Ctrl-click → stacked all-files accordion.
-                        this.open_all_diffs(window, cx);
-                    } else if event.click_count() > 1 {
-                        // Double-click → pin the single-file diff (focus moves in).
-                        this.open_diff_for_selected(SoloDiffOpen::Permanent, window, cx);
-                    } else {
-                        // Single click → replaceable preview; keep focus in the
-                        // panel so arrow-nav can keep driving the preview.
-                        this.open_diff_for_selected(SoloDiffOpen::Preview, window, cx);
-                    }
+                    // The gesture mapping itself lives on `GitPanel` so a test
+                    // can drive it; this closure only reports what the mouse
+                    // said.
+                    this.handle_row_click(
+                        event.modifiers().secondary(),
+                        event.click_count(),
+                        window,
+                        cx,
+                    );
                 })
             })
             .on_mouse_down(
