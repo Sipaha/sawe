@@ -5830,6 +5830,26 @@ impl Repository {
         })
     }
 
+    /// Tags that *point at* the given commit — `git tag --points-at`. Drives
+    /// the git panel's Commit tab tag row, which shows the commit's own tags
+    /// rather than every tag that can reach it (that is
+    /// [`Self::tags_containing`], and it belongs to the "Contains" panel).
+    /// Returns an empty list for collab repos, exactly as the two containment
+    /// queries do: there is no proto message for any of them.
+    pub fn tags_pointing_at(
+        &mut self,
+        sha: String,
+    ) -> oneshot::Receiver<Result<Vec<SharedString>>> {
+        self.send_job("tags_pointing_at", None, move |git_repo, _cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.tags_pointing_at(sha).await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
     /// Merge-parent toggle: load the diff of a commit against its `parent_index`-th
     /// parent (1-based, mirroring git's `<sha>^N` syntax). For `parent_index == 1`
     /// this is exactly [`Self::load_commit_diff`]. Collab repos fall through to

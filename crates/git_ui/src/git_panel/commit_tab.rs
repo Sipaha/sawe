@@ -41,13 +41,93 @@ use time::{UtcOffset, format_description::BorrowedFormatItem};
 /// `tree_view` ships `false`, so every Changes file row is at depth 0.
 const COMMIT_TREE_INDENT: f32 = 1.0 + ROW_LEFT_PADDING + SECTION_CONTENT_INDENT + 14.0 + 6.0 - 4.0;
 
-/// Cap on the Commit tab's message block *when there is room for it*.
+/// Cap on the Commit tab's message block *while the user has never dragged the
+/// divider*, and only then.
 ///
-/// The block is not pinned at this height: it is a flex child with
-/// [`COMMIT_MESSAGE_MIN_HEIGHT`] as its floor, so on a dock-height panel it
-/// gives its space back to the changed-files tree instead of pushing the tree
-/// off the bottom. It scrolls internally, so shrinking it costs only scrolling.
+/// This is layout policy, not a safety rail: however tall the panel gets, an
+/// undragged message block stops growing here and hands the surplus to the
+/// changed-files tree. A drag is the user overriding that policy, so
+/// [`GitPanel::commit_message_height`] being `Some` drops this cap entirely —
+/// leaving it on would freeze the divider at 200px, broken exactly where the
+/// user is pulling. The floor ([`COMMIT_MESSAGE_MIN_HEIGHT`]) stays on in both
+/// cases. The block scrolls internally, so shrinking it costs only scrolling.
 const COMMIT_MESSAGE_MAX_HEIGHT: f32 = 200.0;
+
+/// Stop on a *dragged* message block, in logical pixels.
+///
+/// Not the divider's real upper bound. That is the changed-files tree's own
+/// [`COMMIT_FILE_TREE_MIN_HEIGHT`], enforced by the flex pass: `.h()` is a
+/// preferred height and `flex-shrink` defaults to 1, so once the tree bottoms
+/// out the message block is squeezed back down whatever this says. All this
+/// does is stop a pathological drag from parking an absurd number in the
+/// panel's serialized state — the same job `MAX_COMPOSE_HEIGHT` does for the
+/// solution session composer's handle, and the same number.
+const COMMIT_MESSAGE_DRAG_MAX_HEIGHT: f32 = 400.0;
+
+/// Half-height of the files↔message divider's grab area, either side of the
+/// 1px rule it paints. A 1px rule with no slop is not grabbable; widening the
+/// hitbox without widening the paint is the whole trick, and 3px is what the
+/// solution band's top-edge handle uses for the same reason.
+const COMMIT_MESSAGE_HANDLE_HIT_SLOP: f32 = 3.0;
+
+/// Drag payload for the files↔message divider. Carries nothing: the height
+/// comes from the message block's own hitbox and the cursor position, both of
+/// which arrive on the `DragMoveEvent`.
+#[derive(Clone)]
+struct DraggedCommitMessageEdge;
+
+/// Keep a message-block height inside the range the layout can use. Applied to
+/// dragged values and to whatever comes back out of the panel's serialized
+/// state, which is a hand-editable KVP row.
+pub(super) fn clamp_commit_message_height(height: Pixels) -> Pixels {
+    height.clamp(
+        px(COMMIT_MESSAGE_MIN_HEIGHT),
+        px(COMMIT_MESSAGE_DRAG_MAX_HEIGHT),
+    )
+}
+
+/// Height to store for the message block while the divider is being dragged,
+/// from the block's last painted `bounds` and the cursor's `pointer_y`.
+///
+/// Measured down from the block's painted BOTTOM edge, which the drag does not
+/// move — the identity row and the containment line under it are
+/// `flex_shrink_0` — rather than from an anchor captured at mouse-down. An
+/// undragged block has no stored height to anchor on, and its automatic one is
+/// content-derived and unknowable outside a layout pass, so an anchored delta
+/// would make the very first grab jump.
+///
+/// Deliberately NOT capped at what the last frame actually granted. Once the
+/// changed-files tree hits its floor the block paints shorter than the stored
+/// height, and capping there looks like it would help the reversal — but this
+/// value is absolute, not a delta, so reversal is already immediate: the moment
+/// the cursor descends past the painted divider, `requested` is below the
+/// painted height and the divider follows on that very event. The cap instead
+/// oscillates, because `bounds` is the hitbox from the LAST PAINT and both X11
+/// and Wayland dispatch a whole batch of motion events back to back with no
+/// draw between them. Two moves in one frame then read the same stale bounds:
+/// the first raises the height, the second sees the stale shortfall and puts it
+/// back. An even number of motions per frame means an upward drag does not move
+/// at all, while downward stays smooth. It also lets a temporarily short panel
+/// permanently overwrite a taller stored height.
+pub(super) fn dragged_commit_message_height(bounds: Bounds<Pixels>, pointer_y: Pixels) -> Pixels {
+    clamp_commit_message_height(bounds.bottom() - pointer_y)
+}
+
+/// The stored height after a click on the divider. A double click hands the
+/// block back to the automatic layout; anything else must leave the height
+/// alone.
+///
+/// A drag never arrives here: crossing gpui's drag threshold takes the pending
+/// mouse-down, so releasing after a real drag emits no click at all. The
+/// single-click branch exists so that a stray press on the handle is not a
+/// reset — and it is also why a fast second drag can never be misread as a
+/// double click and discard the height the user just set.
+pub(super) fn commit_message_height_after_click(
+    click_count: usize,
+    stored: Option<Pixels>,
+) -> Option<Pixels> {
+    if click_count >= 2 { None } else { stored }
+}
 
 /// Floor of the Commit tab's message block: enough for the first line of the
 /// subject plus the block's own vertical padding, so that however short the
@@ -58,21 +138,29 @@ const COMMIT_MESSAGE_MIN_HEIGHT: f32 = 44.0;
 /// a guaranteed share rather than absorbing every shortfall as the `flex_1`
 /// child: without this the message block and the identity row together left it
 /// zero pixels on a git panel at its shipped dock height.
+///
+/// Deliberately not re-derived from `changes_list::list_item_height`: it is a
+/// pixel floor on the region, not a row count, and rounding it to a whole
+/// number of rows would only make the tree stop scrolling at exactly the point
+/// where a partly-visible row is the cue that there is more below.
 const COMMIT_FILE_TREE_MIN_HEIGHT: f32 = 72.0;
 
-/// Cap on the expanded containing-branches list.
+/// Cap on an expanded containment list — the tag row's as well as the
+/// containing-branches line's.
 ///
 /// Collapsed, the line is one truncating row and costs the changed-files tree
 /// nothing it was not already paying for the identity row above it. Expanded it
 /// wraps, and a commit on a busy repository can be contained in hundreds of
-/// branches — without a cap the tree would be pushed to its own floor by a
-/// single click. Four wrapped rows of `LabelSize::Small` is enough to read a
-/// dozen branch names; past that the block scrolls internally, which is the
-/// same bargain the message block above it makes.
-const COMMIT_BRANCHES_EXPANDED_MAX_HEIGHT: f32 = 64.0;
+/// branches — and, since `git tag --contains` answers with every tag whose
+/// history reaches the commit, in hundreds of tags too — so without a cap the
+/// tree would be pushed to its own floor by a single click. Four wrapped rows
+/// of `LabelSize::Small` is enough to read a dozen names; past that the block
+/// scrolls internally, which is the same bargain the message block above it
+/// makes.
+const COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT: f32 = 64.0;
 
-/// Settle time before the Commit tab asks git which branches contain the
-/// selected commit.
+/// Settle time before the Commit tab asks git which branches *and tags*
+/// contain the selected commit.
 ///
 /// The tab is driven by the git graph's selection, arrow-key movement from row
 /// to row included. Without a debounce, holding an arrow key queues one
@@ -80,11 +168,30 @@ const COMMIT_BRANCHES_EXPANDED_MAX_HEIGHT: f32 = 64.0;
 /// the commit diff, which is the thing the tab actually paints first. Dropping
 /// the task on the next selection cancels the pending query before it is ever
 /// sent, so only the row the user stops on costs a git invocation.
+///
+/// Named for branches only because it is spelled out by name in
+/// `git_panel`'s tests; the one timer now gates both halves of
+/// [`GitPanel::load_commit_tab_containment`].
 pub(super) const BRANCHES_CONTAINING_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// How many branch names the "In N branches" line spells out before it hides
 /// the rest behind `Show all`.
 const MAX_LISTED_BRANCHES: usize = 5;
+
+/// How many tag names the tag row spells out before it hides the rest behind
+/// `Show all`.
+///
+/// The row is fed by `git tag --points-at`, so it lists the commit's own tags:
+/// zero for almost every commit, one for a release, and the cap will not fire
+/// on either. It is kept anyway because the case that overflows it is real
+/// rather than hypothetical — a monorepo release commit carries one tag per
+/// published package (`pkg-a@1.2.3`, `pkg-b@4.5.6`, …), and a repo that keeps
+/// moving aliases stacks `v1.4`, `v1.4.0`, `stable` and `latest` on the same
+/// commit. The row deliberately carries no count (see
+/// [`format_tags_pointing_at`]), so without the cap those names would push the
+/// changed-files tree down with nothing telling the user why. Same five as
+/// [`MAX_LISTED_BRANCHES`]: one truncating line's worth.
+const MAX_LISTED_TAGS: usize = 5;
 
 /// One of the stacked regions of the Commit tab body.
 ///
@@ -100,6 +207,11 @@ enum CommitTabSection {
     /// The commit message and the identity line under it, or the placeholder
     /// standing in for them while the details load or after they failed.
     Message,
+    /// IDEA's tag row: a tag icon and the names of the tags *pointing at* the
+    /// commit, with no `In N tags:` prose — a tag is a name, not a count.
+    /// Renders nothing at all until the tags are loaded and non-empty — see
+    /// [`format_tags_pointing_at`].
+    Tags,
     /// IDEA's `In N branches: …` line. Renders nothing at all until the
     /// branches are loaded and non-empty — see [`format_branches_containing`].
     Branches,
@@ -112,14 +224,17 @@ enum CommitTabSection {
 /// rule follows from this order: it hangs off the *message*, the section
 /// painted directly under the tree, so that it always separates the two.
 ///
-/// Containment comes last because it is metadata about the commit of the same
-/// class as the identity row the message section ends with — IDEA puts it under
-/// the sha/author/date line for the same reason — and because it is the one
-/// section that can render nothing, which at the bottom costs no rule and no
-/// gap.
-const COMMIT_TAB_SECTIONS: [CommitTabSection; 3] = [
+/// The two containment rows come last because they are metadata about the
+/// commit of the same class as the identity row the message section ends with
+/// — IDEA puts them under the sha/author/date line for the same reason — and
+/// because they are the sections that can render nothing, which at the bottom
+/// costs no rule and no gap. Tags sit above branches, matching IDEA: the tag
+/// row is the shorter, more specific fact, and a commit that has one usually
+/// has exactly one.
+const COMMIT_TAB_SECTIONS: [CommitTabSection; 4] = [
     CommitTabSection::Diff,
     CommitTabSection::Message,
+    CommitTabSection::Tags,
     CommitTabSection::Branches,
 ];
 
@@ -146,10 +261,15 @@ struct ChangedFileEntry {
     file_name: SharedString,
     dir_path: SharedString,
     repo_path: RepoPath,
+    /// The row's `+N −M`, or `None` when it has none to show: a binary file,
+    /// or `git_panel.diff_stats` turned off. Passed in rather than derived
+    /// here — see [`compute_diff_stats`] for why the row must never diff its
+    /// own file.
+    stat: Option<DiffLineCount>,
 }
 
 impl ChangedFileEntry {
-    fn from_commit_file(file: &CommitFile) -> Self {
+    fn from_commit_file(file: &CommitFile, stat: Option<DiffLineCount>) -> Self {
         let file_name: SharedString = file
             .path
             .file_name()
@@ -179,6 +299,7 @@ impl ChangedFileEntry {
             file_name,
             dir_path,
             repo_path: file.path.clone(),
+            stat,
         }
     }
 
@@ -271,6 +392,7 @@ impl ChangedFileEntry {
             })
             .child(
                 ButtonLike::new(("changed-file", ix))
+                    .height(changes_list::list_item_height().into())
                     .toggle_state(is_selected)
                     .child(
                         h_flex()
@@ -278,8 +400,28 @@ impl ChangedFileEntry {
                             .w_full()
                             .gap_1()
                             .overflow_hidden()
-                            .child(git_status_icon(self.status))
-                            .child(Label::new(file_name).size(LabelSize::Small).truncate()),
+                            // Name and figures are laid out the way a Changes
+                            // tab row lays them out: the name takes the slack
+                            // and truncates, the figures never shrink. Without
+                            // `flex_shrink_0` on the stat the numbers are the
+                            // first thing a narrow dock drops, which is exactly
+                            // backwards — the row already tells you the name is
+                            // truncated by ellipsizing it.
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .gap_1()
+                                    .child(git_status_icon(self.status))
+                                    .child(Label::new(file_name).truncate()),
+                            )
+                            .children(self.stat.map(|stat| {
+                                div().flex_shrink_0().child(ui::DiffStat::new(
+                                    ("changed-file-stat", ix),
+                                    stat.added,
+                                    stat.removed,
+                                ))
+                            })),
                     )
                     .tooltip({
                         let meta = full_path;
@@ -325,6 +467,24 @@ enum ChangedFileRow {
         collapsed: bool,
     },
     File(ChangedFileEntry),
+}
+
+/// Pair every file of a loaded commit diff with the +/− figures computed when
+/// the diff landed. A file with no entry in [`CommitDiffStats::per_file`] — a
+/// binary one — renders no figures, and `show_stats` (the `git_panel.diff_stats`
+/// setting) drops them from every row at once.
+fn changed_file_entries(loaded: &LoadedCommitDiff, show_stats: bool) -> Vec<ChangedFileEntry> {
+    loaded
+        .diff
+        .files
+        .iter()
+        .map(|file| {
+            let stat = show_stats
+                .then(|| loaded.stats.per_file.get(&file.path).copied())
+                .flatten();
+            ChangedFileEntry::from_commit_file(file, stat)
+        })
+        .collect()
 }
 
 /// Flatten a commit's changed files into directory-grouped rows. Files under a
@@ -376,6 +536,7 @@ fn render_changed_directory_row(
 ) -> AnyElement {
     let tooltip_label = label.clone();
     ButtonLike::new(("changed-dir", ix))
+        .height(changes_list::list_item_height().into())
         .child(
             h_flex()
                 .min_w_0()
@@ -383,10 +544,9 @@ fn render_changed_directory_row(
                 .gap_1()
                 .overflow_hidden()
                 // A plain chevron rather than a `Disclosure`: that renders as
-                // an `IconButton`, and a nested button inside the row's own
-                // `ButtonLike` both muddies the click target and makes the row
-                // taller than a file row — `uniform_list` sizes every row from
-                // the first one, so the two must match exactly.
+                // an `IconButton`, a nested button inside the row's own
+                // `ButtonLike` that muddies the click target — the whole row is
+                // the collapse affordance here, as it is on the Changes tab.
                 .child(
                     Icon::new(if collapsed {
                         IconName::ChevronRight
@@ -399,7 +559,7 @@ fn render_changed_directory_row(
                 // Default (16px), matching the project panel's folder glyph and
                 // the 16px status glyph on the file rows below it.
                 .child(Icon::new(IconName::Folder).color(Color::Muted))
-                .child(Label::new(label).size(LabelSize::Small).truncate_start())
+                .child(Label::new(label).truncate_start())
                 .child(
                     Label::new(format!(
                         "{file_count} {}",
@@ -479,21 +639,74 @@ fn commit_identity(
     }
 }
 
-/// The containing-branches line, split at the seam where prose stops and the
-/// expand affordance begins.
+/// A containment row's text, split at the seam where the names stop and the
+/// expand affordance begins. Both the containing-branches line and the tag row
+/// are this shape.
 ///
 /// The two halves are separate because the tail is a *button*: the deleted
 /// `git_graph` version wrote `… and 3 more` as plain text, which told the user
 /// there were more branches and then gave them no way to see them. That is the
 /// gap this line exists to close, so the count and the control cannot be one
 /// formatted string.
-struct BranchesContaining {
-    /// `In 1 branch: main` / `In 12 branches: a, b, c, d, e`. The count is
-    /// always the *total*, never the number of names actually listed.
+struct ContainmentLine {
+    /// `In 1 branch: main` / `In 12 branches: a, b, c, d, e` for branches, the
+    /// bare `v1.2.0, v1.2.1` for tags. Where there is a count it is always the
+    /// *total*, never the number of names actually listed.
     line: SharedString,
     /// Label of the toggle that swaps the truncated list for the full one, or
-    /// `None` when every branch already fits and there is nothing to expand.
+    /// `None` when every name already fits and there is nothing to expand.
     toggle: Option<SharedString>,
+}
+
+/// Everything that distinguishes the tag row from the containing-branches
+/// line in [`GitPanel::render_commit_containment_line`]. The rest of the row —
+/// truncate-when-collapsed, scroll-when-expanded, the toggle's placement — is
+/// identical, and duplicating it was how the two drifted apart the first time.
+struct ContainmentRow {
+    /// Stable element id of the name block, which is a scroll container when
+    /// expanded and so cannot share an id with the other row's.
+    list_id: &'static str,
+    toggle_id: &'static str,
+    /// The tag row is labelled by an icon instead of prose; the branches line
+    /// carries its count in the text and takes none.
+    icon: Option<IconName>,
+    formatted: ContainmentLine,
+    expanded: bool,
+    /// Flips this row's own `*_expanded` flag. A plain fn pointer rather than
+    /// a field name because the flag lives on `CommitTabState`, which the
+    /// click handler only reaches through the panel's lease.
+    toggle: fn(&mut CommitTabState),
+}
+
+/// The names half of a containment row: the comma-joined list, capped at `cap`
+/// unless `expanded`, and the label of the toggle that swaps one for the other.
+///
+/// The toggle is keyed off the *total* rather than off what was listed, so a
+/// list that exactly fits never paints a control that would change nothing.
+fn listed_names(
+    names: &[SharedString],
+    cap: usize,
+    expanded: bool,
+) -> (String, Option<SharedString>) {
+    let listed = if expanded {
+        names.len()
+    } else {
+        names.len().min(cap)
+    };
+    let joined = names
+        .iter()
+        .take(listed)
+        .map(|name| name.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toggle = (names.len() > cap).then(|| {
+        if expanded {
+            SharedString::new_static("Show less")
+        } else {
+            SharedString::new_static("Show all")
+        }
+    });
+    (joined, toggle)
 }
 
 /// IDEA's `In 1 branch: main` / `In 12 branches: a, b, c, d, e` + `Show all`.
@@ -507,36 +720,47 @@ struct BranchesContaining {
 fn format_branches_containing(
     branches: &[SharedString],
     expanded: bool,
-) -> Option<BranchesContaining> {
+) -> Option<ContainmentLine> {
     if branches.is_empty() {
         return None;
     }
-    let truncated = branches.len() > MAX_LISTED_BRANCHES;
-    let listed = if expanded {
-        branches.len()
-    } else {
-        branches.len().min(MAX_LISTED_BRANCHES)
-    };
     let prefix = if branches.len() == 1 {
         "In 1 branch: ".to_string()
     } else {
         format!("In {} branches: ", branches.len())
     };
-    let names = branches
-        .iter()
-        .take(listed)
-        .map(|branch| branch.as_ref())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(BranchesContaining {
+    let (names, toggle) = listed_names(branches, MAX_LISTED_BRANCHES, expanded);
+    Some(ContainmentLine {
         line: format!("{prefix}{names}").into(),
-        toggle: truncated.then(|| {
-            if expanded {
-                SharedString::new_static("Show less")
-            } else {
-                SharedString::new_static("Show all")
-            }
-        }),
+        toggle,
+    })
+}
+
+/// IDEA's tag row: `2.9.16`, or `pkg-a@1.2.3, pkg-b@4.5.6` + `Show all`.
+///
+/// The names are the commit's own tags — `git tag --points-at`, not
+/// `--contains` — so `Release 2.9.16` shows `2.9.16` and not every release
+/// tagged since. There can be more than one, and all of them belong on the row.
+///
+/// Deliberately no `In N tags:` prefix — IDEA labels this row with a tag icon
+/// instead, and a tag is a name the user recognises rather than a count they
+/// have to read. The row's icon is supplied by the renderer, so a caller that
+/// gets `Some` here is holding text that means nothing on its own.
+///
+/// `None` for a commit with no tags, exactly as for branches — and with the
+/// same two cases folded together: genuinely untagged, and a *remote*
+/// repository, where `Repository::tags_pointing_at` answers `Ok(vec![])`
+/// because the query has no proto message. "No tags" and "cannot ask" are
+/// therefore indistinguishable here, and on a collab repo the row is simply
+/// absent rather than empty.
+fn format_tags_pointing_at(tags: &[SharedString], expanded: bool) -> Option<ContainmentLine> {
+    if tags.is_empty() {
+        return None;
+    }
+    let (names, toggle) = listed_names(tags, MAX_LISTED_TAGS, expanded);
+    Some(ContainmentLine {
+        line: names.into(),
+        toggle,
     })
 }
 
@@ -641,20 +865,58 @@ fn detail_text_style(color: Color, weight: Option<gpui::FontWeight>, cx: &App) -
     }
 }
 
-fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
-    diff.files.iter().fold((0, 0), |(added, removed), file| {
+/// The `+N −M` of one file, or of a whole commit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DiffLineCount {
+    added: usize,
+    removed: usize,
+}
+
+/// A commit's +/− figures, whole and per file.
+///
+/// `CommitFile` carries no numstat — the counts are derived here from the
+/// texts git already handed us, which is why the per-file half exists at all:
+/// the diff that produces the header's total produces every row's figures on
+/// the way, and throwing them away only to recompute them per frame would run
+/// [`line_diff`] over every file of the commit on the render path.
+#[derive(Default)]
+struct CommitDiffStats {
+    total: DiffLineCount,
+    /// Keyed by the path of the `CommitFile` it was derived from. A **binary**
+    /// file has no entry at all rather than a zero one — see
+    /// [`compute_diff_stats`] — so `per_file` is not the same length as
+    /// `CommitDiff::files` and a missing key means "this file has no line
+    /// count", not "not computed yet".
+    per_file: HashMap<RepoPath, DiffLineCount>,
+}
+
+/// Fold a commit's diff into its whole-commit and per-file +/− counts in a
+/// single pass; the two must not be computed separately, or a future change to
+/// one silently stops describing the other.
+///
+/// Binary files are skipped on both sides. `git --numstat` reports `-` rather
+/// than a line count for one, and `load_commit_diff` gives us *empty* texts for
+/// a binary file, so diffing it would only ever produce a truthful-looking
+/// `+0 −0`. Skipping it from the total as well as from the rows keeps
+/// `total == sum(per_file)` true by construction.
+fn compute_diff_stats(diff: &CommitDiff) -> CommitDiffStats {
+    let mut stats = CommitDiffStats::default();
+    for file in &diff.files {
+        if file.is_binary {
+            continue;
+        }
         let old_text = file.old_text.as_deref().unwrap_or("");
         let new_text = file.new_text.as_deref().unwrap_or("");
-        let hunks = line_diff(old_text, new_text);
-        hunks
-            .iter()
-            .fold((added, removed), |(a, r), (old_range, new_range)| {
-                (
-                    a + (new_range.end - new_range.start) as usize,
-                    r + (old_range.end - old_range.start) as usize,
-                )
-            })
-    })
+        let mut file_count = DiffLineCount::default();
+        for (old_range, new_range) in line_diff(old_text, new_text) {
+            file_count.added += (new_range.end - new_range.start) as usize;
+            file_count.removed += (old_range.end - old_range.start) as usize;
+        }
+        stats.total.added += file_count.added;
+        stats.total.removed += file_count.removed;
+        stats.per_file.insert(file.path.clone(), file_count);
+    }
+    stats
 }
 
 /// A git-graph selection handed to the git panel's Commit tab.
@@ -707,8 +969,7 @@ pub(super) enum LoadState<T> {
 
 pub(super) struct LoadedCommitDiff {
     diff: CommitDiff,
-    lines_added: usize,
-    lines_removed: usize,
+    stats: CommitDiffStats,
 }
 
 /// Selectable text of the commit message. `ui::Label` has no selection
@@ -739,19 +1000,29 @@ pub(super) struct CommitTabState {
     /// Branches containing the commit. `Loading` covers the debounce window as
     /// well as the query itself, and `Loaded(vec![])` is both "on no branch"
     /// and "remote repository" — all three render nothing, so the distinction
-    /// exists only for tests and for [`Self::retry_failed_commit_loads`].
+    /// exists only for tests and for [`GitPanel::retry_failed_commit_loads`].
     pub(super) branches: LoadState<Vec<SharedString>>,
+    /// Tags containing the commit, loaded by the same task as `branches` and
+    /// therefore in lockstep with it. Same three-way collapse: loading, no
+    /// tags and remote repository all render nothing.
+    tags: LoadState<Vec<SharedString>>,
     /// Whether the containing-branches line is spelling out every branch.
     /// Lives here, so re-pointing the tab at another commit resets it with the
     /// rest of the state.
     branches_expanded: bool,
+    /// The same, for the tag row. Separate from `branches_expanded` because
+    /// the two rows hide different amounts and the user expands the one they
+    /// are reading.
+    tags_expanded: bool,
     text: Option<CommitDetailText>,
     pub(super) collapsed_dirs: HashSet<SharedString>,
     scroll_handle: UniformListScrollHandle,
     selected_file: Option<RepoPath>,
     _details_task: Option<Task<()>>,
     _diff_task: Option<Task<()>>,
-    _branches_task: Option<Task<()>>,
+    /// The one debounced task behind both `branches` and `tags` — see
+    /// [`GitPanel::load_commit_tab_containment`].
+    _containment_task: Option<Task<()>>,
 }
 
 impl CommitTabState {
@@ -761,14 +1032,16 @@ impl CommitTabState {
             details: LoadState::Idle,
             diff: LoadState::Idle,
             branches: LoadState::Idle,
+            tags: LoadState::Idle,
             branches_expanded: false,
+            tags_expanded: false,
             text: None,
             collapsed_dirs: HashSet::default(),
             scroll_handle: UniformListScrollHandle::new(),
             selected_file: None,
             _details_task: None,
             _diff_task: None,
-            _branches_task: None,
+            _containment_task: None,
         }
     }
 }
@@ -857,7 +1130,7 @@ impl GitPanel {
         if is_single_commit {
             self.load_commit_tab_details(sha, &repository, cx);
             self.load_commit_tab_diff(sha, &repository, cx);
-            self.load_commit_tab_branches(sha, &repository, cx);
+            self.load_commit_tab_containment(sha, &repository, cx);
         }
 
         if source == CommitSelectionSource::UserGesture {
@@ -889,7 +1162,9 @@ impl GitPanel {
         let repository = state.selection.repository.clone();
         let retry_details = matches!(state.details, LoadState::Failed(_));
         let retry_diff = matches!(state.diff, LoadState::Failed(_));
-        let retry_branches = matches!(state.branches, LoadState::Failed(_));
+        // One task loads both, so either half having failed reruns the pair.
+        let retry_containment = matches!(state.branches, LoadState::Failed(_))
+            || matches!(state.tags, LoadState::Failed(_));
         if retry_details {
             self.load_commit_tab_details(sha, &repository, cx);
         }
@@ -898,9 +1173,9 @@ impl GitPanel {
         }
         // A remote repository answers with an *empty* list rather than an
         // error, so this retry cannot loop on collab; only a real
-        // `git branch --contains` failure reaches it.
-        if retry_branches {
-            self.load_commit_tab_branches(sha, &repository, cx);
+        // `git branch --contains` / `git tag --contains` failure reaches it.
+        if retry_containment {
+            self.load_commit_tab_containment(sha, &repository, cx);
         }
     }
 
@@ -982,12 +1257,8 @@ impl GitPanel {
                 }
                 let loaded = match loaded {
                     Ok(Ok(diff)) => {
-                        let (lines_added, lines_removed) = compute_diff_stats(&diff);
-                        LoadState::Loaded(LoadedCommitDiff {
-                            diff,
-                            lines_added,
-                            lines_removed,
-                        })
+                        let stats = compute_diff_stats(&diff);
+                        LoadState::Loaded(LoadedCommitDiff { diff, stats })
                     }
                     Ok(Err(error)) => LoadState::Failed(SharedString::from(format!(
                         "Couldn't load the changes of commit {}: {error:#}",
@@ -1011,15 +1282,31 @@ impl GitPanel {
         }
     }
 
-    /// Load the branches containing the commit into the open Commit tab, after
-    /// [`BRANCHES_CONTAINING_DEBOUNCE`].
+    /// Load the branches containing the commit *and* the tags pointing at it
+    /// into the open Commit tab, after [`BRANCHES_CONTAINING_DEBOUNCE`].
+    ///
+    /// The two halves are deliberately different git queries: `In N branches:`
+    /// means reachability, matching IDEA, while the tag row means the commit's
+    /// own tags. Only the branch half is containment, which is why the shared
+    /// debounce constant keeps its branch-flavoured name.
+    ///
+    /// One task for both, not two. The debounce is the reason: the tab is
+    /// driven by graph selection including arrow-key movement, so a second
+    /// independent task would need its own timer and would queue its own job
+    /// on every row the user travels — reintroducing exactly the queue-jamming
+    /// the debounce was added to prevent. Folding them also collapses the
+    /// staleness re-check to a single point: both fields are assigned inside
+    /// one guarded block, so they cannot disagree about which commit they
+    /// describe. The two queries are issued together and awaited with
+    /// `join!` rather than in sequence, so the pair costs one round trip
+    /// through the repository's job queue rather than two.
     ///
     /// Unlike the tab's other two loads this one cannot ask the repository up
     /// front — the whole point of the debounce is that the job is not queued
     /// until the selection has settled — so the task carries a *weak* handle
     /// and re-acquires it on the far side of the timer, rather than keeping a
     /// repository the user has since navigated away from alive for 150ms.
-    fn load_commit_tab_branches(
+    fn load_commit_tab_containment(
         &mut self,
         sha: Oid,
         repository: &Entity<Repository>,
@@ -1030,12 +1317,15 @@ impl GitPanel {
             cx.background_executor()
                 .timer(BRANCHES_CONTAINING_DEBOUNCE)
                 .await;
-            let Ok(branches) = repository.update(cx, |repository, _| {
-                repository.branches_containing(sha.to_string())
+            let Ok((branches, tags)) = repository.update(cx, |repository, _| {
+                (
+                    repository.branches_containing(sha.to_string()),
+                    repository.tags_pointing_at(sha.to_string()),
+                )
             }) else {
                 return;
             };
-            let loaded = branches.await;
+            let (branches, tags) = futures::join!(branches, tags);
             this.update(cx, |this, cx| {
                 // Same guard as the other two loads: a response that resolved
                 // after the selection moved on describes a commit that is no
@@ -1043,19 +1333,25 @@ impl GitPanel {
                 if this.commit_tab_sha() != Some(sha) {
                     return;
                 }
-                let loaded = match loaded {
-                    Ok(Ok(branches)) => LoadState::Loaded(branches),
+                // `what` is a whole noun phrase, not just the ref kind: the
+                // two halves ask different questions and an error that says
+                // "tags containing" would name a query we no longer run.
+                let loaded = |what: &str, response| match response {
+                    Ok(Ok(names)) => LoadState::Loaded(names),
                     Ok(Err(error)) => LoadState::Failed(SharedString::from(format!(
-                        "Couldn't list the branches containing commit {}: {error:#}",
+                        "Couldn't list the {what} commit {}: {error:#}",
                         sha.display_short()
                     ))),
                     Err(_) => LoadState::Failed(SharedString::from(format!(
-                        "Listing the branches containing commit {} was cancelled.",
+                        "Listing the {what} commit {} was cancelled.",
                         sha.display_short()
                     ))),
                 };
+                let branches = loaded("branches containing", branches);
+                let tags = loaded("tags on", tags);
                 if let Some(state) = this.commit_tab.as_mut() {
-                    state.branches = loaded;
+                    state.branches = branches;
+                    state.tags = tags;
                 }
                 cx.notify();
             })
@@ -1063,8 +1359,10 @@ impl GitPanel {
         });
         if let Some(state) = self.commit_tab.as_mut() {
             state.branches = LoadState::Loading;
+            state.tags = LoadState::Loading;
             state.branches_expanded = false;
-            state._branches_task = Some(task);
+            state.tags_expanded = false;
+            state._containment_task = Some(task);
         }
     }
 
@@ -1271,11 +1569,20 @@ impl GitPanel {
         let mut body = v_flex().flex_1().size_full().min_h_0().overflow_hidden();
 
         let border = cx.theme().colors().border;
+        // One switch for both halves of the tab's +/− figures. The setting is
+        // documented as "the addition/deletion change count next to each file
+        // in the Git panel", and the Changes tab hides its own header total
+        // under it too; a Commit tab that kept the total while dropping the
+        // rows would honour it half way.
+        let show_diff_stats = GitPanelSettings::get_global(cx).diff_stats;
         // The tab's one horizontal rule belongs to the section painted second,
         // so it separates the two — but only when the first section actually
         // put something above it. `Idle` (a diff that was never asked for)
         // renders nothing, and a rule against the top of the body would then be
-        // separating the message from the tab bar.
+        // separating the message from the tab bar. It also gates the divider:
+        // with nothing painted above the message there is nothing to resize
+        // against, so the handle would only ever move the message against the
+        // tab bar.
         let message_carries_rule = !matches!(state.diff, LoadState::Idle);
 
         for section in COMMIT_TAB_SECTIONS {
@@ -1302,11 +1609,13 @@ impl GitPanel {
                                 // `ui::DiffStat`, fully qualified: `use super::*`
                                 // brings `git::status::DiffStat`, the data type,
                                 // into scope under the same bare name.
-                                .child(ui::DiffStat::new(
-                                    "commit-tab-diff-stat",
-                                    loaded.lines_added,
-                                    loaded.lines_removed,
-                                )),
+                                .when(show_diff_stats, |this| {
+                                    this.child(ui::DiffStat::new(
+                                        "commit-tab-diff-stat",
+                                        loaded.stats.total.added,
+                                        loaded.stats.total.removed,
+                                    ))
+                                }),
                         )
                         .child(self.render_commit_file_tree(
                             state,
@@ -1360,7 +1669,10 @@ impl GitPanel {
                             .size(px(16.))
                             .render(window, cx);
 
-                        body.child(
+                        body.when(message_carries_rule, |this| {
+                            this.child(self.render_commit_message_resize_handle(border, cx))
+                        })
+                        .child(
                             // Shrinkable between its floor and its cap rather
                             // than pinned at the cap: on a dock-height panel the
                             // tab body has ~282px to spend, and a fixed 200px
@@ -1368,14 +1680,44 @@ impl GitPanel {
                             // distributes by factor and clamps by min/max, not
                             // by order, so this arithmetic is the same whether
                             // the block is painted above the tree or below it.
+                            //
+                            // Once dragged the cap goes and `.h()` takes over as
+                            // a *preferred* height: `flex-shrink` still defaults
+                            // to 1 and the floor is still on, so the tree's own
+                            // floor squeezes the block back down through the
+                            // flex pass rather than through any arithmetic here.
                             div()
                                 .id("commit-tab-message")
                                 .min_h(px(COMMIT_MESSAGE_MIN_HEIGHT))
-                                .max_h(px(COMMIT_MESSAGE_MAX_HEIGHT))
-                                .overflow_y_scroll()
-                                .when(message_carries_rule, |this| {
-                                    this.border_t_1().border_color(border)
+                                .map(|this| match self.commit_message_height {
+                                    Some(height) => this.h(height),
+                                    None => this.max_h(px(COMMIT_MESSAGE_MAX_HEIGHT)),
                                 })
+                                // The divider's grab strip is `deferred` and
+                                // `block_mouse_except_scroll`, so it is the
+                                // topmost hitbox for the whole gesture and no
+                                // ancestor's `on_drop` ever fires (FORK.md #84,
+                                // #92). The height is therefore committed here,
+                                // on every move, and there is no separate
+                                // "visible" value waiting for a drop that never
+                                // comes. Do not "fix" this back to `on_drop`.
+                                .on_drag_move(cx.listener(
+                                    |this,
+                                     event: &DragMoveEvent<DraggedCommitMessageEdge>,
+                                     _window,
+                                     cx| {
+                                        let height = dragged_commit_message_height(
+                                            event.bounds,
+                                            event.event.position.y,
+                                        );
+                                        if this.commit_message_height != Some(height) {
+                                            this.commit_message_height = Some(height);
+                                            this.serialize(cx);
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .overflow_y_scroll()
                                 .child(
                                     v_flex()
                                         .min_w_0()
@@ -1398,12 +1740,25 @@ impl GitPanel {
                         // shrink, and it truncates rather than wrapping. A
                         // wrapped identity row is vertical budget taken from the
                         // changed-files tree above it.
+                        //
+                        // `pt_1p5` is the gap between the message and this row,
+                        // and it has to live *here* rather than on the message
+                        // block: that block's own padding is inside its scroll
+                        // container, so a message longer than
+                        // `COMMIT_MESSAGE_MAX_HEIGHT` scrolls its bottom padding
+                        // out of the viewport and clips mid-line flush against
+                        // this row. It matches the message block's own `py_1p5`
+                        // so that the seam reads the same whether the message
+                        // overflowed or not. A `border_t_1` here instead would
+                        // be the tab's second rule, and on a subject-only commit
+                        // the two would sit ~44px apart and box a single line.
                         .child(
                             h_flex()
                                 .id("commit-tab-identity")
                                 .flex_shrink_0()
                                 .w_full()
                                 .px_2()
+                                .pt_1p5()
                                 .pb_1p5()
                                 .gap_1()
                                 .items_center()
@@ -1458,6 +1813,32 @@ impl GitPanel {
                             ),
                     ),
                 },
+                CommitTabSection::Tags => {
+                    let expanded = state.tags_expanded;
+                    let formatted = match &state.tags {
+                        LoadState::Loaded(tags) => format_tags_pointing_at(tags, expanded),
+                        _ => None,
+                    };
+                    match formatted {
+                        // No child at all when there are no tags — not an
+                        // empty row, which would still spend its padding. Most
+                        // commits carry no tag, and that is what makes a third
+                        // metadata row affordable in a tab whose body is
+                        // already fighting two hard floors.
+                        None => body,
+                        Some(formatted) => body.child(self.render_commit_containment_line(
+                            ContainmentRow {
+                                list_id: "commit-tab-tags",
+                                toggle_id: "commit-tab-tags-toggle",
+                                icon: Some(IconName::Bookmark),
+                                formatted,
+                                expanded,
+                                toggle: |state| state.tags_expanded = !state.tags_expanded,
+                            },
+                            cx,
+                        )),
+                    }
+                }
                 CommitTabSection::Branches => {
                     let expanded = state.branches_expanded;
                     let formatted = match &state.branches {
@@ -1471,10 +1852,23 @@ impl GitPanel {
                         _ => None,
                     };
                     match formatted {
-                        Some(formatted) => {
-                            body.child(self.render_commit_branches_line(formatted, expanded, cx))
-                        }
                         None => body,
+                        Some(formatted) => body.child(self.render_commit_containment_line(
+                            ContainmentRow {
+                                list_id: "commit-tab-branches",
+                                toggle_id: "commit-tab-branches-toggle",
+                                // The count is in the text, so no icon: an
+                                // icon plus `In 3 branches:` would say the
+                                // same thing twice.
+                                icon: None,
+                                formatted,
+                                expanded,
+                                toggle: |state| {
+                                    state.branches_expanded = !state.branches_expanded
+                                },
+                            },
+                            cx,
+                        )),
                     }
                 }
             };
@@ -1483,25 +1877,76 @@ impl GitPanel {
         body.into_any_element()
     }
 
-    /// IDEA's containment line, under the identity row.
+    /// The files↔message divider: the 1px rule the message block used to paint
+    /// as its own `border_t_1`, now a flex child of its own so it can carry a
+    /// grab area.
+    ///
+    /// The rule stays 1px; the grab strip is a `deferred` child straddling it,
+    /// [`COMMIT_MESSAGE_HANDLE_HIT_SLOP`] either side. `deferred` because the
+    /// strip overhangs the changed-files tree above it and has to be hit-tested
+    /// on top of its rows, and `block_mouse_except_scroll` rather than
+    /// `occlude` because `occlude` swallows the wheel too and the tree right
+    /// above would lose three pixels of scrollable band.
+    fn render_commit_message_resize_handle(
+        &self,
+        border: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("commit-tab-message-resize")
+            .flex_none()
+            .w_full()
+            .h(px(1.))
+            .bg(border)
+            .child(deferred(
+                div()
+                    .id("commit-tab-message-resize-grab")
+                    .absolute()
+                    .top(px(-COMMIT_MESSAGE_HANDLE_HIT_SLOP))
+                    .left_0()
+                    .right_0()
+                    .h(px(COMMIT_MESSAGE_HANDLE_HIT_SLOP * 2. + 1.))
+                    .cursor_row_resize()
+                    .block_mouse_except_scroll()
+                    .on_click(cx.listener(|this, event: &ClickEvent, _window, cx| {
+                        let height = commit_message_height_after_click(
+                            event.click_count(),
+                            this.commit_message_height,
+                        );
+                        if height != this.commit_message_height {
+                            this.commit_message_height = height;
+                            this.serialize(cx);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_drag(DraggedCommitMessageEdge, |_, _, _, cx| cx.new(|_| Empty)),
+            ))
+            .into_any_element()
+    }
+
+    /// IDEA's containment rows, under the identity row: the tag row and the
+    /// `In N branches: …` line, which differ only by the fields of
+    /// [`ContainmentRow`].
     ///
     /// Collapsed it is one row that truncates rather than wrapping, for the
     /// reason the identity row above it gives: a wrapped row is vertical budget
     /// taken from the changed-files tree. Expanded it wraps and scrolls inside
-    /// [`COMMIT_BRANCHES_EXPANDED_MAX_HEIGHT`], so `Show all` can never push the
-    /// tree past its floor however many branches contain the commit. The toggle
-    /// sits outside the scrolling block so that `Show less` stays reachable
-    /// without scrolling back up to it.
-    fn render_commit_branches_line(
+    /// [`COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT`], so `Show all` can never push
+    /// the tree past its floor however many branches or tags contain the
+    /// commit. The toggle sits outside the scrolling block so that `Show less`
+    /// stays reachable without scrolling back up to it.
+    fn render_commit_containment_line(
         &self,
-        formatted: BranchesContaining,
-        expanded: bool,
+        row: ContainmentRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let label = Label::new(formatted.line)
+        let expanded = row.expanded;
+        let label = Label::new(row.formatted.line)
             .size(LabelSize::Small)
             .color(Color::Muted);
         let label = if expanded { label } else { label.truncate() };
+        let toggle = row.toggle;
 
         h_flex()
             .flex_shrink_0()
@@ -1510,25 +1955,30 @@ impl GitPanel {
             .pb_1p5()
             .gap_1()
             .when(expanded, |this| this.items_start())
+            .children(row.icon.map(|icon| {
+                div()
+                    .flex_shrink_0()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+            }))
             .child(
                 div()
-                    .id("commit-tab-branches")
+                    .id(row.list_id)
                     .min_w_0()
                     .when(expanded, |this| {
-                        this.max_h(px(COMMIT_BRANCHES_EXPANDED_MAX_HEIGHT))
+                        this.max_h(px(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT))
                             .overflow_y_scroll()
                     })
                     .child(label),
             )
-            .children(formatted.toggle.map(|toggle| {
+            .children(row.formatted.toggle.map(|label| {
                 div().flex_shrink_0().child(
-                    Button::new("commit-tab-branches-toggle", toggle)
+                    Button::new(row.toggle_id, label)
                         .style(ButtonStyle::Subtle)
                         .label_size(LabelSize::Small)
                         .color(Color::Accent)
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(state) = this.commit_tab.as_mut() {
-                                state.branches_expanded = !state.branches_expanded;
+                                toggle(state);
                                 cx.notify();
                             }
                         })),
@@ -1555,12 +2005,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let entries: Vec<ChangedFileEntry> = loaded
-            .diff
-            .files
-            .iter()
-            .map(ChangedFileEntry::from_commit_file)
-            .collect();
+        let entries = changed_file_entries(loaded, GitPanelSettings::get_global(cx).diff_stats);
         let repo_label: SharedString = state
             .selection
             .repository
@@ -1649,7 +2094,7 @@ mod tests {
 
         assert_eq!(
             COMMIT_TAB_SECTIONS.len(),
-            3,
+            4,
             "a further section would need its own place in the rule's ordering"
         );
         assert_eq!(
@@ -1658,15 +2103,98 @@ mod tests {
             "the changed-files tree must be painted above the commit message, \
              mirroring the Changes tab, and directly above it: \
              `message_carries_rule` in `render_commit_tab` hangs the tab's one \
-             horizontal rule off the message to separate the two"
+             horizontal rule — and the resize handle on it — off the message, \
+             and a divider only divides the two regions it sits between"
         );
         assert_eq!(
             position(CommitTabSection::Branches),
             COMMIT_TAB_SECTIONS.len() - 1,
             "the containing-branches line is metadata of the same class as the \
              identity row the message section ends with, and IDEA puts it under \
-             that row; it is also the one section that can render nothing, \
-             which is only free at the bottom"
+             that row; it is also one of the two sections that can render \
+             nothing, which is only free at the bottom"
+        );
+        assert_eq!(
+            position(CommitTabSection::Tags),
+            position(CommitTabSection::Branches) - 1,
+            "IDEA paints the tag row between the identity line and the \
+             containing-branches line, and the tag row is the other section \
+             that can render nothing — above the branches line it still costs \
+             no rule and no gap when it does"
+        );
+    }
+
+    /// The message block as the flex pass last painted it, with its bottom
+    /// edge — the one the drag measures from — pinned at y=220.
+    fn painted_message_bounds(height: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(0.), px(220.) - px(height)),
+            size: size(px(300.), px(height)),
+        }
+    }
+
+    #[test]
+    fn test_dragged_commit_message_height_is_measured_from_the_bottom_edge() {
+        let bounds = painted_message_bounds(120.);
+
+        assert_eq!(
+            dragged_commit_message_height(bounds, px(150.)),
+            px(70.),
+            "the height is the gap between the cursor and the block's bottom \
+             edge, which the drag does not move — measuring from the top edge \
+             would chase the value being changed"
+        );
+
+        assert_eq!(
+            dragged_commit_message_height(bounds, px(-1000.)),
+            px(COMMIT_MESSAGE_DRAG_MAX_HEIGHT),
+            "dragging off the top of the window parks a pathological number in \
+             the panel's serialized state unless the ceiling stops it"
+        );
+        assert_eq!(
+            dragged_commit_message_height(bounds, px(1000.)),
+            px(COMMIT_MESSAGE_MIN_HEIGHT),
+            "dragging past the bottom leaves the floor, so the tab never loses \
+             the line saying which commit it is describing"
+        );
+    }
+
+    #[test]
+    fn test_clamp_commit_message_height_guards_the_deserialized_value() {
+        assert_eq!(
+            clamp_commit_message_height(px(180.)),
+            px(180.),
+            "a height inside the range survives a restart unchanged"
+        );
+        assert_eq!(
+            clamp_commit_message_height(px(0.)),
+            px(COMMIT_MESSAGE_MIN_HEIGHT)
+        );
+        assert_eq!(
+            clamp_commit_message_height(px(100_000.)),
+            px(COMMIT_MESSAGE_DRAG_MAX_HEIGHT),
+            "the KVP row is hand-editable, so a nonsense height must not reach \
+             the layout"
+        );
+    }
+
+    #[test]
+    fn test_double_clicking_the_divider_restores_the_automatic_layout() {
+        assert_eq!(
+            commit_message_height_after_click(1, Some(px(180.))),
+            Some(px(180.)),
+            "a single click is how every grab of the handle ends; resetting on \
+             one would destroy the split the user just dragged"
+        );
+        assert_eq!(
+            commit_message_height_after_click(2, Some(px(180.))),
+            None,
+            "a double click hands the block back to the flex pass"
+        );
+        assert_eq!(
+            commit_message_height_after_click(3, Some(px(180.))),
+            None,
+            "a triple click is still a double click that kept going"
         );
     }
 
@@ -1723,6 +2251,76 @@ mod tests {
             expanded.line.as_ref(),
             "In 8 branches: b0, b1, b2, b3, b4, b5, b6, b7"
         );
+        assert_eq!(
+            expanded.toggle.as_deref(),
+            Some("Show less"),
+            "expanding must offer a way back"
+        );
+    }
+
+    #[test]
+    fn test_format_tags_pointing_at() {
+        assert!(
+            format_tags_pointing_at(&[], false).is_none(),
+            "an untagged commit — which is most of them, and also every commit \
+             on a remote repository — renders no row at all, not a bare tag icon"
+        );
+
+        // The maintainer's screenshot: `Release 2.9.16` shows `2.9.16` alone,
+        // in a repo that has tagged plenty of releases since.
+        let single =
+            format_tags_pointing_at(&["2.9.16".into()], false).expect("one tag still gets a row");
+        assert_eq!(
+            single.line.as_ref(),
+            "2.9.16",
+            "the row is the tag name and nothing else: it is labelled by the \
+             tag icon, not by `In 1 tag:` prose"
+        );
+        assert_eq!(
+            single.toggle, None,
+            "nothing is hidden, so there is nothing to expand"
+        );
+
+        // "And there can be more than one" — a monorepo release commit.
+        let several = format_tags_pointing_at(&["pkg-a@1.2.3".into(), "pkg-b@4.5.6".into()], false)
+            .expect("several tags still fit on one row");
+        assert_eq!(several.line.as_ref(), "pkg-a@1.2.3, pkg-b@4.5.6");
+        assert_eq!(several.toggle, None);
+
+        let at_threshold: Vec<SharedString> = (0..MAX_LISTED_TAGS)
+            .map(|index| SharedString::from(format!("v{index}")))
+            .collect();
+        let at_threshold = format_tags_pointing_at(&at_threshold, false)
+            .expect("the threshold itself yields a row");
+        assert_eq!(at_threshold.line.as_ref(), "v0, v1, v2, v3, v4");
+        assert_eq!(
+            at_threshold.toggle, None,
+            "a list that exactly fits is not truncated, so it gets no toggle"
+        );
+
+        // The cap fires rarely now that the row lists only the commit's own
+        // tags, but a release commit in a monorepo really does carry one tag
+        // per published package.
+        let many: Vec<SharedString> = (0..8)
+            .map(|index| SharedString::from(format!("v{index}")))
+            .collect();
+        let collapsed =
+            format_tags_pointing_at(&many, false).expect("a long list still yields a row");
+        assert_eq!(
+            collapsed.line.as_ref(),
+            "v0, v1, v2, v3, v4",
+            "the row must not push the changed-files tree down with a dozen \
+             package tags"
+        );
+        assert_eq!(
+            collapsed.toggle.as_deref(),
+            Some("Show all"),
+            "the row carries no count, so the toggle is the only thing telling \
+             the user that names are hidden — and the only way to reach them"
+        );
+
+        let expanded = format_tags_pointing_at(&many, true).expect("expanding keeps the row");
+        assert_eq!(expanded.line.as_ref(), "v0, v1, v2, v3, v4, v5, v6, v7");
         assert_eq!(
             expanded.toggle.as_deref(),
             Some("Show less"),
@@ -1793,13 +2391,140 @@ mod tests {
         );
     }
 
-    fn changed_file_entry(path: &str) -> ChangedFileEntry {
-        ChangedFileEntry::from_commit_file(&CommitFile {
+    fn commit_file(
+        path: &str,
+        old_text: Option<&str>,
+        new_text: Option<&str>,
+        is_binary: bool,
+    ) -> CommitFile {
+        CommitFile {
             path: RepoPath::new(path).expect("valid repo path"),
-            old_text: Some("old".to_string()),
-            new_text: Some("new".to_string()),
-            is_binary: false,
-        })
+            old_text: old_text.map(str::to_string),
+            new_text: new_text.map(str::to_string),
+            is_binary,
+        }
+    }
+
+    fn changed_file_entry(path: &str) -> ChangedFileEntry {
+        ChangedFileEntry::from_commit_file(
+            &commit_file(path, Some("old"), Some("new"), false),
+            None,
+        )
+    }
+
+    fn stat_of(stats: &CommitDiffStats, path: &str) -> Option<DiffLineCount> {
+        stats
+            .per_file
+            .get(&RepoPath::new(path).expect("valid repo path"))
+            .copied()
+    }
+
+    fn line_count(added: usize, removed: usize) -> Option<DiffLineCount> {
+        Some(DiffLineCount { added, removed })
+    }
+
+    /// The header total and every row's figures come out of one pass over the
+    /// commit, so this pins both halves and the identity between them.
+    #[test]
+    fn test_compute_diff_stats_counts_each_file_and_sums_to_the_total() {
+        let diff = CommitDiff {
+            files: vec![
+                // Replaces a line and appends one: both columns non-zero.
+                commit_file(
+                    "src/mixed.rs",
+                    Some("one\ntwo\nthree\n"),
+                    Some("one\nTWO\nthree\nfour\n"),
+                    false,
+                ),
+                // A modification that only adds.
+                commit_file("src/appended.rs", Some("a\n"), Some("a\nb\n"), false),
+                // A file the commit added: no old text at all.
+                commit_file("src/added.rs", None, Some("x\ny\n"), false),
+                // A file the commit deleted: no new text at all.
+                commit_file("src/deleted.rs", Some("p\nq\nr\n"), None, false),
+                // What `load_commit_diff` hands us for a binary file: the
+                // status is real, the texts are empty stand-ins.
+                commit_file("assets/icon.png", Some(""), Some(""), true),
+            ],
+        };
+
+        let stats = compute_diff_stats(&diff);
+
+        assert_eq!(stat_of(&stats, "src/mixed.rs"), line_count(2, 1));
+        assert_eq!(stat_of(&stats, "src/appended.rs"), line_count(1, 0));
+        assert_eq!(
+            stat_of(&stats, "src/added.rs"),
+            line_count(2, 0),
+            "an added file is all additions, the way `git --numstat` reports it"
+        );
+        assert_eq!(
+            stat_of(&stats, "src/deleted.rs"),
+            line_count(0, 3),
+            "a deleted file is all removals"
+        );
+        assert_eq!(
+            stat_of(&stats, "assets/icon.png"),
+            None,
+            "a binary file has no line count at all — `+0 −0` would be a \
+             truthful-looking lie about a file whose texts we never had"
+        );
+
+        let summed =
+            stats
+                .per_file
+                .values()
+                .fold(DiffLineCount::default(), |mut sum, file_count| {
+                    sum.added += file_count.added;
+                    sum.removed += file_count.removed;
+                    sum
+                });
+        assert_eq!(
+            stats.total, summed,
+            "the header's total must be exactly what the rows add up to: \
+             double-counting a file, or dropping one, shows up only here"
+        );
+        assert_eq!(
+            stats.total,
+            DiffLineCount {
+                added: 5,
+                removed: 4
+            }
+        );
+    }
+
+    /// The join between the map and the rows. A key that stops matching turns
+    /// every row's figures off at once and nothing else fails.
+    #[test]
+    fn test_changed_file_entries_carry_their_figures() {
+        let loaded = LoadedCommitDiff {
+            stats: compute_diff_stats(&CommitDiff {
+                files: vec![
+                    commit_file("src/lib.rs", Some("a\n"), Some("a\nb\n"), false),
+                    commit_file("assets/icon.png", Some(""), Some(""), true),
+                ],
+            }),
+            diff: CommitDiff {
+                files: vec![
+                    commit_file("src/lib.rs", Some("a\n"), Some("a\nb\n"), false),
+                    commit_file("assets/icon.png", Some(""), Some(""), true),
+                ],
+            },
+        };
+
+        let entries = changed_file_entries(&loaded, true);
+        assert_eq!(
+            entries.iter().map(|entry| entry.stat).collect::<Vec<_>>(),
+            vec![line_count(1, 0), None],
+            "each row is paired with the figures computed for its own path, \
+             and a binary row gets none"
+        );
+
+        let entries = changed_file_entries(&loaded, false);
+        assert_eq!(
+            entries.iter().map(|entry| entry.stat).collect::<Vec<_>>(),
+            vec![None, None],
+            "`git_panel.diff_stats` off drops the figures from every row"
+        );
     }
 
     fn describe_changed_file_row(row: &ChangedFileRow) -> String {
@@ -1889,9 +2614,12 @@ mod tests {
         }
     }
 
-    async fn commit_tab_click_harness(
+    /// A one-repository workspace with its git repository already resolved —
+    /// the setup both the click harness and the Commit tab's panel-level tests
+    /// need before they diverge.
+    async fn commit_tab_test_workspace(
         cx: &mut gpui::TestAppContext,
-    ) -> (CommitTabClickHarness, VisualTestContext) {
+    ) -> (Entity<Workspace>, Entity<Repository>, VisualTestContext) {
         crate::git_panel::tests::init_test(cx);
 
         let fs = project::FakeFs::new(cx.background_executor.clone());
@@ -1924,18 +2652,148 @@ mod tests {
             .update_in(&mut cx, |workspace, _window, cx| {
                 workspace.project().read(cx).active_repository(cx)
             })
-            .expect("the fake project exposes its repository")
-            .downgrade();
+            .expect("the fake project exposes its repository");
 
+        (workspace, repository, cx)
+    }
+
+    async fn commit_tab_click_harness(
+        cx: &mut gpui::TestAppContext,
+    ) -> (CommitTabClickHarness, VisualTestContext) {
+        let (workspace, repository, cx) = commit_tab_test_workspace(cx).await;
         (
             CommitTabClickHarness {
                 workspace,
-                repository,
+                repository: repository.downgrade(),
                 // A full sha: `open_file_diff` forwards it verbatim to git.
                 sha: "0123456789abcdef0123456789abcdef01234567".into(),
             },
             cx,
         )
+    }
+
+    /// A git panel over [`commit_tab_test_workspace`], for the tab's
+    /// load-lifecycle tests.
+    async fn commit_tab_panel(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GitPanel>,
+        Entity<Repository>,
+        Arc<project::FakeFs>,
+        VisualTestContext,
+    ) {
+        let (workspace, repository, mut cx) = commit_tab_test_workspace(cx).await;
+        let fs = workspace.read_with(&cx, |workspace, cx| {
+            fs::Fs::as_fake(workspace.project().read(cx).fs().as_ref())
+        });
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        (panel, repository, fs, cx)
+    }
+
+    /// Branches and tags load in one task, so the staleness re-check that task
+    /// makes has to cover both: a response that resolved after the selection
+    /// moved on must land on neither row, not on the row whose assignment
+    /// happens to come first.
+    ///
+    /// The debounce widens the window in which the selection can move under an
+    /// in-flight query, so this matters more here than for the tab's two
+    /// undebounced loads, not less.
+    #[gpui::test]
+    async fn test_a_stale_containment_load_lands_on_neither_row(cx: &mut gpui::TestAppContext) {
+        let (panel, repository, _fs, mut cx) = commit_tab_panel(cx).await;
+        let cx = &mut cx;
+
+        let first: Oid = "823a3f8a".parse().expect("valid abbreviated sha");
+        let second: Oid = "1a2b3c4d".parse().expect("valid abbreviated sha");
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec![first],
+                },
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.update_window_entity(&panel, |panel, _window, _cx| {
+            panel
+                .commit_tab
+                .as_mut()
+                .expect("the tab is open")
+                .selection
+                .shas = vec![second];
+        });
+        cx.executor()
+            .advance_clock(BRANCHES_CONTAINING_DEBOUNCE);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert!(
+                matches!(state.branches, LoadState::Loading),
+                "the first commit's branches were pasted onto the second"
+            );
+            assert!(
+                matches!(state.tags, LoadState::Loading),
+                "the first commit's tags were pasted onto the second"
+            );
+        });
+    }
+
+    /// The tag row must ask for the tags *on* the commit. The fake answers
+    /// [`GitRepository::tags_pointing_at`] from seeded state and leaves
+    /// `tags_containing` on the trait's empty default, so a loader that asked
+    /// the containment question would leave the row empty.
+    #[gpui::test]
+    async fn test_the_tag_row_loads_the_tags_pointing_at_the_commit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, repository, fs, mut cx) = commit_tab_panel(cx).await;
+        let cx = &mut cx;
+
+        let sha: Oid = "823a3f8a".parse().expect("valid abbreviated sha");
+        fs.with_git_state(util::path!("/project/.git").as_ref(), true, |state| {
+            state.tags_pointing_at.insert(
+                sha.to_string(),
+                vec!["pkg-a@1.2.3".into(), "pkg-b@4.5.6".into()],
+            );
+        })
+        .expect("the fake project has a git repository");
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec![sha],
+                },
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(BRANCHES_CONTAINING_DEBOUNCE);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            let LoadState::Loaded(tags) = &state.tags else {
+                panic!("the tag row should have loaded by now");
+            };
+            assert_eq!(
+                tags.as_slice(),
+                &[
+                    SharedString::from("pkg-a@1.2.3"),
+                    SharedString::from("pkg-b@4.5.6"),
+                ],
+                "every tag on the commit reaches the row, and it is the \
+                 points-at query that supplied them"
+            );
+        });
     }
 
     #[gpui::test]

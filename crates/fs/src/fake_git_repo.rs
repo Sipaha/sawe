@@ -97,6 +97,13 @@ pub struct FakeGitRepositoryState {
     pub simulated_push_error: Option<String>,
     /// How many fetches the fake has been asked to run.
     pub fetch_count: usize,
+    /// Tags pointing at a commit, keyed by sha — the fake's answer to
+    /// [`GitRepository::tags_pointing_at`]. A plain map rather than something
+    /// derived from [`FakeGitRepositoryState::refs`]: that map mixes `HEAD`
+    /// with bare branch names and has no `refs/tags/` convention for a query
+    /// to key off, so deriving tags from it would invent one that nothing
+    /// else in the fake honours.
+    pub tags_pointing_at: HashMap<String, Vec<SharedString>>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
@@ -120,6 +127,7 @@ impl FakeGitRepositoryState {
             pushes: Default::default(),
             simulated_push_error: Default::default(),
             fetch_count: 0,
+            tags_pointing_at: Default::default(),
             worktrees_requiring_force_delete: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
             merge_base_contents: Default::default(),
@@ -1158,6 +1166,12 @@ impl GitRepository for FakeGitRepository {
                 stdout: String::new(),
                 stderr: String::new(),
             })
+        })
+    }
+
+    fn tags_pointing_at(&self, sha: String) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        self.with_state_async(false, move |state| {
+            Ok(state.tags_pointing_at.get(&sha).cloned().unwrap_or_default())
         })
     }
 

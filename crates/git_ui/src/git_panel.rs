@@ -27,6 +27,7 @@ use git::repository::{
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
+use git_conflict_ui::{InProgressOp, OpenConflictResolver, detect_in_progress_op};
 use git::{Amend, Commit, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
 use git::{
     ExpandCommitEditor, GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
@@ -35,9 +36,10 @@ use git::{
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, DismissEvent,
-    Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyContext, MouseButton,
-    MouseDownEvent, Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt, TextStyle,
-    UniformListScrollHandle, WeakEntity, actions, anchored, deferred, point, size, uniform_list,
+    DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyContext,
+    MouseButton, MouseDownEvent, Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt,
+    TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred, point, size,
+    uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, File};
@@ -220,14 +222,35 @@ impl EntryMenuItem {
 /// The per-file context menu of the Changes list, laid out the way IDEA lays
 /// out its Local Changes row menu: staging, rollback, ignore rules, then the
 /// two ways of looking at the file (its diff, its source), then history.
-fn entry_context_menu_items(entry: &GitStatusEntry) -> Vec<EntryMenuItem> {
+///
+/// `had_conflict` is [`Repository::had_conflict_on_last_merge_head_change`] for
+/// this row — the same sticky predicate that puts it under the `Conflicts`
+/// header. It is what makes the staging row speak IDEA's resolution vocabulary
+/// (`Mark Resolved`) instead of git's index vocabulary (`Stage File`); the
+/// action behind the row is still [`ToggleStaged`], because marking a conflict
+/// resolved *is* staging it.
+fn entry_context_menu_items(entry: &GitStatusEntry, had_conflict: bool) -> Vec<EntryMenuItem> {
     let is_created = entry.status.is_created();
-    let stage_title = if entry.status.staging().is_fully_staged() {
-        "Unstage File"
-    } else {
-        "Stage File"
+    // Sticky vs. live: `had_conflict` stays true for the whole merge, while
+    // `is_conflicted` is "the index entry is still unmerged right now". Only
+    // the latter breaks `git show :<path>`, which is what a single-file diff
+    // needs for its base side.
+    let is_unmerged = entry.status.is_conflicted();
+    let stage_title = match (had_conflict, entry.status.staging().is_fully_staged()) {
+        (true, true) => "Mark Unresolved",
+        (true, false) => "Mark Resolved",
+        (false, true) => "Unstage File",
+        (false, false) => "Stage File",
     };
-    let mut items = vec![
+    let mut items = Vec::new();
+    if had_conflict {
+        items.push(EntryMenuItem::Action {
+            label: "Resolve Conflicts...",
+            action: OpenConflictResolver.boxed_clone(),
+            disabled: false,
+        });
+    }
+    items.extend([
         EntryMenuItem::Action {
             label: stage_title,
             action: ToggleStaged.boxed_clone(),
@@ -253,7 +276,10 @@ fn entry_context_menu_items(entry: &GitStatusEntry) -> Vec<EntryMenuItem> {
         EntryMenuItem::Action {
             label: "Open Diff",
             action: menu::Confirm.boxed_clone(),
-            disabled: false,
+            // An unmerged path has no stage-0 index entry, so the diff would
+            // open with an absent base and report zero differences. The
+            // resolver is the view that can read stages 1/2/3.
+            disabled: is_unmerged,
         },
         EntryMenuItem::Action {
             label: "Jump to Source",
@@ -261,7 +287,7 @@ fn entry_context_menu_items(entry: &GitStatusEntry) -> Vec<EntryMenuItem> {
             // A deleted file has no working-tree copy left to open.
             disabled: entry.status.is_deleted(),
         },
-    ];
+    ]);
     if !is_created {
         items.push(EntryMenuItem::Separator);
         items.push(EntryMenuItem::Action {
@@ -271,6 +297,61 @@ fn entry_context_menu_items(entry: &GitStatusEntry) -> Vec<EntryMenuItem> {
         });
     }
     items
+}
+
+/// What the Changes footer says while a merge / rebase / cherry-pick / revert
+/// is unfinished, and how many conflicts are still unresolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InProgressOpBanner {
+    op: InProgressOp,
+    unresolved: usize,
+}
+
+/// Derives the footer banner from the two facts the panel already tracks: the
+/// `.git` operation marker sampled in `update_counts`, and the conflicted /
+/// conflicted-and-staged counts.
+///
+/// `None` is the *absence* of the banner rather than a hidden one: the footer
+/// adds no node at all in that case, so the commit editor and the file list
+/// keep exactly the geometry they have when nothing is in progress.
+///
+/// A count of zero still produces a banner. That is the "I resolved everything,
+/// now what?" moment the whole thing exists for — the answer is "commit".
+fn in_progress_op_banner(
+    op: Option<InProgressOp>,
+    conflicted_count: usize,
+    conflicted_staged_count: usize,
+) -> Option<InProgressOpBanner> {
+    Some(InProgressOpBanner {
+        op: op?,
+        unresolved: conflicted_count.saturating_sub(conflicted_staged_count),
+    })
+}
+
+impl InProgressOpBanner {
+    /// Sentence-case name of the operation. `InProgressOp::cli_subcommand` is
+    /// the lower-case git spelling, which reads wrong opening a sentence.
+    fn noun(self) -> &'static str {
+        match self.op {
+            InProgressOp::Merge => "Merge",
+            InProgressOp::Rebase => "Rebase",
+            InProgressOp::CherryPick => "Cherry-pick",
+            InProgressOp::Revert => "Revert",
+        }
+    }
+
+    fn message(self) -> String {
+        let noun = self.noun();
+        match self.unresolved {
+            0 => format!("{noun} in progress — all conflicts resolved, commit to finish."),
+            1 => format!(
+                "{noun} in progress — 1 unresolved conflict; tick a file to mark it resolved."
+            ),
+            count => format!(
+                "{noun} in progress — {count} unresolved conflicts; tick a file to mark it resolved."
+            ),
+        }
+    }
 }
 
 fn git_panel_context_menu(
@@ -429,6 +510,13 @@ struct SerializedGitPanel {
     amend_pending: bool,
     #[serde(default)]
     signoff_enabled: bool,
+    /// Logical pixels; absent while the Commit tab's message block is still
+    /// laid out automatically. The tab's *content* stays ephemeral (the panel
+    /// still boots on Changes and restores no commit) — this is the geometry
+    /// the user set with a mouse, and a resize that has to be redone on every
+    /// launch is not a resize.
+    #[serde(default)]
+    commit_message_height: Option<f32>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -795,6 +883,11 @@ pub struct GitPanel {
     commit_editor_expanded: bool,
     conflicted_count: usize,
     conflicted_staged_count: usize,
+    /// Whether a merge / rebase / cherry-pick / revert is unfinished in the
+    /// active repository. Sampled from the `.git` marker files in
+    /// `update_counts` rather than read during `render`, so the footer banner
+    /// costs no syscalls per frame.
+    in_progress_op: Option<InProgressOp>,
     add_coauthors: bool,
     generate_commit_message_task: Option<Task<Option<()>>>,
     entries: Vec<GitListEntry>,
@@ -847,6 +940,14 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     /// `Some` exactly while the closable Commit tab is in the tab bar.
     commit_tab: Option<commit_tab::CommitTabState>,
+    /// Height the user dragged the Commit tab's message block to; `None` while
+    /// the block is still sized by the flex pass.
+    ///
+    /// Deliberately *not* on `CommitTabState`: that struct is rebuilt from
+    /// scratch on every selection push, so a height stored there would reset
+    /// each time the user arrow-keyed to another commit — the bug
+    /// `editor::split_editor_view::LastSplitRatio` exists to prevent.
+    commit_message_height: Option<Pixels>,
 
     _settings_subscription: Subscription,
     git_access: GitAccess,
@@ -1033,6 +1134,7 @@ impl GitPanel {
                 commit_editor_expanded: false,
                 conflicted_count: 0,
                 conflicted_staged_count: 0,
+                in_progress_op: None,
                 add_coauthors: true,
                 generate_commit_message_task: None,
                 entries: Vec::new(),
@@ -1074,6 +1176,7 @@ impl GitPanel {
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
                 commit_tab: None,
+                commit_message_height: None,
                 _settings_subscription,
                 git_access: GitAccess::Yes,
                 _store_subscription,
@@ -1182,6 +1285,7 @@ impl GitPanel {
     fn serialize(&mut self, cx: &mut Context<Self>) {
         let amend_pending = self.amend_pending;
         let signoff_enabled = self.signoff_enabled;
+        let commit_message_height = self.commit_message_height.map(f32::from);
         let kvp = KeyValueStore::global(cx);
 
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
@@ -1208,6 +1312,7 @@ impl GitPanel {
                         serde_json::to_string(&SerializedGitPanel {
                             amend_pending,
                             signoff_enabled,
+                            commit_message_height,
                         })?,
                     )
                     .await?;
@@ -1472,6 +1577,14 @@ impl GitPanel {
     /// Open the selected file's single-file diff (`SoloDiffView`). `Preview`
     /// opens a replaceable italic tab and keeps focus in the panel; `Permanent`
     /// pins it and moves focus into the diff.
+    ///
+    /// A file whose index entry is still unmerged is routed to the conflict
+    /// resolver instead: `SoloDiffView`'s base side is `git show :<path>`,
+    /// which fails outright on an unmerged path, so the diff would open with no
+    /// base and announce "0 differences" over the one file blocking the commit.
+    /// Only the `Permanent` gesture opens the resolver — `Preview` fires on
+    /// every arrow-key step through the list, and stepping past a conflict
+    /// should not spawn a three-pane merge view.
     fn open_diff_for_selected(
         &mut self,
         mode: SoloDiffOpen,
@@ -1485,6 +1598,13 @@ impl GitPanel {
                 .status_entry()?
                 .clone();
             let repository = self.active_repository.clone()?;
+
+            if entry.status.is_conflicted() {
+                if matches!(mode, SoloDiffOpen::Permanent) {
+                    window.dispatch_action(OpenConflictResolver.boxed_clone(), cx);
+                }
+                return Some(());
+            }
 
             SoloDiffView::open_or_focus(
                 entry,
@@ -4014,6 +4134,10 @@ impl GitPanel {
 
     fn update_counts(&mut self, repo: &Repository) {
         self.show_placeholders = false;
+        // Only meaningful for a local checkout: the markers are files inside
+        // `.git`, and a repository reached over collab/SSH has no local ones,
+        // so a remote project simply gets no banner.
+        self.in_progress_op = detect_in_progress_op(&repo.dot_git_abs_path);
         self.conflicted_count = 0;
         self.conflicted_staged_count = 0;
         self.new_count = 0;
@@ -4870,6 +4994,90 @@ impl GitPanel {
         Some(section)
     }
 
+    /// One line above the commit editor answering "a merge stopped here, now
+    /// what?": what git is in the middle of, how much is left, the gesture that
+    /// resolves a file, and the way out. The way out is deliberately the least
+    /// prominent thing in the row — it throws the whole merge away.
+    fn render_in_progress_op_banner(
+        &self,
+        banner: InProgressOpBanner,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let subcommand = banner.op.cli_subcommand();
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_t_1()
+            .border_color(cx.theme().status().warning_border)
+            .bg(cx.theme().status().warning_background.opacity(0.5))
+            .child(
+                Icon::new(IconName::GitMergeConflict)
+                    .size(IconSize::XSmall)
+                    .color(Color::Warning),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(banner.message())
+                        .size(LabelSize::Small)
+                        .truncate(),
+                ),
+            )
+            .child(
+                Button::new("abort-in-progress-op", "Abort")
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .tooltip(Tooltip::text(format!("git {subcommand} --abort")))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.abort_in_progress_op(window, cx);
+                    })),
+            )
+    }
+
+    /// `git <op> --abort` from the footer banner. It discards the merge and
+    /// every resolution made so far, so it confirms first, and it goes through
+    /// `OpRunner` for the same backup-ref and undo-registry entry the conflict
+    /// resolver's own Abort gets.
+    fn abort_in_progress_op(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(op), Some(repository)) = (self.in_progress_op, self.active_repository.clone())
+        else {
+            return;
+        };
+        let work_directory = repository.read(cx).work_directory_abs_path.to_path_buf();
+        let subcommand = op.cli_subcommand();
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!("Abort this {subcommand}?"),
+            Some(&format!(
+                "`git {subcommand} --abort` restores the working tree to its state \
+                 before the {subcommand} started. Every conflict resolution made \
+                 so far is discarded."
+            )),
+            &["Abort", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if prompt.await.ok() != Some(0) {
+                return;
+            }
+            let outcome = cx
+                .background_spawn(async move {
+                    git::operations::OpRunner::run(
+                        git_conflict_ui::operations::AbortMergeOp { op },
+                        &work_directory,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = outcome {
+                    this.show_error_toast(format!("{subcommand} --abort"), error, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn render_footer(
         &self,
         window: &mut Window,
@@ -4909,9 +5117,18 @@ impl GitPanel {
             false
         };
 
+        let operation_banner = in_progress_op_banner(
+            self.in_progress_op,
+            self.conflicted_count,
+            self.conflicted_staged_count,
+        );
+
         let footer = v_flex()
             .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
             .child(PanelRepoFooter::new(branch, head_commit, Some(git_panel)))
+            .when_some(operation_banner, |this, banner| {
+                this.child(self.render_in_progress_op_banner(banner, cx))
+            })
             .when(title_exceeds_limit, |this| {
                 this.child(
                     h_flex()
@@ -5781,7 +5998,11 @@ impl GitPanel {
         let Some(entry) = self.entries.get(ix).and_then(|e| e.status_entry()).cloned() else {
             return;
         };
-        let items = entry_context_menu_items(&entry);
+        let had_conflict = self.active_repository.as_ref().is_some_and(|repo| {
+            repo.read(cx)
+                .had_conflict_on_last_merge_head_change(&entry.repo_path)
+        });
+        let items = entry_context_menu_items(&entry, had_conflict);
         let focus_handle = self.focus_handle.clone();
         let context_menu = ContextMenu::build(window, cx, move |context_menu, _, _| {
             let mut context_menu = context_menu.context(focus_handle);
@@ -6070,6 +6291,11 @@ impl GitPanel {
                 panel.update(cx, |panel, cx| {
                     panel.amend_pending = serialized_panel.amend_pending;
                     panel.signoff_enabled = serialized_panel.signoff_enabled;
+                    // Clamped on the way in: the KVP row is hand-editable, and
+                    // a nonsense height here would otherwise reach the layout.
+                    panel.commit_message_height = serialized_panel
+                        .commit_message_height
+                        .map(|height| commit_tab::clamp_commit_message_height(px(height)));
                     cx.notify();
                 })
             }
@@ -7171,7 +7397,7 @@ mod tests {
             staging: StageStatus::Unstaged,
             diff_stat: None,
         };
-        let labels = entry_context_menu_items(&modified)
+        let labels = entry_context_menu_items(&modified, false)
             .iter()
             .filter_map(EntryMenuItem::label)
             .collect::<Vec<_>>();
@@ -7204,7 +7430,7 @@ mod tests {
             staging: StageStatus::Unstaged,
             diff_stat: None,
         };
-        let items = entry_context_menu_items(&created);
+        let items = entry_context_menu_items(&created, false);
         let labels = items
             .iter()
             .filter_map(EntryMenuItem::label)
@@ -7236,7 +7462,7 @@ mod tests {
             staging: StageStatus::Unstaged,
             diff_stat: None,
         };
-        let disabled = entry_context_menu_items(&deleted)
+        let disabled = entry_context_menu_items(&deleted, false)
             .iter()
             .find_map(|item| match item {
                 EntryMenuItem::Action {
@@ -7245,6 +7471,109 @@ mod tests {
                 _ => None,
             });
         assert_eq!(disabled, Some(true));
+    }
+
+    fn menu_labels(items: &[EntryMenuItem]) -> Vec<&'static str> {
+        items.iter().filter_map(EntryMenuItem::label).collect()
+    }
+
+    fn menu_item_disabled(items: &[EntryMenuItem], wanted: &str) -> Option<bool> {
+        items.iter().find_map(|item| match item {
+            EntryMenuItem::Action {
+                label, disabled, ..
+            } if *label == wanted => Some(*disabled),
+            _ => None,
+        })
+    }
+
+    fn unmerged_entry(path: &str) -> GitStatusEntry {
+        GitStatusEntry {
+            repo_path: repo_path(path),
+            status: UnmergedStatus {
+                first_head: UnmergedStatusCode::Updated,
+                second_head: UnmergedStatusCode::Updated,
+            }
+            .into(),
+            staging: StageStatus::Unstaged,
+            diff_stat: None,
+        }
+    }
+
+    /// A row under `Conflicts` speaks IDEA's resolution vocabulary, offers the
+    /// otherwise-undiscoverable resolver, and does not offer a single-file diff
+    /// whose index base cannot exist (`git show :<path>` fails on an unmerged
+    /// path). The same entry with `had_conflict = false` keeps the plain index
+    /// wording and gets no resolver row.
+    #[test]
+    fn test_conflicted_entry_context_menu_speaks_resolution() {
+        let entry = unmerged_entry("src/conflicted.rs");
+
+        let conflicted = entry_context_menu_items(&entry, true);
+        let labels = menu_labels(&conflicted);
+        assert_eq!(labels.first(), Some(&"Resolve Conflicts..."));
+        assert!(labels.contains(&"Mark Resolved"));
+        assert!(!labels.contains(&"Stage File"));
+        assert_eq!(menu_item_disabled(&conflicted, "Open Diff"), Some(true));
+
+        let plain = entry_context_menu_items(&entry, false);
+        let labels = menu_labels(&plain);
+        assert!(!labels.contains(&"Resolve Conflicts..."));
+        assert!(!labels.contains(&"Mark Resolved"));
+        assert!(labels.contains(&"Stage File"));
+    }
+
+    /// Section membership is sticky for the whole merge, so a file that has
+    /// been marked resolved keeps its `Conflicts` row with a tick. Its menu has
+    /// to offer the way back — and its diff works again, because the index now
+    /// has a stage-0 entry for it.
+    #[test]
+    fn test_resolved_conflict_entry_offers_mark_unresolved() {
+        let resolved = GitStatusEntry {
+            repo_path: repo_path("src/conflicted.rs"),
+            status: StatusCode::Modified.index(),
+            staging: StageStatus::Staged,
+            diff_stat: None,
+        };
+
+        let items = entry_context_menu_items(&resolved, true);
+        let labels = menu_labels(&items);
+        assert!(labels.contains(&"Mark Unresolved"));
+        assert!(!labels.contains(&"Unstage File"));
+        assert!(labels.contains(&"Resolve Conflicts..."));
+        assert_eq!(menu_item_disabled(&items, "Open Diff"), Some(false));
+    }
+
+    /// The footer banner is derived, not stored: no in-progress operation means
+    /// the footer builds no banner node at all, which is what keeps the commit
+    /// editor's geometry identical in the ordinary case.
+    #[test]
+    fn test_in_progress_op_banner_absent_without_an_operation() {
+        assert_eq!(in_progress_op_banner(None, 0, 0), None);
+        // Conflict counts alone are not enough: a stale count with no `.git`
+        // marker must not put a banner on screen.
+        assert_eq!(in_progress_op_banner(None, 3, 1), None);
+    }
+
+    /// With an operation in progress the banner reports the *unresolved*
+    /// remainder — conflicted rows minus the ones already ticked — and survives
+    /// the fully-resolved case, which is the "now what?" moment it exists for.
+    #[test]
+    fn test_in_progress_op_banner_counts_unresolved_conflicts() {
+        let banner = in_progress_op_banner(Some(InProgressOp::Merge), 3, 1)
+            .expect("an in-progress merge always shows the banner");
+        assert_eq!(banner.unresolved, 2);
+        assert_eq!(banner.noun(), "Merge");
+
+        let all_resolved = in_progress_op_banner(Some(InProgressOp::CherryPick), 2, 2)
+            .expect("still in progress once every file is marked resolved");
+        assert_eq!(all_resolved.unresolved, 0);
+        assert_eq!(all_resolved.noun(), "Cherry-pick");
+
+        // `conflicted_staged_count` is derived separately from
+        // `conflicted_count`; a transient overshoot must not underflow.
+        let overshoot = in_progress_op_banner(Some(InProgressOp::Rebase), 1, 2)
+            .expect("still in progress regardless of the counts");
+        assert_eq!(overshoot.unresolved, 0);
     }
 
     #[gpui::test]

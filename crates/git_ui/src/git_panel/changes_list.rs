@@ -46,6 +46,15 @@ fn content_row_padding(depth: usize) -> Pixels {
     px(ROW_LEFT_PADDING + SECTION_CONTENT_INDENT + depth as f32 * TREE_INDENT)
 }
 
+/// Height of one row of a changed-files list. A free function rather than a
+/// `GitPanel` method because the Commit tab's tree pins its rows to the same
+/// number: that tab is typographically slaved to this one, and its rows carry
+/// the same `LabelSize::Default` text, which does not fit a `ButtonLike`'s own
+/// 22px default.
+pub(super) fn list_item_height() -> Rems {
+    rems(1.75)
+}
+
 impl GitPanel {
     pub(super) fn update_visible_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path_style = self.project.read(cx).path_style(cx);
@@ -454,10 +463,6 @@ impl GitPanel {
         Label::new(label.into()).color(color)
     }
 
-    fn list_item_height(&self) -> Rems {
-        rems(1.75)
-    }
-
     /// IDEA-style disclosure chevron for the collapsible rows (section headers
     /// and directories). Deliberately a plain `Icon` and not `ui::Disclosure`:
     /// the latter renders an `IconButton`, which is taller than a file row, and
@@ -539,7 +544,7 @@ impl GitPanel {
             .id(id)
             .cursor_pointer()
             .group(group_name)
-            .h(self.list_item_height())
+            .h(list_item_height())
             .w_full()
             .pl(header_row_padding())
             .pr_1()
@@ -584,12 +589,18 @@ impl GitPanel {
                                 }
                             })
                             .tooltip(move |_window, cx| {
-                                let action = if toggle_state == ToggleState::Selected {
-                                    "Unstage"
-                                } else {
-                                    "Stage"
+                                // The Conflicts section speaks resolution, not
+                                // index state: the tick is what tells git the
+                                // conflict is settled.
+                                let phrase = match (section, toggle_state) {
+                                    (Section::Conflict, ToggleState::Selected) => {
+                                        "Mark section unresolved"
+                                    }
+                                    (Section::Conflict, _) => "Mark section resolved",
+                                    (_, ToggleState::Selected) => "Unstage section",
+                                    (_, _) => "Stage section",
                                 };
-                                Tooltip::simple(format!("{action} section"), cx)
+                                Tooltip::simple(phrase, cx)
                             }),
                     ),
             )
@@ -636,6 +647,10 @@ impl GitPanel {
         };
 
         let has_conflict = status.is_conflicted();
+        // Sticky for the whole merge, unlike `has_conflict`: a file that has
+        // been marked resolved keeps its row under `Conflicts` with a tick, and
+        // that tick's tooltip has to keep speaking resolution vocabulary.
+        let had_conflict = repo.had_conflict_on_last_merge_head_change(&entry.repo_path);
         let is_modified = status.is_modified();
         let is_deleted = status.is_deleted();
         let is_created = status.is_created();
@@ -737,7 +752,7 @@ impl GitPanel {
 
         h_flex()
             .id(id)
-            .h(self.list_item_height())
+            .h(list_item_height())
             .w_full()
             .pl(content_row_padding(depth))
             .pr_1()
@@ -790,9 +805,15 @@ impl GitPanel {
                                 }
                             })
                             .tooltip(move |_window, cx| {
-                                let action = match stage_status {
-                                    StageStatus::Staged => "Unstage",
-                                    StageStatus::Unstaged | StageStatus::PartiallyStaged => "Stage",
+                                // Ticking a row under `Conflicts` is the same
+                                // `ToggleStaged` action with the same binding,
+                                // but the thing it means to the user is IDEA's
+                                // "Mark as Resolved", not "add to the index".
+                                let action = match (had_conflict, stage_status) {
+                                    (true, StageStatus::Staged) => "Mark Unresolved",
+                                    (true, _) => "Mark Resolved",
+                                    (false, StageStatus::Staged) => "Unstage",
+                                    (false, _) => "Stage",
                                 };
                                 let tooltip_name = action.to_string();
 
@@ -903,7 +924,7 @@ impl GitPanel {
 
         h_flex()
             .id(id)
-            .h(self.list_item_height())
+            .h(list_item_height())
             .min_w_0()
             .w_full()
             .pl(content_row_padding(entry.depth))

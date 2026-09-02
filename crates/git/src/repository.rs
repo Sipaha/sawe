@@ -1042,6 +1042,18 @@ pub trait GitRepository: Send + Sync {
         let _ = sha;
         future::ready(Ok(Vec::new())).boxed()
     }
+
+    /// Tags that *point at* the given commit — `git tag --points-at`, not
+    /// `--contains`. A commit carries the tags whose ref resolves to it and no
+    /// others, so a commit one step below a tagged release answers empty here
+    /// while [`Self::tags_containing`] would answer with that release and every
+    /// one after it. Both queries exist because both are wanted: the commit
+    /// detail view's "Contains" panel means reachability, the Commit tab's tag
+    /// row means identity.
+    fn tags_pointing_at(&self, sha: String) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let _ = sha;
+        future::ready(Ok(Vec::new())).boxed()
+    }
     fn blame(
         &self,
         path: RepoPath,
@@ -3229,7 +3241,7 @@ impl GitRepository for RealGitRepository {
                         String::from_utf8_lossy(&output.stderr).trim_end()
                     );
                 }
-                Ok(parse_contains_output(&String::from_utf8_lossy(
+                Ok(parse_ref_name_lines(&String::from_utf8_lossy(
                     &output.stdout,
                 )))
             })
@@ -3251,7 +3263,29 @@ impl GitRepository for RealGitRepository {
                         String::from_utf8_lossy(&output.stderr).trim_end()
                     );
                 }
-                Ok(parse_contains_output(&String::from_utf8_lossy(
+                Ok(parse_ref_name_lines(&String::from_utf8_lossy(
+                    &output.stdout,
+                )))
+            })
+            .boxed()
+    }
+
+    fn tags_pointing_at(&self, sha: String) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let git_binary = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let git = git_binary;
+                let output = git
+                    .build_command(&["tag", "--points-at", &sha])
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    bail!(
+                        "git tag --points-at failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim_end()
+                    );
+                }
+                Ok(parse_ref_name_lines(&String::from_utf8_lossy(
                     &output.stdout,
                 )))
             })
@@ -4635,12 +4669,15 @@ fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
     }))
 }
 
-/// Parse the stdout of `git branch --list --contains <sha> --format=%(refname:short)`
-/// or `git tag --contains <sha>`. Each line is one ref name; an empty line is
+/// Parse the stdout of a ref-listing command: `git branch --list --contains
+/// <sha> --format=%(refname:short)`, `git tag --contains <sha>`, or `git tag
+/// --points-at <sha>`. All three print one ref name per line. An empty line is
 /// skipped, and `git branch` may emit a leading `* ` marker on the current
 /// branch when invoked without `--format` (we pass `--format=%(refname:short)`
-/// to avoid that, but be defensive in case a backend overrides the format).
-pub(crate) fn parse_contains_output(stdout: &str) -> Vec<SharedString> {
+/// to avoid that, but be defensive in case a backend overrides the format);
+/// neither `git tag` form ever prefixes a name, so the stripping is inert for
+/// them.
+pub(crate) fn parse_ref_name_lines(stdout: &str) -> Vec<SharedString> {
     stdout
         .lines()
         .filter_map(|line| {
@@ -5192,9 +5229,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_contains_output_basic() {
+    fn test_parse_ref_name_lines_basic() {
         let raw = "main\nfeat/foo\n  feat/bar  \n";
-        let names = parse_contains_output(raw);
+        let names = parse_ref_name_lines(raw);
         assert_eq!(
             names,
             vec![
@@ -5206,12 +5243,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_contains_output_strips_current_branch_marker() {
+    fn test_parse_ref_name_lines_strips_current_branch_marker() {
         // git branch --list (without --format) emits "* current" for HEAD's
         // branch and "+ name" for branches checked out in a worktree. The
         // parser drops both prefixes defensively.
         let raw = "* main\n+ feat/wt\n  feat/regular\n";
-        let names = parse_contains_output(raw);
+        let names = parse_ref_name_lines(raw);
         assert_eq!(
             names,
             vec![
@@ -5223,9 +5260,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_contains_output_empty() {
-        assert!(parse_contains_output("").is_empty());
-        assert!(parse_contains_output("\n\n").is_empty());
+    fn test_parse_ref_name_lines_empty() {
+        assert!(parse_ref_name_lines("").is_empty());
+        assert!(parse_ref_name_lines("\n\n").is_empty());
     }
 
     #[gpui::test]
@@ -5553,6 +5590,82 @@ mod tests {
                 .await
                 .contains(&"refs/remotes/origin/doomed".to_string()),
             "fetch must prune the tracking ref of a branch that is gone on the remote"
+        );
+    }
+
+    /// `git tag --points-at`, the query behind the Commit tab's tag row.
+    ///
+    /// The load-bearing case is the ancestor: a commit one step below a
+    /// tagged release must answer with nothing. `git tag --contains` — the
+    /// query this method was split off from — would answer with that release
+    /// and every later one, which is exactly the bug the split fixes.
+    #[gpui::test]
+    async fn test_tags_pointing_at_lists_only_the_tags_on_the_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let file = repo_dir.path().join("file.txt");
+
+        let commit = |contents: &str, message: &str| {
+            fs::write(&file, contents).unwrap();
+            git_command(repo_dir.path(), ["add", "file.txt"]);
+            git_command(repo_dir.path(), ["commit", "-m", message]);
+            git_rev_parse(repo_dir.path(), "HEAD")
+        };
+        let ancestor = commit("one", "base");
+        let single = commit("two", "Release 0.9");
+        git_command(repo_dir.path(), ["tag", "v0.9"]);
+        let double = commit("three", "Release 1.0");
+        git_command(repo_dir.path(), ["tag", "v1.0"]);
+        git_command(repo_dir.path(), ["tag", "release-1.0"]);
+        let untagged_tip = commit("four", "after the release");
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            repository.tags_pointing_at(single.clone()).await.unwrap(),
+            vec![SharedString::from("v0.9")],
+            "a commit with one tag reports that tag"
+        );
+        assert_eq!(
+            repository.tags_pointing_at(double.clone()).await.unwrap(),
+            vec![
+                SharedString::from("release-1.0"),
+                SharedString::from("v1.0"),
+            ],
+            "the maintainer's `there can be more than one`: every tag on the \
+             commit is reported, in git's own sorted order"
+        );
+        assert_eq!(
+            repository.tags_pointing_at(ancestor.clone()).await.unwrap(),
+            Vec::<SharedString>::new(),
+            "an ancestor of two tagged releases carries no tag of its own — \
+             this is the assertion `git tag --contains` fails"
+        );
+        assert_eq!(
+            repository.tags_pointing_at(untagged_tip).await.unwrap(),
+            Vec::<SharedString>::new(),
+            "a commit after the last release carries no tag either"
+        );
+
+        assert_eq!(
+            repository.tags_containing(ancestor).await.unwrap(),
+            vec![
+                SharedString::from("release-1.0"),
+                SharedString::from("v0.9"),
+                SharedString::from("v1.0"),
+            ],
+            "the sibling containment query still answers with every tag whose \
+             history reaches the commit — the empty answer above is a real \
+             difference in semantics, not an empty repository"
         );
     }
 

@@ -19,9 +19,6 @@ use std::{ops::Range, sync::Arc};
 use ui::{ButtonLike, Divider, Tooltip, prelude::*};
 use util::{debug_panic, maybe};
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
-use zed_actions::agent::{
-    ConflictContent, ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent,
-};
 
 pub(crate) struct ConflictAddon {
     buffers: HashMap<BufferId, BufferConflicts>,
@@ -322,8 +319,6 @@ fn render_conflict_buttons(
     editor: WeakEntity<Editor>,
     cx: &mut BlockContext,
 ) -> AnyElement {
-    let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
-
     h_flex()
         .id(cx.block_id)
         .h(cx.line_height)
@@ -388,54 +383,25 @@ fn render_conflict_buttons(
                     }
                 }),
         )
-        .when(is_ai_enabled, |this| {
-            this.child(Divider::vertical()).child(
-                Button::new("resolve-with-agent", "Resolve with Agent")
-                    .label_size(LabelSize::Small)
-                    .start_icon(
-                        Icon::new(IconName::ZedAssistant)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .on_click({
-                        let conflict = conflict.clone();
-                        move |_, window, cx| {
-                            let content = editor
-                                .update(cx, |editor, cx| {
-                                    let multibuffer = editor.buffer().read(cx);
-                                    let buffer_id = conflict.ours.end.buffer_id;
-                                    let buffer = multibuffer.buffer(buffer_id)?;
-                                    let buffer_read = buffer.read(cx);
-                                    let snapshot = buffer_read.snapshot();
-                                    let conflict_text = snapshot
-                                        .text_for_range(conflict.range.clone())
-                                        .collect::<String>();
-                                    let file_path = buffer_read
-                                        .file()
-                                        .and_then(|file| file.as_local())
-                                        .map(|f| f.abs_path(cx).to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    Some(ConflictContent {
-                                        file_path,
-                                        conflict_text,
-                                        ours_branch_name: conflict.ours_branch_name.to_string(),
-                                        theirs_branch_name: conflict.theirs_branch_name.to_string(),
-                                    })
-                                })
-                                .ok()
-                                .flatten();
-                            if let Some(content) = content {
-                                window.dispatch_action(
-                                    Box::new(ResolveConflictsWithAgent {
-                                        conflicts: vec![content],
-                                    }),
-                                    cx,
-                                );
-                            }
-                        }
-                    }),
-            )
-        })
+        .child(Divider::vertical())
+        .child(
+            // Was "Resolve with Agent", gated on `AgentSettings::enabled`. That
+            // dispatched `ResolveConflictsWithAgent`, whose only handler
+            // early-returns unless an `AgentPanel` is registered — and this fork
+            // never registers one, so the button was a silent no-op. The merge
+            // tool is the real answer here and is not an AI feature, so it is
+            // not gated either.
+            Button::new("open-merge-tool", "Open Merge Tool")
+                .label_size(LabelSize::Small)
+                .start_icon(
+                    Icon::new(IconName::GitBranch)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(Box::new(git_conflict_ui::OpenConflictResolver), cx);
+                }),
+        )
         .into_any()
 }
 
@@ -552,11 +518,12 @@ impl MergeConflictIndicator {
                 | GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _)
         );
 
-        let agent_settings = AgentSettings::get_global(cx);
-        if !agent_settings.enabled(cx)
-            || !agent_settings.show_merge_conflict_indicator
-            || !conflicts_changed
-        {
+        // No `AgentSettings::enabled` check: this indicator now opens the
+        // fork's own three-way resolver, so whether the AI agent is switched on
+        // has nothing to do with whether it should appear. The
+        // `show_merge_conflict_indicator` toggle stays — it is the setting
+        // `hide_setting` writes when the user dismisses the item for good.
+        if !AgentSettings::get_global(cx).show_merge_conflict_indicator || !conflicts_changed {
             return;
         }
 
@@ -581,14 +548,15 @@ impl MergeConflictIndicator {
         }
     }
 
-    fn resolve_with_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.dispatch_action(
-            Box::new(ResolveConflictedFilesWithAgent {
-                conflicted_file_paths: self.conflicted_paths.clone(),
-            }),
-            cx,
-        );
-        self.dismissed = true;
+    /// Upstream sent this at `ResolveConflictedFilesWithAgent`, whose only
+    /// handler starts by looking up an `AgentPanel` — a panel this fork never
+    /// registers, so the click did nothing while still setting `dismissed` and
+    /// making the indicator disappear as if it had. Point it at the fork's own
+    /// three-way resolver instead, and leave the indicator up: the resolver is
+    /// a closable tab, and the conflicts are still there until git says they
+    /// are not.
+    fn open_conflict_resolver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(Box::new(git_conflict_ui::OpenConflictResolver), cx);
         cx.notify();
     }
 
@@ -600,9 +568,7 @@ impl MergeConflictIndicator {
 
 impl Render for MergeConflictIndicator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let agent_settings = AgentSettings::get_global(cx);
-        if !agent_settings.enabled(cx)
-            || !agent_settings.show_merge_conflict_indicator
+        if !AgentSettings::get_global(cx).show_merge_conflict_indicator
             || self.conflicted_paths.is_empty()
             || self.dismissed
         {
@@ -612,7 +578,7 @@ impl Render for MergeConflictIndicator {
         let file_count = self.conflicted_paths.len();
 
         let message: SharedString = format!(
-            "Resolve Merge Conflict{} with Agent",
+            "Resolve Merge Conflict{}",
             if file_count == 1 { "" } else { "s" }
         )
         .into();
@@ -652,12 +618,12 @@ impl Render for MergeConflictIndicator {
                         Tooltip::with_meta(
                             tooltip_label.clone(),
                             None,
-                            "Click to Resolve with Agent",
+                            "Click to open the conflict resolver",
                             cx,
                         )
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.resolve_with_agent(window, cx);
+                        this.open_conflict_resolver(window, cx);
                     })),
             )
             .child(
