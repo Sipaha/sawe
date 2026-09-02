@@ -1,11 +1,12 @@
 # TODO — deferred work
 
-Findings from the 2026-08-31 sessions that do **not** block using the editor on
+Findings from the 2026-08-31 sessions onward that do **not** block using the editor on
 Linux. Recorded here for future execution rather than chased at the time.
 
 Each entry says what is wrong, why it was deferred, and where the evidence is.
 Nothing here is a guess: every item was established by reading or measuring, and the
-long-form record is in `FORK.md` and `docs/findings/2026-08-31b-session-handoff.md`.
+long-form record is in `FORK.md`, `docs/findings/2026-08-31b-session-handoff.md` and
+the plan doc named by each entry.
 
 ---
 
@@ -137,6 +138,68 @@ sent on as part of the filename (which made the instance open a folder-kind wind
 rooted at a path that does not exist). Delivering it properly needs
 `navigate_to_positions`, which lives in `recent_projects` — above `workspace`, where
 the tool is registered. Moving the tool needs a manifest change.
+
+### C6. Splitting a diff pane twice trips a debug assertion in `display_map`
+`SplittableEditor::unsplit`, running on a clone that shares its multibuffer with the
+original, reaches `crates/editor/src/display_map.rs:303` with an empty patch list and
+fails `"patches_for_*_in_range is only allowed to return an empty vec if the multibuffer
+is empty"`. **It predates this work**: `CommitView` has had `can_split = true` and a
+multibuffer-sharing `clone_on_split` all along
+(`20c695d7fb:crates/git_ui/src/commit_view.rs:1233,1259`). What the diff-view unification
+newly *exposed* is the **working-tree** diff, which had no `can_split` before
+`b26c6bd0ea` and now has the same gesture.
+
+Deferred rather than gated: the assertion is `cfg!(any(test, debug_assertions))` and
+`release-fast` inherits `release`, so a user-facing binary degrades to a possibly
+misaligned scroll/selection mapping (`Point::zero()..max_point()` is the fallback) rather
+than aborting — and gating the gesture in `git_ui` would be working around an `editor`
+split-machinery bug at the wrong layer. Cost of leaving it: an agent driving a **debug**
+build that splits a diff pane twice hits an assertion. The fix belongs in
+`SplittableEditor`'s split/unsplit bookkeeping, not in the views that call it.
+FORK.md #136 / `docs/plans/2026-09-02-unify-the-two-diff-views.md`.
+
+### C7. `SoloDiffView` never reports itself dirty
+`Item::is_dirty` is not overridden (`crates/git_ui/src/solo_diff_view.rs`), so it takes the
+trait default `false`, while `can_save` returns true for the working-tree source. An edit
+in the Changes tab's diff therefore shows no dirty dot on the tab and does not prompt on
+close. The commit source is unaffected — since `5a3b279610` `can_save` is
+`self.source.is_editable() && …`, so one of the view's two sources is now genuinely
+read-only and only the other one has the bug.
+
+Deferred because the obvious fix is a trap. The view implements
+`EventEmitter<EditorEvent>` and `to_item_events` but never subscribes to its editor and
+never emits, so **no `ItemEvent` ever reaches the pane** — and that is load-bearing: an
+`ItemEvent::Edit` would promote the shared preview tab out of the preview slot, which is
+exactly the pinning that FORK.md #136's gesture model forbids. A correct fix reports
+dirtiness without emitting a promoting event, or teaches the pane to distinguish the two.
+
+### C8. The Commit tab's merge-parent toggle does not change the diff
+`CommitView::select_parent_index` (`crates/git_ui/src/commit_view.rs`) loads
+`load_commit_diff_against_parent` and then assigns the result to `self.diff_files` and
+calls `cx.notify()` — nothing else. `diff_files` feeds only the affected-files list and
+`clone_on_split`; the multibuffer's excerpts are built once in `CommitView::open` and are
+never rebuilt. So on a merge commit, flipping "diff vs parent" re-renders the file list
+against the other parent while the diff editor below keeps showing the first parent's
+diff.
+
+Deferred: out of the unification's scope (that work deleted `CommitView`'s *single-file*
+mode and left the whole-commit view alone), and the fix is a re-excerpting pass, not a
+one-liner — it has to rebuild the multibuffer through `commit_blob::load_commit_file_blob`
+for every file of the new diff, the way `open` does, and decide what happens to scroll
+position and to any split clone sharing that multibuffer.
+
+### C9. A split pane has no preview item, so the git panel cannot retarget into it
+After splitting a diff pane, the new pane holds a permanent tab and no preview item.
+`SoloDiffView::resolve_gesture` declines a `DiffOpen::Retarget`
+when the **active** pane's preview slot holds no `SoloDiffView`, so single-clicking files
+in the git panel silently does nothing while the split pane is active — until the user
+activates the original pane again, or double-clicks to summon.
+
+Ordinary pane semantics, and `CommitView` behaved the same way before, but it is newly
+reachable for the working-tree source now that it can split. Deferred because the
+alternative — summoning into a pane that has no preview slot — is the pinning the gesture
+model forbids; the real question is whether a split should inherit a preview slot at all,
+which is a `workspace::Pane` decision.
 
 ---
 

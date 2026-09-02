@@ -118,7 +118,9 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/workspace/src/welcome.rs` | `render_agent_card` gated off via `false &&` — fork uses `solution_agent`, not upstream agent panel. | `solution_agent` |
 | `crates/workspace/src/active_file_name.rs` | `ActiveFileName::new` now takes the `Workspace` (holds a `WeakEntity<Project>`); the status-bar label prefixes the worktree-relative path with the worktree's root name so it's unambiguous across a Solution's worktrees. (`status_bar.show_active_file` also flipped to `true` in `default.json`.) | rebrand / solutions |
 | `crates/git_ui/src/conflict_view.rs` | The merge-conflict status-bar indicator and the in-editor conflict block both dispatched agent actions whose only handler early-returns without an `AgentPanel`, which this fork never registers — two silent no-ops, one of which also dismissed itself as if it had worked. Both now open the fork's own conflict resolver (`git_conflict_ui::OpenConflictResolver`) and are relabelled accordingly; the indicator no longer self-dismisses, and neither is gated on `AgentSettings::enabled`, since neither involves the agent any more. | `git_conflict_ui` |
-| `crates/git_ui/src/commit_view.rs` | S-DET commit-view surface (header / parents / refs / contains / affected-files / footer decomposed into `commit_view::*` submodules) **and** a `single_file: Option<RepoPath>` mode (`CommitView::open_file_diff`) that renders just the diff editor — no metadata chrome, tab titled with the file name. Its one caller is the git panel's Commit tab, and since #125 it opens into the pane's preview slot rather than a tab of its own. | `git_ui` (S-DET) / `git_graph` |
+| `crates/git_ui/src/commit_view.rs` | S-DET commit-view surface (header / parents / refs / contains / affected-files / footer decomposed into `commit_view::*` submodules). **(decision #136, 2026-09-02)** The `single_file: Option<RepoPath>` mode that used to live here is **deleted** — `open_file_diff`, `preview_holds_single_file_diff` and `open_internal` with it — and single-file commit diffs are served by `SoloDiffView`. What remains is the whole-commit view and the `base..head` compare-range view (#87). `open`'s `file_filter` parameter is *not* that mode and stays: it narrows which files the whole-commit diff shows while keeping the metadata chrome. | `git_ui` (S-DET) / `git_graph` |
+| `crates/git_ui/src/commit_blob.rs` | **New (decision #136).** The historic-blob loader extracted out of `CommitView`: `GitBlob` (a `DiskState::Historic` synthetic file), `build_buffer` / `build_buffer_diff`, and `load_commit_file_blob`, which turns one `CommitFile` into a `LoadedBlob { buffer, diff, status, excerpt_ranges, path_key, is_binary }`. Two callers: `CommitView`'s per-file loop and `SoloDiffView::open_commit_file`. Takes `&mut AsyncWindowContext` deliberately — narrowing to `AsyncApp` would trade five recoverable `?` short-circuits for a `.upgrade().expect(..)` panic. | `git_ui` |
+| `crates/search/src/buffer_search.rs` | The bar hosts the split-diff style controls (prev/next hunk, Unified/Split) for every `SplittableEditor` consumer that has no toolbar of its own — see decision #137 for `paints_diff_style_controls`, `keeps_primary_left` and `has_files_to_collapse`, and for why the first two must not be welded to the "Collapse All Files" predicate. Also carries the `debug_selector` paint tests over both the dismissed and the shown element tree. | `editor` / `git_ui` |
 | `crates/paths/src/paths.rs` | `.zed` → `.sawe` rename for per-worktree config dir. Adds `run_configurations_file()` (global `~/.spk/sawe/config/run-configurations.json`) and `local_run_configurations_file_relative_path()` (`.sawe/run-configurations.json`) for S-RUN. Adds `remote_control_settings_file()` (`~/.spk/sawe/config/remote-control.json`) for R-1. Adds `remote_control_cert_file()` / `remote_control_key_file()` siblings for the R-2 self-signed TLS cert + key (persisted across restarts so fingerprint pinning stays stable). | rebrand / `run_config` (S-RUN) / `remote_control` (R-1 / R-2) |
 | `crates/gpui_tokio/src/gpui_tokio.rs` | Adds `Tokio::try_handle(cx) -> Option<tokio::runtime::Handle>` — the non-panicking analogue of `Tokio::handle`, used by `remote_control::store::start_listener_async` to short-circuit when the runtime isn't installed (rather than panic deep in the bootstrap path). | `remote_control` (R-2) |
 | `assets/keymaps/default-*.json` | Default shortcuts for Solutions / sessions. Adds `alt-shift-f10` → `run_config::Run`, `alt-shift-f9` → `run_config::Debug`, `alt-shift-f2` → `run_config::Stop` (Workspace context; IntelliJ-style — `alt-shift` variants chosen because `shift-f10`/`shift-f9`/`ctrl-f2` are already bound in Editor context). | `solutions_ui` / `run_config_ui` |
@@ -1499,10 +1501,12 @@ What: phase 3 of the Solution-band work (spec `docs/plans/2026-08-26-solution-ba
 History tab is deleted outright, and the git graph's inline right-hand commit-details sidebar is deleted with it.
 Selecting a commit in the graph opens a closable **Commit** tab carrying the full commit message, a
 `short hash · author · date` row, whole-commit +/− totals and a changed-files tree; double-clicking a file there opens
-that file's diff **for that commit** in the centre pane (`CommitView::open_file_diff`, reused verbatim — its doc comment
+that file's diff **for that commit** in the centre pane (at the time `CommitView::open_file_diff`, reused verbatim — its doc comment
 already named the graph's changed-files list as its caller). **The gesture and the tab identity changed on 2026-09-01 —
 see #125**: double click now summons one shared diff into the pane's preview slot and single click retargets it, and
-`open_file_diff`'s only caller is the Commit tab (the doc comment's graph attribution was stale and is corrected). A multi-row graph selection renders a bare "N commits
+that call's only caller was the Commit tab (the doc comment's graph attribution was stale and was corrected). **And the callee changed
+on 2026-09-02 — see #136**: `CommitView`'s single-file mode is deleted, and the Commit tab now opens
+`SoloDiffView::open_commit_file`, the same view type the Changes tab opens. A multi-row graph selection renders a bare "N commits
 selected" and loads nothing. The sidebar's building blocks — the changed-files tree, the commit-message split, the
 markdown style, the client-side +/− fold — were **relocated, not rebuilt**, into `crates/git_ui/src/git_panel/commit_tab.rs`.
 
@@ -2390,7 +2394,7 @@ a stale `origin/x` as a deliberate marker.
 
 What: double-clicking a file in the Commit tab opens its diff into the pane's **preview
 slot** and leaves it a preview; single-clicking another file **retargets that same tab**, but
-only if the slot already holds a single-file `CommitView` — it never summons a diff from
+only if the slot already holds a single-file diff — it never summons a diff from
 nothing. Opening uses `focus_item = false`, so clicking down a file list keeps focus in the
 git panel. This reverses the ruling that made single click selection-only.
 
@@ -2401,10 +2405,22 @@ behaves this way; the Commit tab was simply never wired to it.
 
 How to apply: **double click must not pin.** Pinning would promote the item out of the preview
 slot, after which single clicks would stop retargeting and would open a *second* preview —
-exactly the complaint. This inverts the Changes tab's mapping, where double click means
-`Permanent`, and it is the correction a later reader will "fix" back. The guard mirrors
-`GitPanel::move_diff_to_entry` and type-checks the slot's occupant, so the two surfaces cannot
-retarget each other's item even though they share one slot per pane. Also fixed here: the
+exactly the complaint.
+
+**Amended 2026-09-02 (see #136) — there is no inversion left, and the guard is no longer a
+type check.** This entry used to warn that the rule *inverted* the Changes tab's mapping,
+where double click meant `SoloDiffOpen::Permanent`, and that a later reader would "fix" it
+back. The unification made the Changes tab obey this rule too, so both tabs now behave
+identically and there is nothing left to invert. What survives — and is now the rule for
+**both** tabs — is that neither double click **nor `menu::Confirm` / Enter** may pin; the
+reasoning in the paragraph above is exactly why, and it is unchanged. The guard also changed
+shape: the two surfaces no longer have separate item types to type-check each other with (one
+`SoloDiffView` serves both), so it is now the single question "does the active pane's preview
+slot hold a `SoloDiffView`" (`SoloDiffView::preview_holds_a_diff`), and reuse is by *source
+identity* rather than by path. `CommitView::open_internal`, its `single_file` field and
+`open_file_diff` no longer exist.
+
+Also fixed here — in code this refactor has since deleted: the
 dedupe in `CommitView::open_internal` found the *index* by `(sha, single_file)` but the item
 to remove by **sha alone** and then `.unwrap()`ed it, so re-opening a file could close a full
 commit view open to its left; both halves now come from one `find_map`, and an already-open
@@ -2596,3 +2612,143 @@ Why the width reservation had to change with it: `EditorSnapshot::gutter_dimensi
 How to apply: the renderer owns the row's layout, so it is the only thing that can price it — `BlameRenderer::gutter_fixed_columns(cx)` reports the date, the gaps and the avatar, `max_author_columns()` caps the name, and `GitBlame::max_author_display_columns` measures the *shortened* name in **display columns** (`unicode-width`), never bytes and never `char`s. If you add an element to the row, add its columns there in the same commit. `truncate_to_columns` (not `util::truncate_and_trailoff`, which counts `char`s) keeps the drawn name inside the cap, and `.overflow_x_hidden()` on the row is the backstop that turns any future mis-measurement into a clipped name instead of text over the line numbers.
 
 Not done: IntelliJ also tints runs of lines from one commit and prints the metadata once per run. `layout_blame_entries` does have the neighbouring rows in hand, so it is reachable — but only by adding a run-position argument to both `BlameRenderer::render_blame_entry*` methods, painting the run background in `element.rs`, and keeping the continuation rows interactive so hovering one still shows its commit. That is a redesign of the trait, not a width change, and it is deliberately left as a follow-up.
+
+### 136. One `SoloDiffView` with a `DiffSource` serves both git-panel tabs, and the open gesture names what the user did
+
+The maintainer's ruling that started it, verbatim: *«Вообще мне видится, что это должен быть
+один компонент с флагом "editable". Я за рефакторинг.»*
+
+What: `SoloDiffView` (`crates/git_ui/src/solo_diff_view.rs`) renders one file's diff from
+either of two sources, and `CommitView`'s single-file mode is **deleted** — `single_file`,
+`open_file_diff`, `preview_holds_single_file_diff` and `open_internal` with it. The Commit tab
+calls `SoloDiffView::open_commit_file`, the Changes tab calls `SoloDiffView::open_or_focus`,
+and `CommitView` is left serving the whole-commit view and the `base..head` compare-range view
+(#87). The historic-blob loader they share moved out to `crates/git_ui/src/commit_blob.rs`.
+
+Why a `DiffSource` enum and not the bare `editable` bool the ruling proposed: a bool answers
+one question, and the view has to derive **four** things from the same fact — the multibuffer
+shape (`MultiBuffer::singleton` over a live project buffer vs
+`MultiBuffer::without_headers(Capability::ReadOnly)` over detached blobs), the capability, the
+blame base, and the tab's identity (used both for dedupe in `resolve_gesture` and for the git
+panel's open-diff mark, `OpenDiff::from_active_item`). Those four must not be able to
+disagree, and a bool has nowhere to hang the sha that two of them need. Everything the modes
+differ about is a method on the source — `is_editable`, `matches`, `blame_base`, `tab_icon`,
+`tab_title` — never an `if` scattered through the view, and `SoloDiffView::new` carries a
+`debug_assert!` that the `DiffSource` and the `LoadedDiff` handed to it are the same variant,
+because a mismatched pair builds a view that is read-only in one respect and editable in
+another.
+
+**There are exactly two essential differences, and blame is not one of them.** Editability and
+hunk staging both follow from the single fact that the right-hand side is a live project
+buffer in one case and a detached historic blob in the other; `can_save` / `save` /
+`disable_diff_hunk_controls` all read `DiffSource::is_editable()`. Blame is a **parameter**:
+`blame_base()` is `Some("HEAD")` for the working tree (the left pane holds the file at HEAD)
+and `None` for a commit. The `None` is mechanical, not conceptual —
+`SplittableEditor::sync_lhs_blame_sources` (`crates/editor/src/split.rs`) resolves the
+`(repository, repo_path)` to blame through `repository_and_path_for_buffer_id` on the
+**right-hand** buffer id, and a detached blob is not in the project's buffer store, so every
+source it builds is dropped. Wiring commit-mode blame needs an explicit repository override on
+`SplittableEditor`: a separate change inside `editor`, with its own tests. #59 records the
+same gap from the other end — its "how to apply" lists `commit_view` among the consumers that
+deliberately do **not** opt in, because *both* of its panes are detached buffers — and its
+ordering trap applies here too: `sync_lhs_blame_sources` prunes entries whose base buffer is
+no longer excerpted, so it must run **after** the excerpts are installed, never before.
+
+The gesture model — the maintainer's, now the rule for **both** tabs (amends #125):
+
+| gesture | behaviour |
+|---|---|
+| double click (either tab) | **summon** the shared diff into the active pane's preview slot; never pin; focus stays in the panel (`DiffOpen::Summon { focus: false }`) |
+| single click (either tab) | **retarget** the shared diff if one is open; do nothing at all if it is not (`DiffOpen::Retarget`) |
+| arrow-key step (Changes) | same as single click — retarget only |
+| `menu::Confirm` / Enter (Changes) | summon **and** focus (`Summon { focus: true }`); still never pins |
+| `menu::SecondaryConfirm` (cmd-click / alt-enter) | unchanged — the stacked `ProjectDiff` accordion |
+
+`DiffOpen` names the gesture rather than the destination (`SoloDiffOpen { Preview, Permanent }`
+is gone) because the placement is never the caller's decision once one tab is shared: a summon
+always takes the preview slot and a retarget always reuses whatever is in it. That is the
+property that keeps the two tabs from drifting apart again — and it is a behaviour change for
+the **Changes** tab, which used to pin on double click and summon a preview from nothing on
+every single click and every arrow step.
+
+How to apply — three things a future reader must not "fix":
+
+**Neither double click nor Enter may pin.** Nothing in the open path calls
+`unpreview_item_if_preview` any more; that call *was* pinning. Pinning promotes the item out
+of the preview slot, `preview_holds_a_diff` then answers false, and the next single click
+summons a *second* tab — the exact complaint #125 was written to fix. Pinning stays reachable
+through the editor's own double-click-on-the-*tab* gesture and `TogglePreviewTab`.
+
+**`resolve_gesture` declines a `Retarget` *before* it searches for an existing view, not
+after.** Search-first looks obviously better (it would surface a diff parked in another pane)
+and is wrong: the pre-unification Changes tab gated the whole call in `move_diff_to_entry`, so
+a declined arrow step never reached a workspace-wide activate. Searching first lets an
+arrow-key step flip a pane onto a pinned diff and never flip back. `Summon` keeps the
+workspace-wide reuse; `Retarget` does not.
+
+**Conflict routing follows the summon gesture, not the pin gesture.** A conflicted file opens
+the merge resolver on `Summon` and does nothing on `Retarget` — the old rule was `Permanent`
+opens / `Preview` does nothing, expressed against the gesture that survived. Stepping past a
+conflict with the arrow keys must not spawn a three-pane merge view.
+
+Not carried over deliberately: `ExplainCommit` was bound unconditionally on `CommitView`'s
+root element, so it was dispatchable in single-file mode and spawned an AI task whose output
+nothing rendered. Deleting the mode closed that by construction — do not re-add the binding to
+`SoloDiffView`.
+
+### 137. Who paints the diff style controls is stated by the consumer, and the search bar's toolbar location is one predicate
+
+What: `SplittableEditor` gained `set_style_controls_painted_by_consumer(bool)` /
+`style_controls_painted_by_consumer()` (`crates/editor/src/split.rs`), and
+`BufferSearchBar::paints_diff_style_controls` (`crates/search/src/buffer_search.rs`) is the
+single gate on the four diff style buttons — previous hunk, next hunk, Unified, Split — that
+the bar draws in `PrimaryLeft`. `SoloDiffView` is the one consumer that sets the flag, because
+it paints the same quartet itself in `SoloDiffStyleToolbar`, which lands in the same
+`PrimaryLeft` slot. Alongside it: `keeps_primary_left()` = "the leading group has anything in
+it" is what all **three** location emitters ask, and `has_files_to_collapse()` is what
+"Collapse All Files" asks.
+
+Why the flag lives on the consumer: `search` sits below `git_ui` / `editor`'s diff views and
+cannot name them, and "who paints this" is a fact about the *consumer*, not about the
+multibuffer's shape. The commit-source `SoloDiffView` is the case that exposed it — its
+multibuffer is not a singleton, so the bar drew a second identical quartet beside the view's
+own. The working-tree source escaped only because its multibuffer happens to be a singleton,
+which is a coincidence rather than a reason.
+
+Why this is **not** welded to "Collapse All Files": it was, and that shipped two regressions in
+one task. The collapse predicate and the style controls ask different questions about
+different buttons. `MultiBuffer::new` sets `show_headers: true` in its constructor while
+`without_headers` leaves it `false`, so a headered multibuffer answers the collapse predicate
+`true` even with **zero** buffers — which is why only `CommitView`'s compare-range mode
+(`compact = compare_range.is_some()`, the one headerless multi-file case) lost its controls
+while its blobs were still loading asynchronously. Narrow the claim to that: it is not "any
+multi-file commit view". Conversely, gating the style controls on "the multibuffer spans more
+than one buffer" would have silently stripped hunk navigation and Unified/Split from one-file
+`ProjectDiff`, one-file whole-commit `CommitView`, one-file compare-range and
+`text_diff_view` — four everyday surfaces.
+
+Deliberate scope widening, recorded because it is user-visible: `file_diff_view` now shows the
+quartet, which it never had. It is the only `SplittableEditor` consumer affected, its sibling
+`text_diff_view` already had them, and a `buffer_kind` carve-out to exclude it would reinstate
+exactly the class of gate that caused both regressions.
+
+How to apply — **the failure mode here is one decision expressed in more than one place where
+the copies can disagree**, and all three regressions in this work had that shape: the
+`split_buttons` element vs. the toolbar location; the location emitted independently by
+`set_active_pane_item`, `show()` and `dismiss()` with nothing recomputing it afterwards; and
+the painted row vs. the predicate that was supposed to describe it. So: the row's visibility
+condition is `split_buttons.is_some()` — the thing actually being rendered — not a
+separately-computed boolean; and every emitter calls `keeps_primary_left`, never
+`needs_expand_collapse_option` directly. If you add a fourth emitter, it calls the same
+function.
+
+And **assert on the painted element tree, not on the predicate.** Each of the three was caught
+by a reviewer rather than by a test, because each test asserted the predicate and shipped
+green while the consequence was wrong. GPUI supports the stronger assertion and the idiom was
+available and unused in these crates: `VisualTestContext::debug_bounds("ICON-{IconName:?}")`
+against a drawn bar, with `IconButton` registering that selector automatically and
+`div().debug_selector()` for anything else (`crates/search/src/buffer_search.rs`,
+`crates/editor/src/edit_prediction_tests.rs`, `crates/agent_ui/src/agent_panel.rs`). Note the
+one hole in the paint tests as written: the Split button's icon alternates
+`DiffSplit`/`DiffSplitAuto`, so it is asserted on by neither name and a change that dropped
+only that button would still pass.

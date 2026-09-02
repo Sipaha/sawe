@@ -1,10 +1,17 @@
 # Unify the two single-file diff views
 
-**Status:** in progress (2026-09-02)
+**Status:** complete (2026-09-02) — commits `85fdf77f38..4875ae53c5`, thirteen on `main`.
+FORK.md decisions **#136** (the unification + the gesture model) and **#137** (who paints
+the diff style controls), with **#125** amended and **#100**'s stale call reference
+corrected. See "What actually shipped" at the bottom for every place the implementation
+diverged from what is written above.
+
 **Maintainer ruling that started this:** *«Вообще мне видится, что это должен быть
 один компонент с флагом "editable". Я за рефакторинг.»*
 
-Two types render a single file's diff today:
+Two types rendered a single file's diff *before this work*. The table below, and every
+present tense in the sections up to "What actually shipped", describe that starting state —
+they are kept as the record of what was merged, not as a description of the code today.
 
 | | `SoloDiffView` (`crates/git_ui/src/solo_diff_view.rs`) | `CommitView` single-file mode (`crates/git_ui/src/commit_view.rs`) |
 |---|---|---|
@@ -47,7 +54,7 @@ blob in the other.
 blame was a third essential difference and was right: the blame base is a
 *parameter* (`HEAD` for the working tree, `<sha>^` for a commit), not a
 property of the view. The one real obstacle is mechanical:
-`SplittableEditor::sync_lhs_blame_sources` (`crates/editor/src/split.rs:627`)
+`SplittableEditor::sync_lhs_blame_sources` (`crates/editor/src/split.rs`)
 resolves `(repository, repo_path)` through `repository_and_path_for_buffer_id`
 on the **right-hand** buffer id, which a detached blob cannot answer. FORK.md
 #59 records this as "deliberately unwired", not impossible.
@@ -101,11 +108,20 @@ pub enum DiffOpen {
 }
 ```
 
+**Corrected after implementation — steps 1 and 2 ship in the opposite order.** The plan said
+search first; `SoloDiffView::resolve_gesture` declines first. Gating the whole call is what
+the pre-unification Changes tab did (`preview_is_solo_diff` in `move_diff_to_entry`), so a
+declined arrow step never reached a workspace-wide activate. Search-first lets an arrow-key
+step flip a pane onto a pinned diff and never flip back — a live regression in the
+maintainer's daily path. `Summon` keeps the workspace-wide reuse; `Retarget` does not, and
+the cost is that a single click on a file whose diff is pinned in another pane no longer
+surfaces that pinned tab.
+
 ```
-1. An existing SoloDiffView anywhere in the workspace whose source equals this
-   one → activate it (focus per the gesture) and stop. Never unpreview it.
-2. Retarget, and the active pane's preview slot does not hold a SoloDiffView
+1. Retarget, and the active pane's preview slot does not hold a SoloDiffView
    → do nothing and stop.
+2. An existing SoloDiffView anywhere in the workspace whose source equals this
+   one → activate it (focus per the gesture) and stop. Never unpreview it.
 3. Load the source; build the view.
 4. Previews enabled → take the preview slot (`replace_preview_item_id`) and
    add the item with `focus` from the gesture.
@@ -243,3 +259,92 @@ FORK.md: amend #125 to the new model, add a decision for the unification.
 One view type serves both tabs; the gesture model above holds in a live
 headless probe; the ported tests pass; `cargo check --workspace --all-targets`
 is clean of **errors and warnings**; FORK.md #125 is amended.
+
+---
+
+## What actually shipped
+
+Thirteen commits, `85fdf77f38..4875ae53c5`, all on `main`. Five tasks: extract the blob
+loader (`1bbd811424`), teach `SoloDiffView` the `Commit` source (`5a3b279610`), repoint both
+tabs and unify the gestures (`68ef040316` `20c695d7fb`), converge the toolbars and
+`can_split` (`b26c6bd0ea` `a35b037b9a` + three fix rounds `8dc64b6a10` `eed754f552`
+`8754c9d60c` `bbfe0be8be` `182df8b042` `4875ae53c5`), and this documentation pass. Final
+gates: `cargo check --workspace --all-targets` clean of errors **and** warnings; `search` 70
+tests, `git_ui` 387, `editor` 799.
+
+Where the implementation diverged from the design above:
+
+- **The retarget/reuse step order is reversed** — corrected inline in "The one open algorithm
+  both tabs call" above.
+- **`CommitView::open_internal` was folded into `open`**, and its now-permanently-false
+  `preview` parameter deleted. All eleven production callers passed `file_filter = None` and
+  reached the non-preview branch. `file_filter` itself survives, exactly as the plan warned.
+- **Buffer search is offered for *both* sources, not commit-only.** `as_searchable` already
+  returns this view's editor whatever it is showing, `QuickActionBar` downcasts to the
+  concrete `Editor` type and so is genuinely hidden here, and a button that blinked out
+  whenever a single click retargeted the shared tab from an uncommitted change to a commit's
+  file is the chrome drift this refactor exists to undo.
+- **`load_commit_file_blob` kept `&mut AsyncWindowContext`** rather than narrowing to
+  `AsyncApp`, overturning Task 2's brief: in this GPUI tree `AsyncApp::update` is infallible
+  and reaches its `App` through `.upgrade().expect(..)`, so narrowing would trade five
+  recoverable `?` short-circuits for a production panic. The gain that is actually lost is
+  small — a commit-file load now survives its window closing and wastes the work.
+- **A fifth crate got involved that the plan did not anticipate: `search`.** Making the
+  commit source's multibuffer non-singleton exposed that `BufferSearchBar` paints its own
+  copy of the diff style controls into the same `PrimaryLeft` slot as `SoloDiffStyleToolbar`.
+  Closing that took three review rounds and produced FORK.md #137 — `SplittableEditor::
+  set_style_controls_painted_by_consumer`, `BufferSearchBar::{paints_diff_style_controls,
+  keeps_primary_left, has_files_to_collapse}`, and paint tests over both the dismissed and
+  the shown element tree.
+- **`file_diff_view` gained the diff style controls it never had** — prev/next hunk, Unified,
+  Split — as a deliberate, reviewed widening. It is the only `SplittableEditor` consumer
+  affected; its sibling `text_diff_view` already had them; and the carve-out that would have
+  excluded it is the exact class of gate that caused two of the three regressions.
+- **The async toolbar-location hole is compare-range only**, not "any multi-file commit
+  view": `MultiBuffer::new` sets `show_headers: true` in the constructor and
+  `without_headers` leaves it `false`, so a headered multibuffer answers the collapse
+  predicate `true` even with zero buffers. Only `CommitView`'s compact mode
+  (`compact = compare_range.is_some()`) is headerless.
+- **The gesture tests moved from task 5 to task 3.** Task 3 could not compile with the five
+  `commit_tab.rs` gesture tests and `test_open_diff*` unchanged, so it ported them in the
+  same commit. Task 5 is documentation only.
+
+## Deferred, with evidence
+
+Recorded in `TODO.md` (section C), because they are durable and user-visible:
+
+- **A diff pane split twice trips a debug assertion** (`crates/editor/src/display_map.rs:303`
+  via `SplittableEditor::unsplit` on a clone that shares its multibuffer). Pre-existing —
+  `CommitView` has had `can_split = true` and a multibuffer-sharing `clone_on_split` all
+  along (`20c695d7fb:crates/git_ui/src/commit_view.rs:1233,1259`). What is **newly exposed**
+  is the working-tree diff, which had no `can_split` before task 4. → `TODO.md` C6.
+- **`SoloDiffView` does not override `Item::is_dirty`** while `can_save` is true for the
+  working-tree source. → `TODO.md` C7.
+- **`CommitView::select_parent_index` refreshes only `diff_files`**, so the merge-parent
+  toggle changes the affected-files list and not the diff. → `TODO.md` C8.
+- **A split pane has no preview item**, so a single-click retarget from the git panel does
+  nothing there until the user activates the original pane. → `TODO.md` C9.
+
+Deliberately *not* in `TODO.md` — real, but too narrow to earn a row there:
+
+- `commit_view.rs`'s replace-lookup matches on `view.commit.sha == commit_sha`, which also
+  matches a `compare_range` view whose head sha equals it, so opening the whole-commit view
+  for X after a `base..X` comparison removes the comparison tab. The pre-change predicate
+  matched identically; it is a one-line predicate fix whenever someone is next in that
+  function.
+- Buffer search offers Replace on the read-only commit diff; `Editor::edit` early-returns on
+  `read_only`, so it silently no-ops. Pre-existing for `CommitView`, and only reachable by
+  explicitly toggling replace mode.
+- Two `MultiBufferSnapshot` clones per render on the commit path, and a `multibuffer` field
+  on `SoloDiffView` that duplicates a handle reachable through the editor — `SplittableEditor`
+  has no `rhs_multibuffer()` accessor, which is why.
+- The paint tests assert three of the four style buttons; Split is skipped because its icon
+  alternates `DiffSplit`/`DiffSplitAuto`, so a change dropping only that button would survive.
+  Recorded in FORK.md #137.
+- `Event::UpdateLocation` (`crates/search/src/buffer_search.rs`) is emitted three times and
+  subscribed nowhere — a dead event, pre-existing.
+- `has_collapse_button` now means "the leading group is non-empty" rather than "there is a
+  collapse chevron"; the alignment use is correct but the name has drifted.
+- `test_reopening_the_commit_view_spares_the_file_diff_tab` still reproduces the original
+  pane geometry and still guards the bug, but can no longer express the original mutation
+  (`single_file` dropped from the lookup key) — that mutation is unexpressible now.
