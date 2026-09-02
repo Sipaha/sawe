@@ -106,17 +106,18 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/git_ui/src/git_panel.rs` | **(2026-06-23, decision #27)** No longer hosts a project dropdown; `refresh_active_repository_for_selector` overrides `active_repository` with the active member's matching repo; subscribes to `ActiveMemberChanged`. (Per-member dropdown-badge change-count map retired with the selector.) **(decision #75)** That override now resolves through `solutions::active_member_repository`, and `set_active_repository` is the single seam every piece of per-repository panel state hangs off — the History tab's rows and subscriptions used to be cleared there, and since decision #100 the Commit tab is closed there for the same reason. **(decision #100)** The tab set is now `Changes \| Commit`; History is deleted. | `solutions_ui` / `solutions` |
 | `crates/git_ui/src/git_panel/commit_tab.rs` | **New (decision #100).** The git panel's Commit tab: `CommitSelection` / `CommitSelectionSource`, the `CommitTabState` the panel hangs off an `Option`, the two guarded background loads (`Repository::show` / `load_commit_diff`), and the changed-files tree / message split / markdown style / client-side +/− fold **relocated verbatim** from the git graph's deleted commit-details sidebar. A private `mod`: `git_panel.rs` re-exports only `CommitSelection` and `CommitSelectionSource`, which is all `git_graph` needs to name. | `git_ui` / `git_graph` |
 | `crates/git/Cargo.toml` | `test-support` feature now also activates `db/test-support` — the `db::static_connection!` macro's expansion references `db::open_test_db`, which only exists under that feature; without it, crates that enable `git/test-support` but not `db/test-support` fail to compile. Pre-existing latent workspace bug, fixed in-tree. **(2026-08-31)** It now also activates `gpui/test-support`, for the same reason one level along: `CommitDataReader::for_test`, gated `#[cfg(any(test, feature = "test-support"))]`, calls `BackgroundExecutor::simulate_random_delay`, which exists only under that feature — so `git_hosting_providers`, whose dev-deps enable `git/test-support`, could not compile its own test targets (E0599). Fixed in `git`'s feature list rather than in the consumer, so the arm and the method it needs stay in lockstep for every consumer. See `docs/findings/2026-08-31-cfg-universes-and-the-warning-gate.md`. | build / upstream-fix |
-| `crates/git/src/repository.rs` | Adds `branches_containing` / `tags_containing` / `load_commit_against_parent` methods on `GitRepository` (default no-op impls + real impls in `RealGitRepository`) for the S-DET commit-view metadata surface. Adds module-level `parse_contains_output` parser. Also: `load_commit_template` special-cases `ErrorKind::NotFound` on the `git config --get` spawn — treats "cwd disappeared" (e.g. an open repo whose underlying directory was removed mid-session via `git worktree remove`) as "no template available" with a debug log, instead of propagating ENOENT through to `detach_and_log_err`. | `git_ui` (S-DET) / general robustness |
+| `crates/git/src/repository.rs` | Adds `branches_containing` / `tags_containing` / `tags_pointing_at` / `load_commit_against_parent` methods on `GitRepository` (default no-op impls + real impls in `RealGitRepository`) for the S-DET commit-view metadata surface. Adds the module-level `parse_ref_name_lines` parser shared by all three ref queries (named `parse_contains_output` until `--points-at` joined them). Also: `load_commit_template` special-cases `ErrorKind::NotFound` on the `git config --get` spawn — treats "cwd disappeared" (e.g. an open repo whose underlying directory was removed mid-session via `git worktree remove`) as "no template available" with a debug log, instead of propagating ENOENT through to `detach_and_log_err`. | `git_ui` (S-DET) / general robustness |
 | `crates/git/src/blame.rs` | `Blame::for_path_at_revision` + a `BlameTarget` enum, so `git blame` can annotate a commit-ish instead of only working-tree content piped on stdin (decision #58). | `editor` (diff-pane blame) |
 | `crates/fs/src/fake_git_repo.rs` + `crates/fs/src/fs.rs` | `FakeGitRepositoryState::blames_at_revision` + `FakeFs::set_blame_at_revision_for_repo`, the test double for the revision-aware blame call. | `editor` (diff-pane blame) |
 | `crates/fs/src/fs_watcher.rs` | `unwatch` swallows `notify::ErrorKind::WatchNotFound` and `PathNotFound` as benign races (the watched path was already removed from underneath us — `git worktree remove`, `rm -rf`, tempdir teardown — and the kernel-side watch was invalidated before our bookkeeping caught up). Logs at debug instead of propagating, so one removed directory tree doesn't flood the log with one ERROR per nested subdir's unwatch attempt. | general robustness |
-| `crates/project/src/git_store.rs` | Adds `Repository::branches_containing` / `tags_containing` / `load_commit_diff_against_parent` job-dispatch helpers. Adds `Repository::refresh_branches` + the shared `rescan_branches` helper (extracted from the tail of `Repository::push`) so a push that bypasses `Repository::push` can still republish ahead/behind and drop the cached graph log. | `git_ui` (S-DET) |
+| `crates/project/src/git_store.rs` | Adds `Repository::branches_containing` / `tags_containing` / `tags_pointing_at` / `load_commit_diff_against_parent` job-dispatch helpers. Adds `Repository::refresh_branches` + the shared `rescan_branches` helper (extracted from the tail of `Repository::push`) so a push that bypasses `Repository::push` can still republish ahead/behind and drop the cached graph log. | `git_ui` (S-DET) |
 | `crates/settings_content/src/settings_content.rs` | Adds `CommitViewSettingsContent` (avatars, lazy threshold, mention parsing) + nested field on `GitPanelSettingsContent`. Also adds `SolutionAgentSettingsContent { ephemeral }` (S-AI-MSG ephemeral-pool sizing). Adds `RunConfigSettingsContent { toolbar }` + nested `run_config` field on `SettingsContent` (S-RUN). | `git_ui` (S-DET) / `solution_agent` (S-AI-MSG) / `run_config` (S-RUN) |
 | `crates/settings/src/vscode_import.rs` | Add `solution_agent: None` field initializer to keep VS Code import in lockstep with the new `SettingsContent.solution_agent` field. Adds `run_config: None` for the same reason (S-RUN). | `solution_agent` (S-AI-MSG) / `run_config` (S-RUN) |
 | `crates/task/src/task_template.rs` | Adds `before_commit: bool` field on `TaskTemplate` (default `false`). Read by `git_ui::pre_commit` to surface a task as a before-commit check row in the commit panel. | `git_ui` (S-PCH-HK) |
 | `crates/project/src/task_inventory.rs` | Adds `Inventory::before_commit_templates(worktree)` accessor (mirrors `templates_with_hooks` shape) so the git panel can enumerate pre-commit-flagged tasks without touching `templates_from_settings`. Also adds `Inventory::task_templates_from_settings(worktree)` — a synchronous, context-free listing of settings-derived task templates used by the `task-ref` run-config provider (language runnables excluded; those need the async `list_tasks`). | `git_ui` (S-PCH-HK), `run_config` (S-RUN) |
 | `crates/workspace/src/welcome.rs` | `render_agent_card` gated off via `false &&` — fork uses `solution_agent`, not upstream agent panel. | `solution_agent` |
 | `crates/workspace/src/active_file_name.rs` | `ActiveFileName::new` now takes the `Workspace` (holds a `WeakEntity<Project>`); the status-bar label prefixes the worktree-relative path with the worktree's root name so it's unambiguous across a Solution's worktrees. (`status_bar.show_active_file` also flipped to `true` in `default.json`.) | rebrand / solutions |
+| `crates/git_ui/src/conflict_view.rs` | The merge-conflict status-bar indicator and the in-editor conflict block both dispatched agent actions whose only handler early-returns without an `AgentPanel`, which this fork never registers — two silent no-ops, one of which also dismissed itself as if it had worked. Both now open the fork's own conflict resolver (`git_conflict_ui::OpenConflictResolver`) and are relabelled accordingly; the indicator no longer self-dismisses, and neither is gated on `AgentSettings::enabled`, since neither involves the agent any more. | `git_conflict_ui` |
 | `crates/git_ui/src/commit_view.rs` | S-DET commit-view surface (header / parents / refs / contains / affected-files / footer decomposed into `commit_view::*` submodules) **and** a `single_file: Option<RepoPath>` mode (`CommitView::open_file_diff`) that renders just the diff editor — no metadata chrome, tab titled with the file name. Its one caller is the git panel's Commit tab, and since #125 it opens into the pane's preview slot rather than a tab of its own. | `git_ui` (S-DET) / `git_graph` |
 | `crates/paths/src/paths.rs` | `.zed` → `.sawe` rename for per-worktree config dir. Adds `run_configurations_file()` (global `~/.spk/sawe/config/run-configurations.json`) and `local_run_configurations_file_relative_path()` (`.sawe/run-configurations.json`) for S-RUN. Adds `remote_control_settings_file()` (`~/.spk/sawe/config/remote-control.json`) for R-1. Adds `remote_control_cert_file()` / `remote_control_key_file()` siblings for the R-2 self-signed TLS cert + key (persisted across restarts so fingerprint pinning stays stable). | rebrand / `run_config` (S-RUN) / `remote_control` (R-1 / R-2) |
 | `crates/gpui_tokio/src/gpui_tokio.rs` | Adds `Tokio::try_handle(cx) -> Option<tokio::runtime::Handle>` — the non-panicking analogue of `Tokio::handle`, used by `remote_control::store::start_listener_async` to short-circuit when the runtime isn't installed (rather than panic deep in the bootstrap path). | `remote_control` (R-2) |
@@ -851,6 +852,8 @@ Deliberately out of scope (there was no data / the ask didn't need it): per-file
 **Second amendment (recon 2026-08-31): the trigger is withdrawn, permanently — the third tree never arrived.** `commit_tab.rs`'s `build_changed_file_rows` is not a tree builder at all: no recursion, no `depth`, no compaction pass. It is a two-level `BTreeMap<full_dir_path, Vec<file>>` grouper, pinned by its own test (`test_build_changed_file_rows_groups_by_directory`), and its rendered structure differs from the other two *on purpose* — `docs/plans` and `docs/findings` are sibling flat headers rather than a nested `docs`, root files get a header named after the repository, and file rows use one fixed `COMMIT_TREE_INDENT` measured against the Changes tab's content edge instead of a per-level indent. Sharing a tree builder with it would be a UX change, not a refactor. It belongs with `branch_picker/tree.rs`'s `BranchTree::build`, the crate's other flat prefix grouper. If the maintainer ever wants the Commit tab to paint a real nested tree, that is a UX decision on its own merits — and only *then* does it become a consumer of the option below.
 
 **Correcting this entry's original reasoning while we are here:** the `GitStatusEntry` / `Section` / staging coupling cited above as the reason not to generalise the git-panel builder is **render-side, not build-side**. `Section` appears in `build_tree_entries` only to namespace a `TreeKey`; the builder touches `GitStatusEntry` only for `.repo_path` and for cloning into a `Vec<_>`. Everything the entry names — the tri-state staging checkbox, `stage_status_for_directory`, folder icons, chevrons, indent guides — lives in `changes_list.rs`'s `render_directory_entry`. The proof is that `rollback_modal.rs` is an unaccounted-for **fourth** consumer that already reuses `TreeViewState::build_tree_entries` verbatim, passing a synthetic `Section`, with zero generics.
+
+**Third amendment (2026-09-02): the per-file +/− carve-out above is withdrawn — see decision #127.** "No numstat, so it needs a diff-stat load path" stopped being true once the Commit tab computed its header total from `line_diff` over the commit's own `old_text`/`new_text`: the per-file figures fall out of that same fold and were simply being discarded.
 
 **The remaining option, labelled and NOT scheduled:** the two *real* trees (`git_panel.rs`'s ~130 lines and `commit_view/affected_files.rs`'s ~72) are near-identical — same compaction predicate, same one-level-per-compacted-chain depth rule, same dirs-before-files ordering, same deepest-path collapse key. If they are ever unified, the route is **leaf adaptation** the way `rollback_modal` did it — adapt the leaf, keep one builder — never a generic `PathTree<L>`, which needs six knobs plus a lifetime across two call sites to save ~50 net lines. The template for the leaf conversion is `ChangedFileEntry::from_commit_file` in `commit_tab.rs`, which already derives a `FileStatus` from a `CommitFile`'s `old_text`/`new_text`; what does not exist anywhere yet is a `CommitFile` → `GitStatusEntry` conversion, and writing one is the actual work. Three costs keep it unscheduled: `build_tree_entries` is `&mut self` with side effects while `affected_files` rebuilds per frame, so reuse forces a caching refactor; the row-emission contract flips (`TreeViewState` keeps hidden rows and namespaces keys by `Section`); and `affected_files` has **zero** tests today, while the git-panel builder is exercised end-to-end by the nine `#[gpui::test]`s in `git_panel/changes_list.rs` plus nine more in `rollback_modal.rs` that build real trees through the same function — so the tests have to be written first or it is an unverified refactor of the surface being rewritten.
 
@@ -2317,7 +2320,9 @@ change here would have been a silent no-op. Both metrics are now set on the cont
 Two things this does **not** change, deliberately. Reordering siblings in a `v_flex` does not
 touch the height arithmetic — flexbox clamps by `min_h`/`max_h`, not DOM order — so the
 message keeps its shrinkable `min_h`/`max_h` + `overflow_y_scroll` and is **not** pinned the
-way the Changes tab pins its editor; that tab can afford a hard height because its file list
+way the Changes tab pins its editor — true only while the user has never dragged the divider,
+which #128 later added: a dragged height replaces `max_h` with `.h()`, and the floor and the
+tree's floor are then what bound it; that tab can afford a hard height because its file list
 has no floor and is allowed to collapse to zero, and the Commit tab's tree has a documented
 72px floor. And `COMMIT_TAB_SECTIONS` is a real constant the renderer loops over, not
 documentation — `test_commit_tab_paints_files_above_message` is load-bearing only because of
@@ -2435,3 +2440,144 @@ are ephemeral *and* untabbed), but the handle maps are the authoritative in-flig
 cannot be missed by a future create path that forgets a flag. This changes only what is
 counted — **no session rows are deleted**, and the standing instruction not to clean up the
 legacy orphans is untouched.
+
+### 127. The Commit tab's per-file +/− figures are derived client-side, in the pass that computes the total
+
+What: `compute_diff_stats` (`crates/git_ui/src/git_panel/commit_tab.rs`) now returns a
+`CommitDiffStats { total, per_file: HashMap<RepoPath, DiffLineCount> }` instead of a bare
+`(usize, usize)`, and the changed-files rows render their own `ui::DiffStat` next to the file
+name — right-aligned and `flex_shrink_0`, so a narrow dock truncates the *path* and never the
+numbers, the way a Changes tab row behaves. Binary files get no figures at all and are
+skipped from the total as well, which keeps `total == sum(per_file)` true by construction.
+Both halves — rows and header total — are gated on `git_panel.diff_stats`, the setting whose
+own documentation is "the addition/deletion change count next to each file in the Git panel"
+and which the Changes tab already applies to its header total.
+
+Why: **this withdraws the "per-file counts are out of scope" carve-out in #55 and in
+`docs/plans/2026-08-30-git-panel-commit-tab.md`.** Both rested on "`CommitFile` carries no
+numstat, so this needs a new diff-stat load path", and that premise died the moment the
+header's total was computed here: the total is `line_diff(old_text, new_text)` folded over
+every file of the `CommitDiff`, so the per-file figures were already being produced and then
+thrown away. No new git invocation, no new proto message, no new load path — only a map that
+is kept instead of discarded.
+
+How to apply: the counts must stay on the **load** side. `line_diff` runs once per file of
+the commit, and the Commit tab re-renders on every panel notify, so a row that derives its
+own figures would run the whole commit's diff on the render path; `ChangedFileEntry` takes
+its `stat` as a parameter for exactly that reason and `changed_file_entries` is the single
+join between the map and the rows. Directory header rows deliberately show **no** subtotal:
+they already carry a muted "N files" count, the whole-commit total sits in the header
+directly above the tree, and a third number would crowd a row whose path is already
+`truncate_start`-ed at dock width.
+
+### 128. The Commit tab's message is resizable, in pixels, committed on every drag move
+
+What: a drag handle between the changed-files tree and the commit-message block.
+`GitPanel::commit_message_height: Option<Pixels>` — `None` is the automatic layout
+(`min_h` + `COMMIT_MESSAGE_MAX_HEIGHT`), `Some(h)` applies `.h(h)` and **drops the cap
+entirely**, leaving the message's own floor and the tree's `min_h` to bound it through the
+flex pass. Double-click resets to `None`. Persisted per workspace as a `#[serde(default)]`
+field on `SerializedGitPanel`. This reverses the second half of the "no resize split inside
+the Commit tab" ruling; the deleted `SplitState` pair did **not** come back — one field.
+
+Why pixels and not a fraction: FORK.md #81's failure mode, and the Commit tab is exposed to
+it — a fraction inside this flex chain never resolves, the cap silently evaporates, and the
+sibling `uniform_list` then measures against an overflowing container and renders **zero
+rows**. The tree *is* a `uniform_list`.
+
+Why the cap has to go once dragged: `COMMIT_MESSAGE_MAX_HEIGHT` is layout *policy*
+("however tall the panel, the message never exceeds 200px, surplus goes to the tree"), not a
+safety rail. A drag is the user overriding that policy, so keeping the cap would freeze the
+divider at 200px — broken exactly where they are pulling.
+
+How to apply — the three traps, in the order they bite:
+
+**The height is measured absolutely, from the block's painted bottom edge to the cursor, and
+must NOT be capped at what the last frame granted.** That cap looks obviously right and was
+written, reviewed and removed: `bounds` is the hitbox from the **last paint**, and both X11
+and Wayland dispatch a whole batch of motion events back to back with no draw between them,
+so two moves in one frame read the same stale bounds — the first raises the height, the
+second sees a phantom shortfall and puts it back. An even number of motions per frame means
+an upward drag does not move at all while downward stays smooth, and a temporarily short
+panel can permanently overwrite a taller stored height. The cap was also unnecessary: because
+the value is absolute rather than a delta, reversal is already immediate — the moment the
+cursor descends past the painted divider the value drops and the divider follows on that very
+event. **Neither a live drag nor an MCP `drag_at` can reproduce this** (both yield a frame per
+step), and the unit tests feed `bounds` by hand, so nothing but reading catches it.
+
+**Commit in `on_drag_move`, never `on_drop`** — #84 and #92 both record it, and the deleted
+predecessor shipped exactly that bug: a `deferred` + `block_mouse_except_scroll` handle is the
+topmost hitbox for the whole drag, so the container's `on_drop` never fires.
+
+**The height belongs to `GitPanel`, not `CommitTabState`** — that struct is rebuilt on every
+selection push, so a height stored there resets each time the user arrow-keys to another
+commit. That is the bug `LastSplitRatio` exists to prevent.
+
+Also: a drag never produces a click (crossing gpui's drag threshold takes the pending
+mouse-down), so the double-click reset cannot be triggered by a fast second drag.
+
+### 129. Both Commit-tab row kinds are pinned to the Changes tab's row height, because `ButtonLike` and `Label` disagree
+
+What: the Commit tab's changed-files rows and directory headers render at the Changes tab's
+sizes — file names and directory paths at `LabelSize::Default`, the "N file(s)" count staying
+`Small`, exactly as `changes_list.rs` splits it — and **both** row kinds carry
+`.height(changes_list::list_item_height())`, a `rems(1.75)` value now shared by the two tabs
+rather than duplicated.
+
+Why the height had to come with the font: `ButtonLike` pins its own height at
+`ButtonSize::Default` = 22px, while a `LabelSize::Default` line box is `round(14 × 1.618)` ≈
+23px. A bare size swap overflows the button by a pixel and leaves the rows visibly denser
+than the Changes tab's — same font, wrong rhythm, which is not "aligned typography". And
+`uniform_list` measures **item 0** and applies that height to every row, so two row kinds at
+two different heights clip rather than merely misalign. Both kinds get the same value or
+neither does.
+
+Note the deliberate asymmetry with `COMMIT_FILE_TREE_MIN_HEIGHT`: the row height is `Rems`
+and scales with `ui_font_size`, the tree's floor is a pixel constant and does not. The floor
+promises "a guaranteed share rather than zero pixels", never a row count, so it stays 72px —
+2.6 rows at the default rem instead of the 3.3 it was. Do not re-derive it from the row
+height.
+
+### 130. A search popover with no `menu::Confirm` handler is not a focus bug
+
+What: the Solution and Project tab strips' `+` popovers were hand-rolled — a single-line `Editor` plus a `div` of clickable rows, with no selection cursor and, between them, exactly one registered action (`menu::Cancel`). Enter did nothing and the arrow keys did nothing. Both are now `Picker::list(...).modal(false)`, with the action rows (`Create new solution…`, `Add project from git…`) as **in-list entries pinned at index 0**, so Enter targets the first *match* and the action rows are still reachable by arrow key.
+
+Why it was never a focus problem, which is where an hour goes if you assume otherwise: a single-line editor's key context is `mode == single_line`, so the `Editor` binding `enter → editor::Newline` (which requires `mode == full`) does not match, and the global `enter → menu::Confirm` is the only candidate; it dispatches from the focused editor up through the popover container. The proof by existing behaviour was already on screen — **`escape` worked**, via `Editor::cancel`'s `cx.propagate()` into the container's `menu::Cancel`. Same for the arrows: `Editor::move_up`/`move_down` propagate immediately in single-line mode. The keystrokes always arrived; there was nothing to receive them.
+
+How to apply: **not `render_header`** for the action rows, which is what this decision originally specified and an implementer correctly refused — `Picker` renders the header inside `.when(match_count() > 0, …)`, so it disappears exactly when the filter matches nothing and `Create new solution…` is the only thing left to do. **Not `uniform_list`** either: the rows are not homogeneous (a solution row carries a hover trash button, the action row a smaller icon), and `uniform_list` measures item 0 and applies that height to all. `Picker::list` is the variant for that and still gives scroll-into-view, which is the whole reason to prefer `Picker` over hand-rolling — the fork's one hand-rolled popover keyboard layer, `BranchesPopup`, admits in a comment that it has none.
+
+Consequence to know: `tab` is globally bound to `menu::SelectNext`, so it now moves the selection in these popovers. Nothing there wanted it.
+
+### 131. The git graph's filter popovers get a cursor, not a `Picker`
+
+What: the branch / user / path filter popovers in the git-graph toolbar gained arrow-key navigation, `Enter` to toggle the cursored checkbox, `ctrl-enter` to apply, `escape` to dismiss, scroll-into-view, and — a second bug — **focus on their search field when they open**, which they never had, so the user had to click into the field before typing.
+
+Why not `Picker`: these are **multi-select with checkboxes and an explicit Apply footer**, and `PickerDelegate::confirm(secondary)` has no vocabulary for "toggle this row, stay open, apply the set later". The decisive constraint on `Enter`'s meaning is that `space` is unavailable — it is text input in the focused search field — so if `Enter` applied-and-closed there would be **no** keyboard route to a checkbox at all and the popover would be mouse-only. Hence toggle-and-stay-open.
+
+How to apply: the cursor is a **second, orthogonal** notion to the existing checked `BTreeSet` — do not overload that field. The cursor resets to the first actionable row on every rebuild rather than being clamped, because after a query change index 3 of the old ranking has no relationship to index 3 of the new one. `Focusable` must return the *query editor's* handle: `PopoverMenu::show_menu` focuses whatever `focus_handle(cx)` returns, so returning the container handle is precisely the bug, and returning the query's handle also means the two-frame deferral inside `show_menu` cannot race the constructor's own focus call.
+
+### 132. Resolving a conflict is a staging gesture, and the panel now says so
+
+What: a family of fixes to the merge-conflict flow, prompted by the maintainer resolving a conflict's text and asking what to do next. The workflow already worked — ticking a conflicted row runs `git update-index --add --remove`, which resolves the unmerged index entry, after which `Commit` enables and produces a proper two-parent merge commit — but nothing said so. Now: an in-progress-operation banner above the commit box naming the op, the unresolved count and the gesture, with a confirming `Abort`; the checkbox and context menu say **Mark Resolved / Mark Unresolved** instead of Stage / Unstage for a conflicted path; the row menu offers **Resolve Conflicts…**; and a conflicted row opens the resolver rather than a single-file diff.
+
+Why the last one: `SoloDiffView`'s index side is `git show :<path>`, which **fails on an unmerged path** (`is in the index, but not at stage 0`), so the diff had no index base and the toolbar read `0 differences` over the one file blocking everything. The tempting deep fix — falling back to `git show :2:<path>` — is **wrong**: it would make `BufferDiff`'s index base a lie for staging purposes, and hunk-level stage/unstage against an unmerged path could then silently write a wrong index. Gate on the **live** `status.is_conflicted()`, not the sticky `had_conflict_on_last_merge_head_change`, so a row that has been marked resolved diffs normally again.
+
+Also fixed, and the reason none of this was reachable before: the fork's own 3-way resolver had exactly one in-product entry point (a merge started from the branch picker's context menu), and its `Continue` was broken twice over — see #133.
+
+### 133. `git merge --continue` needs `GIT_EDITOR`, and "unrelated changes" is staged-minus-incoming
+
+What: the conflict resolver's `Continue` now spawns git with `GIT_EDITOR=true` and `GIT_SEQUENCE_EDITOR=true`, surfaces its errors instead of `.log_err()`-ing them, and blocks only on **staged paths that the incoming change did not touch**.
+
+Why the editor override: `git merge --continue` opens `$EDITOR`. Spawned with piped stdio it fails with `Standard input is not a terminal` / `error: There was a problem with the editor 'editor'`, exit 1, and no commit — and the failure went to the log and nowhere else. **`--no-edit` does not work**: `fatal: --continue expects no arguments`.
+
+Why the guard had to be rewritten rather than narrowed: it counted *any* non-conflict porcelain record as unrelated, **including untracked files**, so a merge with a stray `.md` in the tree could not be continued at all, silently — `log::warn!` plus a bare `notify`. Narrowing it to untracked-only was the obvious fix and is wrong; narrowing it to *staged-only* is also wrong, and this is the non-obvious part: **a merge auto-stages every path the incoming side changed**, so "any staged path" flags the merge's own work and produces the same dead end by a different route. The rule is staged minus `git diff --name-only HEAD...MERGE_HEAD` (or `<PICK>^ <PICK>` for rebase/cherry-pick/revert). The tempting cheaper spelling `git diff --cached --name-only MERGE_HEAD` misclassifies a cleanly auto-merged file as the user's work.
+
+How to apply: the guard **fails open** — if `git status` or `git diff` cannot run, `Continue` proceeds. Blocking on a failed courtesy check is exactly the dead end being fixed. Feedback is a toast rather than a disabled button, because the condition is only knowable by spawning git: a cached predicate would leave the button wrongly disabled with a lying tooltip the moment the user unstages the offending file.
+
+### 134. The Commit tab's tag row is `--points-at`, not `--contains`
+
+What: `GitRepository::tags_pointing_at` (`git tag --points-at <sha>`), a sibling of the existing `tags_containing` rather than a replacement — the latter still serves `CommitView`'s "Contains" panel, where containment is the correct semantic.
+
+Why: the two answer different questions and the difference is enormous, not cosmetic. `--contains` is a reachability query, so on any repo that tags releases, a commit from a year ago is contained in *every subsequent tag* — dozens of names. The maintainer wanted the commit's own tags, and there can be more than one (a monorepo release commit carries one tag per published package; a repo with moving aliases stacks `v1.4`, `v1.4.0`, `stable`, `latest`). The discriminating test is a commit that is an **ancestor** of a tagged release and carries no tag itself: `--points-at` returns empty, `--contains` returns every later tag.
+
+How to apply: the branches half of the same row stays `--contains` — `In N branches:` is genuinely a containment question, and IDEA shows it that way too. Both queries share one 150 ms-debounced task, one `futures::join!` and one staleness guard, so they cannot disagree about which commit they describe; the debounce is not optional, because the tab is driven by graph selection including arrow-key movement.
