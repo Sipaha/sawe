@@ -234,6 +234,43 @@ reservation.
 *Done when:* runs are visually grouped, the metadata is drawn once per run, and every row
 in a run — including continuations — still hovers, right-clicks and opens its commit.
 
+### C11. The S-ANN blame-options layer has no producer, so it is permanently default
+`BlameOptions` (`crates/editor/src/git/blame.rs:41` — `ignore_whitespace`, `follow_renames`,
+`color_mode`, `author_filter`), its setter `GitBlame::set_options` (`:402`), the enumeration
+helpers `all_entries` / `date_range` (`:416`, `:424`), the whole of
+`crates/editor/src/git/blame_colors.rs` and `crates/editor/src/git/blame_filters.rs`, and the
+options-aware renderer `render_blame_entry_with_options` (`crates/git_ui/src/blame_ui.rs:92`,
+which really does implement author-filter dimming and the ByAuthor / ByDate colouring) are all
+present and all unreachable with anything but defaults.
+
+Two independent breaks, both verified rather than assumed:
+
+- **`set_options` has zero callers repo-wide.** The only `.set_options(` hit in `crates/` is
+  `crates/terminal/src/alacritty.rs:150`, an unrelated alacritty call. So `GitBlame::options()`
+  is `BlameOptions::default()` for the life of the process.
+- **The paint path never asks for them anyway.** `element.rs:2179` calls the free
+  `render_blame_entry` (`:7150`), which calls `renderer.render_blame_entry` (`:7179`) — the
+  non-options trait method. `git_ui`'s implementation (`blame_ui.rs:63`) then forwards to its
+  own `render_blame_entry_with_options` with a literal `&BlameOptions::default()` and
+  `date_range: None` (`:76-88`). `ColorMode::ByDate` needs that `date_range` and so could not
+  work even if a producer set the mode.
+
+There is also **no annotate toolbar in the tree**. `blame.rs`'s own doc comments describe "v1
+of the toolbar" tracking this state and an "author-filter dropdown" enumerating contributors;
+nothing renders either — `ColorMode` and `AuthorFilter` appear only in their defining modules,
+in `blame_ui.rs`'s match arms, and in `blame_filters.rs`'s tests. The layer looks lost in the
+refork transplant: the renderer half survived, the UI half did not.
+
+Recorded, not fixed, because the decision is a product one — build the toolbar (an action or
+gutter-menu surface that calls `set_options`, plus threading `blame.options()` and
+`blame.date_range()` through `element.rs` into the options-aware trait method), or delete the
+layer and the doc comments that promise it. Note the second half is not optional in either
+direction: wiring only `set_options` changes nothing while the paint path still hands over
+defaults.
+
+*Done when:* colour modes / author filter / date toggle are reachable and actually change the
+gutter, or the dead layer and its doc comments are gone.
+
 ---
 
 ## D. Tooling gaps
