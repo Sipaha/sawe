@@ -956,23 +956,43 @@ impl ConsolePanel {
         .detach_and_log_err(cx);
     }
 
+    /// The `SolutionBand` installed in this panel's window, if any. `None` in
+    /// a headless or test workspace that never installed one.
+    fn solution_band(&self, cx: &App) -> Option<Entity<SolutionBand>> {
+        let workspace = self.workspace.upgrade()?;
+        workspace
+            .read(cx)
+            .solution_band_item()?
+            .downcast::<SolutionBand>()
+            .ok()
+    }
+
     /// Whether the Solution band is currently handing its utility half to
     /// THIS panel: the half is visible and its content kind is `Terminal`.
     ///
-    /// Answered from `SolutionAgentStore`, which is where a Solution
-    /// workspace's band state lives. A plain-folder workspace has no
-    /// Solution, so the band keeps its state window-locally and the store
-    /// never sees it; this reports `false` there and the auto-start below
-    /// simply does not apply — the same place `active_member_path` and every
-    /// other Solution-scoped decision in this panel stops.
+    /// Read from wherever the band actually keeps that state, which depends
+    /// on the window. A Solution window's band writes through to
+    /// `SolutionAgentStore` (that is what makes the geometry persist per
+    /// Solution); a plain-folder window has no Solution to key a store row
+    /// on, so `SolutionBand` keeps the identical `BandState` in its own
+    /// `local_state` field. Asking the band directly in that case is not a
+    /// second source of truth — it is the only one that window has, and
+    /// `ctrl-\`` there deserves the same non-empty terminal half.
     fn band_shows_this_panel(&self, cx: &App) -> bool {
-        let Some(solution_id) = self.active_solution_id(cx) else {
-            return false;
+        let state = match self.active_solution_id(cx) {
+            Some(solution_id) => {
+                let Some(store) = SolutionAgentStore::try_global(cx) else {
+                    return false;
+                };
+                store.read(cx).band_state(solution_id)
+            }
+            None => {
+                let Some(band) = self.solution_band(cx) else {
+                    return false;
+                };
+                band.read(cx).band_state(cx)
+            }
         };
-        let Some(store) = SolutionAgentStore::try_global(cx) else {
-            return false;
-        };
-        let state = store.read(cx).band_state(solution_id);
         state.utility_visible && state.utility_kind == UtilityKind::Terminal
     }
 
@@ -988,6 +1008,9 @@ impl ConsolePanel {
     /// equivalent edge source is `BandStateChanged`, which covers all three
     /// ways the half opens: `ctrl-\``, the status-bar Terminal button, and
     /// the hydration that restores a window whose band was already open.
+    ///
+    /// Two sources are armed, not one, because `BandStateChanged` describes
+    /// only Solution windows — see the comment on the observation below.
     ///
     /// Called from [`Self::load`] rather than from `new` because the
     /// subscription needs a `Window` (constructing a `TerminalView` does) and
@@ -1013,8 +1036,35 @@ impl ConsolePanel {
         // `workspace.update_in`, a test's `WindowHandle::update` — may hold
         // that same entity leased. A read under a lease aborts the process
         // (`entity_map.rs:164`), so take the snapshot once the lease is gone.
-        cx.defer_in(window, |this, _window, cx| {
+        cx.defer_in(window, |this, window, cx| {
             this.band_showed_this_panel = this.band_shows_this_panel(cx);
+            // Second edge source, for the window `BandStateChanged` cannot
+            // describe. A plain-folder window has no Solution, so
+            // `SolutionBand::set_utility_visible` takes its `None` arm: it
+            // writes `local_state` and calls `cx.notify()`, and the store —
+            // and therefore the event above — never hears about it. That
+            // notify is the honest edge source for such a window, because the
+            // band entity IS that window's band state. Observing it runs the
+            // very same check, so no second code path decides anything.
+            //
+            // Both sources are live in a Solution window (the band re-notifies
+            // when it sees `BandStateChanged`), and that is harmless:
+            // `on_band_state_changed` is edge-guarded by
+            // `band_showed_this_panel`, so whichever arrives first takes the
+            // false → true edge and the other sees none. Observing rather than
+            // checking in `render` keeps the "never level-triggered" property
+            // that stops the panel resurrecting the terminal a user just
+            // closed — a notify with `shows == showed` does nothing.
+            //
+            // Resolved here rather than at the top of this method because
+            // finding the band means reading the `Workspace`, and every caller
+            // that can arm this holds that entity leased.
+            if let Some(band) = this.solution_band(cx) {
+                let subscription = cx.observe_in(&band, window, |this, _band, window, cx| {
+                    this.on_band_state_changed(window, cx);
+                });
+                this._subscriptions.push(subscription);
+            }
         });
         let subscription = cx.subscribe_in(&store, window, |this, _store, event, window, cx| {
             // Not filtered on the event's `solution_id`: the state is
@@ -2413,6 +2463,73 @@ mod tests {
                 "a leaked counter reads as \"a terminal is already on the \
                  way\" forever, so opening the empty terminal half after a \
                  failed task run would silently start nothing"
+            );
+        });
+    }
+
+    /// A window that belongs to no Solution keeps its band state in
+    /// `SolutionBand::local_state` rather than in `SolutionAgentStore`, so it
+    /// produces no `BandStateChanged` — and until the band entity itself was
+    /// observed, `ctrl-\`` there opened the terminal half empty, which is the
+    /// exact defect the auto-start exists to fix, just in the other kind of
+    /// window. The band's `cx.notify()` is that window's honest edge source;
+    /// this pins that it is wired to the same edge check.
+    #[gpui::test]
+    async fn showing_an_empty_terminal_half_starts_a_shell_without_a_solution(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        // `false`: the workspace's worktree lives OUTSIDE any Solution root,
+        // so `active_solution_id` is `None` and the band falls back to
+        // `local_state` — the case under test. No `give_the_solution_a_member`
+        // either: with no Solution, `workspace_has_project` is satisfied by
+        // the window's own visible worktree.
+        let (window_handle, panel, _solution_id) = bootstrap_band_and_panel(cx, false).await;
+        let band = band_of(&window_handle, cx);
+
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel.active_solution_id(cx).is_none(),
+                "precondition: this window belongs to no Solution, or the \
+                 store path would answer and the fallback would go untested"
+            );
+            assert!(
+                panel.tabs.is_empty(),
+                "precondition: the panel starts with no terminal"
+            );
+        });
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Terminal, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tabs.len(),
+                1,
+                "a plain-folder window's terminal half must not be handed over \
+                 empty either"
+            );
+            assert_eq!(panel.active_index, Some(0));
+        });
+
+        // The other half of the edge: the fallback must be edge-triggered too,
+        // not level-triggered on every band notify, or hiding and re-showing
+        // would pile shells up in exactly the window that has no store row to
+        // deduplicate against.
+        for _ in 0..2 {
+            band.update(cx, |band, cx| {
+                band.activate_utility_kind(UtilityKind::Terminal, cx)
+            });
+            cx.run_until_parked();
+        }
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tabs.len(),
+                1,
+                "hiding and re-showing a half that already holds a terminal \
+                 must not start another one"
             );
         });
     }
