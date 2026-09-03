@@ -734,6 +734,9 @@ impl SplittableEditor {
     /// still blames its right one, so this must never be reached only through
     /// left-pane work. Ordering trap: it runs *after* the excerpts land,
     /// because it prunes against each multibuffer's live buffers.
+    ///
+    /// [`Self::remove_excerpts_for_path`] is the one deliberate exception —
+    /// see the reasoning there.
     fn sync_blame_sources(&self, paths: &[(PathKey, Entity<BufferDiff>)], cx: &mut Context<Self>) {
         let (lhs_sources, rhs_sources) = self.blame_sources_for(paths, cx);
 
@@ -773,6 +776,13 @@ impl SplittableEditor {
                 // without help — and which the left pane's repository and path
                 // are resolved *through*.
                 rhs_sources.clear();
+                // Everything below derives left-pane sources only, and
+                // `sync_blame_sources` discards them when there is no left
+                // pane. In Unified mode that would be one git-store lookup per
+                // path, on every excerpt update, for a map nobody reads.
+                if self.lhs.is_none() {
+                    return (lhs_sources, rhs_sources);
+                }
                 let Some(project) = self.rhs_editor.read(cx).project().cloned() else {
                     lhs_sources.clear();
                     return (lhs_sources, rhs_sources);
@@ -1476,6 +1486,13 @@ impl SplittableEditor {
         self.sync_blame_sources(&paths, cx);
     }
 
+    /// The one excerpt-changing operation that deliberately does **not** call
+    /// [`Self::sync_blame_sources`]: a source for a buffer that is no longer
+    /// excerpted can never be consulted, because `GitBlame::generate` walks
+    /// the multibuffer's live buffers and looks each one's source up by id,
+    /// and the next sync's prune against those same live ids drops it. The
+    /// only cost of leaving it is that the map holds this path's
+    /// `Entity<Repository>` handle until then.
     pub fn remove_excerpts_for_path(&mut self, path: PathKey, cx: &mut Context<Self>) {
         self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
             rhs_multibuffer.remove_excerpts(path.clone(), cx);
@@ -2529,7 +2546,7 @@ impl Render for SplittableEditor {
 
 #[cfg(test)]
 mod tests {
-    use std::{any::TypeId, sync::Arc};
+    use std::{any::TypeId, path::Path, sync::Arc};
 
     use buffer_diff::BufferDiff;
     use collections::{HashMap, HashSet};
@@ -2560,19 +2577,30 @@ mod tests {
         soft_wrap: SoftWrap,
         style: DiffViewStyle,
     ) -> (Entity<SplittableEditor>, &mut VisualTestContext) {
-        init_test_with_headers(cx, soft_wrap, style, true).await
+        let (editor, _project, cx) = init_test_with_headers(cx, soft_wrap, style, true, None).await;
+        (editor, cx)
     }
 
     /// `rhs_shows_headers` picks which `MultiBuffer` constructor the right pane
     /// gets. `false` is a *non-singleton* headerless multibuffer — the shape a
     /// single-file commit diff and an agent edit review build, and the one that
     /// used to leave the left pane two rows lower than the right.
-    async fn init_test_with_headers(
-        cx: &mut gpui::TestAppContext,
+    ///
+    /// `git_worktree_root` is `None` for every test that only needs loose
+    /// buffers; naming a path opens it as a worktree containing a bare `.git`,
+    /// which is what makes the project's git store hold a `Repository` a test
+    /// can hand to [`DiffBlameBase::Blob`].
+    async fn init_test_with_headers<'a>(
+        cx: &'a mut gpui::TestAppContext,
         soft_wrap: SoftWrap,
         style: DiffViewStyle,
         rhs_shows_headers: bool,
-    ) -> (Entity<SplittableEditor>, &mut VisualTestContext) {
+        git_worktree_root: Option<&str>,
+    ) -> (
+        Entity<SplittableEditor>,
+        Entity<Project>,
+        &'a mut VisualTestContext,
+    ) {
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
@@ -2593,7 +2621,12 @@ mod tests {
             crate::init(cx);
         });
         let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs as Arc<dyn fs::Fs>, [], cx).await;
+        if let Some(root) = git_worktree_root {
+            fs.insert_tree(root, serde_json::json!({ ".git": {} }))
+                .await;
+        }
+        let project =
+            Project::test(fs as Arc<dyn fs::Fs>, git_worktree_root.map(Path::new), cx).await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
@@ -2620,7 +2653,7 @@ mod tests {
             });
             editor
         });
-        (editor, cx)
+        (editor, project, cx)
     }
 
     /// A split diff whose right pane is a genuine singleton buffer — the shape
@@ -3051,8 +3084,9 @@ mod tests {
         use text::Bias;
         use unindent::Unindent as _;
 
-        let (editor, mut cx) =
-            init_test_with_headers(cx, SoftWrap::EditorWidth, DiffViewStyle::Split, false).await;
+        let (editor, _project, mut cx) =
+            init_test_with_headers(cx, SoftWrap::EditorWidth, DiffViewStyle::Split, false, None)
+                .await;
 
         // The maintainer's repro: exactly one line differs.
         let base_text = "
@@ -6723,6 +6757,88 @@ mod tests {
         });
 
         cx.run_until_parked();
+    }
+
+    /// Unified mode has no left pane, and its right pane's blame sources are
+    /// written by the same `sync_blame_sources` the split path uses — so the
+    /// excerpt update itself has to be the trigger. While that derivation ran
+    /// only from the tail of `sync_lhs_for_paths`, which returns early with no
+    /// left pane, a path excerpted *after* the consumer declared its base got
+    /// no sources at all and the pane silently blamed nothing.
+    #[gpui::test]
+    async fn test_unified_mode_gets_rhs_blame_sources_on_excerpt_update(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::DiffBlameBase;
+        use git::repository::repo_path;
+        use multi_buffer::PathKey;
+        use rope::Point;
+        use util::path;
+
+        let (editor, project, mut cx) = init_test_with_headers(
+            cx,
+            SoftWrap::None,
+            DiffViewStyle::Unified,
+            true,
+            Some(path!("/my-repo")),
+        )
+        .await;
+        cx.run_until_parked();
+
+        let repository = project
+            .read_with(cx, |project, cx| {
+                project
+                    .git_store()
+                    .read(cx)
+                    .repositories()
+                    .values()
+                    .next()
+                    .cloned()
+            })
+            .expect("the worktree's .git dir should register a repository");
+
+        let repo_path = repo_path("file.txt");
+        // Declared *before* the path is excerpted, which is the order a
+        // multi-file `Blob` consumer is forced into: it learns the commit it
+        // is showing once, and then excerpts each file.
+        editor.update(cx, |editor, cx| {
+            editor.set_blame_base(
+                Some(DiffBlameBase::Blob {
+                    repository,
+                    repo_path: repo_path.clone(),
+                    rhs_revision: Some("abc123".into()),
+                    lhs_revision: Some("abc123^".into()),
+                }),
+                cx,
+            );
+        });
+
+        let (buffer, diff) = buffer_with_diff("aaa\n", "bbb\n", &mut cx);
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+        editor.update(cx, |editor, cx| {
+            editor.update_excerpts_for_path(
+                PathKey::with_sort_prefix(0, repo_path.as_ref().clone()),
+                buffer.clone(),
+                vec![Point::new(0, 0)..buffer.read(cx).max_point()],
+                0,
+                diff.clone(),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        editor.update(cx, |editor, cx| {
+            assert!(
+                editor.lhs_editor().is_none(),
+                "the point of this test is the pane that has no left-hand partner"
+            );
+            let sources = editor.rhs_editor().read(cx).blame_base_sources();
+            let source = sources
+                .get(&buffer_id)
+                .expect("the right pane's buffer should be blamed at the declared revision");
+            assert_eq!(source.repo_path, repo_path);
+            assert_eq!(source.revision.as_ref(), "abc123");
+        });
     }
 
     #[gpui::test]
