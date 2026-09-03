@@ -397,9 +397,7 @@ pub(super) fn plan_branch_submenu(
         BranchRef::Local(_) => None,
     };
     let local_info = match branch {
-        BranchRef::Local(local_name) => local_branches
-            .iter()
-            .find(|info| info.name == *local_name),
+        BranchRef::Local(local_name) => local_branches.iter().find(|info| info.name == *local_name),
         BranchRef::Remote(_) => None,
     };
     let upstream_gone = local_info.is_some_and(|info| info.upstream_gone);

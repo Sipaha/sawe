@@ -1129,13 +1129,12 @@ mod tests {
     /// The branch list as the *UI* currently sees it — the snapshot the
     /// graph paints its ref chips from, which only a rescan updates.
     fn published_branch_refs(ctx: &CommitContext, cx: &mut VisualTestContext) -> Vec<String> {
-        ctx.repository
-            .read_with(cx, |repo, _| {
-                repo.branch_list
-                    .iter()
-                    .map(|branch| branch.ref_name.to_string())
-                    .collect::<Vec<_>>()
-            })
+        ctx.repository.read_with(cx, |repo, _| {
+            repo.branch_list
+                .iter()
+                .map(|branch| branch.ref_name.to_string())
+                .collect::<Vec<_>>()
+        })
     }
 
     /// Drive a confirmed "Delete on origin…" against a clone that still
