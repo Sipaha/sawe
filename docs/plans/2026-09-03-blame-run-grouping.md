@@ -1,7 +1,13 @@
 # Plan — group consecutive blame lines from one commit
 
-Status: in progress (2026-09-03)
-Tracks: `TODO.md` **C10**, `FORK.md` **#135** ("Not done" paragraph)
+Status: **complete** (2026-09-03) — commits `c0085392d9`, `e9e3978a7e`, `3e04449a7a`,
+`b14ee2f7eb`, `58e722a7cd`, plus this doc pass.
+Tracked: `TODO.md` **C10** (now deleted), `FORK.md` **#135** ("Not done" paragraph, now
+amended) — the decision that records what shipped is `FORK.md` **#140**.
+
+Everything below the "What actually shipped" heading at the end of this file is the
+record; everything above it is the plan as written before dispatch, left unedited so the
+divergences are readable.
 
 ## The goal
 
@@ -251,3 +257,110 @@ Report the three absolute paths. The controller looks at them and rules.
 - This plan file: a "What actually shipped" section with every divergence.
 
 Nothing here is a code change; do not touch code in this task.
+
+## What actually shipped
+
+Five commits, in order: `c0085392d9` (this plan), `e9e3978a7e` (Task 1),
+`3e04449a7a` (Task 2), `b14ee2f7eb` (Task 3), `58e722a7cd` (Task 3b — not in
+this plan). The durable record is `FORK.md` #140; the per-task detail, including
+each task's mutation table, is in
+`.superpowers/sdd/2026-09-03-blame-run-grouping/task-{1,2,3,3b}-report.md`, and
+every ruling is in that directory's `progress.md` — all of which are **local working
+notes only**: `.superpowers/` is gitignored, so the reports and the five screenshots
+they cite are not in the repository and this file plus `FORK.md` #140 are the durable
+record.
+
+### Rulings made after dispatch
+
+- **R6 (Task 1)** — a deletion hunk inside a diff does *not* break a run. Deleted
+  rows carry `buffer_id: Some(base_buffer)` and are unblamed-but-not-block, so R1
+  joins the lines either side of them. No code was written for this; it is what
+  R1 already does. Task 3 was told to screenshot a split diff so the pixel was
+  judged on evidence — which is what produced R7.
+- **R7 (Task 3), superseded** — Task 3's screenshots showed R6 holding in the
+  left pane and failing in the right, where the deleted lines render as a
+  *block* row and R1 therefore severs the run and re-prints the label. The
+  controller first ruled this was the honest pixel: a block row is a visible
+  break, and teaching the rule to distinguish "a block that is a visual gap"
+  from "a block that is a header" needed a distinction `RowInfo` does not carry.
+- **R7′ (supersedes R7)** — the reviewer confirmed on pixels that the two panes
+  of one split diff then render the *same commit* differently, which is worse
+  than either behaviour on its own; and the premise was only half true, since
+  the block map knows the block's kind even though `RowInfo::default()` throws it
+  away. R7′: an alignment/deleted-line spacer must not sever a run, while excerpt
+  and folded-buffer headers must keep severing. Dispatched as Task 3b.
+
+### Divergences from the plan
+
+- **Task 3b did not exist in this plan at all.** It added
+  `Block::is_alignment_only()` to `crates/editor/src/display_map/block_map.rs` —
+  a file no task's file list named — and a viewport wrapper,
+  `blame_run_positions_in_viewport(snapshot, start_row, rows, blamed_rows)`,
+  which reads the alignment flags off the `DisplaySnapshot` so the classifier
+  stays pure and no caller has to expand blocks over their `height()`. The
+  rejected alternative was a flag on `RowInfo`: cheaper at the producer, but
+  `RowInfo` lives in `multi_buffer`, knows nothing about blocks, and is built by
+  exhaustive struct literals in crates other agents were mid-flight in.
+- **`blame_run_positions` returns `Vec<Option<BlameRunPosition>>`, not one
+  position per row.** The plan said "one position per row"; an unblamed row
+  genuinely has no position, and making that `None` is what lets the block and
+  soft-wrap tests assert the *middle* row rather than only its successor.
+- **It takes a third slice.** Task 1 shipped `(rows, blamed_rows)`; Task 3b added
+  `alignment_rows`, positionally aligned like the other two, with its own
+  `debug_assert_eq!` on the length.
+- **The `debug_assert_eq!` on slice lengths was not planned** — it came from
+  Task 1's review as a deferred minor and landed in Task 2.
+- **The explicit row height is conditional.** Global Constraint 1 said to give
+  the row an explicit height; only *continuation* rows got one. A head row is
+  22.5px of intrinsic text height inside a 23px pitch and stating a height for it
+  would have moved the date relative to its code line.
+- **The hairline is absolutely positioned, not a top border**, for the same
+  geometry reason, and it is added *after* the row in the child list so the row's
+  hover background cannot paint over it. `crates/editor/src/element.rs` was
+  therefore **not** needed for Task 3 — the escape hatch the task allowed went
+  unused.
+- **The plan undercounted the existing painted tests.** Global Constraint 3 and
+  the mechanics section say "six existing painted tests assert
+  `debug_bounds("GIT-BLAME-ENTRY…")` (`solo_diff_view.rs:1712-2005`)". At
+  `c0085392d9` there were **seven**; the seventh,
+  `test_the_blame_base_follows_the_source`, sat below the quoted line range. All
+  seven kept their names and stayed green.
+- **`before.png` is a reconstruction, not a build of `c0085392d9`.** Task 3 could
+  not afford a cold ~20-minute debug compile in a checkout other agents were
+  editing, so it disabled the two visual deltas in the current tree, built,
+  photographed and reverted. The report justifies the equivalence hunk by hunk;
+  it is stated here because a screenshot labelled "before" that is not a build of
+  the before-commit is exactly the claim a later reader would assume.
+- **Task 3 delivered a fourth screenshot** beyond the three the plan listed —
+  `after-separator-split-diff.png`, the R6 evidence shot — and Task 3b a fifth,
+  `after-r7-split-diff.png`, for the same view after the fix.
+- **The tint alternative (R3) was photographed and rejected on the evidence**, as
+  planned: it reads run structure faster at a glance but competes with the code
+  across the whole column, weakens the per-row hover background it sits under,
+  and leaves a 0.5px unpainted seam under every labelled row (the head-row height
+  again). The hairline, being one out-of-flow pixel, has no seam.
+- **Task 3b found the defect in both panes, not one.** Task 3's report described
+  the re-cutting as right-pane-only; the left pane has its own spacer, standing
+  for the commit's added lines, and was re-cutting there too. One change fixed
+  both.
+- **Two file citations in the dispatch briefs were wrong** (`wrap_map.rs` and
+  `block_map.rs` live under `crates/editor/src/display_map/`, not
+  `crates/multi_buffer/src/`). The facts they asserted were correct and were
+  re-verified by the implementer.
+
+### Deferred, with the reasons
+
+Carried out of the reviews and deliberately not fixed here: the duplicated test
+fixture helpers `set_blame_at_revisions` / `set_blame_runs_at_revisions`; one
+combined `assert!` in `solo_diff_view.rs` that loses the diagnostic
+distinguishing its two halves; the fact that a filtered-out author's run head
+draws no hairline (unreachable while `TODO.md` C11 stands); and
+`alignment_rows.get(ix).copied().unwrap_or(false)`, which means a short flag
+slice reverts to pre-fix behaviour in a release build — documented, with a single
+production caller that builds the slice itself.
+
+### Task 4 (this pass)
+
+`FORK.md` gained decision **#140** (and #135's "Not done" paragraph was amended
+to point at it) plus a touched-files row for `block_map.rs`; `TODO.md` **C10**
+was deleted with nothing in its place and no renumbering.

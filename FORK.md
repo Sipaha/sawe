@@ -105,8 +105,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/project_panel/src/project_panel.rs` | **(2026-06-23, decision #27)** No longer hosts a project dropdown; filters `state.visible_entries` to worktrees under the **solution-wide active member's** `local_path` (resolved via a private `active_solution` helper + `SolutionStore::active_member`) after each `update_visible_entries`, and subscribes to `ActiveMemberChanged`; resets `max_width_item_index` and recomputes `last_worktree_root_id` post-filter. | `solutions_ui` / `solutions` |
 | `crates/git_ui/src/git_panel.rs` | **(2026-06-23, decision #27)** No longer hosts a project dropdown; `refresh_active_repository_for_selector` overrides `active_repository` with the active member's matching repo; subscribes to `ActiveMemberChanged`. (Per-member dropdown-badge change-count map retired with the selector.) **(decision #75)** That override now resolves through `solutions::active_member_repository`, and `set_active_repository` is the single seam every piece of per-repository panel state hangs off — the History tab's rows and subscriptions used to be cleared there, and since decision #100 the Commit tab is closed there for the same reason. **(decision #100)** The tab set is now `Changes \| Commit`; History is deleted. | `solutions_ui` / `solutions` |
 | `crates/git_ui/src/git_panel/commit_tab.rs` | **New (decision #100).** The git panel's Commit tab: `CommitSelection` / `CommitSelectionSource`, the `CommitTabState` the panel hangs off an `Option`, the two guarded background loads (`Repository::show` / `load_commit_diff`), and the changed-files tree / message split / markdown style / client-side +/− fold **relocated verbatim** from the git graph's deleted commit-details sidebar. A private `mod`: `git_panel.rs` re-exports only `CommitSelection` and `CommitSelectionSource`, which is all `git_graph` needs to name. | `git_ui` / `git_graph` |
-| `crates/git_ui/src/commit_refs.rs` | **New (decision #138).** The ref-decoration chip both the git graph's rows and the git panel's Commit tab paint: `ref_chip` (with the S-SOL-PRT lock glyph and the HEAD check), `overflow_chip`, `strip_ref_namespace`, `is_head_ref`, `tag_names`, `accent_color`. Lives in `git_ui` because `git_graph` depends on it and never the reverse. |  `git_ui` / `git_graph` |
-| `crates/ui/src/components/chip.rs` | **(decision #138)** Registers a `CHIP-{label}` debug selector (a no-op outside `test` / `test-support`), the way `IconButton` registers `ICON-{icon}`, so a paint test can assert which chips a row put on screen. | `git_ui` (Commit tab ref chips) |
+| `crates/git_ui/src/commit_refs.rs` | **New (decision #139).** The ref-decoration chip both the git graph's rows and the git panel's Commit tab paint: `ref_chip` (with the S-SOL-PRT lock glyph and the HEAD check), `overflow_chip`, `strip_ref_namespace`, `is_head_ref`, `tag_names`, `accent_color`. Lives in `git_ui` because `git_graph` depends on it and never the reverse. |  `git_ui` / `git_graph` |
+| `crates/ui/src/components/chip.rs` | **(decision #139)** Registers a `CHIP-{label}` debug selector (a no-op outside `test` / `test-support`), the way `IconButton` registers `ICON-{icon}`, so a paint test can assert which chips a row put on screen. | `git_ui` (Commit tab ref chips) |
 | `crates/git/Cargo.toml` | `test-support` feature now also activates `db/test-support` — the `db::static_connection!` macro's expansion references `db::open_test_db`, which only exists under that feature; without it, crates that enable `git/test-support` but not `db/test-support` fail to compile. Pre-existing latent workspace bug, fixed in-tree. **(2026-08-31)** It now also activates `gpui/test-support`, for the same reason one level along: `CommitDataReader::for_test`, gated `#[cfg(any(test, feature = "test-support"))]`, calls `BackgroundExecutor::simulate_random_delay`, which exists only under that feature — so `git_hosting_providers`, whose dev-deps enable `git/test-support`, could not compile its own test targets (E0599). Fixed in `git`'s feature list rather than in the consumer, so the arm and the method it needs stay in lockstep for every consumer. See `docs/findings/2026-08-31-cfg-universes-and-the-warning-gate.md`. | build / upstream-fix |
 | `crates/git/src/repository.rs` | Adds `branches_containing` / `tags_containing` / `tags_pointing_at` / `load_commit_against_parent` methods on `GitRepository` (default no-op impls + real impls in `RealGitRepository`) for the S-DET commit-view metadata surface. Adds the module-level `parse_ref_name_lines` parser shared by all three ref queries (named `parse_contains_output` until `--points-at` joined them). Also: `load_commit_template` special-cases `ErrorKind::NotFound` on the `git config --get` spawn — treats "cwd disappeared" (e.g. an open repo whose underlying directory was removed mid-session via `git worktree remove`) as "no template available" with a debug log, instead of propagating ENOENT through to `detach_and_log_err`. | `git_ui` (S-DET) / general robustness |
 | `crates/git/src/blame.rs` | `Blame::for_path_at_revision` + a `BlameTarget` enum, so `git blame` can annotate a commit-ish instead of only working-tree content piped on stdin (decision #58). **(decision #135)** Also `display_author` + `UNKNOWN_AUTHOR`, the shortened author name the blame gutter draws — it lives here because both the renderer (`git_ui`) and the gutter's width reservation (`editor`) have to agree on it. | `editor` (diff-pane blame, blame gutter width) / `git_ui` (blame gutter) |
@@ -151,6 +151,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/search/src/search.rs` | Registers `find_in_path::init` alongside the existing `project_search` registration. | `search` |
 | `crates/search/Cargo.toml` | Adds `schemars` (modal action/settings schema) + `solutions` (Solution/member scope resolution for the scope tabs) deps. | `search` |
 | `crates/editor/src/display_map.rs` | Adds `HighlightKey::FindInPathPreview` variant used to highlight the active match in the Find-in-Path preview editor. | `search` |
+| `crates/editor/src/display_map/block_map.rs` | **(decision #140)** `Block::is_alignment_only()` — an exhaustive match, `true` only for `Block::Spacer` — so a consumer can tell the split diff's padding rows from an excerpt or folded-buffer header without re-deriving the distinction. `BlockRows::next` collapses every block row to `RowInfo::default()`, so the row alone cannot answer it. | `editor` (blame run grouping) / `git_ui` |
 | `crates/file_finder/src/file_finder.rs` | IDEA parity: `ToggleFileFinder` seeds the picker query from the active editor's **selection** (`FileFinder::query_from_selection`), so selecting a path in a buffer and hitting `ctrl-shift-n` searches for it. Single-line selections only; suppressed entirely when `seed_search_query_from_cursor` is `never`. | `file_finder` |
 | `crates/editor/src/input.rs` | **(decision #83)** `Editor::newline` no longer extends its edit back to column 0 to clear the auto-indent whitespace of the line it leaves, so a blank line inside a block keeps the block's indent. | `editor` |
 | `crates/language/src/buffer.rs`, `crates/multi_buffer/src/multi_buffer.rs`, `crates/editor/src/selection.rs` | **(decision #83)** `Buffer::set_caret_positions` / `MultiBuffer::set_caret_positions` (local-only bookkeeping — no collab op, no notify) plumbed from `Editor::selections_did_change`; `Buffer::remove_trailing_whitespace` skips rows that hold a cursor. | `editor` / `project` |
@@ -2640,7 +2641,7 @@ Why the width reservation had to change with it: `EditorSnapshot::gutter_dimensi
 
 How to apply: the renderer owns the row's layout, so it is the only thing that can price it — `BlameRenderer::gutter_fixed_columns(cx)` reports the date, the gaps and the avatar, `max_author_columns()` caps the name, and `GitBlame::max_author_display_columns` measures the *shortened* name in **display columns** (`unicode-width`), never bytes and never `char`s. If you add an element to the row, add its columns there in the same commit. `truncate_to_columns` (not `util::truncate_and_trailoff`, which counts `char`s) keeps the drawn name inside the cap, and `.overflow_x_hidden()` on the row is the backstop that turns any future mis-measurement into a clipped name instead of text over the line numbers.
 
-Not done: IntelliJ also tints runs of lines from one commit and prints the metadata once per run. `layout_blame_entries` does have the neighbouring rows in hand, so it is reachable — but only by adding a run-position argument to both `BlameRenderer::render_blame_entry*` methods, painting the run background in `element.rs`, and keeping the continuation rows interactive so hovering one still shows its commit. That is a redesign of the trait, not a width change, and it is deliberately left as a follow-up.
+Done since, in decision #140: runs of consecutive lines from one commit now print their metadata once and are separated by a hairline. The shape this paragraph predicted was right in one half and wrong in the other — the run position *is* a new argument on both `BlameRenderer::render_blame_entry*` methods, and continuation rows *did* have to stay interactive, but the run is not painted in `element.rs` and there is no tint: `element.rs` only computes which row opens a run, and `git_ui` draws the separator on the row it already owns.
 
 ### 136. One `SoloDiffView` with a `DiffSource` serves both git-panel tabs, and the open gesture names what the user did
 
@@ -2880,7 +2881,7 @@ extent. The row now takes `ButtonSize::Default.rems()`, the same metric the `+` 
 `IconButton`s next to it use, which both matches them and scales with the override.
 `h_full()` inside a status-bar item is a no-op; state the height.
 
-### 138. The Commit tab's ref chips come from the graph's row, not from a query of its own
+### 139. The Commit tab's ref chips come from the graph's row, not from a query of its own
 
 The maintainer, on the detail pane beside the commit graph: *«а где упоминание ветки, которая
 на этом коммите есть?»* — the pane showed `15c849d · Pavel Simonov · 03 Sep 2026` and the
@@ -2936,3 +2937,181 @@ How to apply:
 - `ui::Chip` now registers a `CHIP-{label}` debug selector, the way `IconButton` registers
   `ICON-{icon}`, so a paint test can assert *which* chips a row put on screen rather than
   asserting the predicate that decides them.
+
+### 140. A blame run is classified in the editor, from row adjacency, and the gutter only draws what it is told
+
+What: the blame gutter prints the date and the shortened author **once per run** of consecutive
+lines that came from one commit, and marks where one run ends and the next begins with a
+hairline. Continuation rows draw no metadata and keep every affordance they had — hover
+background, tooltip, right-click menu, left-click `OpenAtCommit`.
+
+**Why the renderer cannot decide this.** `BlameRenderer` is handed one entry at a time and
+cannot see its neighbours; the only place that holds both the viewport's display-row metadata
+(`&[RowInfo]`) and the flattened per-row entries (`GitBlame::blame_for_rows`) is
+`EditorElement::layout_blame_entries`. So `crates/editor/src/git/blame.rs` gained
+`BlameRunPosition { Head, Continuation }` and a pure `blame_run_positions`, and both gutter
+methods of the trait gained the position as an argument — one argument rather than a parallel
+"run-aware" method, because two paths that can disagree about the same row is the failure mode
+worth designing out. `git_ui` decides only what a `Continuation` looks like.
+
+**The boundary rule.** A row continues the run above it only when all of: same `BufferId`, same
+`sha`, and its `RowInfo::buffer_row` is exactly the previous blamed row's `buffer_row + 1`;
+and no severing block row intervened. Each clause is there for a case that actually occurs:
+
+- **Adjacency, not sha equality.** A fold deletes rows from display space, so two runs of one
+  commit separated in the buffer by another commit's lines become *adjacent display rows* once
+  the lines between them are folded. Sha equality alone would weld them into one run and print
+  the metadata once for what the user sees as two blocks.
+- **`BufferId`**, because a multibuffer can show two excerpts of two files whose rows happen to
+  be numbered consecutively.
+- **A soft-wrap continuation row does not break a run** (`buffer_id: None` *and*
+  `wrapped_buffer_row: Some(_)`) — it is the same buffer line still being drawn.
+- **A block row does** (`buffer_id: None` *and* `wrapped_buffer_row: None`): an excerpt or
+  folded-buffer header is real vertical space standing for something between the two lines, and
+  the rows either side may come from different excerpts of one buffer.
+- **An alignment spacer is the exception to that** — see below.
+- A plain unblamed text row needs no clause at all: it keeps its `buffer_row`, so the adjacency
+  check already sees the gap it leaves.
+
+**Do not re-key this on `BlameEntry::range`.** It is the obvious run key and it is wrong:
+`blame_for_rows` hands out a *clone* of the same entry for every line of a hunk, and
+`GitBlame::sync` leaves the original (now stale) range in **both** halves when an in-buffer
+edit splits an entry — so two rows carrying equal ranges are not necessarily adjacent lines of
+one run. The unit tests are built to catch the shortcut: every fixture entry is given the same
+`range`, so an implementation that grouped on it collapses six of the eight into one run.
+
+**The first blamed row of the viewport is always a head.** Runs are computed from the visible
+slice, so a run that started above the viewport has no head in view. Rather than reach outside
+the slice, the topmost blamed row is treated as a head: scrolling into the middle of a large
+commit shows who wrote it instead of a blank column. The visible consequence is that the label
+appears to stick to the top of the viewport while scrolling through one long run.
+
+**The hairline is absolutely positioned, not a border**, and it is added *after* the row in the
+child list. A head row is 22.5px of intrinsic text height inside a 23px row pitch and has no
+explicit height (only continuation rows get one, because a childless flex collapses and would
+take the hit area with it), so a `border_t_1` would both grow the row and push its date down a
+pixel relative to the code line it annotates — jitter between labelled and unlabelled rows. Out
+of flow, it lands on the row's top edge and changes no other geometry. After the row rather
+than before it, because the row paints its hover background across its whole box and would
+swallow a hairline drawn underneath. `ix > 0` exempts the topmost visible row, where a rule
+reads as a frame around the editor rather than as a break. The colour is
+`border_variant` — the token the tree already uses for a divider *inside* a surface
+(`ui::Divider`, `ListSeparator`) — not a per-commit tint: a tint would fight the per-row hover
+background, and the per-commit colour on the author name (#135) is already the "same commit"
+cue.
+
+**The alignment-spacer exemption, and the asymmetry that forced it.** `BlockRows::next`
+collapses *every* block row to `RowInfo::default()`, so the rule above could not tell an
+excerpt header from the spacer a split diff pads the shorter pane with — and a split diff pads
+*both* panes, each opposite the other's insertions. The two panes of one commit's diff
+therefore cut the same commit's run in different places and printed a different number of
+labels for it, which is worse than either behaviour on its own. The fix classifies on the
+block, not on the row: `Block::is_alignment_only()` (`display_map/block_map.rs`) is an
+exhaustive match that is `true` only for `Block::Spacer` — whose sole producer is
+`BlockMap::spacer_blocks`, i.e. split-view padding — and
+`blame_run_positions_in_viewport(snapshot, start_row, rows, blamed_rows)` walks
+`blocks_in_range`, expands each alignment-only block over its `height()` rows, and hands the
+flags to the still-pure classifier. Headers keep severing; a spacer does not. A spacer does
+**not** paper over a genuine row jump — the adjacency check still runs.
+
+How to apply:
+
+- The flag lives on `Block`, not on `RowInfo`. `RowInfo` is `multi_buffer`'s and knows nothing
+  about blocks, it is built by exhaustive struct literals in crates outside `editor`, and the
+  block map already knows the kind — putting it there would have been a field documented
+  entirely in terms of a producer in another crate. A new `Block` variant will not compile
+  until someone answers `is_alignment_only` for it; if it is also pure padding, add it there
+  and nowhere else. (`Block::Spacer` is not `BlockStyle::Spacer` — the latter is a rendering
+  style used elsewhere.)
+- **Do not reduce a continuation row to `render_muted_blame_entry`.** That shape exists and
+  drops every listener; it is the anti-pattern here, not the precedent (and it is currently
+  unreachable anyway — `TODO.md` C11).
+- **Do not reclaim the columns the skipped date frees.** `gutter_fixed_columns` /
+  `max_author_columns` stay row-agnostic; the reservation is an upper bound (#135) and a
+  per-row width would make the text jitter as the user scrolls.
+- Both the run computation and the pixels are testable without git: `blame_run_positions` is a
+  pure function with unit tests built from hand-made `RowInfo` vectors, and the painted side is
+  asserted through `VisualTestContext::debug_bounds` on per-row selectors — `GIT-BLAME-META…-<ix>`
+  (present iff the row is a head), `GIT-BLAME-ROW…-<ix>` (every blamed row) and
+  `GIT-BLAME-SEPARATOR…-<ix>`, alongside the pre-existing `GIT-BLAME-ENTRY[-LEFT|-RIGHT]`,
+  which are keyed by name alone and so cannot distinguish rows.
+
+### 141. The band's terminal half auto-starts a shell on a store event, because it has no `Panel` to give it an activity edge
+
+What: opening the Solution band's terminal half while it holds no terminal now starts one, the
+way upstream's terminal dock does — «в панели терминала должна сразу сессия запускаться если её
+нету».
+
+Why it needed a new mechanism rather than a fix: upstream spawns that shell from
+`TerminalPanel::set_active` (`terminal_view::terminal_panel`), on the `false → true` edge of the
+`workspace::Panel` activity flag. `ConsolePanel` deliberately implements **no** `Panel` — it is a
+Solution band occupant installed through `Workspace::set_solution_band_utility_item`, not a dock
+panel — so `set_active` is never called and the behaviour was silently dropped in the port. The
+band's equivalent of that flag is `SolutionAgentStore::band_state(solution_id)`
+(`utility_visible && utility_kind == Terminal`) and its equivalent edge source is
+`SolutionAgentStoreEvent::BandStateChanged`, which covers all three ways the half opens:
+`ctrl-\``, the status-bar Terminal button, and the hydration that restores a window whose band
+was already open. The subscription is armed from `ConsolePanel::load` rather than `new`, because
+it needs a `Window` and `load` already runs inside a `workspace.update_in` that has one — which
+keeps `new`'s signature, and with it `run_config_ui`'s test constructor, untouched.
+
+**It must stay edge-triggered.** A level check in `render` would respawn the terminal the user
+just deliberately closed, because the panel stays mounted with zero tabs. The only entry points
+are the store subscription and one call at the end of restore, and a test fails if the call is
+added to `render`.
+
+The guards, and why each is load-bearing: `band_shows_this_panel` is redundant on the edge path
+and essential on the boot path, which is a level check — without it every workspace whose
+console panel restored no tabs started an invisible shell, and the tell was `debugger_ui`'s
+suite losing determinism to real PTYs; `tabs.is_empty() && pending_terminals_to_add == 0` is
+upstream's `has_no_terminals`, and the counter (which `add_terminal_tab` did not previously
+maintain) is what makes two edges inside one spawn's round trip idempotent; `workspace_has_project`
+is this fork's own — an empty Solution has nowhere to `cd`, which is exactly why the `+` menu
+greys "New Terminal" out there, and an auto-start must not do what the menu forbids;
+`restore_in_flight` keeps the boot check from racing the restore that is about to repopulate the
+panel. Focus is deliberately untouched: the auto-start only appends a tab.
+
+How to apply: a plain-folder workspace is **not** covered and that is deliberate — it has no
+Solution, so its band state stays window-local on `SolutionBand` and no `BandStateChanged` ever
+arrives. Covering it would mean observing the band entity itself, which the panel cannot resolve
+at `load` time (`zed.rs` installs the band *after* it awaits `ConsolePanel::load`). More
+generally: any band occupant that wants a "became visible" edge reads `band_state` and subscribes
+to that event; there is no `Panel` lifecycle to hook, and looking for one is the wrong turn this
+decision exists to prevent. Beware, too, that `band_shows_this_panel` resolves the Solution by
+reading the `Workspace` through the panel's weak handle, so the initial snapshot is taken in a
+`cx.defer_in` — every caller that can arm the subscription is already holding that entity leased,
+and a read under a lease aborts the process.
+
+### 142. AI-session affordances live on the status-bar session strip; its `+` is left-click new, right-click reopen
+
+What: `ConsolePanel`'s `+` popover is terminal/task only ("New Terminal" · separator ·
+"Spawn Task…"). The AI entries it used to carry are gone: "New AI Chat" was pure duplication of
+the session strip's own `+` (both dispatch `console_panel::NewChat`), and "Reopen Closed Chat…"
+moved to the **right-click menu** of `SessionTabStrip`'s trailing `+`, whose plain left click
+still creates a session in one click. `ConsolePanel::open_reopen_session_modal` became the free
+function `solution_agent::reopen_session_modal::open_reopen_session_modal`, next to the modal it
+opens, and `console_panel` no longer names `solution_agent::reopen_session_modal` at all.
+
+Why the `+` and not the tab context menu: the reopen picker is the only entry point to
+`SolutionAgentStore::list_closed_sessions`, and the state that needs it is "I just closed my last
+chat" — a tab context menu disappears with the tabs, while the `+` is the one strip affordance
+that still paints when the Solution has zero session tabs. Why a right click and not a second
+icon: the strip is deliberately *losing* chrome (the per-tab close cross went in the same batch,
+#138), and creating a session is the frequent action that has to stay one click while reopening
+is rare and can afford a gesture.
+
+Because a hidden gesture is only as good as what advertises it, the tooltip, the menu entry and
+the tab-close confirmation prompt are assembled from the same three consts
+(`REOPEN_ENTRY_LABEL` / `PLUS_TOOLTIP` / `REOPEN_GESTURE`) and the prompt's text is a function
+(`close_prompt_detail()`) rather than a literal at the call site, so a test can read exactly what
+the user is shown. That is not decoration: the prompt previously pointed at "Reopen Closed Chat…"
+*in the console panel* and stayed wrong for as long as nothing read it.
+
+How to apply: an AI-session affordance belongs on the strip, not in the console panel — the two
+surfaces are different objects that happened to share a `+`. If you move or rename this entry,
+move the const, not a copy of the string. And note the mechanics of the two gestures on one
+element: `ui::right_click_menu` fires on `MouseDownEvent { button: Right }` only when its hitbox
+is **already hovered**, so a test must rest the cursor before sending the event; and
+`Window::dispatch_action` routes to the *focused* dispatch node and bubbles up from there, so a
+harness asserting the left click's dispatch must focus its root or the action goes nowhere the
+handler can see it.
