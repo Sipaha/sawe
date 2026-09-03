@@ -136,3 +136,128 @@ None that meet the three-criteria bar. One observation for whoever writes the do
 pass: `ui::ContextMenu` already registers a `MENU_ITEM-{label}` debug selector for
 every entry, so menu contents are directly paint-testable via
 `VisualTestContext::debug_bounds` — worth knowing, but it is a map, not a trap.
+
+---
+
+# Fix pass — split the strip's `+` (coordinator ruling on concern (1))
+
+Ruling: creating a session is the frequent action and must stay one click;
+reopening is rare and can afford a right click. A second icon next to `+` is
+the wrong direction on a strip the maintainer has been *removing* chrome from
+(`0c569d6c95` dropped the per-tab close cross). So the two-entry `PopoverMenu`
+from the first pass is gone.
+
+## What changed
+
+| # | Mutation | Run | Outcome |
+|---|---|---|---|
+| 13 | `SessionTabStrip::render_plus_popover` → `render_plus_button`: `PopoverMenu` replaced by `ui::right_click_menu` wrapping the same `IconButton`; the button keeps its `on_click` → `cx.build_action("console_panel::NewChat")` → `window.dispatch_action` | applied | kept |
+| 14 | `build_plus_menu` reduced to a single entry, `REOPEN_ENTRY_LABEL` | applied | kept |
+| 15 | Consts `REOPEN_ENTRY_LABEL` / `PLUS_TOOLTIP` / `REOPEN_GESTURE`; prompt text extracted to `close_prompt_detail()` and assembled from them | applied | kept |
+| 16 | Tooltip → `"New AI Session — right-click for more"` | applied | kept |
+| 17 | Module doc + `render_plus_button` doc rewritten for the two-gesture split | applied | kept |
+| 18 | Test `the_plus_menu_reopens_a_closed_chat_even_with_no_tabs` → split into the two gesture tests below, sharing `paint_strip_with_no_tabs` | applied | kept |
+| 19 | `#[cfg(test)] mod stub { gpui::actions!(console_panel, [NewChat]); }` + `StripHarness` root with `on_action` | applied | kept |
+| 20 | `StripHarness.focus_handle` + `track_focus` + focus it in setup | applied | kept (see below) |
+| 21 | Temporary `zz_probe` diagnostic test | run | **reverted** (deleted after it isolated the failure) |
+
+**Left click**: `on_click` unchanged from the pre-defect behaviour, so a plain
+click is still exactly one action dispatch. **Right click**: `right_click_menu`
+fires on `MouseDownEvent { button: Right }` *only when its hitbox is already
+hovered*, and only when the click lands on the `+` itself — it does not shadow
+the left click (both gestures are asserted independently below).
+
+**Wording agreement.** The tooltip and the close prompt are now built from the
+same three consts, and `close_prompt_detail()` is a function precisely so a
+test can read the string the user is shown:
+
+> The agent is still working. Closing interrupts the current turn — the tab can
+> be brought back with "Reopen Closed Chat…": right-click the session strip's
+> "+" button.
+
+## The one non-obvious failure, and what it was
+
+`left_clicking_the_plus_creates_a_session_and_opens_no_menu` first failed with
+`left: 0, right: 1`. The `zz_probe` throwaway test isolated it in one run:
+`build_action` resolved fine and even a **direct** `window.dispatch_action` was
+not counted. Cause: `Window::dispatch_action` routes to the *focused* dispatch
+node and bubbles **up** from there; with nothing focused it targets the tree
+root, and a root-element `on_action` is not on that path. Focusing the harness
+(mutation 20) fixed both the direct dispatch and the click. This mirrors the
+real app, where the handler is on `Workspace` — an ancestor of whatever holds
+focus — not on an unfocused sibling.
+
+## Covering tests (all in `crates/solution_agent/src/session_tab_strip.rs`)
+
+Shared setup `paint_strip_with_no_tabs` boots a Solution with a live
+`MultiWorkspace` (so the strip's **real** `Render` gets past its
+`active_solution_id` early return) and **zero** sessions, then asserts no
+`SESSION-TAB-*` painted — the precondition that makes both tests about the
+zero-tabs case rather than accidentally true.
+
+- `left_clicking_the_plus_creates_a_session_and_opens_no_menu` — hovers, then
+  `simulate_click`s the painted `+`. Asserts **both sides**: the
+  `console_panel::NewChat` dispatch count is exactly `1`, **and**
+  `MENU_ITEM-Reopen Closed Chat…` did **not** paint. Also asserts the `+` is
+  22 px tall (`ButtonSize::Default` at the 16 px test rem — the same number the
+  existing tab-pill test asserts), which is the status-bar height guard.
+- `right_clicking_the_plus_reopens_a_closed_chat_even_with_no_tabs` — rests the
+  cursor (mandatory: `RightClickMenu` gates on `hitbox_id.is_hovered`), sends a
+  right `MouseDownEvent`, asserts `MENU_ITEM-Reopen Closed Chat…` painted
+  **and** that the dispatch count is still `0` (the right click must not also
+  create a session — the two gestures share one element).
+- `the_close_prompt_and_the_tooltip_point_at_the_same_affordance` — reads
+  `close_prompt_detail()` and asserts it quotes `REOPEN_ENTRY_LABEL` verbatim,
+  that it and `PLUS_TOOLTIP` name the same gesture, and that it no longer says
+  "console panel".
+- `console_panel::panel::tests::the_plus_menu_offers_terminals_and_tasks_but_no_ai_sessions`
+  — unchanged from the first pass, still pinning the console side.
+- The `stub::NewChat` action is what makes "creates a session" *observable*:
+  `solution_agent` cannot link `console_panel`, so without it the left click
+  just `log::error!`s and the test could only ever have asserted the weaker
+  "no menu" half. Paired with console_panel's existing
+  `new_chat_action_matches_the_status_bar_strips_dispatch_string`, the two ends
+  of the by-name dispatch are both pinned.
+
+## Commands and output
+
+```
+$ CARGO_BUILD_JOBS=4 cargo build --bin sawe
+build exit=0        # 0 lines matching ^error, 0 matching ^warning
+
+$ CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets
+check exit=0        # 0 lines matching ^error, 0 matching ^warning
+
+$ CARGO_BUILD_JOBS=4 cargo test -p console_panel -p solution_agent
+test exit=0
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 773 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+## Screenshots (re-shot; `--runtime-dir /tmp/dropdown-probe2`, binary stamp `2026-09-03 16:49:06 +07:00`)
+
+| Path | What I see |
+|---|---|
+| `/tmp/shot-strip-rightclick.png` | Right-click on the strip's `+` with **zero session tabs**: a single-entry context menu anchored at the cursor, just above the status bar, reading **"Reopen Closed Chat…"**. Nothing else changed on screen. |
+| `/tmp/shot-strip-leftclick.png` | Plain left click on the same `+`: a session tab **"Probe"** now paints in the strip in its selected style (status dot + accent underline), the Solution band has opened below it showing "(no messages yet)", the status row `Idle · just now · 0 / 1.0M · 0.0% · claude-acp · model · auto` and the "Send a message…" composer, and the Solution tab up top carries a `1` session badge. **No menu opened.** The `+`'s tooltip is visible reading exactly **"New AI Session — right-click for more"**. `solution_agent.list_sessions` confirms `1 session(s)`. |
+| `/tmp/shot-console-plus.png` | (unchanged from the first pass) Console panel `+`: "New Terminal" · separator · "Spawn Task… Alt-Shift-T". No AI entries. |
+
+Height check, live: with the tab present the strip reads session tab
+`[8, 1051, 99, 24]` and `+` `[111, 1051, 23, 24]` — the same 24 px hitbox as
+every other status-bar item (`[1839/1866/1893, 1051, 23, 24]`), status bar
+still occupying y 1046–1080. Unchanged.
+
+## `FORK.md` sentence (revised — supersedes the first pass's)
+
+> AI-session affordances live on the status-bar session tab strip, not in the
+> console panel: `ConsolePanel`'s `+` popover is terminal/task only, and the
+> reopen-a-closed-chat picker moved to the **right-click** menu of
+> `SessionTabStrip`'s trailing `+`
+> (`solution_agent::reopen_session_modal::open_reopen_session_modal`), whose
+> plain left click still creates a session in one click. The `+` rather than
+> the tab context menu because it is the only strip affordance that still
+> paints when the Solution has zero session tabs — exactly the state a user who
+> just closed their last chat is in — and a right click rather than a second
+> icon because the strip is deliberately losing chrome, not gaining it.

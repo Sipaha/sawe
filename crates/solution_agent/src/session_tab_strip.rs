@@ -14,7 +14,7 @@
 //! Lives in `solution_agent` rather than `console_panel` (which owns the OLD
 //! bottom-dock chat tab strip this one is replacing in phase 2a) because a
 //! dependency the other way would cycle: `console_panel` already depends on
-//! `solution_agent`. The trailing `+` menu therefore dispatches
+//! `solution_agent`. The trailing `+` therefore dispatches
 //! `console_panel::NewChat` *dynamically by name* (`cx.build_action`) rather
 //! than importing the action type — the same cross-crate action-dispatch
 //! idiom already used by `git_ui::commit_context_menu` for
@@ -30,11 +30,11 @@
 //! `open_rename_session_modal` for the mechanics; the overflow popover's
 //! rows are `submenu`s (not plain entries) so the same three actions stay
 //! reachable for a tab that has spilled past `MAX_VISIBLE_TABS`. The trailing
-//! `+` is a two-entry popover ("New AI Session" / "Reopen Closed Chat…") —
-//! the reopen picker used to hang off `ConsolePanel`'s `+`, which no longer
-//! offers AI-session entries at all; see `render_plus_popover` for why the
-//! strip's `+` and not its tab context menu is the reopen flow's new home.
-//! There is no per-tab close cross — the right-click menu is the only close affordance
+//! `+` creates a session on a plain left click and opens "Reopen Closed
+//! Chat…" on a right click — the reopen picker used to hang off
+//! `ConsolePanel`'s `+`, which no longer offers AI-session entries at all;
+//! see `render_plus_button` for why the strip's `+` and not its tab context
+//! menu is the reopen flow's new home. There is no per-tab close cross — the right-click menu is the only close affordance
 //! (maintainer request, 2026-09-03), which is why that entry comes first.
 
 use std::cell::RefCell;
@@ -230,11 +230,47 @@ fn open_rename_session_modal(
     });
 }
 
-/// Build the strip's `+` menu. A free function rather than an inline closure
-/// so a paint test can render exactly the menu the popover renders and read
-/// its `MENU_ITEM-*` debug selectors — the entries are the thing under test
-/// (they moved here out of the console panel's `+`), and asserting a
-/// predicate instead of the paint is a known repeat defect in this repo.
+/// Label of the `+` menu's only entry. A const because the tab-close
+/// confirmation prompt quotes it back to the user: the prompt used to name
+/// "Reopen Closed Chat" *in the console panel*, which stopped being true the
+/// moment the entry moved here, and a plain literal in two files is exactly
+/// how that went stale. Pinned by
+/// `the_close_prompt_and_the_tooltip_point_at_the_same_affordance`.
+const REOPEN_ENTRY_LABEL: &str = "Reopen Closed Chat…";
+
+/// The `+` button's tooltip. Names both gestures, because the right click is
+/// otherwise undiscoverable — there is no second icon advertising it (adding
+/// one would put chrome back on a strip that has been losing it).
+const PLUS_TOOLTIP: &str = "New AI Session — right-click for more";
+
+/// The gesture both the tooltip and the close prompt must name, so a reader
+/// of either is told the same thing.
+const REOPEN_GESTURE: &str = "right-click";
+
+/// Detail line of the tab-close confirmation prompt. Assembled from the same
+/// consts the `+`'s tooltip and menu entry use, so the promise it makes
+/// cannot drift from the affordance it points at the way its predecessor did
+/// (that one named "Reopen Closed Chat" *in the console panel*, and stayed
+/// wrong for as long as nothing read it). A function, not a literal at the
+/// call site, so the test can read exactly what the user is shown.
+fn close_prompt_detail() -> String {
+    format!(
+        "The agent is still working. Closing interrupts the current turn — the tab can be \
+         brought back with \"{REOPEN_ENTRY_LABEL}\": {REOPEN_GESTURE} the session strip's \
+         \"+\" button."
+    )
+}
+
+/// The `+`'s right-click menu. A free function rather than an inline closure
+/// so a paint test can render exactly the menu the button opens and read its
+/// `MENU_ITEM-*` debug selectors — the entry is the thing under test (it moved
+/// here out of the console panel's `+`), and asserting a predicate instead of
+/// the paint is a known repeat defect in this repo.
+///
+/// One entry, deliberately: creating a session is the frequent action and
+/// stays on the button's plain left click, so repeating it here would be the
+/// same duplication that put "New AI Chat" in the console panel's `+` in the
+/// first place.
 fn build_plus_menu(
     solution_id: SolutionId,
     weak_workspace: Option<WeakEntity<Workspace>>,
@@ -243,16 +279,7 @@ fn build_plus_menu(
 ) -> Entity<ContextMenu> {
     ContextMenu::build(window, cx, move |menu, _window, _cx| {
         let weak_workspace = weak_workspace.clone();
-        menu.entry("New AI Session", None, move |window, cx| {
-            // Dispatched by name (not imported) — see the module doc for why.
-            match cx.build_action("console_panel::NewChat", None) {
-                Ok(action) => window.dispatch_action(action, cx),
-                Err(err) => {
-                    log::error!("session_tab_strip: console_panel::NewChat unavailable: {err}")
-                }
-            }
-        })
-        .entry("Reopen Closed Chat…", None, move |window, cx| {
+        menu.entry(REOPEN_ENTRY_LABEL, None, move |window, cx| {
             if let Some(weak_workspace) = weak_workspace.as_ref() {
                 open_reopen_session_modal(weak_workspace, solution_id, window, cx);
             }
@@ -361,13 +388,11 @@ impl SessionTabStrip {
                 .log_err();
             return;
         }
+        let detail = close_prompt_detail();
         let answer = window.prompt(
             PromptLevel::Warning,
             "Close this AI session's tab?",
-            Some(
-                "The agent is still working. Closing interrupts the current turn — the tab can \
-                 be brought back via \"Reopen Closed Chat…\" in this strip's \"+\" menu.",
-            ),
+            Some(&detail),
             &["Close", "Cancel"],
             cx,
         );
@@ -590,37 +615,57 @@ impl SessionTabStrip {
             })
     }
 
-    /// The strip's trailing `+`: a popover, not a bare button, because it is
-    /// the strip's only affordance that still paints when the Solution has
-    /// **zero** session tabs — and "Reopen Closed Chat…" has to survive
-    /// exactly that case (a user who just closed their last session must be
-    /// able to get it back). The per-tab right-click menu, the other
-    /// candidate home, disappears along with the tabs. Costs one extra click
-    /// on "New AI Session"; the alternative costs the recovery path outright.
+    /// The strip's trailing `+`. A plain left click creates a session — the
+    /// frequent action, kept at one click — while a **right** click opens
+    /// [`build_plus_menu`], which is where "Reopen Closed Chat…" now lives
+    /// (it used to hang off `ConsolePanel`'s `+`, which no longer offers
+    /// AI-session entries at all).
     ///
-    /// The trigger stays the same `IconButton` at the same `IconSize::Small`,
-    /// so the strip's row height (`ButtonSize::Default.rems()`, shared with
-    /// the tab pills) and therefore the status bar's height are unchanged.
-    fn render_plus_popover(
+    /// The `+` and not the per-tab context menu, because the `+` is the only
+    /// affordance on this strip that still paints when the Solution has
+    /// **zero** session tabs — and that is exactly the state a user who just
+    /// closed their last chat is in. A right click also keeps the strip's
+    /// affordance count at one: a second icon next to the `+` would add
+    /// chrome to a strip the maintainer has been stripping chrome off (the
+    /// per-tab close cross went in 0c569d6c95). The tooltip carries the
+    /// right-click hint so it is discoverable without one.
+    ///
+    /// The trigger is the same `IconButton` at the same `IconSize::Small` it
+    /// has always been, so the strip's row height
+    /// (`ButtonSize::Default.rems()`, shared with the tab pills) — and with
+    /// it the status bar's height — is unchanged.
+    fn render_plus_button(
         &self,
         solution_id: SolutionId,
         weak_workspace: Option<WeakEntity<Workspace>>,
         _cx: &Context<Self>,
     ) -> impl IntoElement {
-        PopoverMenu::new("session-tab-strip-plus-popover")
-            .trigger_with_tooltip(
-                IconButton::new("session-tab-strip-plus", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted),
-                Tooltip::text("New AI session…"),
-            )
+        let button = IconButton::new("session-tab-strip-plus", IconName::Plus)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text(PLUS_TOOLTIP))
+            .on_click(|_, window, cx| {
+                // Dispatched by name (not imported) — see the module doc for why.
+                match cx.build_action("console_panel::NewChat", None) {
+                    Ok(action) => window.dispatch_action(action, cx),
+                    Err(err) => {
+                        log::error!("session_tab_strip: console_panel::NewChat unavailable: {err}")
+                    }
+                }
+            });
+        // `RightClickMenu::trigger` takes a `FnOnce` but is stored behind an
+        // `Fn`, so the element is handed over through a cell — the same idiom
+        // `render_tab` uses for its own right-click menu.
+        let button_cell = RefCell::new(Some(button.into_any_element()));
+        right_click_menu("session-tab-strip-plus-menu")
+            .trigger(move |_, _, _| {
+                button_cell
+                    .borrow_mut()
+                    .take()
+                    .unwrap_or_else(|| div().into_any_element())
+            })
             .menu(move |window, cx| {
-                Some(build_plus_menu(
-                    solution_id,
-                    weak_workspace.clone(),
-                    window,
-                    cx,
-                ))
+                build_plus_menu(solution_id, weak_workspace.clone(), window, cx)
             })
     }
 }
@@ -782,7 +827,7 @@ impl Render for SessionTabStrip {
             .overflow_x_scroll()
             .children(tabs)
             .when_some(overflow_popover, |this, popover| this.child(popover))
-            .child(self.render_plus_popover(solution_id, weak_workspace.clone(), cx))
+            .child(self.render_plus_button(solution_id, weak_workspace.clone(), cx))
             .into_any_element()
     }
 }
@@ -1033,17 +1078,62 @@ mod tests {
         );
     }
 
-    /// The reopen-a-closed-chat flow moved off `ConsolePanel`'s `+` popover
-    /// onto this strip's `+`, and the case that decided *where* on the strip
-    /// is a Solution with **zero** session tabs: a user who just closed their
-    /// last chat has no tab left to right-click, so a tab context menu would
-    /// have stranded the recovery path. This drives the strip's real `Render`
-    /// (a live `MultiWorkspace` over the solution's own worktree, so
-    /// `active_solution_id` resolves) with no sessions at all, clicks the
-    /// painted `+`, and reads the menu that actually painted.
-    #[gpui::test]
-    async fn the_plus_menu_reopens_a_closed_chat_even_with_no_tabs(cx: &mut TestAppContext) {
-        let (_solution_id, _tmp, project) =
+    /// Stand-in for `console_panel::NewChat`, registered under that exact
+    /// wire name. The `+`'s left click builds the action *by name* because
+    /// `solution_agent` cannot depend on `console_panel` (the edge runs the
+    /// other way), which also means the real action is not linked into this
+    /// crate's test binary — so without a stub, "left click creates a
+    /// session" is unobservable and the click silently `log::error!`s. This
+    /// is `#[cfg(test)]`, so it exists only in `solution_agent`'s own lib
+    /// test binary, where `console_panel` is absent and there is nothing to
+    /// collide with in the action registry. Paired with
+    /// `console_panel::panel::tests::new_chat_action_matches_the_status_bar_strips_dispatch_string`,
+    /// which pins the real action to the same string, this closes the loop.
+    mod stub {
+        gpui::actions!(
+            console_panel,
+            [
+                /// Test stand-in for the real `console_panel::NewChat`.
+                NewChat
+            ]
+        );
+    }
+
+    /// Window root hosting the strip's REAL `Render` (not `TabPaintHarness`,
+    /// which paints hand-built rows) plus an action handler, so a click that
+    /// reaches the `+` can be observed as a dispatch rather than inferred.
+    struct StripHarness {
+        strip: Entity<SessionTabStrip>,
+        new_chat_dispatches: Rc<RefCell<usize>>,
+        /// The harness must hold focus: `Window::dispatch_action` routes to
+        /// the focused dispatch node and bubbles UP from there, so an
+        /// `on_action` on an unfocused root is never in the path — the same
+        /// place the real app puts this handler (`workspace.register_action`,
+        /// an ancestor of whatever holds focus).
+        focus_handle: gpui::FocusHandle,
+    }
+
+    impl Render for StripHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let dispatches = self.new_chat_dispatches.clone();
+            div()
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .on_action(move |_: &stub::NewChat, _window, _cx| {
+                    *dispatches.borrow_mut() += 1;
+                })
+                .child(self.strip.clone())
+        }
+    }
+
+    /// Boot a Solution whose worktree the strip can resolve (a live
+    /// `MultiWorkspace`, so the real `Render` reaches past its
+    /// `active_solution_id` early return) with **zero** sessions, and paint
+    /// it. Returns the dispatch counter and the visual context.
+    async fn paint_strip_with_no_tabs(
+        cx: &mut TestAppContext,
+    ) -> (Rc<RefCell<usize>>, gpui::VisualTestContext) {
+        let (_solution_id, tmp, project) =
             crate::store::tests::setup_solution_and_project(cx).await;
         cx.update(|cx| {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -1057,34 +1147,134 @@ mod tests {
             .root(cx)
             .expect("the multi-workspace window's root");
 
-        let (_strip, cx) = cx.add_window_view(|_window, cx| {
-            SessionTabStrip::new(Some(multi_workspace.downgrade()), cx)
+        let new_chat_dispatches = Rc::new(RefCell::new(0usize));
+        let window = cx.add_window(|_window, cx| StripHarness {
+            strip: cx.new(|cx| SessionTabStrip::new(Some(multi_workspace.downgrade()), cx)),
+            new_chat_dispatches: new_chat_dispatches.clone(),
+            focus_handle: cx.focus_handle(),
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |harness, window, cx| {
+                window.focus(&harness.focus_handle, cx);
+            })
+            .expect("focus the harness");
+        visual.run_until_parked();
+
+        assert!(
+            visual.debug_bounds("SESSION-TAB-INACTIVE-0").is_none()
+                && visual.debug_bounds("SESSION-TAB-ACTIVE-0").is_none(),
+            "these tests are only meaningful with zero session tabs painted"
+        );
+        // The tempdir backs the Solution's on-disk root for the whole test.
+        std::mem::forget(tmp);
+        (new_chat_dispatches, visual)
+    }
+
+    /// The `+`'s plain left click must still create a session in one click —
+    /// and must NOT open the right-click menu. Both sides asserted: a
+    /// regression that swapped the gestures would otherwise show up as only
+    /// one of "no dispatch" or "a menu appeared".
+    #[gpui::test]
+    async fn left_clicking_the_plus_creates_a_session_and_opens_no_menu(cx: &mut TestAppContext) {
+        let (new_chat_dispatches, mut cx) = paint_strip_with_no_tabs(cx).await;
+
+        let plus = cx
+            .debug_bounds("ICON-Plus")
+            .expect("the strip's `+` must paint even with no session tabs");
+        // Height guard: the `+` gained a right-click menu wrapper, and must
+        // still be the same `ButtonSize::Default` row the tab pills use —
+        // growing it would grow the status bar.
+        assert_eq!(plus.size.height, px(22.));
+
+        // Rest the cursor on the button first, mirroring the right-click
+        // test below (where `RightClickMenu`'s `is_hovered` gate makes it
+        // mandatory) and the `windows.click_at`/`hover_at` pairing the MCP
+        // layer uses.
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: plus.center(),
+            pressed_button: None,
+            modifiers: gpui::Modifiers::default(),
+        });
+        cx.simulate_click(plus.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            *new_chat_dispatches.borrow(),
+            1,
+            "a plain left click on `+` must dispatch console_panel::NewChat"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Reopen Closed Chat…").is_none(),
+            "a left click must not open the `+`'s menu"
+        );
+    }
+
+    /// The reopen-a-closed-chat flow moved off `ConsolePanel`'s `+` popover
+    /// onto this strip's `+`, and the case that decided *where* on the strip
+    /// is a Solution with **zero** session tabs: a user who just closed their
+    /// last chat has no tab left to right-click, so a tab context menu would
+    /// have stranded the recovery path. Right-clicks the painted `+` and
+    /// reads the menu that actually painted — and checks the left-click
+    /// action did not also fire, since the two gestures share one element.
+    #[gpui::test]
+    async fn right_clicking_the_plus_reopens_a_closed_chat_even_with_no_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        let (new_chat_dispatches, mut cx) = paint_strip_with_no_tabs(cx).await;
+
+        let plus = cx
+            .debug_bounds("ICON-Plus")
+            .expect("the strip's `+` must paint even with no session tabs");
+        let position = plus.center();
+        // `RightClickMenu` only fires for a mouse-down over an already-hovered
+        // hitbox (`hitbox_id.is_hovered`), so rest the cursor first — the same
+        // reason `windows.drag_at` hovers its start point.
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: gpui::Modifiers::default(),
+        });
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Right,
+            position,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
         });
         cx.run_until_parked();
 
         assert!(
-            cx.debug_bounds("SESSION-TAB-INACTIVE-0").is_none()
-                && cx.debug_bounds("SESSION-TAB-ACTIVE-0").is_none(),
-            "this test is only meaningful with zero session tabs painted"
-        );
-        let plus = cx
-            .debug_bounds("ICON-Plus")
-            .expect("the strip's `+` must paint even with no session tabs");
-        // Height guard: the `+` is a popover trigger now, not a bare button,
-        // and it must still be the same `ButtonSize::Default` row the tab
-        // pills use — growing it would grow the status bar.
-        assert_eq!(plus.size.height, px(22.));
-
-        cx.simulate_click(plus.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-
-        assert!(
             cx.debug_bounds("MENU_ITEM-Reopen Closed Chat…").is_some(),
-            "the `+` menu must offer the reopen picker with no tabs open"
+            "a right click on `+` must offer the reopen picker with no tabs open"
+        );
+        assert_eq!(
+            *new_chat_dispatches.borrow(),
+            0,
+            "a right click must not also create a session"
+        );
+    }
+
+    /// The close prompt promises a way to get the tab back; the tooltip is
+    /// where the user learns that gesture exists. Its predecessor pointed at
+    /// "Reopen Closed Chat" *in the console panel* and went stale the moment
+    /// the entry moved, so both strings are now assembled from the same
+    /// consts and this pins that they agree.
+    #[test]
+    fn the_close_prompt_and_the_tooltip_point_at_the_same_affordance() {
+        let detail = close_prompt_detail();
+        assert!(
+            detail.contains(REOPEN_ENTRY_LABEL),
+            "the close prompt must name the menu entry verbatim: {detail}"
         );
         assert!(
-            cx.debug_bounds("MENU_ITEM-New AI Session").is_some(),
-            "the `+` menu must still create a new session"
+            detail.contains(REOPEN_GESTURE) && PLUS_TOOLTIP.contains(REOPEN_GESTURE),
+            "the prompt and the tooltip must name the same gesture: {detail} / {PLUS_TOOLTIP}"
+        );
+        assert!(
+            !detail.contains("console panel"),
+            "the console panel no longer hosts this flow: {detail}"
         );
     }
 
