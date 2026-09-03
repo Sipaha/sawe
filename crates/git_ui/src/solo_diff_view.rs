@@ -1633,8 +1633,18 @@ mod tests {
     }
 
     fn blame_entry_at(row: u32, author: &str) -> ::git::blame::BlameEntry {
+        blame_entry_at_sha(row, author, run_sha(0xaa))
+    }
+
+    /// A sha built from one repeated byte, so a test can name two distinct
+    /// commits without carrying two forty-character literals around.
+    fn run_sha(byte: u8) -> ::git::Oid {
+        ::git::Oid::from_bytes(&[byte; 20]).expect("twenty bytes is a valid oid")
+    }
+
+    fn blame_entry_at_sha(row: u32, author: &str, sha: ::git::Oid) -> ::git::blame::BlameEntry {
         ::git::blame::BlameEntry {
-            sha: ::git::Oid::from_bytes(&[0xaa; 20]).expect("twenty bytes is a valid oid"),
+            sha,
             range: row..row + 1,
             original_line_number: row + 1,
             author: Some(author.to_string()),
@@ -1676,6 +1686,33 @@ mod tests {
                     repo_path(path),
                     ::git::blame::Blame {
                         entries: (0..rows).map(|row| blame_entry_at(row, "Tester")).collect(),
+                        ..Default::default()
+                    },
+                )],
+            );
+        }
+    }
+
+    /// Like `set_blame_at_revisions`, but annotates row `i` with `row_shas[i]`,
+    /// so a test can lay out explicit runs of consecutive lines per commit.
+    fn set_blame_runs_at_revisions(
+        context: &DiffTestContext,
+        path: &str,
+        revisions: impl IntoIterator<Item = String>,
+        row_shas: &[::git::Oid],
+    ) {
+        for revision in revisions {
+            context.fs.set_blame_at_revision_for_repo(
+                Path::new(path!("/project/.git")),
+                &revision,
+                vec![(
+                    repo_path(path),
+                    ::git::blame::Blame {
+                        entries: row_shas
+                            .iter()
+                            .enumerate()
+                            .map(|(row, sha)| blame_entry_at_sha(row as u32, "Tester", *sha))
+                            .collect(),
                         ..Default::default()
                     },
                 )],
@@ -1879,6 +1916,111 @@ mod tests {
         assert!(
             cx.debug_bounds("GIT-BLAME-ENTRY-LEFT").is_some(),
             "and the left pane holds the file at the commit's parent"
+        );
+    }
+
+    /// The fixture both run tests share: four lines whose first two came from
+    /// one commit and whose last two came from another, opened as a commit
+    /// diff so both panes are blamed. Two runs rather than one is the point —
+    /// it is what separates "the gutter labels the first row of each run" from
+    /// "the gutter labels the first row of the file".
+    async fn open_two_run_commit_diff(
+        context: &DiffTestContext,
+        cx: &mut VisualTestContext,
+    ) -> Entity<SoloDiffView> {
+        set_commit(
+            context,
+            SHA,
+            vec![commit_file(
+                "src/lib.rs",
+                Some("one\ntwo\nthree\nfour\n"),
+                Some("one\nTWO\nthree\nfour\n"),
+            )],
+        );
+        set_blame_runs_at_revisions(
+            context,
+            "src/lib.rs",
+            [SHA.to_string(), format!("{SHA}^")],
+            &[run_sha(0xaa), run_sha(0xaa), run_sha(0xbb), run_sha(0xbb)],
+        );
+
+        let view = open_commit(context, SHA, "src/lib.rs", cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+        blame_both_panes(&view, cx);
+        view
+    }
+
+    /// The date and the author identify a commit, so repeating them on every
+    /// line of a run says nothing the row above did not. Asserted on the
+    /// painted tree, and on both sides of it: the metadata is there on the row
+    /// that opens each run and gone on the row that continues it. Row 2 opening
+    /// the second run is what keeps this from passing for a renderer that only
+    /// ever labels the top row of the viewport.
+    #[gpui::test]
+    async fn test_only_the_head_of_a_run_draws_its_blame_metadata(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        let _view = open_two_run_commit_diff(&context, &mut cx).await;
+
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_some(),
+            "row 0 opens the first run, so it names its commit"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-1").is_none(),
+            "row 1 came from the same commit as the row above it, so repeating \
+             the date and the author there is noise"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-2").is_some(),
+            "row 2 came from a different commit, so it opens a run of its own"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-3").is_none(),
+            "and row 3 continues that second run"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-LEFT-0").is_some()
+                && cx.debug_bounds("GIT-BLAME-META-LEFT-1").is_none(),
+            "the left pane groups its own rows, not the right pane's"
+        );
+    }
+
+    /// A continuation row draws nothing, and an empty flex is zero pixels tall:
+    /// left at that, the row would keep its hover background, its tooltip, its
+    /// context menu and its click-to-open listener and none of them could ever
+    /// fire, because there would be no hit area to land on. The container has
+    /// to stay the size of the line it annotates.
+    #[gpui::test]
+    async fn test_a_continuation_row_keeps_a_full_height_hit_area(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        let _view = open_two_run_commit_diff(&context, &mut cx).await;
+
+        let head = cx
+            .debug_bounds("GIT-BLAME-ROW-RIGHT-0")
+            .expect("the row that opens the run paints its container");
+        let continuation = cx
+            .debug_bounds("GIT-BLAME-ROW-RIGHT-1")
+            .expect("a continuation row paints its container even with no children");
+        let next_head = cx
+            .debug_bounds("GIT-BLAME-ROW-RIGHT-2")
+            .expect("the row that opens the second run paints its container");
+
+        // Derived from the gutter itself rather than restated as a constant:
+        // consecutive rows are one line apart, so the gap between them is the
+        // height a row has to cover to leave no dead band between two lines.
+        let line_height = next_head.origin.y - continuation.origin.y;
+        assert!(line_height > gpui::px(0.), "rows are laid out one line apart");
+        assert_eq!(
+            continuation.size.height, line_height,
+            "a continuation row must cover its whole line, or the mouse falls \
+             between the rows above and below it"
+        );
+        assert!(head.size.width > gpui::px(0.), "the gutter has a width");
+        assert_eq!(
+            continuation.size.width, head.size.width,
+            "and a continuation row spans it just as the head row does"
         );
     }
 

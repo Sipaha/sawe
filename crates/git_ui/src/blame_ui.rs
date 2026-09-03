@@ -101,9 +101,7 @@ impl BlameRenderer for GitBlameRenderer {
         editor: Entity<Editor>,
         ix: usize,
         sha_color: Hsla,
-        // Task 1 of the run-grouping work only plumbs the position through;
-        // acting on it is Task 2, so the gutter is unchanged for now.
-        _run_position: BlameRunPosition,
+        run_position: BlameRunPosition,
         options: &BlameOptions,
         date_range: Option<(i64, i64)>,
         window: &mut Window,
@@ -116,49 +114,79 @@ impl BlameRenderer for GitBlameRenderer {
             return Some(render_muted_blame_entry(style, ix, cx));
         }
 
-        let date = blame_entry_gutter_date(&blame_entry);
-        let name = truncate_to_columns(
-            ::git::blame::display_author(blame_entry.author.as_deref()),
-            GIT_BLAME_MAX_AUTHOR_COLUMNS,
-        );
+        // Consecutive lines from one commit used to repeat the same date and
+        // author on every row, so a file written in a few large commits read
+        // as a wall of identical text. Only the row that opens a run names its
+        // commit; the rest of the run keeps its container — and with it the
+        // hover, the tooltip, the context menu and click-to-open — so the run
+        // costs the repetition and nothing else.
+        let is_continuation = matches!(run_position, BlameRunPosition::Continuation);
 
-        let resolved_color = match options.color_mode {
-            ColorMode::None => sha_color,
-            ColorMode::ByAuthor => blame_entry
-                .author_mail
-                .as_deref()
-                .map(|email| author_color(email, cx))
-                .unwrap_or(sha_color),
-            ColorMode::ByDate => date_range
-                .and_then(|(oldest, newest)| {
-                    let theme = cx.theme();
-                    let cold = theme.status().info;
-                    let hot = theme.status().error;
-                    let time = blame_entry.author_time?;
-                    date_color(time, oldest, newest, cold, hot)
-                })
-                .unwrap_or(sha_color),
-        };
-
-        let avatar = if ProjectSettings::get_global(cx).git.blame.show_avatar {
-            let author_email = blame_entry.author_mail.as_ref().map(|email| {
-                SharedString::from(
-                    email
-                        .trim_start_matches('<')
-                        .trim_end_matches('>')
-                        .to_string(),
-                )
-            });
-            Some(
-                CommitAvatar::new(
-                    &blame_entry.sha.to_string().into(),
-                    author_email,
-                    details.as_ref().and_then(|it| it.remote.as_ref()),
-                )
-                .render(window, cx),
-            )
-        } else {
+        let metadata = if is_continuation {
             None
+        } else {
+            let date = blame_entry_gutter_date(&blame_entry);
+            let name = truncate_to_columns(
+                ::git::blame::display_author(blame_entry.author.as_deref()),
+                GIT_BLAME_MAX_AUTHOR_COLUMNS,
+            );
+
+            let resolved_color = match options.color_mode {
+                ColorMode::None => sha_color,
+                ColorMode::ByAuthor => blame_entry
+                    .author_mail
+                    .as_deref()
+                    .map(|email| author_color(email, cx))
+                    .unwrap_or(sha_color),
+                ColorMode::ByDate => date_range
+                    .and_then(|(oldest, newest)| {
+                        let theme = cx.theme();
+                        let cold = theme.status().info;
+                        let hot = theme.status().error;
+                        let time = blame_entry.author_time?;
+                        date_color(time, oldest, newest, cold, hot)
+                    })
+                    .unwrap_or(sha_color),
+            };
+
+            let avatar = if ProjectSettings::get_global(cx).git.blame.show_avatar {
+                let author_email = blame_entry.author_mail.as_ref().map(|email| {
+                    SharedString::from(
+                        email
+                            .trim_start_matches('<')
+                            .trim_end_matches('>')
+                            .to_string(),
+                    )
+                });
+                Some(
+                    CommitAvatar::new(
+                        &blame_entry.sha.to_string().into(),
+                        author_email,
+                        details.as_ref().and_then(|it| it.remote.as_ref()),
+                    )
+                    .render(window, cx),
+                )
+            } else {
+                None
+            };
+
+            Some(
+                h_flex()
+                    .gap_2()
+                    // Named apart from the row container, and per row, because
+                    // the two now differ: a continuation row paints the
+                    // container and not this. See `blame_pane_suffix`.
+                    .debug_selector(|| {
+                        format!("GIT-BLAME-META{}-{ix}", blame_pane_suffix(&editor, cx))
+                    })
+                    .child(date)
+                    .children(avatar)
+                    // Coloured per commit (or per author / per age, under
+                    // the other colour modes), which is what carries the
+                    // "these lines came from one commit" cue now that the
+                    // SHA it used to tint is gone.
+                    .child(div().text_color(resolved_color).child(name)),
+            )
         };
 
         Some(
@@ -177,14 +205,7 @@ impl BlameRenderer for GitBlameRenderer {
                 // turns blame on for both. Encoding the side beats measuring
                 // against the divider — no geometry to recompute when the split
                 // layout changes, and both sides can be asserted by name.
-                .debug_selector(|| {
-                    match editor.read(cx).split_side() {
-                        Some(SplitSide::Left) => "GIT-BLAME-ENTRY-LEFT",
-                        Some(SplitSide::Right) => "GIT-BLAME-ENTRY-RIGHT",
-                        None => "GIT-BLAME-ENTRY",
-                    }
-                    .into()
-                })
+                .debug_selector(|| format!("GIT-BLAME-ENTRY{}", blame_pane_suffix(&editor, cx)))
                 .child(
                     h_flex()
                         .id(("blame", ix))
@@ -197,14 +218,19 @@ impl BlameRenderer for GitBlameRenderer {
                         .gap_2()
                         .font(style.font())
                         .line_height(style.line_height)
+                        // A continuation row has no children, and a flex with
+                        // no children collapses to zero height — which would
+                        // take the hover, the tooltip, the context menu and the
+                        // click target down with it. The height the row would
+                        // have had, stated explicitly.
+                        .when(is_continuation, |row| {
+                            row.h(style.line_height_in_pixels(window.rem_size()))
+                        })
                         .text_color(cx.theme().status().hint)
-                        .child(date)
-                        .children(avatar)
-                        // Coloured per commit (or per author / per age, under
-                        // the other colour modes), which is what carries the
-                        // "these lines came from one commit" cue now that the
-                        // SHA it used to tint is gone.
-                        .child(div().text_color(resolved_color).child(name))
+                        .debug_selector(|| {
+                            format!("GIT-BLAME-ROW{}-{ix}", blame_pane_suffix(&editor, cx))
+                        })
+                        .children(metadata)
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
                         .cursor_pointer()
                         .on_mouse_down(MouseButton::Right, {
@@ -596,6 +622,23 @@ fn deploy_blame_entry_context_menu(
         editor.deploy_mouse_context_menu(position, context_menu, window, cx);
         cx.notify();
     });
+}
+
+/// The pane half of a blame gutter selector: `-LEFT` / `-RIGHT` in a split
+/// diff, empty in a single editor.
+///
+/// `debug_bounds` is keyed by selector name alone, so every row sharing one
+/// name overwrites a single map entry and a lookup can only ever prove that
+/// *some* row painted. The pane and, for the per-row names, the viewport row
+/// index are therefore part of the name — that is what lets a test say this
+/// row drew metadata and that one did not. Only called from the `debug_selector`
+/// closures, which are compiled to nothing outside tests.
+fn blame_pane_suffix(editor: &Entity<Editor>, cx: &App) -> &'static str {
+    match editor.read(cx).split_side() {
+        Some(SplitSide::Left) => "-LEFT",
+        Some(SplitSide::Right) => "-RIGHT",
+        None => "",
+    }
 }
 
 /// S-ANN — render a single muted dot for a line whose author is filtered

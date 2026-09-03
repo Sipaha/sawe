@@ -149,6 +149,15 @@ pub fn blame_run_positions(
     rows: &[RowInfo],
     blamed_rows: &[Option<(BufferId, BlameEntry)>],
 ) -> Vec<Option<BlameRunPosition>> {
+    // Positional alignment is the whole basis of the classification: a
+    // `blamed_rows` that drifted out of step with `rows` would silently make
+    // every row a `Head` again rather than fail anywhere visible.
+    debug_assert_eq!(
+        rows.len(),
+        blamed_rows.len(),
+        "blame_run_positions expects `blame_for_rows(rows)`, aligned with `rows`"
+    );
+
     // The previous *blamed* row's identity, or `None` when the run was broken
     // (start of the slice, or a block row in between).
     let mut previous: Option<(BufferId, Oid, u32)> = None;
