@@ -2838,16 +2838,23 @@ impl GitGraph {
         }
     }
 
-    /// A click on a commit row. Double-click deliberately does *nothing beyond
-    /// selecting*: it used to open the synthetic `CommitView` tab, which is a
-    /// pseudo-file holding the commit description — redundant now that the git
-    /// panel's Commit tab carries the full message, and far too easy to trigger
-    /// by accident while walking the log. The commit view is still reachable
-    /// explicitly (`menu::Confirm` and the `git_graph::OpenCommitView` action).
+    /// A click on a commit row.
+    ///
+    /// A single click only selects, which re-points the git panel's Commit tab
+    /// at the row (through [`Self::select_entry`]) but leaves the panel exactly
+    /// as visible — or as hidden — as it already was. A double click adds one
+    /// thing: it **summons** that panel, so a commit whose contents nothing is
+    /// showing yet becomes visible. See [`Self::summon_commit_panel`].
+    ///
+    /// What a double click still must not do is open the synthetic `CommitView`
+    /// tab, a pseudo-file holding the commit description — redundant now that
+    /// the Commit tab carries the full message, and far too easy to trigger by
+    /// accident while walking the log. That view stays reachable explicitly
+    /// (`menu::Confirm` and the `git_graph::OpenCommitView` action).
     fn on_row_click(
         &mut self,
         index: usize,
-        _click_count: usize,
+        click_count: usize,
         modifiers: Modifiers,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2862,6 +2869,33 @@ impl GitGraph {
             RowSelectionGesture::Replace
         };
         self.apply_row_click_selection(index, gesture, window, cx);
+        if click_count >= 2 {
+            self.summon_commit_panel(window, cx);
+        }
+    }
+
+    /// Reveal the git panel — the only surface that shows a commit's contents —
+    /// so that the Commit tab the click just re-pointed is actually on screen.
+    ///
+    /// `Workspace::open_panel` opens the panel's dock *and* makes the git panel
+    /// that dock's active one, which is the whole gesture: "not open yet" covers
+    /// a closed dock and a dock open on some other panel equally, and the second
+    /// case is invisible to a `Dock::is_open` check.
+    ///
+    /// It deliberately does not focus. That matches
+    /// `GitPanel::show_commit_selection`, which activates the Commit tab without
+    /// taking focus so the graph keeps its keyboard navigation — this is the
+    /// same summon applied to the container instead of the tab, and pulling
+    /// focus here would make double-clicking down a log a one-way trip. It is
+    /// also why this is not a new tab-spawning gesture: the Commit tab is a
+    /// single `Option` on the panel, so summoning it twice cannot produce two.
+    fn summon_commit_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
     }
 
     /// Fold a row click into the selection and re-point the git panel's Commit
@@ -7491,10 +7525,13 @@ mod tests {
 
     /// Double-clicking a commit row used to open the `CommitView` tab — a
     /// synthetic pseudo-file whose first screen is the commit description.
-    /// It must now do nothing beyond selecting; the same view is still one
-    /// explicit `open_selected_commit_view` away, which is what the second
-    /// half of this test pins down (without it, the assertion above would
-    /// also pass if `CommitView::open` had simply stopped working).
+    /// It must now select and summon the git panel and nothing else; the
+    /// pseudo-file is still one explicit `open_selected_commit_view` away,
+    /// which is what the second half of this test pins down (without it, the
+    /// assertion above would also pass if `CommitView::open` had simply stopped
+    /// working). This workspace carries no git panel, so the summon resolves to
+    /// nothing here and the two behaviours stay separable — the panel side is
+    /// `test_double_click_summons_the_commit_panel`.
     #[gpui::test]
     async fn test_double_click_selects_without_opening_the_commit_view(cx: &mut TestAppContext) {
         init_test(cx);
@@ -7549,6 +7586,172 @@ mod tests {
             commit_views(cx),
             1,
             "the commit view is still reachable explicitly"
+        );
+    }
+
+    /// A commit's contents are shown in exactly one place — the git panel's
+    /// Commit tab — and a click can only re-point a tab that is on screen. A
+    /// single click therefore leaves a closed panel closed (the shared-surface
+    /// rule: a retarget does nothing when nothing is open); the double click is
+    /// the summon that opens it.
+    ///
+    /// Asserted against the painted tree rather than against
+    /// `commit_tab_is_open()`, which is true for an invisible tab in a closed
+    /// dock and so would pass with the dock never opening at all.
+    ///
+    /// The summon must also not move keyboard focus, which is what makes
+    /// double-clicking down a log possible at all. That is asserted as "the
+    /// window's focus did not move", not as "the panel is not focused":
+    /// `GitPanel`'s `focus_handle` is dynamic — it hands out the commit
+    /// editor's while the entry list is empty — so focusing the panel lands on
+    /// a handle that neither `is_focused` nor `contains_focused` on the panel
+    /// reports, and an `open_panel` → `focus_panel` slip survives both.
+    #[gpui::test]
+    async fn test_double_click_summons_the_commit_panel(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
+        let (_project, git_graph, git_panel, mut cx) =
+            setup_graph_with_git_panel(&fs, three_commits(), cx).await;
+        let cx = &mut cx;
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-BODY").is_none(),
+            "the git panel's dock starts closed, so nothing is showing a commit"
+        );
+
+        // A real double click delivers click_count 1 and then 2, so the single
+        // click below is also the first half of the gesture under test.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(0, 1, Modifiers::none(), window, cx);
+        });
+        cx.run_until_parked();
+
+        git_panel.read_with(&*cx, |panel, _| {
+            assert_eq!(
+                panel.commit_tab_shas(),
+                [oid(1)],
+                "a single click still re-points the Commit tab"
+            );
+        });
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-BODY").is_none(),
+            "…but it must not open the panel — a single click retargets only"
+        );
+
+        let focused_before_summon = cx.update(|window, cx| window.focused(cx));
+
+        // Read focus back inside the same update, before the next draw: GPUI
+        // drops a focus whose handle is not in the rendered dispatch tree, and
+        // `GitPanel`'s is not while the Commit tab is up, so a `focus_panel`
+        // slip would be repaired by the following frame and invisible after it.
+        let focused_after_summon = git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(0, 2, Modifiers::none(), window, cx);
+            window.focused(cx)
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-BODY").is_some(),
+            "the double click summons the panel, so the commit is on screen"
+        );
+        git_panel.read_with(&*cx, |panel, _| {
+            assert_eq!(
+                panel.commit_tab_shas(),
+                [oid(1)],
+                "showing the row that was double-clicked"
+            );
+        });
+        assert_eq!(
+            focused_after_summon, focused_before_summon,
+            "the summon reveals the panel and moves nothing else — \
+             `Workspace::focus_panel` opens the same dock but sends the \
+             keyboard into it, and the next arrow step would then walk the \
+             panel instead of the log"
+        );
+    }
+
+    /// Double-clicking another row while the panel is already up retargets the
+    /// one Commit tab. It must not spawn a second surface — not another panel
+    /// in the dock, and not the `CommitView` pseudo-file the summon deliberately
+    /// leaves to `menu::Confirm`.
+    #[gpui::test]
+    async fn test_double_click_retargets_an_already_open_commit_panel(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
+        let (_project, git_graph, git_panel, mut cx) =
+            setup_graph_with_git_panel(&fs, three_commits(), cx).await;
+        let cx = &mut cx;
+        cx.run_until_parked();
+
+        let workspace = git_graph
+            .read_with(&*cx, |graph, _| graph.workspace.clone())
+            .upgrade()
+            .expect("the test workspace outlives the graph");
+
+        let docked_panels = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(&*cx, |workspace, cx| {
+                workspace
+                    .all_docks()
+                    .iter()
+                    .map(|dock| dock.read(cx).panels_len())
+                    .sum::<usize>()
+            })
+        };
+        let commit_views = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(&*cx, |workspace, cx| {
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .filter(|item| item.downcast::<CommitView>().is_some())
+                    .count()
+            })
+        };
+
+        let panels_before = docked_panels(cx);
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(0, 1, Modifiers::none(), window, cx);
+            graph.on_row_click(0, 2, Modifiers::none(), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-BODY").is_some(),
+            "the first double click opened the panel"
+        );
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(1, 1, Modifiers::none(), window, cx);
+            graph.on_row_click(1, 2, Modifiers::none(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-BODY").is_some(),
+            "the panel is still up after a second double click"
+        );
+        git_panel.read_with(&*cx, |panel, _| {
+            assert_eq!(
+                panel.commit_tab_shas(),
+                [oid(2)],
+                "and it describes the row that was double-clicked second — one \
+                 shared tab, retargeted, not two"
+            );
+        });
+        assert_eq!(
+            docked_panels(cx),
+            panels_before,
+            "summoning the panel must not add a panel to any dock"
+        );
+        assert_eq!(
+            commit_views(cx),
+            0,
+            "and it must still not open the commit pseudo-file"
         );
     }
 

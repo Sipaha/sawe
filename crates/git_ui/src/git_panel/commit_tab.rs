@@ -1645,7 +1645,16 @@ impl GitPanel {
         // commit named by a short one.
         let full_sha: SharedString = sha.to_string().into();
 
-        let mut body = v_flex().flex_1().size_full().min_h_0().overflow_hidden();
+        // Painted only when the git panel's dock is open, the git panel is that
+        // dock's active panel, and Commit is the active tab — which is exactly
+        // the conjunction "is the commit visible", so a paint assertion on this
+        // selector is the honest test of the graph's double-click summon.
+        let mut body = v_flex()
+            .debug_selector(|| "COMMIT-TAB-BODY".into())
+            .flex_1()
+            .size_full()
+            .min_h_0()
+            .overflow_hidden();
 
         let border = cx.theme().colors().border;
         // One switch for both halves of the tab's +/− figures. The setting is
