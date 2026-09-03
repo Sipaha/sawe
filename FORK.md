@@ -132,7 +132,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/ui/src/components/scrollbar.rs`, `crates/gpui/src/elements/div.rs` | **(decision #82)** `track_anchor` / `tracks_scroll_handle` + `nested_in_scroll_container`; gpui gains `Interactivity::tracked_scroll_handle()` and `PartialEq` for `ScrollHandle`. | `ui` / `gpui` |
 | `crates/git_ui/src/rollback_modal.rs` | **New.** IDEA's Rollback Changes dialog: checkbox tree over the affected files (reusing the git panel's `TreeViewState::build_tree_entries`), "N modified" summary, "Delete local copies of added files", Rollback / Close. Only checked files are rolled back. | `git_ui` |
 | `crates/workspace/src/mcp/windows.rs` | `windows.click_at` gained a `clicks` parameter — two separate calls are not a double click, so a handler branching on `click_count()` was untestable. Also `windows.resize` (content size in logical pixels): the headless window is fixed at 1920x1080, which hid the Solution band's status-bar overflow from every agent-driven check. It calls `Window::bounds_changed` after `Window::resize` because the headless platform window mutates its bounds without firing the resize callback. | `workspace` |
-| `crates/workspace/src/status_bar.rs` | `flex_none` on the 30px row — it silently absorbed the workspace column's overflow (default `flex-shrink: 1`) and an over-tall Solution band ate it. | `workspace` |
+| `crates/workspace/src/status_bar.rs` | `flex_none` on the row — it silently absorbed the workspace column's overflow (default `flex-shrink: 1`) and an over-tall Solution band ate it. The row is also ~10% taller than upstream's 30px (`STATUS_BAR_HEIGHT`), with its contents scaled to match by a rem override (decision 138). | `workspace` |
 | `crates/editor/src/split_connectors.rs` | Connector ribbons for the side-by-side diff. **(decision #62)** `ribbon_edges` gives a collapsed insertion edge the insertion rule's real 2px extent so the ribbon and the rule join flush. | `editor` |
 | `crates/editor/src/split.rs` | **(decision #79)** The left pane mirrors the right pane's `show_headers()` instead of guessing from `is_singleton()`. | `editor` |
 | `crates/git_ui/src/solo_diff_view.rs`, `crates/git_ui/src/project_diff.rs`, `crates/git_ui/src/commit_view.rs` | **(decision #78)** Diff toolbars lost every staging/commit button and gained the `N difference(s)` count (`difference_count_label` + `HunkCountCache`). | `git_ui` |
@@ -2836,3 +2836,44 @@ green because a test asserted the predicate and not its consequence. The paint t
 that with `VisualTestContext::debug_bounds`; the idiom, its precedents and its traps (including
 the one hole these tests still have) are in
 `docs/findings/2026-09-02-paint-tests-with-debug-bounds.md`.
+
+### 138. The status bar is scaled by one rem override, and the AI session tabs take their height from a button metric
+
+The maintainer asked for a status bar about 10% taller with its contents grown to match.
+The row height is one literal (`workspace::status_bar::STATUS_BAR_HEIGHT`, 30px → 33px), but
+"everything inside it" is not: the bar hosts a dozen items owned by a dozen crates
+(`search`, `go_to_line`, `diagnostics`, `language_tools`, `git_ui`, `remote_control_ui`,
+`solution_agent`, …), each sizing itself with `LabelSize` / `IconSize` / `ButtonSize` /
+`DynamicSpacing` tokens. Hand-bumping a token per item would have been a dozen edits that
+drift apart the first time one of those items is touched, and several of the sizes have no
+next token up.
+
+What makes the one-line version possible is that every one of those tokens resolves through
+`rems_from_px` — they are `Rems`, not `Pixels`, and `Rems` are resolved against the window's
+rem size *at layout time*. So `ui::utils::WithRemSize` (already in the tree, used by the agent
+panel, picker and `ContextMenu` to *reset* the rem inside a buffer-font subtree) wrapped
+around the bar with `ui_font_size * 1.1` scales labels, icons, button heights, padding and
+gaps by exactly one factor. Measured on real pixels: the bar band goes 30 rows → 33, and the
+"Remote Control" label 98×10px → 109×11px.
+
+Two things the override deliberately does not reach, and they are the reason it is safe:
+`ui::ContextMenu` re-establishes `ui_font_size` for its own subtree, so a right-click menu
+opened from the bar is normal size; and tooltips are prepainted at window level
+(`Window::prepaint_tooltip`), outside any rem override. Anything the bar renders that sizes
+itself in **absolute px** is invisible to the override and has to be converted by hand —
+`session_tab_strip`'s tab min/max widths were exactly that, and stayed at their old pixel
+widths while their labels grew until they moved to `rems_from_px`.
+
+How to apply: add a status-bar item in rem-based tokens and it scales for free. If you need a
+literal, write it as `rems_from_px(..)`. Anything sizing itself *against* the bar
+(`solution_agent::model::BAND_RESERVED_HEIGHT` is the one such consumer today) must be
+re-derived when `STATUS_BAR_HEIGHT` changes — the constant's doc comment names it.
+
+The same change removed the AI session tabs' close cross (closing is right-click → Close,
+which already ran the same `close_tab`), and that exposed a latent bug worth naming: the tab
+row's `h_full()` was **inert**, because no ancestor of a status-bar item has a definite
+height. The row's height had therefore always been an accident of its tallest child — the
+cross — so deleting the cross would have collapsed the pill onto the label with no vertical
+extent. The row now takes `ButtonSize::Default.rems()`, the same metric the `+` and overflow
+`IconButton`s next to it use, which both matches them and scales with the override.
+`h_full()` inside a status-bar item is a no-op; state the height.
