@@ -3,13 +3,42 @@ use crate::{
     sidebar_side_context_menu,
 };
 use gpui::{
-    Anchor, AnyView, App, Context, Decorations, Entity, IntoElement, ParentElement, Render,
+    Anchor, AnyView, App, Context, Decorations, Entity, IntoElement, ParentElement, Pixels, Render,
     SharedString, Styled, Subscription, WeakEntity, Window,
 };
 use settings::{SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
-use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
+use ui::{
+    ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu,
+    utils::WithRemSize,
+};
+
+/// The status bar's fixed row height. Sawe runs the bar ~10% taller than
+/// upstream's 30px (maintainer request, 2026-09-03) — see
+/// [`STATUS_BAR_UI_SCALE`] for the other half of that change, which grows the
+/// bar's *contents* by the same factor so the row still reads as one system.
+///
+/// Anything sizing itself against the status bar (e.g.
+/// `solution_agent::model::BAND_RESERVED_HEIGHT`) must be re-derived when this
+/// changes.
+pub const STATUS_BAR_HEIGHT: Pixels = px(33.);
+
+/// Rem multiplier applied to the status bar's whole subtree, so its contents
+/// grow with [`STATUS_BAR_HEIGHT`] rather than rattling around in a taller row.
+///
+/// Every UI metric inside the bar is expressed in rems — label sizes
+/// (`TextSize`), icon sizes (`IconSize`), button heights (`ButtonSize`) and
+/// padding/gaps (`DynamicSpacing`) all resolve through `rems_from_px` — so
+/// overriding the rem size for the subtree scales all of them by exactly one
+/// factor. The alternative was hand-bumping a dozen size tokens across the
+/// dozen crates that contribute status-bar items, which would drift the first
+/// time one of them was edited.
+///
+/// The multiplier deliberately does NOT leak into the popovers the bar opens:
+/// `ui::ContextMenu` re-establishes `ui_font_size` for its own subtree, and
+/// tooltips are prepainted at window level, outside any rem override.
+const STATUS_BAR_UI_SCALE: f32 = 1.1;
 
 /// Describes how a status-bar item can be hidden by the user.
 ///
@@ -111,9 +140,15 @@ impl Render for StatusBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
 
-        h_flex()
+        // `WithRemSize` instead of `h_flex()`: it is a `Div` underneath with an
+        // extra rem-size override wrapped around layout/prepaint/paint, so its
+        // own padding and gap scale together with its children's.
+        WithRemSize::new(theme::theme_settings(cx).ui_font_size(cx) * STATUS_BAR_UI_SCALE)
+            .flex()
+            .flex_row()
+            .items_center()
             .w_full()
-            .h(px(30.))
+            .h(STATUS_BAR_HEIGHT)
             // The status bar is a fixed-height row and must never be the thing
             // that yields when the workspace column overflows — without this it
             // shrinks silently (default `flex-shrink: 1`) and an over-tall

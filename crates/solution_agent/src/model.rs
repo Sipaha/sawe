@@ -1249,22 +1249,24 @@ pub const MAX_BAND_HEIGHT_FRACTION: f32 = 0.8;
 /// Window height the band must leave behind, in logical pixels, on top of
 /// the fraction cap. A pure fraction of the viewport is not enough on a
 /// short window: the band is a `flex_none` sibling of the project zone
-/// (`flex_1`, basis 0 — shrinks to 0 first) and of the status bar (30px
-/// but *shrinkable*, not `flex_none`), so an over-tall band zeroes the
-/// project zone and then eats into the status bar.
+/// (`flex_1`, basis 0 — shrinks to 0 first) and of the status bar
+/// (`workspace::status_bar::STATUS_BAR_HEIGHT`, 33px, but *shrinkable*, not
+/// `flex_none`), so an over-tall band zeroes the project zone and then eats
+/// into the status bar.
 ///
-/// Derivation: ~92px of chrome the band never gets — measured live at
+/// Derivation: ~95px of chrome the band never gets — measured live at
 /// 1280x384 as 61px above the band (the platform title bar plus the member
-/// tab row) and the 30px status bar below — and ~58px more so the project
+/// tab row) and the 33px status bar below — and ~58px more so the project
 /// zone is still an editor rather than a hairline. Re-derive this if any of
-/// those chrome heights change.
+/// those chrome heights change; the status bar grew 30px → 33px when its
+/// contents were scaled up (2026-09-03), which is the 150 → 153 here.
 ///
 /// This is a *coarse* guard, not the safety net: it cannot know the project
 /// zone's own content minimum. The layout invariant that actually keeps the
 /// status bar on screen is the `min_h_0` on the workspace column in
 /// `Workspace::render` plus the band being shrinkable — see the comments
 /// there.
-pub const BAND_RESERVED_HEIGHT: f32 = 150.0;
+pub const BAND_RESERVED_HEIGHT: f32 = 153.0;
 
 /// Clamp a stored band height into the range a row may hold. Mirrors
 /// `clamp_divider_ratio`, including the NaN fold: `f32::clamp` propagates
@@ -1284,7 +1286,7 @@ pub fn clamp_band_height(height: f32) -> f32 {
 /// not permanently shrink the user's saved geometry.
 pub fn effective_band_height(stored: f32, viewport_height: f32) -> f32 {
     // The `.max(MIN_BAND_HEIGHT)` is a deliberate floor, not an oversight:
-    // below roughly 290px of window (150 reserved + a 140px band) the two
+    // below roughly 293px of window (153 reserved + a 140px band) the two
     // constraints cannot both hold, and a usable band wins over a usable
     // project zone. At that size the window is unusable either way.
     let ceiling = (viewport_height * MAX_BAND_HEIGHT_FRACTION)

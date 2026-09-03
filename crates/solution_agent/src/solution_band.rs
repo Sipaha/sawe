@@ -791,7 +791,7 @@ mod tests {
     fn effective_band_height_caps_against_the_live_viewport() {
         assert_eq!(
             effective_band_height(600.0, 400.0),
-            250.0,
+            247.0,
             "a stored height above the ceiling of a small viewport is capped at \
              render, without touching the stored value"
         );
@@ -811,18 +811,18 @@ mod tests {
     #[test]
     fn effective_band_height_reserves_room_for_the_workspace_chrome() {
         // A 1366×768 laptop with the window tiled to the top half. The 0.8
-        // fraction alone would allow 307.2px, which plus the 30px status bar
+        // fraction alone would allow 307.2px, which plus the 33px status bar
         // overflows the 322px left under the title bar / toolbar / borders —
         // zeroing the project zone and squeezing the status bar to 15px.
         assert_eq!(
             effective_band_height(f32::MAX, 384.0),
-            234.0,
+            231.0,
             "the reserve, not the fraction, is what binds on a short window"
         );
         assert_eq!(
-            effective_band_height(f32::MAX, 750.0),
-            600.0,
-            "at the crossover the two ceilings agree (0.8 × 750 = 750 − 150)"
+            effective_band_height(f32::MAX, 765.0),
+            612.0,
+            "at the crossover the two ceilings agree (0.8 × 765 = 765 − 153)"
         );
         assert_eq!(
             effective_band_height(f32::MAX, 800.0),
@@ -831,7 +831,7 @@ mod tests {
         );
         assert_eq!(
             effective_band_height(f32::MAX, 700.0),
-            550.0,
+            547.0,
             "just below the crossover the reserve is the binding ceiling"
         );
         assert_eq!(
