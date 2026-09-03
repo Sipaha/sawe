@@ -996,6 +996,15 @@ impl ConsolePanel {
     /// `run_config_ui`'s — test constructors.
     pub fn observe_band_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(store) = SolutionAgentStore::try_global(cx) else {
+            // Not fatal — a window with no agent store has no band state to
+            // watch — but it silently costs this panel its auto-start for the
+            // window's whole life, so it must not be invisible. In the app the
+            // store is installed before any panel loads; reaching this in a
+            // real session means the install order regressed.
+            log::warn!(
+                "console panel: no SolutionAgentStore global; the band's \
+                 terminal auto-start is disabled for this window"
+            );
             return;
         };
         // Deferred, not read inline: `band_shows_this_panel` resolves the
@@ -1144,52 +1153,77 @@ impl ConsolePanel {
         self.pending_terminals_to_add += 1;
         let origin_cwd = task.cwd.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let project = workspace.read_with(cx, |workspace, cx| {
-                if !workspace.project().read(cx).supports_terminal(cx) {
-                    Err(anyhow!("terminal not yet supported for remote projects"))
-                } else {
-                    Ok(workspace.project().clone())
-                }
-            })??;
-            let terminal = project
-                .update(cx, |project, cx| project.create_terminal_task(task, cx))
-                .await?;
-            let terminal_view = workspace.update_in(cx, |workspace, window, cx| {
-                let view = cx.new(|cx| {
-                    TerminalView::new(
-                        terminal.clone(),
-                        workspace.weak_handle(),
-                        workspace.database_id(),
-                        workspace.project().downgrade(),
-                        window,
-                        cx,
-                    )
-                });
-                match reveal_strategy {
-                    RevealStrategy::Always => {
-                        reveal_utility_section(workspace, UtilityKind::Terminal, cx);
-                        if let Some(panel) = this.upgrade() {
-                            panel.focus_handle(cx).focus(window, cx);
+            // The body is an inner block so that the decrement below is
+            // sequenced AFTER it on every exit, `?` bailouts included (remote
+            // project, a failed `create_terminal_task`, a window that went
+            // away mid-spawn). Decrementing at the end of the happy path only
+            // — as this did — leaks the counter on those three paths, and the
+            // counter is half of `autostart_terminal_if_empty`'s "does this
+            // panel already have a terminal on the way" answer: one leaked
+            // increment silently disables the band's terminal auto-start for
+            // the rest of the window's life. Ordering matters the other way
+            // too, which is why this is not a guard that fires first: while
+            // the body runs, `tabs` is still empty and the counter is the only
+            // thing standing between a second band edge and a second shell.
+            let result: Result<WeakEntity<Terminal>> = {
+                let this = &this;
+                let cx = &mut *cx;
+                async move {
+                    let project = workspace.read_with(cx, |workspace, cx| {
+                        if !workspace.project().read(cx).supports_terminal(cx) {
+                            Err(anyhow!("terminal not yet supported for remote projects"))
+                        } else {
+                            Ok(workspace.project().clone())
                         }
-                    }
-                    RevealStrategy::NoFocus => {
-                        reveal_utility_section(workspace, UtilityKind::Terminal, cx);
-                    }
-                    RevealStrategy::Never => {}
+                    })??;
+                    let terminal = project
+                        .update(cx, |project, cx| project.create_terminal_task(task, cx))
+                        .await?;
+                    let terminal_view = workspace.update_in(cx, |workspace, window, cx| {
+                        let view = cx.new(|cx| {
+                            TerminalView::new(
+                                terminal.clone(),
+                                workspace.weak_handle(),
+                                workspace.database_id(),
+                                workspace.project().downgrade(),
+                                window,
+                                cx,
+                            )
+                        });
+                        match reveal_strategy {
+                            RevealStrategy::Always => {
+                                reveal_utility_section(workspace, UtilityKind::Terminal, cx);
+                                if let Some(panel) = this.upgrade() {
+                                    panel.focus_handle(cx).focus(window, cx);
+                                }
+                            }
+                            RevealStrategy::NoFocus => {
+                                reveal_utility_section(workspace, UtilityKind::Terminal, cx);
+                            }
+                            RevealStrategy::Never => {}
+                        }
+                        view
+                    })?;
+                    this.update(cx, |this, cx| {
+                        this.tabs.push(ConsoleTab::Terminal {
+                            view: terminal_view,
+                            origin_cwd,
+                        });
+                        this.active_index = Some(this.tabs.len() - 1);
+                        cx.notify();
+                        this.persist(cx);
+                    })?;
+                    Ok(terminal.downgrade())
                 }
-                view
-            })?;
-            this.update(cx, |this, cx| {
-                this.tabs.push(ConsoleTab::Terminal {
-                    view: terminal_view,
-                    origin_cwd,
-                });
-                this.active_index = Some(this.tabs.len() - 1);
+                .await
+            };
+            // An `Err` here means the panel itself is gone, so there is no
+            // counter left to correct — not a failure to report.
+            this.update(cx, |this, _cx| {
                 this.pending_terminals_to_add = this.pending_terminals_to_add.saturating_sub(1);
-                cx.notify();
-                this.persist(cx);
-            })?;
-            Ok(terminal.downgrade())
+            })
+            .ok();
+            result
         })
     }
 
@@ -1756,9 +1790,7 @@ mod tests {
     /// value: an entry that stops painting for some other reason is the same
     /// bug to the user.
     #[gpui::test]
-    async fn the_plus_menu_offers_terminals_and_tasks_but_no_ai_sessions(
-        cx: &mut TestAppContext,
-    ) {
+    async fn the_plus_menu_offers_terminals_and_tasks_but_no_ai_sessions(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let (_window_handle, panel) = bootstrap_panel(cx).await;
         let weak_panel = panel.downgrade();
@@ -2295,6 +2327,96 @@ mod tests {
         });
     }
 
+    /// A `SpawnInTerminal` whose command is an absolute path to no program,
+    /// so `Project::create_terminal_task` fails instead of handing back a
+    /// terminal: `spawn_task.command` becomes the PTY's program, and the
+    /// exec of a nonexistent one fails in `TerminalBuilder::new`.
+    ///
+    /// A nonexistent `cwd` was tried first and does NOT work — the terminal
+    /// falls back to another directory rather than erroring — so this must
+    /// stay keyed on the program, and the `outcome.is_err()` precondition
+    /// below is what stops a future change to that fallback from quietly
+    /// turning this into a happy-path test.
+    fn a_task_that_cannot_spawn() -> SpawnInTerminal {
+        SpawnInTerminal {
+            id: TaskId("console-panel-unspawnable".to_string()),
+            label: "unspawnable".to_string(),
+            full_label: "unspawnable".to_string(),
+            command: Some(
+                "/nonexistent-console-panel-program-for-the-failed-spawn-test".to_string(),
+            ),
+            ..SpawnInTerminal::default()
+        }
+    }
+
+    /// `pending_terminals_to_add` is not a statistic — it is half of
+    /// `autostart_terminal_if_empty`'s "does this panel already have a
+    /// terminal on the way" answer. So an increment that leaks on an error
+    /// path does not merely skew a number: it permanently convinces the panel
+    /// that a shell is coming, and the band's terminal half is handed to the
+    /// user empty for the rest of the window's life, with no log line to say
+    /// why. The three ways `add_terminal_task` can bail (remote project,
+    /// failed `create_terminal_task`, window gone mid-spawn) all used to skip
+    /// the decrement, because it sat at the end of the happy path.
+    ///
+    /// Asserted through the user-visible consequence — a later band edge must
+    /// still start a shell — and not only on the counter, because the counter
+    /// is an implementation detail and the auto-start is the promise.
+    #[gpui::test]
+    async fn a_failed_task_spawn_does_not_leak_the_pending_counter(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, solution_id) = bootstrap_band_and_panel(cx, true).await;
+        give_the_solution_a_member(cx, solution_id);
+        let band = band_of(&window_handle, cx);
+
+        let spawn = window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.add_terminal_task(
+                        a_task_that_cannot_spawn(),
+                        RevealStrategy::Never,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        let outcome = spawn.await;
+        cx.run_until_parked();
+
+        assert!(
+            outcome.is_err(),
+            "precondition: the task spawn has to actually fail, or this test \
+             is exercising the happy path it was written to avoid"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.tabs.is_empty(),
+                "precondition: a failed spawn adds no tab"
+            );
+            assert_eq!(
+                panel.pending_terminals_to_add, 0,
+                "the increment taken before the spawn must come back on the \
+                 error path too"
+            );
+        });
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Terminal, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tabs.len(),
+                1,
+                "a leaked counter reads as \"a terminal is already on the \
+                 way\" forever, so opening the empty terminal half after a \
+                 failed task run would silently start nothing"
+            );
+        });
+    }
+
     /// Why the auto-start is edge-driven and not a check in `render`: the
     /// panel stays mounted after its last tab closes, so a level-triggered
     /// check would instantly resurrect the terminal the user just closed and
@@ -2311,7 +2433,11 @@ mod tests {
         });
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.tabs.len(), 1, "precondition: the half auto-started one");
+            assert_eq!(
+                panel.tabs.len(),
+                1,
+                "precondition: the half auto-started one"
+            );
         });
 
         window_handle
