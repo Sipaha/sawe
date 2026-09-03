@@ -1644,7 +1644,7 @@ mod tests {
             .expect("a working-tree diff opens split");
 
         assert!(
-            cx.debug_bounds("GIT-BLAME-ENTRY").is_none(),
+            cx.debug_bounds("GIT-BLAME-ENTRY-LEFT").is_none(),
             "nothing is blamed before the user asks for it"
         );
 
@@ -1661,8 +1661,13 @@ mod tests {
             "the fixture's blame at HEAD must have reached the left pane's GitBlame"
         );
         assert!(
-            cx.debug_bounds("GIT-BLAME-ENTRY").is_some(),
+            cx.debug_bounds("GIT-BLAME-ENTRY-LEFT").is_some(),
             "the left pane reserves the blame column, so it must also paint in it"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ENTRY-RIGHT").is_none(),
+            "and that has to be a claim about the left pane, not about either \
+             one: blame was toggled on only that side"
         );
     }
 
@@ -1727,8 +1732,12 @@ mod tests {
             "the rebuilt pane's GitBlame must still resolve the base text's blame"
         );
         assert!(
-            cx.debug_bounds("GIT-BLAME-ENTRY").is_some(),
+            cx.debug_bounds("GIT-BLAME-ENTRY-LEFT").is_some(),
             "a pane split after the view joined the workspace must paint blame too"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ENTRY-RIGHT").is_none(),
+            "and that has to be the rebuilt left pane, not the right one"
         );
     }
 

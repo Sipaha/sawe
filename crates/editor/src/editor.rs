@@ -104,7 +104,7 @@ pub use editor_settings::{
 };
 pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
-    render_breadcrumb_text,
+    SplitSide, render_breadcrumb_text,
 };
 pub use git::blame::BlameRenderer;
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
@@ -151,7 +151,7 @@ use edit_prediction_types::{
     EditPredictionGranularity, SuggestionDisplayType,
 };
 use editor_settings::{GoToDefinitionFallback, Minimap as MinimapSettings};
-use element::{LineWithInvisibles, PositionMap, SplitSide, layout_line};
+use element::{LineWithInvisibles, PositionMap, layout_line};
 use futures::{
     FutureExt,
     future::{self, Shared},
@@ -10906,6 +10906,16 @@ impl Editor {
             self.split_side = side;
             cx.notify();
         }
+    }
+
+    /// Which pane of a split diff this editor is, or `None` when it is not in
+    /// one. Read by gutter decorations that a test has to attribute to a
+    /// specific pane: the painted-element map `VisualTestContext::debug_bounds`
+    /// searches is window-global and keyed by selector alone, so a decoration
+    /// both panes can draw has to name its side or the assertion cannot tell
+    /// them apart.
+    pub fn split_side(&self) -> Option<SplitSide> {
+        self.split_side
     }
 
     pub fn disable_code_lens(&mut self, cx: &mut Context<Self>) {

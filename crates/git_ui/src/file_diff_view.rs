@@ -341,10 +341,11 @@ impl Item for FileDiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Forwarded to the `SplittableEditor`, not past it to a single pane:
+        // its own hook re-points the workspace handle `SplittableEditor::split`
+        // later upgrades, and reaches both panes. See FORK.md #59.
         self.editor.update(cx, |editor, cx| {
-            editor.rhs_editor().update(cx, |editor, cx| {
-                editor.added_to_workspace(workspace, window, cx)
-            })
+            editor.added_to_workspace(workspace, window, cx)
         });
     }
 

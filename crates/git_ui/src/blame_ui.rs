@@ -5,7 +5,7 @@ use crate::{
     git_panel::OpenAtCommit,
 };
 use editor::{
-    BlameRenderer, Editor,
+    BlameRenderer, Editor, SplitSide,
     git::blame::BlameOptions,
     git::blame_colors::{ColorMode, author_color, date_color},
     hover_markdown_style,
@@ -165,7 +165,21 @@ impl BlameRenderer for GitBlameRenderer {
                 // laid out by a separate path that can bail. Only the painted
                 // tree tells the two apart, so this is the anchor a test asserts
                 // on (`VisualTestContext::debug_bounds`).
-                .debug_selector(|| "GIT-BLAME-ENTRY".into())
+                //
+                // Named per pane because that map is window-global and keyed by
+                // selector alone: one shared name would only ever prove *some*
+                // pane blamed, which stops being the question the moment a test
+                // turns blame on for both. Encoding the side beats measuring
+                // against the divider — no geometry to recompute when the split
+                // layout changes, and both sides can be asserted by name.
+                .debug_selector(|| {
+                    match editor.read(cx).split_side() {
+                        Some(SplitSide::Left) => "GIT-BLAME-ENTRY-LEFT",
+                        Some(SplitSide::Right) => "GIT-BLAME-ENTRY-RIGHT",
+                        None => "GIT-BLAME-ENTRY",
+                    }
+                    .into()
+                })
                 .child(
                     h_flex()
                         .id(("blame", ix))
