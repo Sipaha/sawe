@@ -2163,9 +2163,23 @@ mod tests {
             cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_some(),
             "row 0 opens the run, so it names the commit"
         );
+        // Both sides of row 3, not just the absent one: `GIT-BLAME-ROW-{ix}`
+        // is painted for head and continuation rows alike, so a regression
+        // that dropped the container — the childless-flex collapse, which
+        // takes the hover, the tooltip, the context menu and the click target
+        // with it — would satisfy every `is_none` below while painting
+        // nothing at all.
+        let continuation = cx
+            .debug_bounds("GIT-BLAME-ROW-RIGHT-3")
+            .expect("the row below the spacer still paints its gutter container");
+        assert!(
+            continuation.size.height > gpui::px(0.),
+            "and it covers its line rather than collapsing to nothing: {:?}",
+            continuation.size.height
+        );
         assert!(
             cx.debug_bounds("GIT-BLAME-META-RIGHT-3").is_none(),
-            "and the row below the spacer came from that same commit, so \
+            "while the row below the spacer came from that same commit, so \
              repeating its date and author under the spacer says nothing"
         );
         assert!(
@@ -2173,6 +2187,25 @@ mod tests {
             "nor is there a run boundary to mark below it"
         );
 
+        // The left pane's own continuation rows, both sides again: all four
+        // of its lines are one run, so three of them draw no metadata, and
+        // three empty containers are exactly what a collapse would look like
+        // to an `is_none`-only assertion.
+        for selector in [
+            "GIT-BLAME-ROW-LEFT-0",
+            "GIT-BLAME-ROW-LEFT-1",
+            "GIT-BLAME-ROW-LEFT-2",
+            "GIT-BLAME-ROW-LEFT-3",
+        ] {
+            let row = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} paints its gutter container"));
+            assert!(
+                row.size.height > gpui::px(0.),
+                "{selector} covers its line rather than collapsing: {:?}",
+                row.size.height
+            );
+        }
         assert!(
             cx.debug_bounds("GIT-BLAME-META-LEFT-0").is_some()
                 && cx.debug_bounds("GIT-BLAME-META-LEFT-1").is_none()

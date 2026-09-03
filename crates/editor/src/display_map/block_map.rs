@@ -476,6 +476,11 @@ impl Block {
     /// consumer working from row info alone cannot tell such a row from a
     /// header; this is the distinction, and it is the block map's to make.
     /// See [`crate::git::blame::blame_run_positions`].
+    ///
+    /// Not to be confused with [`BlockStyle::Spacer`], one word away: that is
+    /// a *layout* style, and `crate::code_lens` gives it to a `Block::Custom`
+    /// that renders a real code lens. Such a block correctly does not get this
+    /// flag — it stands for something, so it should sever.
     pub fn is_alignment_only(&self) -> bool {
         match self {
             Block::Custom(_) => false,
