@@ -11,11 +11,12 @@
 
 use gpui::{
     App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, Styled, Window, div, rems,
+    IntoElement, ParentElement, Render, SharedString, Styled, WeakEntity, Window, div, rems,
 };
 use ui::prelude::*;
 use ui::{Label, LabelSize};
-use workspace::ModalView;
+use util::ResultExt as _;
+use workspace::{ModalView, Workspace};
 
 use crate::model::{SolutionSessionId, SolutionSessionMetadata};
 use crate::status_row::{format_tokens_compact, relative_time_short};
@@ -35,9 +36,7 @@ pub struct ReopenableSession {
 }
 
 impl ReopenableSession {
-    /// Build a row from a DB metadata record. Kept here so the console
-    /// panel (which queries `list_closed_sessions`) doesn't need to know the
-    /// row shape.
+    /// Build a row from a DB metadata record.
     pub fn from_metadata(meta: &SolutionSessionMetadata) -> Self {
         Self {
             id: meta.id,
@@ -47,6 +46,45 @@ impl ReopenableSession {
             last_activity_at: meta.last_activity_at,
         }
     }
+}
+
+/// Open the reopen-a-closed-chat picker over `weak_workspace`.
+///
+/// Lives here, next to the modal, rather than on whatever surface offers the
+/// entry point: it used to be a `ConsolePanel` method, but the console
+/// panel's `+` no longer offers AI-session entries at all (AI sessions live
+/// on the status-bar session tab strip), and `solution_agent` cannot depend
+/// on `console_panel` to call back into it — that edge already runs the other
+/// way. Closed sessions live only on disk, so the list is queried
+/// asynchronously and the modal is toggled once it resolves.
+pub fn open_reopen_session_modal(
+    weak_workspace: &WeakEntity<Workspace>,
+    solution_id: SolutionId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = weak_workspace.upgrade() else {
+        return;
+    };
+    // The query already returns top-level closed rows ordered
+    // most-recently-active first, each carrying the token total +
+    // last-activity time the rows display.
+    let store = SolutionAgentStore::global(cx);
+    let closed = store.update(cx, |store, cx| store.list_closed_sessions(solution_id, cx));
+    window
+        .spawn(cx, async move |cx| {
+            let metas = closed.await.log_err().unwrap_or_default();
+            let sessions: Vec<ReopenableSession> =
+                metas.iter().map(ReopenableSession::from_metadata).collect();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.toggle_modal(window, cx, move |window, cx| {
+                        ReopenSessionModal::new(sessions, window, cx)
+                    });
+                })
+                .log_err();
+        })
+        .detach();
 }
 
 pub struct ReopenSessionModal {

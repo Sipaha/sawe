@@ -7,7 +7,6 @@ use gpui::{
     Entity, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, Pixels, Point,
     Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
 };
-use solution_agent::reopen_session_modal::{ReopenSessionModal, ReopenableSession};
 use solution_agent::solution_band::SolutionBand;
 use solution_agent::store::SolutionAgentStore;
 use solutions::{MemberId, SolutionId, SolutionStore};
@@ -21,7 +20,48 @@ use util::ResultExt as _;
 use workspace::{Item, UtilityKind, Workspace, WorkspaceDb};
 
 use crate::TerminalProvider;
-use crate::actions::NewChat;
+
+/// Build the console panel's `+` menu. A free function rather than an inline
+/// closure inside [`ConsolePanel::render_plus_popover`] so a paint test can
+/// render exactly the menu the popover renders and read its `MENU_ITEM-*`
+/// debug selectors — the entries themselves are what regressed (the panel
+/// used to offer "New AI Chat" and "Reopen Closed Chat…" here, duplicating /
+/// misplacing affordances that belong to the status-bar session tab strip),
+/// and asserting a predicate instead of the paint would not have caught it.
+///
+/// AI-session entries deliberately do NOT belong here: chat creation lives on
+/// `solution_agent::session_tab_strip`'s own `+`, which is where AI sessions
+/// now live. This menu is terminal/task only.
+fn build_plus_menu(
+    panel: WeakEntity<ConsolePanel>,
+    has_project: bool,
+    active_path: Option<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, move |menu, _, _| {
+        // New Terminal in the active project's folder. Disabled when there's
+        // no active project (empty / no solution) — there's nowhere to run it.
+        let label = if has_project {
+            "New Terminal"
+        } else {
+            "New Terminal (no project)"
+        };
+        menu.item(
+            ui::ContextMenuEntry::new(label)
+                .disabled(!has_project)
+                .handler(move |window, cx| {
+                    if let Some(panel) = panel.upgrade() {
+                        panel.update(cx, |panel, cx| {
+                            panel.add_terminal_tab(active_path.clone(), window, cx);
+                        });
+                    }
+                }),
+        )
+        .separator()
+        .action("Spawn Task…", zed_actions::Spawn::modal().boxed_clone())
+    })
+}
 
 /// Resolve the active solution for a workspace by walking its worktrees and
 /// matching against the global `SolutionStore`. Mirrors
@@ -738,11 +778,8 @@ impl ConsolePanel {
 
     fn render_plus_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_solution_id = self.active_solution_id(cx);
-        let has_active_solution = active_solution_id.is_some();
         // New terminals open in the active project's folder (the project
-        // selected in the project tab strip). New chats are solution-scoped
-        // and always root at `solution.root` — handled entirely by the
-        // `NewChat` action (`console_panel.rs`), not here.
+        // selected in the project tab strip).
         let active_path = active_solution_id.and_then(|id| active_member_path(id, cx));
         // A terminal needs a project directory to run in. An empty solution has
         // no member project, so grey out "New Terminal" (the action handlers
@@ -771,65 +808,13 @@ impl ConsolePanel {
                 )
                 .anchor(Anchor::TopLeft)
                 .menu(move |window, cx| {
-                    let active_path = active_path.clone();
-                    let weak_self = weak_self.clone();
-                    Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                        // New Terminal in the active project's folder. Disabled
-                        // when there's no active project (empty / no solution) —
-                        // there's nowhere to run it.
-                        let menu = {
-                            let weak_self = weak_self.clone();
-                            let cwd = active_path.clone();
-                            let label = if has_project {
-                                "New Terminal"
-                            } else {
-                                "New Terminal (no project)"
-                            };
-                            menu.item(
-                                ui::ContextMenuEntry::new(label)
-                                    .disabled(!has_project)
-                                    .handler(move |window, cx| {
-                                        if let Some(panel) = weak_self.upgrade() {
-                                            panel.update(cx, |panel, cx| {
-                                                panel.add_terminal_tab(cwd.clone(), window, cx);
-                                            });
-                                        }
-                                    }),
-                            )
-                        };
-                        // New AI Chat: dispatches the same `NewChat` action the
-                        // status-bar session tab strip's own "+" button uses
-                        // (`solution_agent::session_tab_strip`), so chat
-                        // creation has exactly one code path regardless of
-                        // which "+" menu triggered it — two paths disagreeing
-                        // on a new chat's cwd was the phase-1 Critical. The
-                        // handler itself no-ops without an active solution;
-                        // grey the entry out for the same reason here.
-                        let menu = menu.action_disabled_when(
-                            !has_active_solution,
-                            "New AI Chat",
-                            NewChat.boxed_clone(),
-                        );
-                        // Reopen a chat that was closed but still lives on disk.
-                        // Solution-scoped like New AI Chat above — needs an
-                        // active solution, not a member project.
-                        let menu = {
-                            let weak_self = weak_self.clone();
-                            menu.item(
-                                ui::ContextMenuEntry::new("Reopen Closed Chat…")
-                                    .disabled(!has_active_solution)
-                                    .handler(move |window, cx| {
-                                        if let Some(panel) = weak_self.upgrade() {
-                                            panel.update(cx, |panel, cx| {
-                                                panel.open_reopen_session_modal(window, cx);
-                                            });
-                                        }
-                                    }),
-                            )
-                        };
-                        menu.separator()
-                            .action("Spawn Task…", zed_actions::Spawn::modal().boxed_clone())
-                    }))
+                    Some(build_plus_menu(
+                        weak_self.clone(),
+                        has_project,
+                        active_path.clone(),
+                        window,
+                        cx,
+                    ))
                 }),
         )
     }
@@ -1510,54 +1495,6 @@ impl ConsolePanel {
         });
     }
 
-    /// Reopen-a-closed-chat flow. Hydrates the active solution's
-    /// on-disk sessions, gathers the top-level ones that aren't currently
-    /// pinned in the strip (closed tabs whose transcript survives), and
-    /// opens a picker. Selecting a session re-pins it via
-    /// `SolutionAgentStore::open_session_in_strip` — the same "open" path
-    /// create and the wire RPC use — so the tab lands through the normal
-    /// `TabsChanged` writer.
-    ///
-    /// Deliberately kept in `ConsolePanel`'s "+" popover even though chat
-    /// tabs left the panel for the Solution band (phase 2a task 5): unlike
-    /// `add_chat_tab`, this flow never builds a `ConsoleTab` — it only reads
-    /// the store and opens a modal — so it has no replacement to migrate to
-    /// and no reason to move. `Rename Session` / `Restart Agent`, which used
-    /// to live on the (now-deleted) chat tab's right-click menu, have no
-    /// such home any more; both remain reachable via the
-    /// `solution_agent.{rename_session,restart_agent}` MCP tools but not
-    /// from a desktop click path until a future task gives the status-bar
-    /// `SessionTabStrip` (`solution_agent::session_tab_strip`) its own
-    /// context menu.
-    fn open_reopen_session_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(solution_id) = self.active_solution_id(cx) else {
-            return;
-        };
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        // Closed sessions live only on disk (close_session evicts them from
-        // memory), so the picker reads them straight from the DB. The query
-        // already returns top-level closed rows ordered most-recently-active
-        // first, each carrying the token total + last-activity time the rows
-        // display.
-        let store = SolutionAgentStore::global(cx);
-        let closed = store.update(cx, |store, cx| store.list_closed_sessions(solution_id, cx));
-        cx.spawn_in(window, async move |_this, cx| {
-            let metas = closed.await.log_err().unwrap_or_default();
-            let sessions: Vec<ReopenableSession> =
-                metas.iter().map(ReopenableSession::from_metadata).collect();
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.toggle_modal(window, cx, move |window, cx| {
-                        ReopenSessionModal::new(sessions, window, cx)
-                    });
-                })
-                .log_err();
-        })
-        .detach();
-    }
-
     fn render_active_tab(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let scope_flags = self.tab_scope_flags(cx);
         let Some(ix) = effective_active_index(&scope_flags, self.active_index) else {
@@ -1718,6 +1655,7 @@ async fn wait_for_terminals_tasks(
 mod tests {
     use super::*;
     use crate::ToggleFocus;
+    use crate::actions::NewChat;
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use settings::SettingsStore;
@@ -1793,6 +1731,59 @@ mod tests {
         // a legacy chat row, none of which the panel can restore any more
         // (chat tabs left `ConsolePanel` for the Solution band).
         assert!(!restore_may_reconcile(5, 0));
+    }
+
+    /// Window root that paints exactly the `ContextMenu`
+    /// [`ConsolePanel::render_plus_popover`] builds, so `debug_bounds` can
+    /// read its `MENU_ITEM-*` entries. The popover itself is not driven here
+    /// (its trigger needs a laid-out panel inside a dock); the menu is the
+    /// thing under test and `build_plus_menu` is the single source both use.
+    struct PlusMenuPaintHarness {
+        menu: Entity<ContextMenu>,
+    }
+
+    impl Render for PlusMenuPaintHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.menu.clone())
+        }
+    }
+
+    /// The console panel's `+` is terminals and tasks only. "New AI Chat" was
+    /// pure duplication of the status-bar session strip's own `+`, and
+    /// "Reopen Closed Chat…" moved onto that strip with the sessions it
+    /// recovers (`solution_agent::session_tab_strip::build_plus_menu`).
+    /// Asserted on the painted tree rather than on the builder's return
+    /// value: an entry that stops painting for some other reason is the same
+    /// bug to the user.
+    #[gpui::test]
+    async fn the_plus_menu_offers_terminals_and_tasks_but_no_ai_sessions(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let (_window_handle, panel) = bootstrap_panel(cx).await;
+        let weak_panel = panel.downgrade();
+
+        let (_harness, cx) = cx.add_window_view(|window, cx| PlusMenuPaintHarness {
+            menu: build_plus_menu(weak_panel, true, None, window, cx),
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("MENU_ITEM-New Terminal").is_some(),
+            "the `+` menu must still create a terminal"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Spawn Task…").is_some(),
+            "the `+` menu must still spawn a task"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-New AI Chat").is_none(),
+            "AI chat creation belongs to the status-bar session tab strip's `+`"
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Reopen Closed Chat…").is_none(),
+            "reopening a closed chat moved to the status-bar session tab strip's `+`"
+        );
     }
 
     /// `solution_agent::session_tab_strip`'s trailing `+` button dispatches
