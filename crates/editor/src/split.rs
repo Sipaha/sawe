@@ -797,6 +797,26 @@ impl SplittableEditor {
             editor.set_render_diff_hunk_controls(render_diff_hunk_controls, cx);
         });
 
+        // The left pane is built here, not handed to the workspace as an item,
+        // so nothing else ever calls `Item::added_to_workspace` on it — that
+        // hook reaches the consumer's item and, through it, at most the right
+        // pane. `Self::added_to_workspace` covers a left pane that already
+        // exists, which is only true when the consumer's item was added after
+        // this ran; a pane split later (or one whose consumer forwards the hook
+        // straight to `rhs_editor`) is left without a workspace handle.
+        //
+        // An editor without one does not fail loudly: element layout that needs
+        // the workspace bails with `?`. Git blame is the case that bit — the
+        // gutter still reserves the author column, because that width is priced
+        // off `GitBlame`'s entries, while `layout_blame_entries` returns before
+        // building a single annotation. The pane's text shifts right and the
+        // column stays empty.
+        workspace.update(cx, |workspace, cx| {
+            lhs_editor.update(cx, |editor, cx| {
+                editor.added_to_workspace(workspace, window, cx);
+            });
+        });
+
         let mut subscriptions = vec![cx.subscribe_in(
             &lhs_editor,
             window,

@@ -999,10 +999,12 @@ impl Item for SoloDiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Forwarded to the `SplittableEditor`, not straight to its right pane:
+        // its own hook re-points the handle it splits with and reaches *both*
+        // panes, which is what every sibling diff view does. Reaching past it
+        // left the left pane on whatever workspace it was born with.
         self.editor.update(cx, |editor, cx| {
-            editor.rhs_editor().update(cx, |editor, cx| {
-                editor.added_to_workspace(workspace, window, cx)
-            })
+            editor.added_to_workspace(workspace, window, cx)
         });
     }
 
@@ -1584,6 +1586,150 @@ mod tests {
         let view = open.await;
         cx.run_until_parked();
         view
+    }
+
+    fn blame_entry_at(row: u32, author: &str) -> ::git::blame::BlameEntry {
+        ::git::blame::BlameEntry {
+            sha: ::git::Oid::from_bytes(&[0xaa; 20]).expect("twenty bytes is a valid oid"),
+            range: row..row + 1,
+            original_line_number: row + 1,
+            author: Some(author.to_string()),
+            author_mail: None,
+            author_time: Some(1_700_000_000),
+            author_tz: None,
+            committer_name: Some(author.to_string()),
+            committer_email: None,
+            committer_time: Some(1_700_000_000),
+            committer_tz: None,
+            summary: Some("a commit".to_string()),
+            previous: None,
+            filename: "a.rs".to_string(),
+        }
+    }
+
+    /// Blame on the left pane of a working-tree diff has to *paint*, not merely
+    /// be permitted: the gutter reserves the blame column from
+    /// `GitBlame::max_author_display_columns` while the annotations themselves
+    /// are laid out by `EditorElement::layout_blame_entries`, which bails out
+    /// when the editor has no workspace. The two used to disagree here — the
+    /// column appeared, ~170px of text shifted right, and nothing was drawn in
+    /// it — so this asserts the painted tree rather than the predicate.
+    #[gpui::test]
+    async fn test_the_left_pane_paints_blame_for_a_working_tree_diff(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        context.fs.set_blame_at_revision_for_repo(
+            Path::new(path!("/project/.git")),
+            "HEAD",
+            vec![(
+                repo_path("a.rs"),
+                ::git::blame::Blame {
+                    entries: vec![
+                        blame_entry_at(0, "Tester"),
+                        blame_entry_at(1, "Tester"),
+                        blame_entry_at(2, "Tester"),
+                    ],
+                    ..Default::default()
+                },
+            )],
+        );
+
+        let view = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+
+        let splittable = view.read_with(&cx, |view, _| view.editor.clone());
+        let lhs = splittable
+            .read_with(&cx, |editor, _| editor.lhs_editor().cloned())
+            .expect("a working-tree diff opens split");
+
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ENTRY").is_none(),
+            "nothing is blamed before the user asks for it"
+        );
+
+        lhs.update_in(&mut cx, |editor, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.toggle_git_blame(&::git::Blame, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            lhs.read_with(&cx, |editor, cx| editor
+                .blame()
+                .is_some_and(|blame| blame.read(cx).has_generated_entries())),
+            "the fixture's blame at HEAD must have reached the left pane's GitBlame"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ENTRY").is_some(),
+            "the left pane reserves the blame column, so it must also paint in it"
+        );
+    }
+
+    /// The same assertion for a left pane created *after* the view joined the
+    /// workspace: Unified and back to Split rebuilds it from scratch, and the
+    /// `Item::added_to_workspace` hook has long since fired, so the rebuilt pane
+    /// only has a workspace if `SplittableEditor::split` gives it one. Every
+    /// consumer of a split diff reaches this path through the toolbar's
+    /// Unified/Split toggle, not just this view.
+    #[gpui::test]
+    async fn test_a_re_split_left_pane_still_paints_blame(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        context.fs.set_blame_at_revision_for_repo(
+            Path::new(path!("/project/.git")),
+            "HEAD",
+            vec![(
+                repo_path("a.rs"),
+                ::git::blame::Blame {
+                    entries: vec![
+                        blame_entry_at(0, "Tester"),
+                        blame_entry_at(1, "Tester"),
+                        blame_entry_at(2, "Tester"),
+                    ],
+                    ..Default::default()
+                },
+            )],
+        );
+
+        let view = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+
+        let splittable = view.read_with(&cx, |view, _| view.editor.clone());
+        splittable.update_in(&mut cx, |editor, window, cx| {
+            editor.toggle_split(&editor::ToggleSplitDiff, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            splittable.read_with(&cx, |editor, _| editor.lhs_editor().is_none()),
+            "the first toggle collapses the diff to a single pane"
+        );
+
+        splittable.update_in(&mut cx, |editor, window, cx| {
+            editor.toggle_split(&editor::ToggleSplitDiff, window, cx);
+        });
+        cx.run_until_parked();
+        let lhs = splittable
+            .read_with(&cx, |editor, _| editor.lhs_editor().cloned())
+            .expect("the second toggle rebuilds the left pane");
+
+        lhs.update_in(&mut cx, |editor, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.toggle_git_blame(&::git::Blame, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            lhs.read_with(&cx, |editor, cx| editor
+                .blame()
+                .is_some_and(|blame| blame.read(cx).has_generated_entries())),
+            "the rebuilt pane's GitBlame must still resolve the base text's blame"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ENTRY").is_some(),
+            "a pane split after the view joined the workspace must paint blame too"
+        );
     }
 
     fn open_view_count(context: &DiffTestContext, cx: &mut VisualTestContext) -> usize {

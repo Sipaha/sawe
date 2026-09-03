@@ -159,6 +159,13 @@ impl BlameRenderer for GitBlameRenderer {
         Some(
             div()
                 .mr_2()
+                // A gutter that reserves the blame column and paints nothing in
+                // it looks identical to one that has no blame — the reservation
+                // is priced from the entries while the entries themselves are
+                // laid out by a separate path that can bail. Only the painted
+                // tree tells the two apart, so this is the anchor a test asserts
+                // on (`VisualTestContext::debug_bounds`).
+                .debug_selector(|| "GIT-BLAME-ENTRY".into())
                 .child(
                     h_flex()
                         .id(("blame", ix))
