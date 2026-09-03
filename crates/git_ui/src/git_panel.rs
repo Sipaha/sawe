@@ -6593,6 +6593,12 @@ impl Render for GitPanel {
 
         v_flex()
             .id("git_panel")
+            // "The panel is on screen" has no tab-independent selector
+            // otherwise: `COMMIT-TAB-BODY` only exists while the Commit tab is
+            // the active one, so a test about a summon that lands on the
+            // Changes tab cannot tell "the dock never opened" apart from "the
+            // dock opened on Changes" without this.
+            .debug_selector(|| "GIT-PANEL-BODY".into())
             .key_context(self.dispatch_context(window, cx))
             .track_focus(&self.focus_handle)
             .when(has_write_access && !project.is_read_only(cx), |this| {

@@ -3194,6 +3194,18 @@ would make double-clicking down a log a one-way trip, since the graph would lose
 navigation that makes walking it possible. And a summon still cannot multiply surfaces: the
 Commit tab is a single `Option` on the panel, so summoning twice produces one tab.
 
+The file-history view's synthetic *Local changes* row at view-index 0 shares the gesture:
+`on_row_click` does not special-case it, so double-clicking it summons the panel too. That
+arrived as a side effect of the `click_count` branch above and was flagged as unowned, but the
+maintainer ruled it intentional and it is now pinned by
+`test_double_clicking_the_local_changes_row_summons_the_panel`. It is coherent rather than
+merely tolerated, because of what the summoned panel shows: row 0 has no commit, so
+`selected_commit_shas` comes back empty, `push_selection_to_git_panel` takes its
+`close_commit_tab` arm, and `close_commit_tab` yanks the active tab back to **Changes** — the
+surface a working-tree change belongs to. There is no stale-commit case to worry about: with the
+Commit tab genuinely up and describing a commit, double-clicking the local row closes it rather
+than leaving it pointed at the row above.
+
 What the gesture must still **not** do is open the synthetic `CommitView` pseudo-file. That is
 the behaviour a double click had before it was removed as too easy to hit while walking a log,
 and it stays reachable only through `menu::Confirm` and `git_graph::OpenCommitView`. The rest of
@@ -3202,7 +3214,10 @@ nothing when nothing is open.
 
 How to apply: assert a summon on the **painted tree**, not on `commit_tab_is_open()` — that
 predicate is true for an invisible tab inside a closed dock, so a test written against it passes
-with the dock never opening at all (the tests use a `COMMIT-TAB-BODY` selector instead). And read
+with the dock never opening at all (the tests use a `COMMIT-TAB-BODY` selector instead). A summon
+that lands on the *Changes* tab needs a different selector again: `COMMIT-TAB-BODY` is absent both
+when the dock never opened and when it opened on Changes, so `GitPanel::render` carries a
+tab-independent `GIT-PANEL-BODY` selector for exactly that distinction. And read
 a focus assertion back *inside the same update*, before the next draw: GPUI drops a focus whose
 handle is not in the rendered dispatch tree, and `GitPanel`'s is not while the Commit tab is up,
 so an accidental `open_panel` → `focus_panel` slip is repaired by the following frame and

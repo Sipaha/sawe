@@ -7755,6 +7755,125 @@ mod tests {
         );
     }
 
+    /// The synthetic *Local changes* row at view-index 0 shares the double-click
+    /// summon with the commit rows, deliberately (decision #143 — the maintainer
+    /// approved it after it arrived as a side effect). `on_row_click` does not
+    /// special-case it, and this pins the consequence.
+    ///
+    /// The interesting half is what the summoned panel then shows. Row 0 has no
+    /// commit, so `selected_commit_shas` comes back empty and the push that
+    /// rides along with the summon **closes** the Commit tab rather than leaving
+    /// it pointed at the previous row — `close_commit_tab` yanks the panel back
+    /// to Changes, which is the surface a working-tree change belongs to. The
+    /// last leg is the one that proves it: it double-clicks a real commit first,
+    /// so the Commit tab is genuinely up and describing something when the local
+    /// row is clicked again.
+    ///
+    /// Asserted on the painted tree, against `GIT-PANEL-BODY` rather than
+    /// `COMMIT-TAB-BODY` — the latter is absent both when the dock never opened
+    /// and when it opened on Changes, which is precisely the distinction this
+    /// test exists to make.
+    #[gpui::test]
+    async fn test_double_clicking_the_local_changes_row_summons_the_panel(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let oid = |byte: u8| Oid::from_bytes(&[byte; 20]).expect("valid oid");
+        let (_project, git_graph, git_panel, mut cx) =
+            setup_graph_with_git_panel(&fs, three_commits(), cx).await;
+        let cx = &mut cx;
+
+        git_graph.update_in(cx, |graph, _window, _cx| {
+            graph.log_source = LogSource::Path(RepoPath::new(&"file.txt").expect("valid path"));
+            graph.file_history_options.with_local_changes = true;
+            assert!(graph.has_local_changes_row());
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("GIT-PANEL-BODY").is_none(),
+            "the git panel's dock starts closed"
+        );
+
+        // A real double click delivers click_count 1 and then 2, so the single
+        // click below is also the first half of the gesture under test.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(0, 1, Modifiers::none(), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("GIT-PANEL-BODY").is_none(),
+            "a single click on the local-changes row retargets only, as on any \
+             other row — it must not summon"
+        );
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(0, 2, Modifiers::none(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("GIT-PANEL-BODY").is_some(),
+            "the double click summons the panel from the local-changes row too"
+        );
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-BODY").is_none(),
+            "…and what it reveals is not a commit: row 0 has none to describe"
+        );
+        git_panel.read_with(&*cx, |panel, _| {
+            assert!(!panel.commit_tab_is_open());
+            assert!(
+                !panel.commit_tab_is_active(),
+                "the summoned panel lands on the Changes tab"
+            );
+        });
+        git_graph.read_with(&*cx, |graph, _| {
+            assert_eq!(
+                graph.selected_entry_idx,
+                Some(0),
+                "and the row the user double-clicked stays selected"
+            );
+        });
+
+        // The other side of the gesture: one row down it still reveals a commit,
+        // so the assertions above describe the local-changes row and not a
+        // summon that quietly stopped working.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(1, 1, Modifiers::none(), window, cx);
+            graph.on_row_click(1, 2, Modifiers::none(), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-BODY").is_some(),
+            "double-clicking a commit row reveals the Commit tab"
+        );
+        git_panel.read_with(&*cx, |panel, _| {
+            assert_eq!(panel.commit_tab_shas(), [oid(1)]);
+        });
+
+        // Back to the local row with the Commit tab genuinely up: the tab is
+        // closed, not left describing the commit above it.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.on_row_click(0, 1, Modifiers::none(), window, cx);
+            graph.on_row_click(0, 2, Modifiers::none(), window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("GIT-PANEL-BODY").is_some(),
+            "the panel stays up"
+        );
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-BODY").is_none(),
+            "and the Commit tab is gone rather than still showing the commit \
+             that was selected a moment ago"
+        );
+        git_panel.read_with(&*cx, |panel, _| {
+            assert!(panel.commit_tab_shas().is_empty());
+        });
+    }
+
     fn rows(indices: impl IntoIterator<Item = usize>) -> HashSet<usize> {
         HashSet::from_iter(indices)
     }
