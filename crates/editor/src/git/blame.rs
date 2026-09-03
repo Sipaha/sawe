@@ -1,6 +1,7 @@
-use crate::Editor;
+use crate::display_map::DisplaySnapshot;
 use crate::git::blame_colors::ColorMode;
 use crate::git::blame_filters::AuthorFilter;
+use crate::{DisplayRow, Editor};
 use anyhow::{Context as _, Result};
 use collections::HashMap;
 
@@ -145,9 +146,16 @@ pub enum BlameRunPosition {
 /// same length as `rows` and positionally aligned with it; a row with no blame
 /// entry gets no position. Rows past the end of `blamed_rows` are treated as
 /// unblamed rather than panicking on the index.
+///
+/// `alignment_rows` is aligned with `rows` too and flags the rows that belong
+/// to a block the block map inserted purely to keep this pane level with its
+/// companion — see [`crate::display_map::Block::is_alignment_only`] and
+/// [`blame_run_positions_in_viewport`], which derives it. A shorter slice
+/// reads as "not an alignment row", which is the pre-split behaviour.
 pub fn blame_run_positions(
     rows: &[RowInfo],
     blamed_rows: &[Option<(BufferId, BlameEntry)>],
+    alignment_rows: &[bool],
 ) -> Vec<Option<BlameRunPosition>> {
     // Positional alignment is the whole basis of the classification: a
     // `blamed_rows` that drifted out of step with `rows` would silently make
@@ -156,6 +164,11 @@ pub fn blame_run_positions(
         rows.len(),
         blamed_rows.len(),
         "blame_run_positions expects `blame_for_rows(rows)`, aligned with `rows`"
+    );
+    debug_assert_eq!(
+        rows.len(),
+        alignment_rows.len(),
+        "blame_run_positions expects one alignment flag per row of `rows`"
     );
 
     // The previous *blamed* row's identity, or `None` when the run was broken
@@ -168,12 +181,16 @@ pub fn blame_run_positions(
             let Some((buffer_id, entry)) = blamed_rows.get(ix).and_then(Option::as_ref) else {
                 // A block row (excerpt header, diff-hunk controls, folded-buffer
                 // header) is the one unblamed row that severs a run: it is real
-                // vertical space between the two lines. A soft-wrap
-                // continuation is the same line still, so it must not.
-                // Every other unblamed row keeps its `buffer_row`, so the
-                // adjacency check below already sees the gap it leaves.
+                // vertical space standing for something between the two lines.
+                // An alignment spacer is the exception — it stands for text on
+                // the *other* side of a split diff, so severing on it would let
+                // the two panes cut one commit's run in different places. A
+                // soft-wrap continuation is the same line still, so it must not
+                // sever either. Every other unblamed row keeps its `buffer_row`,
+                // so the adjacency check below already sees the gap it leaves.
                 let is_block_row = info.buffer_id.is_none() && info.wrapped_buffer_row.is_none();
-                if is_block_row {
+                let is_alignment_row = alignment_rows.get(ix).copied().unwrap_or(false);
+                if is_block_row && !is_alignment_row {
                     previous = None;
                 }
                 return None;
@@ -194,6 +211,37 @@ pub fn blame_run_positions(
             Some(position)
         })
         .collect()
+}
+
+/// [`blame_run_positions`] for the rows a renderer is about to lay out, with
+/// the alignment flags read off `snapshot` rather than restated by the caller.
+///
+/// `rows` must be `snapshot.row_infos(start_row)` truncated to its own length,
+/// which is what makes a viewport index addressable as a display row.
+pub fn blame_run_positions_in_viewport(
+    snapshot: &DisplaySnapshot,
+    start_row: DisplayRow,
+    rows: &[RowInfo],
+    blamed_rows: &[Option<(BufferId, BlameEntry)>],
+) -> Vec<Option<BlameRunPosition>> {
+    let mut alignment_rows = vec![false; rows.len()];
+    let end_row = DisplayRow(start_row.0.saturating_add(rows.len() as u32));
+    for (block_row, block) in snapshot.blocks_in_range(start_row..end_row) {
+        if !block.is_alignment_only() {
+            continue;
+        }
+        // `blocks_in_range` yields a block whose *start* may sit above the
+        // viewport, and a block spans `height()` rows from there, so neither
+        // end of the span can be assumed to be in range.
+        for row in block_row.0..block_row.0.saturating_add(block.height()) {
+            if let Some(offset) = row.checked_sub(start_row.0)
+                && let Some(flag) = alignment_rows.get_mut(offset as usize)
+            {
+                *flag = true;
+            }
+        }
+    }
+    blame_run_positions(rows, blamed_rows, &alignment_rows)
 }
 
 pub trait BlameRenderer {
@@ -1714,13 +1762,35 @@ mod tests {
         spec: &[(RowInfo, Option<(BufferId, &str)>)],
         expected: &[Option<BlameRunPosition>],
     ) {
-        let rows = spec.iter().map(|(info, _)| *info).collect::<Vec<_>>();
+        let spec = spec
+            .iter()
+            .map(|(info, blame)| (*info, *blame, false))
+            .collect::<Vec<_>>();
+        assert_run_positions_with_alignment(&spec, expected);
+    }
+
+    /// The third element of each entry is the row's alignment flag, as
+    /// `blame_run_positions_in_viewport` derives it from the block map:
+    /// `true` only for the rows of a `Block::Spacer`.
+    #[track_caller]
+    fn assert_run_positions_with_alignment(
+        spec: &[(RowInfo, Option<(BufferId, &str)>, bool)],
+        expected: &[Option<BlameRunPosition>],
+    ) {
+        let rows = spec.iter().map(|(info, _, _)| *info).collect::<Vec<_>>();
         let blamed_rows = spec
             .iter()
-            .map(|(_, blame)| blame.map(|(buffer_id, sha)| (buffer_id, blame_entry(sha, 0..1))))
+            .map(|(_, blame, _)| blame.map(|(buffer_id, sha)| (buffer_id, blame_entry(sha, 0..1))))
+            .collect::<Vec<_>>();
+        let alignment_rows = spec
+            .iter()
+            .map(|(_, _, alignment)| *alignment)
             .collect::<Vec<_>>();
 
-        pretty_assertions::assert_eq!(blame_run_positions(&rows, &blamed_rows), expected);
+        pretty_assertions::assert_eq!(
+            blame_run_positions(&rows, &blamed_rows, &alignment_rows),
+            expected
+        );
     }
 
     #[test]
@@ -1787,14 +1857,60 @@ mod tests {
         );
     }
 
+    /// A header block stands for something between the two lines — the end of
+    /// one excerpt and the start of the next, or a buffer that was folded
+    /// away — so the run has to be cut there even though the two blamed rows
+    /// around it happen to be buffer-adjacent.
     #[test]
-    fn blame_run_positions_break_across_a_block_row() {
+    fn blame_run_positions_break_across_a_header_block_row() {
         let buffer = test_buffer_id(1);
         assert_run_positions(
             &[
                 (text_row(buffer, 0), Some((buffer, "1a1a1a"))),
                 (block_row(), None),
                 (text_row(buffer, 1), Some((buffer, "1a1a1a"))),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                None,
+                Some(BlameRunPosition::Head),
+            ],
+        );
+    }
+
+    /// The sibling of the header case, and the whole point of the alignment
+    /// flag: a split diff pads the shorter pane with a spacer that stands for
+    /// text on the *other* side. Cutting there would make the two panes label
+    /// one commit in different places — the left pane, which has no spacer,
+    /// keeps a single run over the same lines.
+    #[test]
+    fn blame_run_positions_survive_an_alignment_spacer_row() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_with_alignment(
+            &[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a")), false),
+                (block_row(), None, true),
+                (text_row(buffer, 1), Some((buffer, "1a1a1a")), false),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                None,
+                Some(BlameRunPosition::Continuation),
+            ],
+        );
+    }
+
+    /// A spacer stands for other-side text, not for a jump in this buffer, so
+    /// it does not paper over one: the rows around it still have to be
+    /// consecutive lines of the same commit to stay in one run.
+    #[test]
+    fn blame_run_positions_still_break_when_buffer_rows_jump_across_a_spacer() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_with_alignment(
+            &[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a")), false),
+                (block_row(), None, true),
+                (text_row(buffer, 9), Some((buffer, "1a1a1a")), false),
             ],
             &[
                 Some(BlameRunPosition::Head),

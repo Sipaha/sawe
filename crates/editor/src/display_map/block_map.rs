@@ -467,6 +467,24 @@ impl Block {
             Block::Spacer { .. } => false,
         }
     }
+
+    /// Whether the block exists only to keep this pane's rows level with its
+    /// companion's — it stands for nothing in this buffer, and the two text
+    /// rows it sits between are still consecutive lines of the same file.
+    ///
+    /// [`BlockRows`] collapses every block row to `RowInfo::default()`, so a
+    /// consumer working from row info alone cannot tell such a row from a
+    /// header; this is the distinction, and it is the block map's to make.
+    /// See [`crate::git::blame::blame_run_positions`].
+    pub fn is_alignment_only(&self) -> bool {
+        match self {
+            Block::Custom(_) => false,
+            Block::FoldedBuffer { .. } => false,
+            Block::ExcerptBoundary { .. } => false,
+            Block::BufferHeader { .. } => false,
+            Block::Spacer { .. } => true,
+        }
+    }
 }
 
 impl Debug for Block {

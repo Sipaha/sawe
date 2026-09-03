@@ -25,7 +25,8 @@ use crate::{
         ScrollBeyondLastLine, ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
     },
     git::blame::{
-        BlameRenderer, BlameRunPosition, GitBlame, GlobalBlameRenderer, blame_run_positions,
+        BlameRenderer, BlameRunPosition, GitBlame, GlobalBlameRenderer,
+        blame_run_positions_in_viewport,
     },
     hover_popover::{
         self, HOVER_POPOVER_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
@@ -2139,6 +2140,7 @@ impl EditorElement {
 
     fn layout_blame_entries(
         &self,
+        snapshot: &EditorSnapshot,
         buffer_rows: &[RowInfo],
         em_width: Pixels,
         scroll_position: gpui::Point<ScrollOffset>,
@@ -2162,7 +2164,12 @@ impl EditorElement {
         let blamed_rows: Vec<_> = blame.update(cx, |blame, cx| {
             blame.blame_for_rows(buffer_rows, cx).collect()
         });
-        let run_positions = blame_run_positions(buffer_rows, &blamed_rows);
+        let run_positions = blame_run_positions_in_viewport(
+            &snapshot.display_snapshot,
+            start_row,
+            buffer_rows,
+            &blamed_rows,
+        );
 
         let width = if let Some(max_width) = max_width {
             AvailableSpace::Definite(max_width)
@@ -9167,6 +9174,7 @@ impl Element for EditorElement {
                     }
 
                     let blamed_display_rows = self.layout_blame_entries(
+                        &snapshot,
                         &row_infos,
                         em_width,
                         scroll_position,

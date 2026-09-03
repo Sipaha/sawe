@@ -2011,7 +2011,10 @@ mod tests {
         // consecutive rows are one line apart, so the gap between them is the
         // height a row has to cover to leave no dead band between two lines.
         let line_height = next_head.origin.y - continuation.origin.y;
-        assert!(line_height > gpui::px(0.), "rows are laid out one line apart");
+        assert!(
+            line_height > gpui::px(0.),
+            "rows are laid out one line apart"
+        );
         assert_eq!(
             continuation.size.height, line_height,
             "a continuation row must cover its whole line, or the mouse falls \
@@ -2076,10 +2079,113 @@ mod tests {
             "and spans the blame column, not just the text in it"
         );
         assert!(
-            separator.size.height > gpui::px(0.)
-                && separator.size.height < head.size.height / 2.,
+            separator.size.height > gpui::px(0.) && separator.size.height < head.size.height / 2.,
             "a hairline, not a band: {:?}",
             separator.size.height
+        );
+    }
+
+    /// Opens a commit whose only change deletes two lines, with every line of
+    /// both revisions attributed to one commit. The two panes then hold the
+    /// same run, but only the right pane has a hole in it: the deleted lines
+    /// exist on the left, so the right is padded with a two-row alignment
+    /// spacer to keep the two level. Two rows rather than one so that a rule
+    /// which flagged only a spacer's first row would still be caught.
+    async fn open_one_run_deletion_diff(
+        context: &DiffTestContext,
+        cx: &mut VisualTestContext,
+    ) -> Entity<SoloDiffView> {
+        set_commit(
+            context,
+            SHA,
+            vec![commit_file(
+                "src/lib.rs",
+                Some("one\ntwo\nthree\nfour\n"),
+                Some("one\nfour\n"),
+            )],
+        );
+        let run = run_sha(0xaa);
+        set_blame_runs_at_revisions(context, "src/lib.rs", [SHA.to_string()], &[run, run]);
+        set_blame_runs_at_revisions(
+            context,
+            "src/lib.rs",
+            [format!("{SHA}^")],
+            &[run, run, run, run],
+        );
+
+        let view = open_commit(context, SHA, "src/lib.rs", cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+        blame_both_panes(&view, cx);
+        view
+    }
+
+    /// The spacer a split diff pads the shorter pane with is a block row, and
+    /// `BlockRows` reports every block row as an empty `RowInfo` — so a run
+    /// rule reading row info alone cuts the run there and relabels the very
+    /// same commit a few lines below, on the right pane only. The left pane,
+    /// which holds the deleted line as text, keeps one run over the same
+    /// commit; asserted on the painted tree, and on both panes, because the
+    /// defect is precisely that they disagreed.
+    #[gpui::test]
+    async fn test_an_alignment_spacer_does_not_recut_a_run(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        let view = open_one_run_deletion_diff(&context, &mut cx).await;
+
+        // The fixture has to actually produce the spacer, or every assertion
+        // below would hold for a right pane with no hole in it at all.
+        let rhs = view.read_with(&cx, |view, cx| view.editor.read(cx).rhs_editor().clone());
+        let spacers = rhs.update_in(&mut cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let end = editor::display_map::DisplayRow(snapshot.max_point().row().0 + 1);
+            snapshot
+                .blocks_in_range(editor::display_map::DisplayRow(0)..end)
+                .filter(|(_, block)| block.is_alignment_only())
+                .map(|(row, block)| (row.0, block.height()))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            spacers,
+            vec![(1, 2)],
+            "the two deleted lines leave the right pane one two-row alignment \
+             spacer, starting on the row below the line they followed"
+        );
+
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ROW-RIGHT-1").is_none()
+                && cx.debug_bounds("GIT-BLAME-ROW-RIGHT-2").is_none(),
+            "neither row of the spacer carries a blame entry, so neither \
+             paints a gutter row — the two annotated lines around it are \
+             viewport rows 0 and 3"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_some(),
+            "row 0 opens the run, so it names the commit"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-3").is_none(),
+            "and the row below the spacer came from that same commit, so \
+             repeating its date and author under the spacer says nothing"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-3").is_none(),
+            "nor is there a run boundary to mark below it"
+        );
+
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-LEFT-0").is_some()
+                && cx.debug_bounds("GIT-BLAME-META-LEFT-1").is_none()
+                && cx.debug_bounds("GIT-BLAME-META-LEFT-2").is_none()
+                && cx.debug_bounds("GIT-BLAME-META-LEFT-3").is_none(),
+            "which is what the left pane already did — one label for one \
+             commit — and the two panes have to agree"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-SEPARATOR-LEFT-1").is_none()
+                && cx.debug_bounds("GIT-BLAME-SEPARATOR-LEFT-2").is_none()
+                && cx.debug_bounds("GIT-BLAME-SEPARATOR-LEFT-3").is_none(),
+            "including where neither of them draws a hairline"
         );
     }
 
