@@ -241,6 +241,23 @@ defaults.
 *Done when:* colour modes / author filter / date toggle are reachable and actually change the
 gutter, or the dead layer and its doc comments are gone.
 
+### C12. Double-clicking the graph's *Local changes* row also summons the git panel
+`GitGraph::on_row_click` branches on `click_count >= 2` and calls `summon_commit_panel`
+unconditionally, so the synthetic working-tree row at view-index 0 summons the panel too
+(decision **#143**). `select_entry` early-returns for that row — it has no commit data, so the
+Commit tab is left describing whatever it described before, or nothing.
+
+Framed honestly: it *looks* right (a double click on any row means "show me this", and the panel
+is where a working-tree change would be shown), nobody asked for it, and it arrived as a
+side-effect rather than as a decision. It is also unpinned — every summon test drives a graph
+with no local-changes row, and `test_local_changes_row_is_never_pushed_as_a_commit` never clicks
+— so nothing would catch it changing.
+
+*Done when:* the behaviour is either ruled intentional and pinned by a test that double-clicks
+row 0 with `has_local_changes_row()` true, or excluded in `on_row_click` and pinned the same way.
+Deciding needs the maintainer, since the question is what that row's double click *should* mean
+once the Changes tab is the thing it would want to reveal.
+
 ---
 
 ## D. Tooling gaps

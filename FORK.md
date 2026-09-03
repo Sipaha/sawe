@@ -2919,17 +2919,33 @@ How to apply:
   label is that text verbatim, in both surfaces. The one glyph a chip carries says something the
   text does not: `Check` for the checked-out branch, `LockOutlined` for a branch this Solution's
   policy protects (S-SOL-PRT).
-- **The row never wraps.** A wrapped row is vertical budget taken from the changed-files tree,
-  which is the same reason the identity row above it truncates. What does not fit collapses into
-  the graph's own `+N` chip, whose tooltip still names every ref, at the graph's own
-  `git.log.compact_refs_threshold`. The pane applies that threshold unconditionally where the
-  graph gates it behind its `compact_refs` view toggle: the toggle is a control of the graph's,
-  and the pane is narrower than the graph's Description column.
+- **The row paints every ref — wrapped, capped and scrolling — and applies no threshold.**
+  *(Amended 2026-09-03, `1a73d7d001`. This bullet previously read "the row never wraps" and
+  folded the overflow into the graph's `+N` chip at `git.log.compact_refs_threshold`; that is
+  now wrong in both halves and is stated here rather than quietly replaced, because the
+  reasoning that produced it is the reasoning a future reader will re-derive.)* Two things were
+  wrong with the threshold. A pane whose job is to answer "which branch is this commit on" must
+  not fold the answer into a tooltip — folding is defensible on a log row, which is a list, and
+  not on the detail pane the list points at. And applying it *unconditionally* made the pane
+  disagree with the graph row a few pixels below it: the graph caps only under its own
+  `compact_refs` view toggle, which `ViewOptions::default()` leaves **off**, so the pane was
+  enforcing a control the user had never touched, on the surface with more room for the answer
+  rather than less. The objection the threshold answered — a chip row growing without bound eats
+  the changed-files tree — is answered instead by bounding the *row*, not the list:
+  `render_commit_refs_row` is `flex_wrap()` with `max_h(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT)`
+  (64px, the same cap the expanded containment rows use) and `overflow_y_scroll()`, and each
+  chip is built with `truncate: true`, so a narrow pane shortens every name rather than hiding
+  any. `commit_refs::overflow_chip` still exists and is now the graph's alone.
 - **The tag row subtracts what the chips already name** (`uncharted_tags`). Both describe the
   tags pointing at the commit, from different sources; painting both in full says the same thing
   twice a few pixels apart. Subtracting rather than suppressing the row outright keeps it for a
   tag created since the graph last decorated its rows, which is the only fact it still has that
-  the chips do not.
+  the chips do not. **This is coupled to the bullet above and the coupling is load-bearing:**
+  `uncharted_tags` subtracts against the **whole** decoration list, which is only sound because
+  the row now paints the whole list. While the row applied the threshold, a tag past it was
+  subtracted here *and* folded into a `+N` chip there, so its name appeared nowhere in the pane
+  but a tooltip — the bug `1a73d7d001` fixed. If a cap ever returns to that row, `uncharted_tags`
+  must be given the painted slice instead of the full list, in the same commit.
 - The graph's push site picks the first selected row the same way `selected_commit_shas` picks
   its first element (`first_selected_commit`), including dropping the synthetic local-changes
   row, so the shas and the decorations cannot describe different commits. A multi-commit
@@ -3154,3 +3170,40 @@ is **already hovered**, so a test must rest the cursor before sending the event;
 `Window::dispatch_action` routes to the *focused* dispatch node and bubbles up from there, so a
 harness asserting the left click's dispatch must focus its root or the action goes nowhere the
 handler can see it.
+
+### 143. Double-clicking a commit summons the git panel, and summoning is `open_panel`, not a dock-open check
+
+What: a double click on a git-graph commit row selects it (as a single click does) and then
+**summons** the git panel — `GitGraph::summon_commit_panel` calls
+`Workspace::open_panel::<GitPanel>`. Before this, the gesture re-pointed the Commit tab and left
+the answer wherever it already was, which — with the dock closed, or open on another panel — was
+nowhere. `on_row_click` had been ignoring its `click_count` parameter (it was spelled
+`_click_count`); it now branches on `>= 2`. A real double click delivers `1` and then `2`, so
+the selection leg runs first and the summon is strictly additive.
+
+Why `open_panel` and not a `Dock::is_open` check: "the panel is not open yet" has two shapes, and
+the obvious one hides the other. A closed dock is visible to `is_open`; a dock that is open on
+the project panel is not, and is exactly as unhelpful to a user asking to see a commit.
+`open_panel` opens the dock **and** makes the git panel that dock's active one, so one call
+covers both and there is no state to get wrong.
+
+Why it deliberately does not focus: this is #136's "summon" applied to the container instead of
+the tab, and it keeps the same property. `GitPanel::show_commit_selection` already activates the
+Commit tab through `activate_commit_tab_without_focus`; pulling focus at the container level
+would make double-clicking down a log a one-way trip, since the graph would lose the keyboard
+navigation that makes walking it possible. And a summon still cannot multiply surfaces: the
+Commit tab is a single `Option` on the panel, so summoning twice produces one tab.
+
+What the gesture must still **not** do is open the synthetic `CommitView` pseudo-file. That is
+the behaviour a double click had before it was removed as too easy to hit while walking a log,
+and it stays reachable only through `menu::Confirm` and `git_graph::OpenCommitView`. The rest of
+#136's model is unchanged: a summon never pins, and a single click retargets only and does
+nothing when nothing is open.
+
+How to apply: assert a summon on the **painted tree**, not on `commit_tab_is_open()` — that
+predicate is true for an invisible tab inside a closed dock, so a test written against it passes
+with the dock never opening at all (the tests use a `COMMIT-TAB-BODY` selector instead). And read
+a focus assertion back *inside the same update*, before the next draw: GPUI drops a focus whose
+handle is not in the rendered dispatch tree, and `GitPanel`'s is not while the Commit tab is up,
+so an accidental `open_panel` → `focus_panel` slip is repaired by the following frame and
+invisible to anything that looks after it.
