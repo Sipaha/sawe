@@ -273,6 +273,14 @@ pub struct ConsolePanel {
     /// The member path the panel last rendered for; used to attribute the
     /// outgoing active tab to the correct member when the active member flips.
     last_member_path: Option<PathBuf>,
+    /// Whether the Solution band was last seen handing its utility half to
+    /// this panel. Edge memory for [`Self::on_band_state_changed`] — the
+    /// band's stand-in for upstream's `Panel::set_active` flag.
+    band_showed_this_panel: bool,
+    /// True while [`Self::load`]'s detached [`Self::restore_from_db`] is still
+    /// running, i.e. while `tabs.is_empty()` does not yet mean "this panel has
+    /// no terminal". Read only by [`Self::autostart_terminal_if_empty`].
+    restore_in_flight: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -305,6 +313,8 @@ impl ConsolePanel {
             assistant_enabled: false,
             active_by_member: HashMap::default(),
             last_member_path: None,
+            band_showed_this_panel: false,
+            restore_in_flight: false,
             _subscriptions: subscriptions,
         }
     }
@@ -335,11 +345,35 @@ impl ConsolePanel {
         // immediately: the empty panel + icon paint at once and tabs fill
         // in as their sessions hydrate. Best-effort: a restore failure must
         // not take the panel down, so errors are logged, not propagated.
+        // Arm the auto-start edge before the restore below is spawned, and
+        // mark that restore in flight, so an edge that arrives while
+        // persisted tabs are still on their way in cannot read the
+        // momentarily-empty `tabs` as "this panel has no terminal" and spawn
+        // a duplicate shell.
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.restore_in_flight = true;
+            panel.observe_band_state(window, cx);
+        })?;
+
         {
             let workspace = workspace.clone();
             let panel = panel.clone();
             cx.spawn(async move |cx: &mut AsyncWindowContext| {
-                Self::restore_from_db(workspace, panel, cx).await.log_err();
+                Self::restore_from_db(workspace, panel.clone(), cx)
+                    .await
+                    .log_err();
+                panel
+                    .update_in(cx, |panel, window, cx| {
+                        panel.restore_in_flight = false;
+                        // The one level-triggered check in the whole feature,
+                        // and it is the boot case rather than a shortcut:
+                        // `observe_band_state` above recorded the band's
+                        // state before any tab could exist, so a window that
+                        // boots with the terminal half ALREADY open never
+                        // produces a hidden→visible edge to react to.
+                        panel.autostart_terminal_if_empty(window, cx);
+                    })
+                    .log_err();
             })
             .detach();
         }
@@ -911,17 +945,154 @@ impl ConsolePanel {
         let task = self
             .terminal_provider
             .update(cx, |provider, cx| provider.new_tab(cwd, window, cx));
+        // Counted for the same reason `add_terminal_task` counts it: between
+        // this call and the spawned view landing, `self.tabs` is still empty,
+        // and `autostart_terminal_if_empty` reads exactly that pair to decide
+        // whether the panel already has a terminal (upstream's
+        // `TerminalPanel::has_no_terminals`). Without the counter, two band
+        // edges inside one spawn's round trip start two shells.
+        self.pending_terminals_to_add += 1;
         cx.spawn(async move |this, cx| {
-            let view = task.await?;
+            let view = task.await;
             this.update(cx, |this, cx| {
-                this.tabs.push(ConsoleTab::Terminal { view, origin_cwd });
-                this.active_index = Some(this.tabs.len() - 1);
-                cx.notify();
-                this.persist(cx);
+                this.pending_terminals_to_add = this.pending_terminals_to_add.saturating_sub(1);
+                if let Ok(view) = &view {
+                    this.tabs.push(ConsoleTab::Terminal {
+                        view: view.clone(),
+                        origin_cwd,
+                    });
+                    this.active_index = Some(this.tabs.len() - 1);
+                    cx.notify();
+                    this.persist(cx);
+                }
             })?;
-            anyhow::Ok(())
+            view.map(|_| ())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Whether the Solution band is currently handing its utility half to
+    /// THIS panel: the half is visible and its content kind is `Terminal`.
+    ///
+    /// Answered from `SolutionAgentStore`, which is where a Solution
+    /// workspace's band state lives. A plain-folder workspace has no
+    /// Solution, so the band keeps its state window-locally and the store
+    /// never sees it; this reports `false` there and the auto-start below
+    /// simply does not apply — the same place `active_member_path` and every
+    /// other Solution-scoped decision in this panel stops.
+    fn band_shows_this_panel(&self, cx: &App) -> bool {
+        let Some(solution_id) = self.active_solution_id(cx) else {
+            return false;
+        };
+        let Some(store) = SolutionAgentStore::try_global(cx) else {
+            return false;
+        };
+        let state = store.read(cx).band_state(solution_id);
+        state.utility_visible && state.utility_kind == UtilityKind::Terminal
+    }
+
+    /// Arm the auto-start edge.
+    ///
+    /// Upstream spawns a shell into an empty terminal dock from
+    /// `TerminalPanel::set_active` (`terminal_view::terminal_panel`), on the
+    /// `false → true` edge of the `workspace::Panel` activity flag.
+    /// `ConsolePanel` deliberately implements no `Panel` — it is a Solution
+    /// band occupant, not a dock panel — so nothing ever calls `set_active`
+    /// and the behaviour was silently dropped in the port. The band's
+    /// equivalent flag is `SolutionAgentStore::band_state`, and its
+    /// equivalent edge source is `BandStateChanged`, which covers all three
+    /// ways the half opens: `ctrl-\``, the status-bar Terminal button, and
+    /// the hydration that restores a window whose band was already open.
+    ///
+    /// Called from [`Self::load`] rather than from `new` because the
+    /// subscription needs a `Window` (constructing a `TerminalView` does) and
+    /// `load` already runs inside a `workspace.update_in` that has one, while
+    /// `new`'s signature stays untouched for this crate's — and
+    /// `run_config_ui`'s — test constructors.
+    pub fn observe_band_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = SolutionAgentStore::try_global(cx) else {
+            return;
+        };
+        // Deferred, not read inline: `band_shows_this_panel` resolves the
+        // active Solution by reading the `Workspace` through this panel's weak
+        // handle, and every caller that can arm this — `load`'s
+        // `workspace.update_in`, a test's `WindowHandle::update` — may hold
+        // that same entity leased. A read under a lease aborts the process
+        // (`entity_map.rs:164`), so take the snapshot once the lease is gone.
+        cx.defer_in(window, |this, _window, cx| {
+            this.band_showed_this_panel = this.band_shows_this_panel(cx);
+        });
+        let subscription = cx.subscribe_in(&store, window, |this, _store, event, window, cx| {
+            // Not filtered on the event's `solution_id`: the state is
+            // re-derived for THIS panel's Solution either way, so another
+            // Solution's band change reproduces the same answer and yields no
+            // edge.
+            if matches!(
+                event,
+                solution_agent::store::SolutionAgentStoreEvent::BandStateChanged { .. }
+            ) {
+                this.on_band_state_changed(window, cx);
+            }
+        });
+        self._subscriptions.push(subscription);
+    }
+
+    fn on_band_state_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shows = self.band_shows_this_panel(cx);
+        let showed = std::mem::replace(&mut self.band_showed_this_panel, shows);
+        if shows && !showed {
+            self.autostart_terminal_if_empty(window, cx);
+        }
+    }
+
+    /// Start a shell so the band's terminal half is never handed to the user
+    /// empty — «в панели терминала должна сразу сессия запускаться если её
+    /// нету».
+    ///
+    /// Edge-driven only ([`Self::on_band_state_changed`], plus the one
+    /// boot-time call at the end of restore); never called from `render`. A
+    /// render-time check would be level-triggered, and the panel stays
+    /// mounted after the user closes its last tab, so it would instantly
+    /// respawn the terminal the user just deliberately closed.
+    ///
+    /// The guards:
+    /// * `band_shows_this_panel` — the panel is only auto-populated when the
+    ///   user can actually see it. Redundant on the edge path (the edge is
+    ///   defined by it) and load-bearing on the boot path, which is a level
+    ///   check: without it, every workspace whose console panel restores no
+    ///   tabs starts a shell nobody asked for and nobody can see. Caught by
+    ///   `debugger_ui`'s suite, which spawned real PTYs and lost its
+    ///   determinism.
+    /// * `tabs.is_empty() && pending_terminals_to_add == 0` is upstream's
+    ///   `TerminalPanel::has_no_terminals`; the counter is what makes two
+    ///   edges arriving inside one spawn's round trip idempotent.
+    /// * `workspace_has_project` is this fork's addition: an empty Solution
+    ///   has nowhere to `cd` into, which is exactly why the "+" menu greys
+    ///   "New Terminal" out there. Auto-start must not do what the menu
+    ///   forbids.
+    /// * `restore_in_flight` — see the field.
+    ///
+    /// Focus is deliberately untouched: this only appends a tab. When the
+    /// half was opened by `ctrl-\`` focus is already on the panel's own
+    /// handle and `render`'s redirect hands it down to the new terminal;
+    /// when it was opened by the status-bar button focus stays wherever the
+    /// user left it.
+    fn autostart_terminal_if_empty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.restore_in_flight || !self.tabs.is_empty() || self.pending_terminals_to_add > 0 {
+            return;
+        }
+        if !self.band_shows_this_panel(cx) {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        if !workspace_has_project(workspace.read(cx), cx) {
+            return;
+        }
+        // The same cwd the "+" menu's "New Terminal" entry uses.
+        let cwd = self.active_member_path(cx);
+        self.add_terminal_tab(cwd, window, cx);
     }
 
     /// Handler for `workspace::NewTerminal`. Decides whether to add a terminal
@@ -1877,6 +2048,11 @@ mod tests {
         let panel = window_handle
             .update(cx, |workspace, window, cx| {
                 let panel = cx.new(|cx| ConsolePanel::new(workspace.weak_handle(), cx));
+                // `ConsolePanel::load` arms this in production; without it the
+                // band's terminal half would never auto-start a shell here and
+                // the tests below would pass against a panel that is not the
+                // one the app ships.
+                panel.update(cx, |panel, cx| panel.observe_band_state(window, cx));
                 let band = cx.new(|cx| {
                     SolutionBand::new(workspace.weak_handle(), workspace.project().clone(), cx)
                 });
@@ -1907,6 +2083,293 @@ mod tests {
                     .expect("the band was installed by bootstrap_band_and_panel")
             })
             .unwrap()
+    }
+
+    /// Give the bootstrapped Solution a member project rooted at the
+    /// Solution's own root, so `workspace_has_project` — the auto-start's
+    /// gate, and the "+" menu's — is satisfied.
+    ///
+    /// `create_for_test_minimal` builds a MEMBERLESS Solution, which is why
+    /// the band tests that don't call this never auto-start a terminal: they
+    /// model a Solution with nowhere to `cd` into.
+    fn give_the_solution_a_member(cx: &mut TestAppContext, solution_id: SolutionId) {
+        cx.update(|cx| {
+            SolutionStore::global(cx).update(cx, |store, _| {
+                let root = store
+                    .find_solution(solution_id)
+                    .expect("bootstrapped solution")
+                    .root
+                    .clone();
+                store.test_add_member_with_path(solution_id, "proj", root);
+            });
+        });
+    }
+
+    /// The reported defect: opening the band's terminal half while it holds
+    /// no terminal left the user staring at an empty panel — «в панели
+    /// терминала должна сразу сессия запускаться если её нету».
+    ///
+    /// Upstream spawns one on the `false → true` edge of
+    /// `TerminalPanel::set_active`; `ConsolePanel` implements no
+    /// `workspace::Panel` (it is a band occupant), so nothing called
+    /// `set_active` and the behaviour was lost in the port. The edge is
+    /// re-derived from `SolutionAgentStore`'s band state instead.
+    ///
+    /// Driven through `activate_utility_kind` — what the status-bar Terminal
+    /// button does — rather than `handle_toggle_focus`, so the focus
+    /// assertion cannot pass by accident: this path never focuses the panel,
+    /// so anything that moves focus off the centre pane came from the
+    /// auto-start itself.
+    #[gpui::test]
+    async fn showing_an_empty_terminal_half_starts_a_shell(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, solution_id) = bootstrap_band_and_panel(cx, true).await;
+        give_the_solution_a_member(cx, solution_id);
+        let band = band_of(&window_handle, cx);
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.tabs.is_empty(),
+                "precondition: the panel starts with no terminal"
+            );
+        });
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "precondition: the band's utility half starts hidden"
+        );
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Terminal, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tabs.len(),
+                1,
+                "showing the terminal half with nothing in it must start a shell"
+            );
+            assert_eq!(
+                panel.active_index,
+                Some(0),
+                "and the auto-started shell must be the active tab, or the \
+                 panel renders empty anyway"
+            );
+        });
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                assert!(
+                    workspace.active_pane().focus_handle(cx).is_focused(window),
+                    "the auto-start must not yank focus off the centre pane: \
+                     the user clicked a status-bar button, they did not ask to \
+                     start typing in a shell"
+                );
+                assert!(
+                    !panel.focus_handle(cx).contains_focused(window, cx),
+                    "and focus must not have moved into the console either"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The other side of the auto-start: a terminal half that already holds a
+    /// terminal must be handed back untouched, however many times it is
+    /// hidden and shown. Without this, every `ctrl-\`` would pile up another
+    /// shell.
+    #[gpui::test]
+    async fn showing_a_populated_terminal_half_starts_nothing(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, solution_id) = bootstrap_band_and_panel(cx, true).await;
+        give_the_solution_a_member(cx, solution_id);
+        let band = band_of(&window_handle, cx);
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.tabs.len(), 1, "precondition: one terminal is open");
+        });
+
+        for cycle in 0..2 {
+            band.update(cx, |band, cx| {
+                band.activate_utility_kind(UtilityKind::Terminal, cx)
+            });
+            cx.run_until_parked();
+            assert!(
+                band.read_with(cx, |band, cx| band.utility_visible(cx)),
+                "cycle {cycle}: the half is showing"
+            );
+            panel.read_with(cx, |panel, _| {
+                assert_eq!(
+                    panel.tabs.len(),
+                    1,
+                    "cycle {cycle}: showing a half that already has a terminal \
+                     must not start another one"
+                );
+            });
+            // Toggle it back off; `activate_utility_kind` on the already-shown
+            // kind hides the half, which re-arms the edge for the next pass.
+            band.update(cx, |band, cx| {
+                band.activate_utility_kind(UtilityKind::Terminal, cx)
+            });
+            cx.run_until_parked();
+        }
+    }
+
+    /// The boot path — the call [`ConsolePanel::load`] makes once its restore
+    /// settles — is the one LEVEL-triggered entry point, because a window that
+    /// boots with the terminal half already open never produces a
+    /// hidden→visible edge to react to. Level-triggered means it has to ask
+    /// whether the half is actually open: an early draft did not, so EVERY
+    /// workspace whose console panel restored no tabs started an invisible
+    /// shell at startup. `debugger_ui`'s suite is what caught it — six of its
+    /// tests lost determinism to the real PTYs that appeared.
+    ///
+    /// Deferred rather than called inline for the same reason
+    /// `observe_band_state` defers its snapshot: this reads the `Workspace`
+    /// through the panel's weak handle, and `WindowHandle::update` holds that
+    /// entity leased. Production reaches it from an `AsyncWindowContext`,
+    /// where nothing is leased.
+    #[gpui::test]
+    async fn the_boot_check_starts_nothing_while_the_half_is_hidden(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, solution_id) = bootstrap_band_and_panel(cx, true).await;
+        give_the_solution_a_member(cx, solution_id);
+        let band = band_of(&window_handle, cx);
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "precondition: the band's utility half is hidden"
+        );
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |_panel, cx| {
+                    cx.defer_in(window, |panel, window, cx| {
+                        panel.autostart_terminal_if_empty(window, cx);
+                    });
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.tabs.is_empty(),
+                "a console panel the user cannot see must not be handed a shell"
+            );
+        });
+    }
+
+    /// Two edges arriving inside one spawn's round trip must still produce
+    /// one shell. `add_terminal_tab` only appends to `self.tabs` once its
+    /// async `new_tab` resolves, so between the first edge and that
+    /// resolution `tabs.is_empty()` is still true — which is exactly why
+    /// `pending_terminals_to_add` is part of the "has no terminal" answer
+    /// (upstream's `TerminalPanel::has_no_terminals` reads the same pair).
+    ///
+    /// Deliberately no `run_until_parked` between the toggles: parking is
+    /// what would let the first spawn land and hide the bug.
+    #[gpui::test]
+    async fn a_second_edge_mid_spawn_does_not_start_a_second_shell(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, solution_id) = bootstrap_band_and_panel(cx, true).await;
+        give_the_solution_a_member(cx, solution_id);
+        let band = band_of(&window_handle, cx);
+
+        for _ in 0..3 {
+            // show, hide, show — two rising edges, no parking in between.
+            band.update(cx, |band, cx| {
+                band.activate_utility_kind(UtilityKind::Terminal, cx)
+            });
+        }
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.pending_terminals_to_add, 1,
+                "precondition: the first edge's spawn is still in flight, so \
+                 `tabs` alone cannot answer \"does this panel have a terminal\""
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tabs.len(),
+                1,
+                "a second edge while the first shell is still spawning must not \
+                 start another one"
+            );
+        });
+    }
+
+    /// Why the auto-start is edge-driven and not a check in `render`: the
+    /// panel stays mounted after its last tab closes, so a level-triggered
+    /// check would instantly resurrect the terminal the user just closed and
+    /// the close button would look broken.
+    #[gpui::test]
+    async fn closing_the_last_terminal_does_not_respawn_one(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, solution_id) = bootstrap_band_and_panel(cx, true).await;
+        give_the_solution_a_member(cx, solution_id);
+        let band = band_of(&window_handle, cx);
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Terminal, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.tabs.len(), 1, "precondition: the half auto-started one");
+        });
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| panel.close_tab(0, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.tabs.is_empty(),
+                "closing the last terminal must leave the panel empty — the \
+                 half is still visible, so a level-triggered auto-start would \
+                 have put a new shell right back"
+            );
+            assert_eq!(panel.active_index, None);
+        });
+    }
+
+    /// The auto-start obeys the same empty-Solution gate as the "+" menu's
+    /// "New Terminal" entry: a Solution with no member project has nowhere to
+    /// `cd` into, so showing its terminal half must start nothing rather than
+    /// spawn a shell in an arbitrary directory.
+    #[gpui::test]
+    async fn the_auto_start_respects_the_empty_solution_gate(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, _solution_id) = bootstrap_band_and_panel(cx, true).await;
+        let band = band_of(&window_handle, cx);
+        window_handle
+            .update(cx, |workspace, _window, cx| {
+                assert!(
+                    !workspace_has_project(workspace, cx),
+                    "precondition: the bootstrapped Solution has no members"
+                );
+            })
+            .unwrap();
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Terminal, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.tabs.is_empty(),
+                "a Solution with no project must not get an auto-started shell"
+            );
+        });
     }
 
     /// Double-lease guard for `ctrl-\``, the sibling of
@@ -2203,14 +2666,26 @@ mod tests {
         cx.run_until_parked();
         window_handle
             .update(cx, |_workspace, window, cx| {
-                // This test spawns no terminal tab, so the render redirect in
-                // `focus_active_terminal` early-returns and focus stops on
-                // the panel's OWN handle. The realistic shape — focus resting
-                // on a terminal inside the panel — is
+                // The panel is still empty here, and deliberately so: showing
+                // the terminal half now auto-starts a shell
+                // (`showing_an_empty_terminal_half_starts_a_shell`), but
+                // `bootstrap_band_and_panel` builds a MEMBERLESS Solution, so
+                // the auto-start's empty-Solution gate blocks it — the same
+                // gate that greys out the "+" menu's "New Terminal". Asserted
+                // rather than assumed, because the whole point of this test is
+                // that focus starts on the panel's own handle: with a tab
+                // present the render redirect in `focus_active_terminal` would
+                // hand focus to the terminal instead, and this would silently
+                // become a duplicate of
                 // `switching_the_utility_kind_away_from_a_focused_terminal_
-                // lands_on_the_centre_pane` below; both must reach the centre
-                // pane, and an empty panel is the harsher case because there
-                // is no descendant to blur first.
+                // lands_on_the_centre_pane` below. Both must reach the centre
+                // pane; the empty panel is the harsher case, because there is
+                // no descendant to blur first.
+                assert!(
+                    panel.read(cx).tabs.is_empty(),
+                    "precondition: no member project, so no auto-started shell \
+                     and nothing for the render redirect to aim at"
+                );
                 assert!(
                     panel.focus_handle(cx).is_focused(window),
                     "precondition: the band's (empty) console panel owns the \
