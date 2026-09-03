@@ -6,6 +6,7 @@ use std::{
 use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use collections::{HashMap, HashSet};
 
+use git::repository::RepoPath;
 use gpui::{
     Action, AppContext as _, Entity, EventEmitter, Focusable, Font, Pixels, SharedString,
     Subscription, WeakEntity, canvas,
@@ -16,7 +17,6 @@ use multi_buffer::{
     Anchor, AnchorRangeExt as _, BufferOffset, ExcerptRange, ExpandExcerptDirection, MultiBuffer,
     MultiBufferDiffHunk, MultiBufferPoint, MultiBufferSnapshot, PathKey,
 };
-use git::repository::RepoPath;
 use project::{Project, git_store::Repository};
 use rope::Point;
 use settings::{DiffViewStyle, SeedQuerySetting, Settings, SettingsStore};
@@ -451,8 +451,16 @@ pub enum DiffBlameBase {
     ///
     /// Either revision may be `None`, meaning "that side has no revision to be
     /// blamed against": a file the commit added does not exist at the parent,
-    /// and a file it deleted does not exist at the commit. `git blame` would
-    /// fail outright on those, and the failure surfaces as a toast.
+    /// and a file it deleted does not exist at the commit.
+    ///
+    /// Those `None`s are not redundant, and what makes them load-bearing is
+    /// narrower than "git would fail". When the missing thing is the *path*,
+    /// `git blame` answers `fatal: no such path`, which
+    /// `git::blame::run_git_blame` maps to an empty blame — an ungated call
+    /// would only spend a subprocess to reach the same nothing. When the
+    /// missing thing is the *revision* — a root commit has no `<sha>^` — git
+    /// answers `fatal: bad revision`, which matches no sentinel, so blame
+    /// bails and `GitBlame` raises the failure as a user-visible toast.
     ///
     /// Single-file by construction, and applied only when the editor is
     /// showing exactly that one path. A consumer showing several detached
@@ -718,10 +726,14 @@ impl SplittableEditor {
     /// Tells each pane's editor how to blame the buffers it holds that blame
     /// cannot resolve on its own, re-derived from [`Self::blame_base`].
     ///
-    /// This is the *only* writer of either editor's `BlameBaseSource` map. It
-    /// runs after every excerpt update and whenever the declaration changes,
-    /// so an entry written anywhere else would not survive; the declaration
-    /// is what a consumer owns, and this is what turns it into sources.
+    /// This is the *only* writer of either editor's `BlameBaseSource` map, so
+    /// an entry written anywhere else would not survive; the declaration is
+    /// what a consumer owns, and this is what turns it into sources. Every
+    /// operation that changes which buffers are excerpted has to call it, and
+    /// has to call it in **both** view styles: Unified has no left pane and
+    /// still blames its right one, so this must never be reached only through
+    /// left-pane work. Ordering trap: it runs *after* the excerpts land,
+    /// because it prunes against each multibuffer's live buffers.
     fn sync_blame_sources(&self, paths: &[(PathKey, Entity<BufferDiff>)], cx: &mut Context<Self>) {
         let (lhs_sources, rhs_sources) = self.blame_sources_for(paths, cx);
 
@@ -821,8 +833,10 @@ impl SplittableEditor {
                             }
                             // No revision holds this side's text — a file the
                             // commit added has no parent revision, one it
-                            // deleted has none at the commit. `git blame`
-                            // would fail, and the failure is a toast.
+                            // deleted has none at the commit. Asking anyway
+                            // costs a subprocess when only the path is
+                            // missing, and a user-visible error toast when the
+                            // revision is; see [`DiffBlameBase::Blob`].
                             None => {
                                 sources.remove(&buffer_id);
                             }
@@ -1070,7 +1084,8 @@ impl SplittableEditor {
 
         self.lhs = Some(lhs);
 
-        self.sync_lhs_for_paths(all_paths, cx);
+        self.sync_lhs_for_paths(&all_paths, cx);
+        self.sync_blame_sources(&all_paths, cx);
 
         rhs_display_map.update(cx, |dm, cx| {
             dm.set_companion(Some((lhs_display_map, companion.clone())), cx);
@@ -1405,26 +1420,6 @@ impl SplittableEditor {
         cx: &mut Context<Self>,
     ) -> bool {
         let has_ranges = ranges.clone().into_iter().next().is_some();
-        if self.lhs.is_none() {
-            return self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
-                let added_a_new_excerpt = rhs_multibuffer.update_excerpts_for_path(
-                    path,
-                    buffer.clone(),
-                    ranges,
-                    context_line_count,
-                    cx,
-                );
-                if has_ranges
-                    && rhs_multibuffer
-                        .diff_for(buffer.read(cx).remote_id())
-                        .is_none_or(|old_diff| old_diff.entity_id() != diff.entity_id())
-                {
-                    rhs_multibuffer.add_diff(diff, cx);
-                }
-                added_a_new_excerpt
-            });
-        }
-
         let result = self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
             let added_a_new_excerpt = rhs_multibuffer.update_excerpts_for_path(
                 path.clone(),
@@ -1443,7 +1438,13 @@ impl SplittableEditor {
             added_a_new_excerpt
         });
 
-        self.sync_lhs_for_paths(vec![(path, diff)], cx);
+        // Both syncs run in Unified mode too. `sync_lhs_for_paths` no-ops
+        // there of its own accord, but `sync_blame_sources` must not: the
+        // right pane is the only pane there, and a path excerpted after the
+        // consumer declared its blame base would otherwise never get sources.
+        let paths = [(path, diff)];
+        self.sync_lhs_for_paths(&paths, cx);
+        self.sync_blame_sources(&paths, cx);
         result
     }
 
@@ -1454,13 +1455,6 @@ impl SplittableEditor {
         direction: ExpandExcerptDirection,
         cx: &mut Context<Self>,
     ) {
-        if self.lhs.is_none() {
-            self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
-                rhs_multibuffer.expand_excerpts(excerpt_anchors, lines, direction, cx);
-            });
-            return;
-        }
-
         let paths: Vec<_> = self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
             let snapshot = rhs_multibuffer.snapshot(cx);
             let paths = excerpt_anchors
@@ -1478,7 +1472,8 @@ impl SplittableEditor {
             paths
         });
 
-        self.sync_lhs_for_paths(paths, cx);
+        self.sync_lhs_for_paths(&paths, cx);
+        self.sync_blame_sources(&paths, cx);
     }
 
     pub fn remove_excerpts_for_path(&mut self, path: PathKey, cx: &mut Context<Self>) {
@@ -1504,15 +1499,15 @@ impl SplittableEditor {
         Some(&self.rhs_editor)
     }
 
-    fn sync_lhs_for_paths(
-        &self,
-        paths: Vec<(PathKey, Entity<BufferDiff>)>,
-        cx: &mut Context<Self>,
-    ) {
+    /// Mirrors `paths`' right-hand excerpts onto the left pane. Purely
+    /// left-pane work, so it is a no-op in Unified mode — which is why the
+    /// blame sources those excerpts call for are **not** synced here but by
+    /// each caller, whose own work is not conditional on the split.
+    fn sync_lhs_for_paths(&self, paths: &[(PathKey, Entity<BufferDiff>)], cx: &mut Context<Self>) {
         let Some(lhs) = &self.lhs else { return };
 
         self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
-            for (path, diff) in &paths {
+            for (path, diff) in paths {
                 let (path, diff) = (path.clone(), diff.clone());
                 let main_buffer_id = diff.read(cx).buffer_id;
                 let Some(main_buffer) = rhs_multibuffer.buffer(diff.read(cx).buffer_id) else {
@@ -1593,10 +1588,6 @@ impl SplittableEditor {
                 }
             }
         });
-
-        // After the excerpts land: the blame sources are pruned against each
-        // multibuffer's live buffers, which only now include these paths.
-        self.sync_blame_sources(&paths, cx);
     }
 
     fn width_changed(&mut self, width: Pixels, window: &mut Window, cx: &mut Context<Self>) {

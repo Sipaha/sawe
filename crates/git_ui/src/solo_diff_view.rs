@@ -265,12 +265,21 @@ fn blame_base_for_source(
                 // lines of the file there to attribute to anyone.
                 return None;
             }
+            // The `None`s below state provenance — that side's text is not
+            // any revision's — and one of them is load-bearing, for a
+            // narrower reason than "git blame would fail". Where the missing
+            // thing is the *path* (a deleted file at `sha`, an added file at
+            // an ordinary commit's `<sha>^`) git answers `fatal: no such
+            // path`, which `git::blame::run_git_blame` maps to an empty
+            // blame, so an ungated call would only waste a subprocess. Where
+            // the missing thing is the *revision* it would not: a root commit
+            // has no `<sha>^`, git answers `fatal: bad revision`, that matches
+            // no sentinel, and `GitBlame` raises it as a toast — once per
+            // file, since `git show --name-status` reports every file of a
+            // root commit as added.
             Some(DiffBlameBase::Blob {
                 repository: repository.clone(),
                 repo_path: repo_path.clone(),
-                // A file the commit deleted does not exist at `sha`, and one
-                // it added does not exist at the parent — the pane on that
-                // side is empty, and asking git to blame it would fail.
                 rhs_revision: (!facts.status.is_deleted()).then(|| sha.clone()),
                 // `<sha>^` is the first parent, which is exactly what
                 // `GitRepository::load_commit` diffs against (`git show
@@ -506,6 +515,13 @@ impl SoloDiffView {
             .worktrees(cx)
             .next()
             .map(|worktree| worktree.read(cx).id());
+        // Always the *first* parent, which is what pairs with the hard-coded
+        // `<sha>^` in `blame_base_for_source`: this surface has no merge-parent
+        // toggle, so it never reaches `load_commit_diff_against_parent` and the
+        // diff and its left-pane blame cannot name different parents. If it
+        // ever gains that toggle, `lhs_revision` is already a parameter of
+        // `DiffBlameBase::Blob` — chasing the choice through to `<sha>^N` is a
+        // call-site change here, not a redesign of the blame seam.
         let commit_diff = repository.update(cx, |repository, _| {
             repository.load_commit_diff(sha.to_string())
         });
@@ -1635,6 +1651,56 @@ mod tests {
         }
     }
 
+    fn binary_commit_file(path: &str) -> CommitFile {
+        CommitFile {
+            path: repo_path(path),
+            old_text: Some("one\ntwo\n".to_string()),
+            new_text: Some("one\nTWO\n".to_string()),
+            is_binary: true,
+        }
+    }
+
+    /// Teaches the fake repository to answer `git blame <revision> -- <path>`
+    /// with `rows` annotated lines, at each of `revisions`.
+    fn set_blame_at_revisions(
+        context: &DiffTestContext,
+        path: &str,
+        revisions: impl IntoIterator<Item = String>,
+        rows: u32,
+    ) {
+        for revision in revisions {
+            context.fs.set_blame_at_revision_for_repo(
+                Path::new(path!("/project/.git")),
+                &revision,
+                vec![(
+                    repo_path(path),
+                    ::git::blame::Blame {
+                        entries: (0..rows).map(|row| blame_entry_at(row, "Tester")).collect(),
+                        ..Default::default()
+                    },
+                )],
+            );
+        }
+    }
+
+    /// Turns blame on in both panes of an open commit diff — one at a time,
+    /// each with the keyboard in it, because `GitBlame::generate` defers
+    /// everything while the editor is blurred.
+    fn blame_both_panes(view: &Entity<SoloDiffView>, cx: &mut VisualTestContext) {
+        let splittable = view.read_with(&*cx, |view, _| view.editor.clone());
+        let lhs = splittable
+            .read_with(&*cx, |editor, _| editor.lhs_editor().cloned())
+            .expect("a commit diff opens split");
+        let rhs = splittable.read_with(&*cx, |editor, _| editor.rhs_editor().clone());
+        for editor in [&lhs, &rhs] {
+            editor.update_in(cx, |editor, window, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+                editor.toggle_git_blame(&::git::Blame, window, cx);
+            });
+            cx.run_until_parked();
+        }
+    }
+
     /// Blame on the left pane of a working-tree diff has to *paint*, not merely
     /// be permitted: the gutter reserves the blame column from
     /// `GitBlame::max_author_display_columns` while the annotations themselves
@@ -1785,34 +1851,17 @@ mod tests {
                 Some("one\nTWO\nthree\n"),
             )],
         );
-        for revision in [SHA.to_string(), format!("{SHA}^")] {
-            context.fs.set_blame_at_revision_for_repo(
-                Path::new(path!("/project/.git")),
-                &revision,
-                vec![(
-                    repo_path("src/lib.rs"),
-                    ::git::blame::Blame {
-                        entries: vec![
-                            blame_entry_at(0, "Tester"),
-                            blame_entry_at(1, "Tester"),
-                            blame_entry_at(2, "Tester"),
-                        ],
-                        ..Default::default()
-                    },
-                )],
-            );
-        }
+        set_blame_at_revisions(
+            &context,
+            "src/lib.rs",
+            [SHA.to_string(), format!("{SHA}^")],
+            3,
+        );
 
         let view = open_commit(&context, SHA, "src/lib.rs", &mut cx)
             .await
             .expect("the commit's file opens")
             .expect("the gesture opened a view");
-
-        let splittable = view.read_with(&cx, |view, _| view.editor.clone());
-        let lhs = splittable
-            .read_with(&cx, |editor, _| editor.lhs_editor().cloned())
-            .expect("a commit diff opens split");
-        let rhs = splittable.read_with(&cx, |editor, _| editor.rhs_editor().clone());
 
         assert!(
             cx.debug_bounds("GIT-BLAME-ENTRY-LEFT").is_none()
@@ -1820,15 +1869,7 @@ mod tests {
             "nothing is blamed before the user asks for it"
         );
 
-        // One at a time, each with the keyboard in it: `GitBlame::generate`
-        // defers everything while the editor is blurred.
-        for editor in [&lhs, &rhs] {
-            editor.update_in(&mut cx, |editor, window, cx| {
-                editor.focus_handle(cx).focus(window, cx);
-                editor.toggle_git_blame(&::git::Blame, window, cx);
-            });
-            cx.run_until_parked();
-        }
+        blame_both_panes(&view, &mut cx);
 
         assert!(
             cx.debug_bounds("GIT-BLAME-ENTRY-RIGHT").is_some(),
@@ -1841,11 +1882,11 @@ mod tests {
         );
     }
 
-    /// A file the commit added does not exist at the parent, so `git blame
-    /// <sha>^ -- <path>` would fail outright. The left pane — which is empty
-    /// anyway — must simply go unannotated, and must not take the right pane's
+    /// A file the commit added is not at the parent revision, so the left
+    /// pane must simply go unannotated, and must not take the right pane's
     /// annotations down with it. This is also the shape of every file of a
-    /// root commit, which has no `<sha>^` at all.
+    /// root commit — which has no `<sha>^` at all, and is the case where the
+    /// gate is what stops `git blame` from erroring into a toast.
     #[gpui::test]
     async fn test_an_added_file_blames_only_the_right_pane(cx: &mut TestAppContext) {
         let (context, mut cx) = diff_test_context(cx).await;
@@ -1854,16 +1895,15 @@ mod tests {
             SHA,
             vec![commit_file("src/new.rs", None, Some("one\ntwo\n"))],
         );
-        context.fs.set_blame_at_revision_for_repo(
-            Path::new(path!("/project/.git")),
-            SHA,
-            vec![(
-                repo_path("src/new.rs"),
-                ::git::blame::Blame {
-                    entries: vec![blame_entry_at(0, "Tester"), blame_entry_at(1, "Tester")],
-                    ..Default::default()
-                },
-            )],
+        // The fixture answers at the parent revision too, which real git would
+        // refuse: the left assertion below has to be able to fail when the
+        // `is_created` gate is removed, and it cannot if the fixture is the
+        // thing withholding the annotations.
+        set_blame_at_revisions(
+            &context,
+            "src/new.rs",
+            [SHA.to_string(), format!("{SHA}^")],
+            2,
         );
 
         let view = open_commit(&context, SHA, "src/new.rs", &mut cx)
@@ -1871,21 +1911,7 @@ mod tests {
             .expect("the commit's file opens")
             .expect("the gesture opened a view");
 
-        let splittable = view.read_with(&cx, |view, _| view.editor.clone());
-        let lhs = splittable
-            .read_with(&cx, |editor, _| editor.lhs_editor().cloned())
-            .expect("a commit diff opens split");
-        let rhs = splittable.read_with(&cx, |editor, _| editor.rhs_editor().clone());
-
-        // One at a time, each with the keyboard in it: `GitBlame::generate`
-        // defers everything while the editor is blurred.
-        for editor in [&lhs, &rhs] {
-            editor.update_in(&mut cx, |editor, window, cx| {
-                editor.focus_handle(cx).focus(window, cx);
-                editor.toggle_git_blame(&::git::Blame, window, cx);
-            });
-            cx.run_until_parked();
-        }
+        blame_both_panes(&view, &mut cx);
 
         assert!(
             cx.debug_bounds("GIT-BLAME-ENTRY-RIGHT").is_some(),
@@ -1895,6 +1921,83 @@ mod tests {
             cx.debug_bounds("GIT-BLAME-ENTRY-LEFT").is_none(),
             "the file does not exist at the parent, so there is nothing to \
              annotate the empty left pane with"
+        );
+    }
+
+    /// The mirror of the added file: one the commit **deleted** is not at the
+    /// commit itself, so the right pane goes unannotated while the left pane —
+    /// which holds the file as of the parent — still paints.
+    #[gpui::test]
+    async fn test_a_deleted_file_blames_only_the_left_pane(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/gone.rs", Some("one\ntwo\n"), None)],
+        );
+        // Both revisions answerable, for the same reason as above: the right
+        // assertion has to fail when the `is_deleted` gate is removed.
+        set_blame_at_revisions(
+            &context,
+            "src/gone.rs",
+            [SHA.to_string(), format!("{SHA}^")],
+            2,
+        );
+
+        let view = open_commit(&context, SHA, "src/gone.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        blame_both_panes(&view, &mut cx);
+
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ENTRY-LEFT").is_some(),
+            "the deleted file still exists at the commit's parent, so the \
+             left pane is blamed"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ENTRY-RIGHT").is_none(),
+            "and it does not exist at the commit, so there is nothing to \
+             annotate the empty right pane with"
+        );
+    }
+
+    /// A binary file's panes hold a `(binary file not shown)` placeholder
+    /// rather than the file, so there is no line of it to attribute to anyone
+    /// on either side and the diff declares no blame base at all.
+    #[gpui::test]
+    async fn test_a_binary_file_blames_neither_pane(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(&context, SHA, vec![binary_commit_file("src/logo.png")]);
+        // Answerable at both revisions, so that dropping the binary gate would
+        // actually annotate the placeholder rather than fail to find a blame.
+        set_blame_at_revisions(
+            &context,
+            "src/logo.png",
+            [SHA.to_string(), format!("{SHA}^")],
+            2,
+        );
+
+        let view = open_commit(&context, SHA, "src/logo.png", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        view.read_with(&cx, |view, cx| {
+            assert!(
+                view.editor.read(cx).blame_base().is_none(),
+                "a placeholder is not the file, so neither pane has a \
+                 revision its text came from"
+            );
+        });
+
+        blame_both_panes(&view, &mut cx);
+
+        assert!(
+            cx.debug_bounds("GIT-BLAME-ENTRY-LEFT").is_none()
+                && cx.debug_bounds("GIT-BLAME-ENTRY-RIGHT").is_none(),
+            "and so neither pane paints an annotation"
         );
     }
 
@@ -2109,7 +2212,8 @@ mod tests {
                     view.editor.read(cx).blame_base(),
                     Some(DiffBlameBase::RhsFilesAt(revision)) if revision == "HEAD"
                 ),
-                "the left pane of an uncommitted diff is the file at HEAD, and                  its right pane is a project file blame resolves on its own"
+                "the left pane of an uncommitted diff is the file at HEAD, \
+                 and its right pane is a project file blame resolves on its own"
             );
         });
         commit.read_with(&cx, |view, cx| {
