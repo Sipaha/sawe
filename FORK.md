@@ -3050,51 +3050,76 @@ How to apply:
   output row of a collapsed block crease — is a blamed text row, so when it continues the run
   above it it now draws a blank gutter row where it used to draw the date.
 
-### 141. The band's terminal half auto-starts a shell on a store event, because it has no `Panel` to give it an activity edge
+### 141. The band's terminal half auto-starts a shell on a state edge, because it has no `Panel` to give it an activity edge
 
 What: opening the Solution band's terminal half while it holds no terminal now starts one, the
 way upstream's terminal dock does — «в панели терминала должна сразу сессия запускаться если её
-нету».
+нету» — in a Solution window and in a plain-folder one alike.
 
 Why it needed a new mechanism rather than a fix: upstream spawns that shell from
 `TerminalPanel::set_active` (`terminal_view::terminal_panel`), on the `false → true` edge of the
 `workspace::Panel` activity flag. `ConsolePanel` deliberately implements **no** `Panel` — it is a
 Solution band occupant installed through `Workspace::set_solution_band_utility_item`, not a dock
 panel — so `set_active` is never called and the behaviour was silently dropped in the port. The
-band's equivalent of that flag is `SolutionAgentStore::band_state(solution_id)`
-(`utility_visible && utility_kind == Terminal`) and its equivalent edge source is
+flag's equivalent is `BandState { utility_visible, utility_kind }`, and the edge has to be
+observed rather than polled.
+
+**Two edge sources, because the band keeps that state in two places.** A Solution window's band
+writes through to `SolutionAgentStore::band_state(solution_id)` — that write-through is what
+makes the geometry persist per Solution — and emits
 `SolutionAgentStoreEvent::BandStateChanged`, which covers all three ways the half opens:
 `ctrl-\``, the status-bar Terminal button, and the hydration that restores a window whose band
-was already open. The subscription is armed from `ConsolePanel::load` rather than `new`, because
-it needs a `Window` and `load` already runs inside a `workspace.update_in` that has one — which
-keeps `new`'s signature, and with it `run_config_ui`'s test constructor, untouched.
+was already open. A plain-folder window has no Solution to key a store row on, so
+`SolutionBand::set_utility_visible` takes its `None` arm, stores the identical `BandState` in
+its own `local_state` field and calls `cx.notify()` — the store never hears about it. That
+notify is the honest edge for such a window (the band entity *is* that window's band state), so
+`ConsolePanel` also `cx.observe_in`s the band and routes it into the same
+`on_band_state_changed`. `band_shows_this_panel` gained a matching fallback arm reading
+`SolutionBand::band_state`; nothing else forked. Both sources are live in a Solution window (the
+band re-notifies when it sees the store event) and that is harmless: the handler is guarded by
+the `band_showed_this_panel` edge memory, so whichever arrives first takes the `false → true`
+edge and the other sees none.
 
 **It must stay edge-triggered.** A level check in `render` would respawn the terminal the user
 just deliberately closed, because the panel stays mounted with zero tabs. The only entry points
-are the store subscription and one call at the end of restore, and a test fails if the call is
-added to `render`.
+are the two observations and one call at the end of restore, and a test fails if the call is
+added to `render`. An observation is not a render check for exactly this reason: a notify with
+`shows == showed` does nothing.
 
 The guards, and why each is load-bearing: `band_shows_this_panel` is redundant on the edge path
 and essential on the boot path, which is a level check — without it every workspace whose
 console panel restored no tabs started an invisible shell, and the tell was `debugger_ui`'s
 suite losing determinism to real PTYs; `tabs.is_empty() && pending_terminals_to_add == 0` is
-upstream's `has_no_terminals`, and the counter (which `add_terminal_tab` did not previously
-maintain) is what makes two edges inside one spawn's round trip idempotent; `workspace_has_project`
-is this fork's own — an empty Solution has nowhere to `cd`, which is exactly why the `+` menu
-greys "New Terminal" out there, and an auto-start must not do what the menu forbids;
-`restore_in_flight` keeps the boot check from racing the restore that is about to repopulate the
-panel. Focus is deliberately untouched: the auto-start only appends a tab.
+upstream's `has_no_terminals`; `workspace_has_project` is this fork's own — an empty Solution has
+nowhere to `cd`, which is exactly why the `+` menu greys "New Terminal" out there, and an
+auto-start must not do what the menu forbids; `restore_in_flight` keeps the boot check from
+racing the restore that is about to repopulate the panel. Focus is deliberately untouched: the
+auto-start only appends a tab.
 
-How to apply: a plain-folder workspace is **not** covered and that is deliberate — it has no
-Solution, so its band state stays window-local on `SolutionBand` and no `BandStateChanged` ever
-arrives. Covering it would mean observing the band entity itself, which the panel cannot resolve
-at `load` time (`zed.rs` installs the band *after* it awaits `ConsolePanel::load`). More
-generally: any band occupant that wants a "became visible" edge reads `band_state` and subscribes
-to that event; there is no `Panel` lifecycle to hook, and looking for one is the wrong turn this
-decision exists to prevent. Beware, too, that `band_shows_this_panel` resolves the Solution by
-reading the `Workspace` through the panel's weak handle, so the initial snapshot is taken in a
-`cx.defer_in` — every caller that can arm the subscription is already holding that entity leased,
-and a read under a lease aborts the process.
+**The counter is a guard now, so leaking it is a bug with a user-visible shape.**
+`pending_terminals_to_add` covers the window between "a spawn started" and "its view landed in
+`tabs`", during which `tabs.is_empty()` is still true; without it two band edges inside one
+round trip start two shells. It was write-only before this feature, and `add_terminal_task`
+decremented it only at the end of its happy path — so each of its three `?` bailouts (a remote
+project, a failed `create_terminal_task`, a window that went away mid-spawn) leaked an
+increment, and one leak convinces the panel forever that a shell is already on the way. Running
+a task that fails to spawn then silently costs that window its auto-start for the rest of its
+life. The body now sits in an inner `async` block so the decrement is sequenced after it on
+**every** exit. Its position is load-bearing in both directions: it stays *after* the tab push,
+not before the body, because while the body runs `tabs` is empty and the counter is the only
+thing preventing a second shell.
+
+How to apply: any band occupant that wants a "became visible" edge reads `BandState` and
+observes it — the store event for a Solution window, the band entity's own notify for a
+plain-folder one. There is no `Panel` lifecycle to hook, and looking for one is the wrong turn
+this decision exists to prevent. Two mechanics to respect: `band_shows_this_panel` and
+`solution_band` both resolve through the panel's `WeakEntity<Workspace>`, so the initial
+snapshot and the band observation are both armed inside a `cx.defer_in` — every caller that can
+arm them is already holding that entity leased, and a read under a lease aborts the process. And
+do not confuse the two installs in `zed.rs`: the band entity itself is set at
+`initialize_workspace` (`set_solution_band_item`, before `initialize_panels` is even called), so
+it is resolvable from the panel's deferred arm; only the band's *utility occupant*
+(`set_solution_band_utility_item`) is installed after `ConsolePanel::load` is awaited.
 
 ### 142. AI-session affordances live on the status-bar session strip; its `+` is left-click new, right-click reopen
 
