@@ -16,7 +16,8 @@ use multi_buffer::{
     Anchor, AnchorRangeExt as _, BufferOffset, ExcerptRange, ExpandExcerptDirection, MultiBuffer,
     MultiBufferDiffHunk, MultiBufferPoint, MultiBufferSnapshot, PathKey,
 };
-use project::Project;
+use git::repository::RepoPath;
+use project::{Project, git_store::Repository};
 use rope::Point;
 use settings::{DiffViewStyle, SeedQuerySetting, Settings, SettingsStore};
 use text::{Bias, BufferId, OffsetRangeExt as _, Patch, ToPoint as _};
@@ -415,7 +416,7 @@ pub struct SplittableEditor {
     /// mode, regardless of the current diff view style setting.
     too_narrow_for_split: bool,
     last_width: Option<Pixels>,
-    lhs_blame_base: Option<LhsBlameBase>,
+    blame_base: Option<DiffBlameBase>,
     /// Set by [`Self::disable_diff_hunk_controls`]. The renderer it installs
     /// is an opaque `Arc<dyn Fn>` that a caller cannot ask anything about, so
     /// the decision is recorded here for anyone who needs to know whether this
@@ -425,9 +426,48 @@ pub struct SplittableEditor {
     _subscriptions: Vec<Subscription>,
 }
 
-/// The git revision the left-hand pane's text was taken from, so `git::Blame`
-/// can annotate it correctly. Anything `git blame` accepts, e.g. `HEAD`.
-type LhsBlameBase = SharedString;
+/// What a consumer has declared about the git provenance of the two panes'
+/// text, so `git::Blame` can annotate buffers that are not project files.
+///
+/// This is a *declaration*, not a source map: [`SplittableEditor`] holds it
+/// and is the sole writer of both editors' `BlameBaseSource` maps, re-deriving
+/// them from this value on every sync. A consumer that instead wrote
+/// `Editor::set_blame_base_sources` itself would have its entries thrown away
+/// by the next excerpt update or by the next Unified/Split toggle, which
+/// rebuilds the left pane from scratch.
+#[derive(Clone, PartialEq)]
+pub enum DiffBlameBase {
+    /// The right-hand pane holds live project buffers, which blame resolves on
+    /// its own; each left-hand buffer is the corresponding right-hand file at
+    /// `revision`. Anything `git blame` accepts, e.g. `HEAD`.
+    ///
+    /// Multi-file safe: the repository and repo-relative path are resolved per
+    /// file from the right-hand buffer.
+    RhsFilesAt(SharedString),
+    /// One file, *neither* pane of which is a project buffer — both are
+    /// detached historic blobs, as in a commit's diff. Nothing about them is
+    /// resolvable through the project's buffer store, so the repository and
+    /// path are declared outright.
+    ///
+    /// Either revision may be `None`, meaning "that side has no revision to be
+    /// blamed against": a file the commit added does not exist at the parent,
+    /// and a file it deleted does not exist at the commit. `git blame` would
+    /// fail outright on those, and the failure surfaces as a toast.
+    ///
+    /// Single-file by construction, and applied only when the editor is
+    /// showing exactly that one path. A consumer showing several detached
+    /// files at once needs a per-path declaration, which this deliberately is
+    /// not — silently blaming every file of a multi-file diff as if it were
+    /// this one would be worse than not blaming it.
+    Blob {
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        /// Revision of the right-hand pane's text.
+        rhs_revision: Option<SharedString>,
+        /// Revision of the left-hand pane's text.
+        lhs_revision: Option<SharedString>,
+    },
+}
 
 struct LhsEditor {
     multibuffer: Entity<MultiBuffer>,
@@ -645,89 +685,174 @@ impl SplittableEditor {
             searched_side: None,
             too_narrow_for_split: false,
             last_width: None,
-            lhs_blame_base: None,
+            blame_base: None,
             diff_hunk_controls_disabled: false,
             style_controls_painted_by_consumer: false,
             _subscriptions: subscriptions,
         }
     }
 
-    /// Opts this diff into git blame on the left-hand pane, whose text is the
-    /// content of each file at `revision`.
+    /// Opts this diff into git blame for text that is not a project file —
+    /// always the left-hand pane, and for [`DiffBlameBase::Blob`] the
+    /// right-hand pane too.
     ///
     /// Consumers must opt in: `SplittableEditor` is also used to compare two
     /// unrelated files (`file_diff_view`, `text_diff_view`) and agent-produced
     /// snapshots (`agent_diff`), where the left pane's text is not any
     /// revision of the right pane's path and blaming it would be misleading.
-    /// Passing `None` turns left-pane blame back off, e.g. when a view
-    /// switches to a diff base that has no single commit-ish.
-    pub fn set_lhs_blame_base(&mut self, revision: Option<SharedString>, cx: &mut Context<Self>) {
-        self.lhs_blame_base = revision;
+    /// Passing `None` turns that blame back off, e.g. when a view switches to
+    /// a diff base that has no single commit-ish.
+    pub fn set_blame_base(&mut self, base: Option<DiffBlameBase>, cx: &mut Context<Self>) {
+        self.blame_base = base;
         let paths = self.diff_paths(cx);
-        self.sync_lhs_blame_sources(&paths, cx);
+        self.sync_blame_sources(&paths, cx);
     }
 
-    /// The revision the left-hand pane is being blamed against, if any. A
-    /// consumer's blame base is derived from what it is showing, so this is
-    /// how a test pins that derivation without reaching into blame itself.
-    pub fn lhs_blame_base(&self) -> Option<&SharedString> {
-        self.lhs_blame_base.as_ref()
+    /// What this diff has declared its panes' text to be. A consumer's blame
+    /// base is derived from what it is showing, so this is how a test pins
+    /// that derivation without reaching into blame itself.
+    pub fn blame_base(&self) -> Option<&DiffBlameBase> {
+        self.blame_base.as_ref()
     }
 
-    /// Tells the left-hand editor how to blame each detached base-text buffer.
-    /// The repository and repo-relative path come from the right-hand buffer,
-    /// which for an uncommitted diff is a real project file.
-    fn sync_lhs_blame_sources(
+    /// Tells each pane's editor how to blame the buffers it holds that blame
+    /// cannot resolve on its own, re-derived from [`Self::blame_base`].
+    ///
+    /// This is the *only* writer of either editor's `BlameBaseSource` map. It
+    /// runs after every excerpt update and whenever the declaration changes,
+    /// so an entry written anywhere else would not survive; the declaration
+    /// is what a consumer owns, and this is what turns it into sources.
+    fn sync_blame_sources(&self, paths: &[(PathKey, Entity<BufferDiff>)], cx: &mut Context<Self>) {
+        let (lhs_sources, rhs_sources) = self.blame_sources_for(paths, cx);
+
+        // The right pane exists in Unified mode too, where there is no left
+        // pane at all, so its sources are not conditional on the split.
+        Self::replace_blame_base_sources(&self.rhs_editor, &self.rhs_multibuffer, rhs_sources, cx);
+        if let Some(lhs) = &self.lhs {
+            Self::replace_blame_base_sources(&lhs.editor, &lhs.multibuffer, lhs_sources, cx);
+        }
+    }
+
+    /// The `(left, right)` source maps [`Self::blame_base`] calls for over
+    /// `paths`, each merged into what that pane already holds — `paths` can be
+    /// a subset, and the entries for the paths it leaves out must survive.
+    fn blame_sources_for(
         &self,
         paths: &[(PathKey, Entity<BufferDiff>)],
-        cx: &mut Context<Self>,
+        cx: &App,
+    ) -> (
+        HashMap<BufferId, BlameBaseSource>,
+        HashMap<BufferId, BlameBaseSource>,
     ) {
-        let Some(lhs) = &self.lhs else { return };
-        let (Some(revision), Some(project)) = (
-            self.lhs_blame_base.clone(),
-            self.rhs_editor.read(cx).project().cloned(),
-        ) else {
-            if !lhs.editor.read(cx).blame_base_sources().is_empty() {
-                lhs.editor.update(cx, |editor, cx| {
-                    editor.set_blame_base_sources(HashMap::default(), cx);
-                });
-            }
-            return;
-        };
+        let mut lhs_sources = self
+            .lhs
+            .as_ref()
+            .map(|lhs| lhs.editor.read(cx).blame_base_sources().clone())
+            .unwrap_or_default();
+        let mut rhs_sources = self.rhs_editor.read(cx).blame_base_sources().clone();
 
-        let mut sources = lhs.editor.read(cx).blame_base_sources().clone();
-        for (_, diff) in paths {
-            let diff = diff.read(cx);
-            let base_buffer_id = diff.base_text_buffer().read(cx).remote_id();
-            let rhs_buffer_id = diff.buffer_id;
-            let Some((repository, repo_path)) = project
-                .read(cx)
-                .git_store()
-                .read(cx)
-                .repository_and_path_for_buffer_id(rhs_buffer_id, cx)
-            else {
-                sources.remove(&base_buffer_id);
-                continue;
-            };
-            sources.insert(
-                base_buffer_id,
-                BlameBaseSource {
-                    repository,
-                    repo_path,
-                    revision: revision.clone(),
-                },
-            );
+        match &self.blame_base {
+            None => {
+                lhs_sources.clear();
+                rhs_sources.clear();
+            }
+            Some(DiffBlameBase::RhsFilesAt(revision)) => {
+                // The right pane holds project files, which blame resolves
+                // without help — and which the left pane's repository and path
+                // are resolved *through*.
+                rhs_sources.clear();
+                let Some(project) = self.rhs_editor.read(cx).project().cloned() else {
+                    lhs_sources.clear();
+                    return (lhs_sources, rhs_sources);
+                };
+                for (_, diff) in paths {
+                    let diff = diff.read(cx);
+                    let base_buffer_id = diff.base_text_buffer().read(cx).remote_id();
+                    let Some((repository, repo_path)) = project
+                        .read(cx)
+                        .git_store()
+                        .read(cx)
+                        .repository_and_path_for_buffer_id(diff.buffer_id, cx)
+                    else {
+                        lhs_sources.remove(&base_buffer_id);
+                        continue;
+                    };
+                    lhs_sources.insert(
+                        base_buffer_id,
+                        BlameBaseSource {
+                            repository,
+                            repo_path,
+                            revision: revision.clone(),
+                        },
+                    );
+                }
+            }
+            Some(DiffBlameBase::Blob {
+                repository,
+                repo_path,
+                rhs_revision,
+                lhs_revision,
+            }) => {
+                for (path_key, diff) in paths {
+                    let diff = diff.read(cx);
+                    let base_buffer_id = diff.base_text_buffer().read(cx).remote_id();
+                    let rhs_buffer_id = diff.buffer_id;
+                    // A `Blob` declaration names one file; anything else the
+                    // editor is showing is not it.
+                    if &path_key.path != repo_path.as_ref() {
+                        lhs_sources.remove(&base_buffer_id);
+                        rhs_sources.remove(&rhs_buffer_id);
+                        continue;
+                    }
+                    for (buffer_id, revision, sources) in [
+                        (base_buffer_id, lhs_revision, &mut lhs_sources),
+                        (rhs_buffer_id, rhs_revision, &mut rhs_sources),
+                    ] {
+                        match revision {
+                            Some(revision) => {
+                                sources.insert(
+                                    buffer_id,
+                                    BlameBaseSource {
+                                        repository: repository.clone(),
+                                        repo_path: repo_path.clone(),
+                                        revision: revision.clone(),
+                                    },
+                                );
+                            }
+                            // No revision holds this side's text — a file the
+                            // commit added has no parent revision, one it
+                            // deleted has none at the commit. `git blame`
+                            // would fail, and the failure is a toast.
+                            None => {
+                                sources.remove(&buffer_id);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        let live_buffer_ids = lhs
-            .multibuffer
+        (lhs_sources, rhs_sources)
+    }
+
+    /// Prunes `sources` against the buffers `multibuffer` still excerpts and
+    /// hands the result to `editor`.
+    fn replace_blame_base_sources(
+        editor: &Entity<Editor>,
+        multibuffer: &Entity<MultiBuffer>,
+        mut sources: HashMap<BufferId, BlameBaseSource>,
+        cx: &mut Context<Self>,
+    ) {
+        if sources.is_empty() && editor.read(cx).blame_base_sources().is_empty() {
+            return;
+        }
+        let live_buffer_ids = multibuffer
             .read(cx)
             .snapshot(cx)
             .all_buffer_ids()
             .collect::<HashSet<_>>();
         sources.retain(|buffer_id, _| live_buffer_ids.contains(buffer_id));
-
-        lhs.editor.update(cx, |editor, cx| {
+        editor.update(cx, |editor, cx| {
             editor.set_blame_base_sources(sources, cx);
         });
     }
@@ -1469,9 +1594,9 @@ impl SplittableEditor {
             }
         });
 
-        // After the excerpts land: the blame sources are pruned against the
-        // left multibuffer's live buffers, which only now include these paths.
-        self.sync_lhs_blame_sources(&paths, cx);
+        // After the excerpts land: the blame sources are pruned against each
+        // multibuffer's live buffers, which only now include these paths.
+        self.sync_blame_sources(&paths, cx);
     }
 
     fn width_changed(&mut self, width: Pixels, window: &mut Window, cx: &mut Context<Self>) {

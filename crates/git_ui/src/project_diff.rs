@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    Addon, DiffBlameBase, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent, ToggleSoftWrap},
     multibuffer_context_lines,
     scroll::Autoscroll,
@@ -592,7 +592,8 @@ impl ProjectDiff {
             );
             match branch_diff.read(cx).diff_base() {
                 // The left pane holds each file's content at HEAD.
-                DiffBase::Head => diff_display_editor.set_lhs_blame_base(Some("HEAD".into()), cx),
+                DiffBase::Head => diff_display_editor
+                    .set_blame_base(Some(DiffBlameBase::RhsFilesAt("HEAD".into())), cx),
                 // The left pane holds the content at the merge base of the
                 // target ref and HEAD. `git blame` takes a single commit-ish
                 // and has no syntax for a merge base, so rather than annotate
@@ -641,11 +642,11 @@ impl ProjectDiff {
                 BranchDiffEvent::DiffBaseChanged => {
                     this.pending_scroll.take();
                     let blame_base = match this.branch_diff.read(cx).diff_base() {
-                        DiffBase::Head => Some(SharedString::from("HEAD")),
+                        DiffBase::Head => Some(DiffBlameBase::RhsFilesAt("HEAD".into())),
                         DiffBase::Merge { .. } => None,
                     };
                     this.editor.update(cx, |editor, cx| {
-                        editor.set_lhs_blame_base(blame_base, cx);
+                        editor.set_blame_base(blame_base, cx);
                     });
                     this._task = window.spawn(cx, {
                         let this = cx.weak_entity();

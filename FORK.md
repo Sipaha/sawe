@@ -907,15 +907,28 @@ Why: the left pane of a split diff is built from `BufferDiff::base_text_buffer()
 How it works, two halves:
 
 - **Backend.** `GitRepository::blame_at_revision(path, revision)` runs `git blame --incremental <rev> -- <path>` with no piped content, so the result's line ranges describe the file *at that revision*. `GitStore::blame_path_at_revision` / `Project::blame_path_at_revision` expose it without needing an open buffer. Remote projects return `Ok(None)`: the `BlameBuffer` proto message is keyed by buffer id and has no revision field, so the honest answer is "no annotation" rather than HEAD's.
-- **Association.** `GitBlame` consults `HashMap<BufferId, BlameBaseSource>` — `{repository, repo_path, revision}` — before falling back to the buffer's own repository. `Editor::set_blame_base_sources` owns the map (it survives blame being toggled off and on); `SplittableEditor::sync_lhs_for_paths` fills it from the *right-hand* buffer's repository once a consumer has declared the base revision via `set_lhs_blame_base`.
+- **Association.** `GitBlame` consults `HashMap<BufferId, BlameBaseSource>` — `{repository, repo_path, revision}` — before falling back to the buffer's own repository. `Editor::set_blame_base_sources` owns the map (it survives blame being toggled off and on); `SplittableEditor::sync_blame_sources` fills it once a consumer has declared, via `set_blame_base`, what its panes are showing.
 
 Rejected alternative: synthesising a `File` on the base-text buffer so the ordinary lookup would find it. That buffer is deliberately fileless — a `File` makes unrelated code (save, project-path resolution, worktree/status lookups, `PathKey::for_buffer`) treat it as a real project file. A side-channel that only the blame pipeline reads cannot leak that way, and it carries the revision, which a `File` could not.
 
-How to apply: consumers **opt in**. `SplittableEditor` also backs `file_diff_view` / `text_diff_view` (two unrelated files) and `agent_diff` (a pre-agent snapshot), where the left text is not any revision of the right path — those get no left-pane blame. `project_diff` on `DiffBase::Head` and `solo_diff_view` opt in with `HEAD`; `DiffBase::Merge` deliberately does not, because `git blame` takes a single commit-ish and has no syntax for a merge base. `commit_view` is also unwired: *both* of its panes are detached buffers, so it needs base sources on the right too. Ordering trap: `sync_lhs_blame_sources` prunes entries whose buffer is no longer excerpted, so it must run **after** `update_path_excerpts`, never before.
+How to apply: consumers **opt in**. `SplittableEditor` also backs `file_diff_view` / `text_diff_view` (two unrelated files) and `agent_diff` (a pre-agent snapshot), where the left text is not any revision of the right path — those get no left-pane blame. `project_diff` on `DiffBase::Head` and `solo_diff_view`'s working-tree source opt in with `HEAD`; `DiffBase::Merge` deliberately does not, because `git blame` takes a single commit-ish and has no syntax for a merge base. `commit_view` is still unwired. Ordering trap: `sync_blame_sources` prunes entries whose buffer is no longer excerpted, so it must run **after** `update_path_excerpts`, never before.
 
 Second trap, same silence, different half: the left pane also needs a **workspace handle**. `EditorElement::layout_blame_entries` opens with `self.editor.read(cx).workspace()?`, so an editor without one produces zero annotations — while the column is still reserved: `Editor::snapshot` fills `EditorSnapshot::git_blame_gutter_max_author_columns` from `GitBlame::max_author_display_columns`, which only asks whether entries exist, and `Editor::gutter_dimensions` turns that into pixels. The pane's text shifts right by the full reservation and nothing is drawn in it, which reads as "blame is not implemented here" rather than as a wiring bug. A left pane is built inside `SplittableEditor::split`, not handed to the workspace as an item, so `Item::added_to_workspace` never reaches it on its own: `split` gives it the handle at creation, which is the only point that covers a pane rebuilt by the Unified/Split toggle long after the item was added. Consumers must forward `added_to_workspace` to the `SplittableEditor`, never past it to `rhs_editor()`.
 
 Reachability: the gutter right-click menu gained "Annotate with Git Blame" / "Close Git Blame Annotations". Its breakpoint and bookmark sections are now gated on those affordances being enabled — diff panes disable both (#57), so the menu there previously offered nothing but dead entries. When no section qualifies, `gutter_context_menu` returns `None` and no menu is deployed.
+
+**Amended 2026-09-03 — a commit's diff is no longer unwired, and the declaration is now per-pane.** This entry (and #136) used to say commit-mode blame was deliberately off because `sync_lhs_blame_sources` resolved `(repository, repo_path)` through `repository_and_path_for_buffer_id` on the **right-hand** buffer id, which a detached blob cannot answer. That is fixed, and the shape of the fix is the part worth keeping:
+
+- The consumer declares **provenance**, not sources. `SplittableEditor::set_blame_base(Option<DiffBlameBase>)` takes either `RhsFilesAt(revision)` — the old behaviour, multi-file, right pane resolves itself — or `Blob { repository, repo_path, rhs_revision, lhs_revision }`, where *neither* pane is a project buffer and nothing is resolved through a buffer at all.
+- `sync_blame_sources` is the **sole writer** of both editors' `BlameBaseSource` maps and re-derives them from that declaration on every excerpt update. This is the seam, and it is the whole point: a consumer that instead wrote `Editor::set_blame_base_sources` itself would have its entries wiped by the next `sync_lhs_for_paths`, and again by the next Unified/Split toggle, which rebuilds the left pane from scratch. Right-pane sources are **not** conditional on the split existing — Unified mode has no left pane and still blames.
+- Either revision may be `None`, meaning "this side has no revision to be blamed against". `solo_diff_view` sets `lhs_revision: None` for a file the commit **added** (which is also every file of a **root** commit, since `git show --name-status` reports them all as `A` and `collect_commit_diff_files` never touches `<sha>^`), `rhs_revision: None` for one it **deleted**, and no declaration at all for a binary file, whose panes hold a `(binary file not shown)` placeholder rather than the file. Without those gates `git blame` fails outright and `GitBlame` raises the failure as a user-visible toast on every such diff. With them the miss degrades to a `None` repository lookup and `Task::ready(Ok(None))` — no annotations, no error, same as a remote project.
+- `<sha>^` is the *first* parent, which is exactly what `GitRepository::load_commit` diffs against (`git show --first-parent`, `parent_sha = format!("{commit}^")`), so a merge commit's diff and its left-pane blame agree about which parent they mean. Renames are not a trap either: `load_commit` passes `--no-renames`, so a rename arrives as an add/delete pair and each half is gated by the rule above rather than being blamed at a path that does not exist on that side.
+
+Where the derivation lives is a consequence of #136's own rule: it is **not** a method on `DiffSource`, because the source alone cannot answer it — whether the file exists on both sides, and whether it is binary, are facts of the loaded blob. `git_ui::solo_diff_view::blame_base_for_source` takes both.
+
+Still true, and still a separate defect: `Editor::toggle_git_blame` flips `show_git_blame_gutter` unconditionally, so a pane that yields no annotations still gets the "Close Git Blame Annotations" label. Commit diffs are no longer the common way to hit it, but a binary file or an added file's left pane still is.
+
+Guards: `solo_diff_view::tests::{test_both_panes_paint_blame_for_a_commit_diff, test_an_added_file_blames_only_the_right_pane}`, both asserting `GIT-BLAME-ENTRY-LEFT` / `GIT-BLAME-ENTRY-RIGHT` through `VisualTestContext::debug_bounds` — the painted tree, not the predicate.
 ### 60. Split-diff connector ribbons pair hunks by zipping the two panes' hunk lists, and each ribbon is exactly one GPUI path
 
 Why: IDEA fills the strip between the two line-number columns with polygons tying each old block to the new block it became. Sawe had only a 1px divider there. `crates/editor/src/split_connectors.rs` widens it to a 36px strip (`CONNECTOR_STRIP_WIDTH`) and paints the ribbons into it with a `gpui::canvas`; the strip also hosts the resize handle and a `border_variant` line on each edge.
@@ -2678,17 +2691,19 @@ hunk staging both follow from the single fact that the right-hand side is a live
 buffer in one case and a detached historic blob in the other; `can_save` and `save` read
 `DiffSource::is_editable()`, and `disable_diff_hunk_controls` is applied by
 `configure_editor_for_source` matching the variant. Blame is a **parameter**:
-`blame_base()` is `Some("HEAD")` for the working tree (the left pane holds the file at HEAD)
-and `None` for a commit. The `None` is mechanical, not conceptual —
-`SplittableEditor::sync_lhs_blame_sources` (`crates/editor/src/split.rs`) resolves the
-`(repository, repo_path)` to blame through `repository_and_path_for_buffer_id` on the
-**right-hand** buffer id, and a detached blob is not in the project's buffer store, so every
-source it builds is dropped. Wiring commit-mode blame needs an explicit repository override on
-`SplittableEditor`: a separate change inside `editor`, with its own tests. #59 records the
-same gap from the other end — its "how to apply" lists `commit_view` among the consumers that
-deliberately do **not** opt in, because *both* of its panes are detached buffers — and its
-ordering trap applies here too: `sync_lhs_blame_sources` prunes entries whose base buffer is
-no longer excerpted, so it must run **after** the excerpts are installed, never before.
+`blame_base_for_source` answers `DiffBlameBase::RhsFilesAt("HEAD")` for the working tree (the
+left pane holds the file at HEAD, the right pane is a project buffer) and
+`DiffBlameBase::Blob { .. }` for a commit, whose two panes are blobs of one path at `<sha>`
+and `<sha>^`. It is a free function rather than a `DiffSource` method precisely because of the
+line drawn below: whether the file exists on both sides of its own diff, and whether it is
+binary, are facts of the **loaded blob**, not of the source. #59 (as amended) is where the
+mechanism and its gates are recorded; its ordering trap applies here too —
+`sync_blame_sources` prunes entries whose base buffer is no longer excerpted, so it must run
+**after** the excerpts are installed, never before.
+
+*(Until 2026-09-03 this paragraph said commit-mode blame was `None`, mechanically: the sync
+resolved `(repository, repo_path)` through `repository_and_path_for_buffer_id` on the
+right-hand buffer id, which a detached blob cannot answer. That is no longer true.)*
 
 The gesture model — the maintainer's, now the rule for **both** tabs (amends #125):
 
