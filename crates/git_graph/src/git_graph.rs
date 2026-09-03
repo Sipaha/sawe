@@ -190,10 +190,37 @@ use workspace::{
 /// Index of the Description column, which the commit graph is drawn over.
 const DESCRIPTION_COLUMN_IDX: usize = 0;
 
+/// Number of text columns in the log table: Description / Date / Author.
+///
+/// `Table` converts every rendered row with `TableRow::from_vec`, whose length
+/// check is an **un-gated `panic!`** — a row that emits the wrong number of
+/// cells aborts the editor during layout, in release builds too. So this is a
+/// hard contract shared by the header, [`Table::new`] and every row producer.
+/// Build rows with [`log_table_row`], which takes a fixed-size array and moves
+/// the check to compile time; the reason it exists is that two branches of the
+/// row builder silently drifted to four cells and crashed the editor the first
+/// time the synthetic "Local Changes" row was ever painted.
+const LOG_COLUMN_COUNT: usize = 3;
+
+/// The single place a log-table row is turned into cells. The array argument
+/// is what makes the column count a compile error at each call site instead of
+/// a paint-time abort.
+fn log_table_row(cells: [AnyElement; LOG_COLUMN_COUNT]) -> Vec<AnyElement> {
+    cells.into()
+}
+
+/// Paint-tree selector for the synthetic *Local Changes* row.
+const LOCAL_CHANGES_ROW_SELECTOR: &str = "GIT-GRAPH-LOCAL-CHANGES-ROW";
+
+/// Paint-tree selector for the Description cell of the commit at `data_idx`.
+fn commit_row_selector(data_idx: usize) -> String {
+    format!("GIT-GRAPH-COMMIT-ROW-{data_idx}")
+}
+
 /// Column shares used before the table has been measured — the very first
 /// frame, where `cached_container_width` is still zero. Every later frame
 /// re-derives them from the content (see [`default_column_fractions`]).
-const UNMEASURED_COLUMN_FRACTIONS: [f32; 3] = [0.74, 0.13, 0.13];
+const UNMEASURED_COLUMN_FRACTIONS: [f32; LOG_COLUMN_COUNT] = [0.74, 0.13, 0.13];
 
 /// Smallest share of the log table the Description column keeps. Below this the
 /// Date and Author content widths are scaled back together: on a container too
@@ -237,7 +264,11 @@ const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 /// and what IDEA's log does.
 ///
 /// Returns `[description, date, author]`, summing to 1.
-fn default_column_fractions(date: Pixels, author: Pixels, container: Pixels) -> [f32; 3] {
+fn default_column_fractions(
+    date: Pixels,
+    author: Pixels,
+    container: Pixels,
+) -> [f32; LOG_COLUMN_COUNT] {
     if container <= px(0.) {
         return UNMEASURED_COLUMN_FRACTIONS;
     }
@@ -275,9 +306,9 @@ struct ColumnWidthInputs {
     author: Pixels,
 }
 
-fn new_column_widths_state(fractions: [f32; 3]) -> RedistributableColumnsState {
+fn new_column_widths_state(fractions: [f32; LOG_COLUMN_COUNT]) -> RedistributableColumnsState {
     RedistributableColumnsState::new(
-        3,
+        LOG_COLUMN_COUNT,
         fractions.map(DefiniteLength::Fraction).to_vec(),
         vec![
             TableResizeBehavior::Resizable,
@@ -2332,11 +2363,17 @@ impl GitGraph {
 
         range
             .map(|idx| {
+                let empty_cell = || div().h(row_height).into_any_element();
                 if has_local_row && idx == 0 {
-                    return vec![
+                    return log_table_row([
                         div()
                             .h(row_height)
                             .id(("local-changes-row", 0_u32))
+                            // Paint-level proof that the synthetic row was
+                            // actually rendered: the crash it used to cause
+                            // lived in the row builder, which no test that only
+                            // sets `with_local_changes` on state ever reaches.
+                            .debug_selector(|| LOCAL_CHANGES_ROW_SELECTOR.into())
                             .child(
                                 h_flex()
                                     .gap_1()
@@ -2344,10 +2381,9 @@ impl GitGraph {
                                     .child(Label::new("Local Changes").color(Color::Accent)),
                             )
                             .into_any_element(),
-                        div().h(row_height).into_any_element(),
-                        div().h(row_height).into_any_element(),
-                        div().h(row_height).into_any_element(),
-                    ];
+                        empty_cell(),
+                        empty_cell(),
+                    ]);
                 }
                 // `view_idx` is the row index in the view (used by selection
                 // and hover state); `data_idx` is the index into
@@ -2365,12 +2401,7 @@ impl GitGraph {
                     .get(data_idx)
                     .zip(repository.as_ref())
                 else {
-                    return vec![
-                        div().h(row_height).into_any_element(),
-                        div().h(row_height).into_any_element(),
-                        div().h(row_height).into_any_element(),
-                        div().h(row_height).into_any_element(),
-                    ];
+                    return log_table_row([empty_cell(), empty_cell(), empty_cell()]);
                 };
                 // The remaining code originally indexed by `idx` against
                 // `graph_data` (group-by-date prev lookup). Shadow `idx`
@@ -2522,9 +2553,10 @@ impl GitGraph {
                     px(0.)
                 };
 
-                vec![
+                log_table_row([
                     h_flex()
                         .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
+                        .debug_selector(move || commit_row_selector(idx))
                         .overflow_hidden()
                         .tooltip(Tooltip::text(subject))
                         .child(div().flex_none().w(subject_indent))
@@ -2532,7 +2564,7 @@ impl GitGraph {
                         .into_any_element(),
                     column_label(formatted_time.into()),
                     column_label(author_name),
-                ]
+                ])
             })
             .collect()
     }
@@ -3598,40 +3630,34 @@ impl Render for GitGraph {
                     .flex()
                     .flex_col()
                     .child(
-                        h_flex()
-                            .w_full()
-                            .items_stretch()
-                            .child(div().w_full().child(render_table_header(
+                        h_flex().w_full().items_stretch().child(
+                            div().w_full().child(render_table_header(
                                 TableRow::from_vec(
-                                    vec![
-                                                h_flex()
-                                                    .when(!is_file_history, |this| {
-                                                        this.child(
-                                                            div()
-                                                                .flex_none()
-                                                                .w(widest_row_indent)
-                                                                .overflow_hidden()
-                                                                .child(
-                                                                    Label::new("Graph")
-                                                                        .color(Color::Muted)
-                                                                        .truncate(),
-                                                                ),
-                                                        )
-                                                    })
-                                                    .child(
-                                                        Label::new("Description")
-                                                            .color(Color::Muted)
-                                                            .truncate(),
-                                                    )
-                                                    .into_any_element(),
-                                                Label::new("Date")
+                                    log_table_row([
+                                        h_flex()
+                                            .when(!is_file_history, |this| {
+                                                this.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .w(widest_row_indent)
+                                                        .overflow_hidden()
+                                                        .child(
+                                                            Label::new("Graph")
+                                                                .color(Color::Muted)
+                                                                .truncate(),
+                                                        ),
+                                                )
+                                            })
+                                            .child(
+                                                Label::new("Description")
                                                     .color(Color::Muted)
-                                                    .into_any_element(),
-                                                Label::new("Author")
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                            ],
-                                    3,
+                                                    .truncate(),
+                                            )
+                                            .into_any_element(),
+                                        Label::new("Date").color(Color::Muted).into_any_element(),
+                                        Label::new("Author").color(Color::Muted).into_any_element(),
+                                    ]),
+                                    LOG_COLUMN_COUNT,
                                 ),
                                 header_context,
                                 Some(header_resize_info),
@@ -3645,7 +3671,8 @@ impl Render for GitGraph {
                                 // resized.
                                 Some(self.table_interaction_state.entity_id()),
                                 cx,
-                            ))),
+                            )),
+                        ),
                     )
                     .child({
                         let row_height = Self::row_height(window, cx);
@@ -3669,7 +3696,7 @@ impl Render for GitGraph {
                             .overflow_hidden()
                             .child(self.render_graph_canvas(window, cx));
 
-                        let commits_table = Table::new(3)
+                        let commits_table = Table::new(LOG_COLUMN_COUNT)
                             .interactable(&self.table_interaction_state)
                             .hide_row_borders()
                             .hide_row_hover()
@@ -7774,9 +7801,7 @@ mod tests {
     /// and when it opened on Changes, which is precisely the distinction this
     /// test exists to make.
     #[gpui::test]
-    async fn test_double_clicking_the_local_changes_row_summons_the_panel(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_double_clicking_the_local_changes_row_summons_the_panel(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -7872,6 +7897,89 @@ mod tests {
         git_panel.read_with(&*cx, |panel, _| {
             assert!(panel.commit_tab_shas().is_empty());
         });
+    }
+
+    /// The row builder is a `uniform_list` closure, and `Table` turns whatever
+    /// it returns into a `TableRow` with `TableRow::from_vec`, whose length
+    /// check is an un-gated `panic!`. The synthetic *Local Changes* branch used
+    /// to emit four cells against a three-column table, so the first frame after
+    /// the Pencil toggle aborted the process — in a release build too, and again
+    /// on every relaunch, because `with_local_changes` is serialized into the
+    /// item's state and restored before anyone can turn it back off.
+    ///
+    /// Nothing caught that, because every other test that turns the flag on sets
+    /// it on state and never paints the table. So this one puts the graph in a
+    /// pane, drives a real frame and reads the *painted* tree. Both sides are
+    /// asserted: with the flag on, the synthetic row and the commit rows are
+    /// both on screen; with it off, the synthetic row is gone and the commit
+    /// rows stay — otherwise "the local row is absent" would also pass on a
+    /// graph that paints nothing at all.
+    #[gpui::test]
+    async fn test_the_local_changes_row_paints_alongside_the_commit_rows(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let (_project, git_graph, _git_panel, mut cx) =
+            setup_graph_with_git_panel(&fs, three_commits(), cx).await;
+        let cx = &mut cx;
+        // `debug_bounds` keys on a `&'static str`; the selector is derived from
+        // the commit's data index, so leak the one this test needs.
+        let first_commit_row: &'static str = commit_row_selector(0).leak();
+
+        // `VisualTestContext::draw` paints into a frame it never swaps in, so
+        // the graph has to be a real pane item for `debug_bounds` to see it.
+        let workspace = git_graph
+            .read_with(&*cx, |graph, _| graph.workspace.clone())
+            .upgrade()
+            .expect("the fixture's workspace outlives the graph");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds(first_commit_row).is_some(),
+            "precondition: the commit rows are painted, so the assertions below \
+             are about the local-changes row and not about an empty table"
+        );
+        assert!(
+            cx.debug_bounds(LOCAL_CHANGES_ROW_SELECTOR).is_none(),
+            "precondition: no synthetic row before the toggle"
+        );
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.log_source = LogSource::Path(RepoPath::new(&"file.txt").expect("valid path"));
+            graph.file_history_options.with_local_changes = true;
+            assert!(graph.has_local_changes_row());
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let local_bounds = cx
+            .debug_bounds(LOCAL_CHANGES_ROW_SELECTOR)
+            .expect("the Pencil toggle paints the synthetic Local Changes row");
+        let first_commit_bounds = cx
+            .debug_bounds(first_commit_row)
+            .expect("and a real commit row still paints beside it");
+        assert!(
+            local_bounds.origin.y < first_commit_bounds.origin.y,
+            "the synthetic row occupies view-index 0, above the newest commit"
+        );
+
+        git_graph.update_in(cx, |graph, _window, cx| {
+            graph.file_history_options.with_local_changes = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds(LOCAL_CHANGES_ROW_SELECTOR).is_none(),
+            "toggling the Pencil back off removes the synthetic row"
+        );
+        assert!(
+            cx.debug_bounds(first_commit_row).is_some(),
+            "…and leaves the commit rows painted"
+        );
     }
 
     fn rows(indices: impl IntoIterator<Item = usize>) -> HashSet<usize> {

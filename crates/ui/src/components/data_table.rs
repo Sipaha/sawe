@@ -26,6 +26,37 @@ mod tests;
 /// Will be converted into `TableRow<T>` internally
 pub type UncheckedTableRow<T> = Vec<T>;
 
+/// Converts a row produced by one of the *lazy* row-rendering closures
+/// ([`Table::uniform_list`], [`Table::variable_row_height_list`]) into a
+/// [`TableRow`], degrading instead of aborting when the closure got the column
+/// count wrong.
+///
+/// Those closures run during layout on every frame and cannot be checked when
+/// the table is built, so `TableRow::from_vec`'s un-gated `panic!` turns a
+/// cosmetic arity bug into an editor abort — and, when the state that produced
+/// the bad row is serialized, into a crash loop that survives a restart. That
+/// is exactly how the git graph's synthetic "Local Changes" row bricked the
+/// editor: one stray cell, no way back in without wiping the runtime dir.
+/// A wrong row is still a bug, so it stays a hard failure in tests and dev
+/// builds via `debug_assert!` and is always logged; only the release editor
+/// paints a padded/truncated row rather than dying. The eager
+/// `TableRow::from_vec` keeps its panic — its callers control the arity at the
+/// point of construction, where a panic is a usable stack trace.
+fn coerce_rendered_row(
+    mut row: UncheckedTableRow<AnyElement>,
+    cols: usize,
+) -> TableRow<AnyElement> {
+    if row.len() != cols {
+        log::error!(
+            "table row rendered {} cells but the table has {cols} columns; padding/truncating",
+            row.len()
+        );
+        debug_assert_eq!(row.len(), cols, "rendered table row has the wrong arity");
+        row.resize_with(cols, || div().into_any_element());
+    }
+    row.into_table_row(cols)
+}
+
 /// State for independently resizable columns (spreadsheet-style).
 ///
 /// Each column has its own absolute width; dragging a resize handle changes only
@@ -1161,7 +1192,7 @@ impl RenderOnce for Table {
                                     move |range: Range<usize>, window, cx| {
                                         let elements = render_item_fn(range.clone(), window, cx)
                                             .into_iter()
-                                            .map(|raw_row| raw_row.into_table_row(self.cols))
+                                            .map(|raw_row| coerce_rendered_row(raw_row, self.cols))
                                             .collect::<Vec<_>>();
                                         elements
                                             .into_iter()
@@ -1196,8 +1227,10 @@ impl RenderOnce for Table {
                             list(variable_list_data.list_state.clone(), {
                                 let render_item_fn = variable_list_data.render_row_fn;
                                 move |row_index: usize, window: &mut Window, cx: &mut App| {
-                                    let row = render_item_fn(row_index, window, cx)
-                                        .into_table_row(self.cols);
+                                    let row = coerce_rendered_row(
+                                        render_item_fn(row_index, window, cx),
+                                        self.cols,
+                                    );
                                     render_table_row(
                                         row_index,
                                         row,
