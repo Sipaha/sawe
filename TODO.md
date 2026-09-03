@@ -204,6 +204,36 @@ alternative — summoning into a pane that has no preview slot — is the pinnin
 model forbids; the real question is whether a split should inherit a preview slot at all,
 which is a `workspace::Pane` decision.
 
+### C10. Blame does not group consecutive lines from one commit
+IntelliJ tints a run of lines that share a commit and prints the metadata **once** per
+run; this fork prints the date and author on every line, so a file edited in a few large
+commits reads as a wall of repetition. It is the single largest remaining readability win
+in the gutter, and it is the "Not done" paragraph of FORK.md **#135** — deferred there
+deliberately, because it is a redesign of the renderer trait rather than the width fix
+that commit was about.
+
+Why it needs a trait change: a `BlameRenderer` is handed one entry and cannot see its
+neighbours, so it cannot know it is a continuation. The caller can —
+`crates/editor/src/element.rs::layout_blame_entries` (`:2138`) collects `blamed_rows`
+for the whole visible range before rendering any of them, so the run position is
+available there and nowhere else. That means a run-position argument on **both**
+`BlameRenderer::render_blame_entry` and `render_blame_entry_with_options`
+(`crates/editor/src/git/blame.rs:137`, `:156`; implemented in
+`crates/git_ui/src/blame_ui.rs:63`, `:92`), the run background painted in `element.rs`
+rather than by the renderer, and — the constraint that makes it more than a filter —
+**continuation rows must stay interactive**: every row is hoverable and clickable today
+(tooltip, right-click menu, click-to-open-commit), and a blank continuation row that has
+lost those is a regression, not a simplification.
+
+Two things already in place that this should not re-derive: the per-commit colour moved
+onto the author name in #135, so a run already has a shared visual cue to build on; and
+`GitBlame::max_author_display_columns` prices the gutter width from the *shortened* name
+in display columns, so a run that draws the name on fewer rows must not change the
+reservation.
+
+*Done when:* runs are visually grouped, the metadata is drawn once per run, and every row
+in a run — including continuations — still hovers, right-clicks and opens its commit.
+
 ---
 
 ## D. Tooling gaps
