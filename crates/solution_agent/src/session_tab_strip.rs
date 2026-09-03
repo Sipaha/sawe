@@ -23,19 +23,21 @@
 //! directly) keeps session creation on exactly one code path — two paths
 //! disagreeing about the new session's cwd was the phase-1 Critical.
 //!
-//! Right-click a tab for Rename Session / Restart Agent / Close, and drag a
+//! Right-click a tab for Close / Rename Session / Restart Agent, and drag a
 //! tab onto another to reorder (persisted via `SolutionAgentStore::
 //! persist_tab_order`) — phase-2a task-5b restoring what the deleted
 //! `ConsolePanel` chat-tab strip carried. See `reorder_to` and
 //! `open_rename_session_modal` for the mechanics; the overflow popover's
 //! rows are `submenu`s (not plain entries) so the same three actions stay
-//! reachable for a tab that has spilled past `MAX_VISIBLE_TABS`.
+//! reachable for a tab that has spilled past `MAX_VISIBLE_TABS`. There is no
+//! per-tab close cross — the right-click menu is the only close affordance
+//! (maintainer request, 2026-09-03), which is why that entry comes first.
 
 use std::cell::RefCell;
 
 use gpui::{
     App, Context, ElementId, IntoElement, ParentElement, PromptLevel, Render, SharedString, Styled,
-    Subscription, WeakEntity, Window, div, px,
+    Subscription, WeakEntity, Window, div,
 };
 use solutions::{SolutionId, SolutionStore};
 use ui::{ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*, right_click_menu};
@@ -112,6 +114,39 @@ fn is_busy_state(state: &SessionState) -> bool {
         state,
         SessionState::Running { .. } | SessionState::Stopping { .. }
     )
+}
+
+/// The three visual signals that separate the selected session tab from the
+/// unselected ones. Named as a value rather than inlined into `render_tab` so
+/// the rule itself is unit-testable: `debug_bounds` can prove an element
+/// painted but says nothing about its colours, so without this the house
+/// style would only ever be checked by eye.
+#[derive(Debug, PartialEq, Eq)]
+struct TabSelectionStyle {
+    /// Whether a background is painted at all. The unselected tab gets
+    /// *none* — `tab_active_background` against `tab_inactive_background` is
+    /// two adjacent neutral steps, which is what made the selection
+    /// invisible before.
+    filled: bool,
+    /// Whether the 2px bottom border uses `border_focused` (vs
+    /// `border_transparent`, which reserves the same space).
+    accent_underline: bool,
+    label: Color,
+}
+
+/// The fork's house style for a tab strip, matching
+/// `solutions_ui::project_tab` / `solution_tab` — the two strips in the title
+/// bar the user sees directly above this one.
+fn tab_selection_style(is_active: bool) -> TabSelectionStyle {
+    TabSelectionStyle {
+        filled: is_active,
+        accent_underline: is_active,
+        label: if is_active {
+            Color::Default
+        } else {
+            Color::Muted
+        },
+    }
 }
 
 /// Move `from` so it lands at the slot currently occupied by `target`,
@@ -374,40 +409,86 @@ impl SessionTabStrip {
         } else {
             candidate.title.clone()
         };
-        let bg = if is_active {
-            cx.theme().colors().tab_active_background
+        // Selected-vs-unselected styling follows the fork's house style for a
+        // tab strip (`solutions_ui::project_tab` / `solution_tab`): the active
+        // tab is the only one with a background, it carries a 2px accent
+        // underline, and its label is `Default` against the others' `Muted`.
+        // Three signals instead of the two adjacent neutral greys
+        // (`tab_active_background` vs `tab_inactive_background`) this strip
+        // shipped with, which read as the same dark pill either way.
+        let style = tab_selection_style(is_active);
+        let background = style
+            .filled
+            .then(|| cx.theme().colors().tab_active_background);
+        let border = if style.accent_underline {
+            cx.theme().colors().border_focused
         } else {
-            cx.theme().colors().tab_inactive_background
+            cx.theme().colors().border_transparent
         };
 
         let row = div()
             .id(("session-tab-strip-tab", ix))
+            // Selection state is in the selector because `debug_bounds` can
+            // only answer "did this paint": a paint test asserts both the
+            // active and the inactive row exist, which a single shared
+            // selector could not distinguish.
+            .debug_selector(|| {
+                format!(
+                    "SESSION-TAB-{}-{ix}",
+                    if is_active { "ACTIVE" } else { "INACTIVE" }
+                )
+            })
             .flex()
             .flex_none()
             .items_center()
-            .h_full()
+            // A definite height, taken from the same `ButtonSize` metric the
+            // neighbouring `+`/overflow `IconButton`s size themselves with, so
+            // the pill matches them and scales with the status bar's rem
+            // override. It must be explicit: `h_full()` here was inert (no
+            // ancestor has a definite height), which left the row's height an
+            // accident of its tallest child — the close cross this strip no
+            // longer has. Without it the label sits in a pill with no
+            // vertical extent at all.
+            .h(ButtonSize::Default.rems())
             .gap_1()
             .px_1p5()
-            .min_w(px(90.))
-            .max_w(px(180.))
+            // In rems, not px: the status bar overrides the rem size for its
+            // subtree (`workspace::status_bar::STATUS_BAR_UI_SCALE`), so a
+            // fixed pixel width would hold the tab at its old size while its
+            // label grew — i.e. truncate more text than before.
+            .min_w(rems_from_px(90.))
+            .max_w(rems_from_px(180.))
             .rounded_sm()
-            .bg(bg)
+            .when_some(background, |this, bg| this.bg(bg))
+            .border_b_2()
+            .border_color(border)
             .cursor_pointer()
             .child(Indicator::dot().color(dot_color))
             .child(
+                // Own flex row at full height so the label is optically
+                // centred in the pill, mirroring `console_panel::panel`'s tab.
+                // NB: no `LineHeightStyle::UiLabel` — it pins line-height to
+                // 1.0×font-size and `.truncate()` adds `overflow: hidden`, so
+                // descenders get clipped at the bottom edge.
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Label::new(title.clone()).size(LabelSize::Small).truncate()),
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .child(
+                        Label::new(title.clone())
+                            .size(LabelSize::Small)
+                            .color(style.label)
+                            .truncate(),
+                    ),
             )
-            .child(
-                IconButton::new(("session-tab-strip-close", ix), IconName::Close)
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.close_tab(session_id, window, cx);
-                    })),
-            )
+            // No close cross: closing a session tab goes through the
+            // right-click menu's "Close" below (and the overflow popover's own
+            // "Close" for a tab past `MAX_VISIBLE_TABS`), which is the same
+            // `close_tab` — busy-state confirmation included. The cross was
+            // also the only thing giving this row a height; see the `.h(..)`
+            // above.
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -435,9 +516,9 @@ impl SessionTabStrip {
 
         // Right-click menu restoring the affordances the old dock chat-tab
         // strip carried (see the phase-2a task-5b brief): rename, restart
-        // the agent subprocess (keeping the conversation), and close —
-        // routed through the same busy-confirmation `close_tab` the tab's
-        // own close button uses, so there is exactly one close path.
+        // the agent subprocess (keeping the conversation), and close. With
+        // the cross gone this "Close" is the tab's only close affordance, so
+        // it leads the menu; it runs the busy-confirmation `close_tab`.
         let menu_id = ElementId::from(SharedString::from(format!(
             "session-tab-strip-menu-{session_id}"
         )));
@@ -673,10 +754,61 @@ impl StatusItemView for SessionTabStrip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{Entity, TestAppContext};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    /// Window root that paints a fixed set of [`SessionTabStrip::render_tab`]
+    /// rows. The strip's own `Render` is unusable here — it resolves the
+    /// Solution through a live `MultiWorkspace`, which this scaffolding
+    /// cannot build — but `render_tab` is the element under test and takes
+    /// its inputs as plain data, so driving it directly paints exactly the
+    /// tree the status bar paints.
+    struct TabPaintHarness {
+        strip: Entity<SessionTabStrip>,
+        solution_id: SolutionId,
+        /// `(session id, title, is_active)` per tab, left to right.
+        tabs: Vec<(SolutionSessionId, SharedString, bool)>,
+    }
+
+    impl Render for TabPaintHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let solution_id = self.solution_id;
+            let tabs = self.tabs.clone();
+            let strip = self.strip.clone();
+            let rows = strip.update(cx, |strip, cx| {
+                let weak_self = cx.weak_entity();
+                let order: Vec<SolutionSessionId> = tabs.iter().map(|(id, _, _)| *id).collect();
+                tabs.iter()
+                    .enumerate()
+                    .map(|(ix, (session_id, title, is_active))| {
+                        let candidate = TabCandidate {
+                            session_id: *session_id,
+                            tab_order: ix as i64,
+                            title: title.clone(),
+                            is_cold: true,
+                            is_errored: false,
+                            is_running: false,
+                        };
+                        strip
+                            .render_tab(
+                                solution_id,
+                                &candidate,
+                                *is_active,
+                                ix,
+                                order.clone(),
+                                weak_self.clone(),
+                                None,
+                                cx,
+                            )
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            div().flex().items_center().gap_1().children(rows)
+        }
+    }
 
     // The `+` button dispatches `console_panel::NewChat` *by name* (see the
     // module doc) rather than importing its type — a real dev-dependency on
@@ -767,6 +899,85 @@ mod tests {
         assert!(!is_busy_state(&SessionState::Errored(SharedString::from(
             "boom"
         ))));
+    }
+
+    #[test]
+    fn the_selected_tab_differs_from_an_unselected_one_on_every_signal() {
+        let active = tab_selection_style(true);
+        let inactive = tab_selection_style(false);
+
+        assert_eq!(
+            active,
+            TabSelectionStyle {
+                filled: true,
+                accent_underline: true,
+                label: Color::Default,
+            }
+        );
+        assert_eq!(
+            inactive,
+            TabSelectionStyle {
+                filled: false,
+                accent_underline: false,
+                label: Color::Muted,
+            },
+            "an unselected tab gets no background at all — the previous \
+             `tab_inactive_background` pill was indistinguishable from the \
+             active one"
+        );
+        assert_ne!(active.filled, inactive.filled);
+        assert_ne!(active.accent_underline, inactive.accent_underline);
+        assert_ne!(active.label, inactive.label);
+    }
+
+    /// The painted tree, not the predicate: that a tab row carries no close
+    /// cross, that both selection states actually paint, and that the row has
+    /// the `+` button's height rather than collapsing to its content now that
+    /// the cross is gone.
+    #[gpui::test]
+    async fn a_painted_tab_has_no_close_cross_and_the_button_row_height(
+        cx: &mut TestAppContext,
+    ) {
+        let (solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        drop(project);
+        let (_harness, cx) = cx.add_window_view(|_window, cx| TabPaintHarness {
+            strip: cx.new(|cx| SessionTabStrip::new(None, cx)),
+            solution_id,
+            tabs: vec![
+                (SolutionSessionId::new(), SharedString::from("first"), false),
+                (SolutionSessionId::new(), SharedString::from("second"), true),
+            ],
+        });
+        cx.run_until_parked();
+
+        let inactive = cx
+            .debug_bounds("SESSION-TAB-INACTIVE-0")
+            .expect("the unselected tab must paint");
+        let active = cx
+            .debug_bounds("SESSION-TAB-ACTIVE-1")
+            .expect("the selected tab must paint");
+        assert!(
+            cx.debug_bounds("ICON-Close").is_none(),
+            "a session tab must carry no close cross — closing is right-click \
+             only; this assertion is only meaningful because the two rows \
+             above did paint"
+        );
+
+        // `ButtonSize::Default` at the test window's default 16px rem: the
+        // metric the neighbouring `+` / overflow buttons use.
+        assert_eq!(active.size.height, px(22.));
+        assert_eq!(
+            inactive.size.height,
+            active.size.height,
+            "selection must not change the row's height"
+        );
     }
 
     #[test]
