@@ -189,9 +189,39 @@ impl BlameRenderer for GitBlameRenderer {
             )
         };
 
+        // Dropping the repeated date and author leaves nothing marking where
+        // one run ends and the next begins: two adjacent labelled rows and a
+        // labelled row following four blank ones read the same. A hairline on
+        // the head row's top edge is that boundary.
+        //
+        // Skipped at `ix == 0` because the renderer is handed viewport rows:
+        // the top one is a run head whenever the row scrolled off above it
+        // came from another commit, and a line drawn there sits on the edge of
+        // the visible gutter, where it reads as a frame around the editor
+        // rather than as a break between two commits.
+        //
+        // Absolutely positioned rather than a `border_t_1`: a head row is
+        // 22.5px of intrinsic text height inside a 23px row pitch, so a border
+        // would both grow the row past its line and push the date down a pixel
+        // relative to the code it annotates. Out of flow, the line lands on the
+        // row's top edge and changes no other geometry.
+        let run_separator = (!is_continuation && ix > 0).then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w_full()
+                .h_px()
+                .bg(cx.theme().colors().border_variant)
+                .debug_selector(|| {
+                    format!("GIT-BLAME-SEPARATOR{}-{ix}", blame_pane_suffix(&editor, cx))
+                })
+        });
+
         Some(
             div()
                 .mr_2()
+                .relative()
                 // A gutter that reserves the blame column and paints nothing in
                 // it looks identical to one that has no blame — the reservation
                 // is priced from the entries while the entries themselves are
@@ -278,6 +308,10 @@ impl BlameRenderer for GitBlameRenderer {
                             })
                         }),
                 )
+                // After the row, not before it: the row paints a hover
+                // background over its whole box, which would swallow a
+                // hairline drawn underneath it.
+                .children(run_separator)
                 .into_any(),
         )
     }

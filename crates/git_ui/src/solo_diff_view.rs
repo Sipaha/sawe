@@ -2024,6 +2024,65 @@ mod tests {
         );
     }
 
+    /// With the date and the author printed once per run, the only thing left
+    /// saying "a new commit starts here" is the blank rows above the label —
+    /// and blank rows say nothing at the boundary itself. The hairline does.
+    /// Asserted on the painted tree and on both sides: present on the row that
+    /// opens the second run, absent on both continuation rows, and absent on
+    /// the first row of the viewport, where a line would read as a frame edge
+    /// rather than as a break.
+    #[gpui::test]
+    async fn test_a_run_boundary_draws_a_hairline_above_the_head_row(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        let _view = open_two_run_commit_diff(&context, &mut cx).await;
+
+        assert!(
+            cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-0").is_none(),
+            "the top row of the viewport has no run above it to be separated \
+             from, and a line there reads as a frame around the editor"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-1").is_none(),
+            "row 1 continues the first run, so there is no boundary to mark"
+        );
+        let separator = cx
+            .debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-2")
+            .expect("row 2 opens a second run, so the boundary above it is drawn");
+        assert!(
+            cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-3").is_none(),
+            "and row 3 continues that second run"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-SEPARATOR-LEFT-2").is_some()
+                && cx.debug_bounds("GIT-BLAME-SEPARATOR-LEFT-1").is_none()
+                && cx.debug_bounds("GIT-BLAME-SEPARATOR-LEFT-0").is_none(),
+            "the left pane is separated by its own runs — measured here, not \
+             assumed: the fixture gives both revisions the same per-row shas, \
+             so the two panes break in the same place, and a left pane that \
+             drew no hairline at all would otherwise pass unnoticed"
+        );
+
+        let head = cx
+            .debug_bounds("GIT-BLAME-ROW-RIGHT-2")
+            .expect("the row that opens the second run paints its container");
+        assert_eq!(
+            separator.origin.y, head.origin.y,
+            "the hairline sits on the head row's top edge — drawn inside the \
+             row it would cut the date in half, drawn below it would mark the \
+             wrong boundary"
+        );
+        assert_eq!(
+            separator.size.width, head.size.width,
+            "and spans the blame column, not just the text in it"
+        );
+        assert!(
+            separator.size.height > gpui::px(0.)
+                && separator.size.height < head.size.height / 2.,
+            "a hairline, not a band: {:?}",
+            separator.size.height
+        );
+    }
+
     /// A file the commit added is not at the parent revision, so the left
     /// pane must simply go unannotated, and must not take the right pane's
     /// annotations down with it. This is also the shape of every file of a
