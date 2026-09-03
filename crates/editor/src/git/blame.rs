@@ -1749,14 +1749,19 @@ mod tests {
     }
 
     /// A block row (excerpt header, diff-hunk controls, folded-buffer header)
-    /// as `BlockRows` emits it: every field `None`.
+    /// as `BlockRows` emits it: every field `None`. Not every block row looks
+    /// like this — the first output row of a `Replace` custom block (a
+    /// collapsed block crease) forwards its real row info and so reads as
+    /// ordinary blamed text here.
     fn block_row() -> RowInfo {
         RowInfo::default()
     }
 
     /// Every entry is built with the same `range`, so an implementation that
     /// grouped on `BlameEntry::range` instead of row adjacency would collapse
-    /// all of these into one run and fail the tests below.
+    /// these fixtures into one run — failing five of the ten tests below (the
+    /// header-block case survives it, being pinned by the separate block-row
+    /// clause rather than by the adjacency test).
     #[track_caller]
     fn assert_run_positions(
         spec: &[(RowInfo, Option<(BufferId, &str)>)],

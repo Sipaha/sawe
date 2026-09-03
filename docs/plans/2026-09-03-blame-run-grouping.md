@@ -1,7 +1,7 @@
 # Plan — group consecutive blame lines from one commit
 
 Status: **complete** (2026-09-03) — commits `c0085392d9`, `e9e3978a7e`, `3e04449a7a`,
-`b14ee2f7eb`, `58e722a7cd`, plus this doc pass.
+`b14ee2f7eb`, `58e722a7cd`, `aff2e0800b`, plus this doc pass.
 Tracked: `TODO.md` **C10** (now deleted), `FORK.md` **#135** ("Not done" paragraph, now
 amended) — the decision that records what shipped is `FORK.md` **#140**.
 
@@ -260,9 +260,12 @@ Nothing here is a code change; do not touch code in this task.
 
 ## What actually shipped
 
-Five commits, in order: `c0085392d9` (this plan), `e9e3978a7e` (Task 1),
+Six commits, in order: `c0085392d9` (this plan), `e9e3978a7e` (Task 1),
 `3e04449a7a` (Task 2), `b14ee2f7eb` (Task 3), `58e722a7cd` (Task 3b — not in
-this plan). The durable record is `FORK.md` #140; the per-task detail, including
+this plan), and `aff2e0800b`, a review follow-up that strengthens the spacer
+test to assert its continuation rows are *painted* rather than merely missing
+their metadata, and takes the accompanying doc-comment correction in
+`block_map.rs`. The durable record is `FORK.md` #140; the per-task detail, including
 each task's mutation table, is in
 `.superpowers/sdd/2026-09-03-blame-run-grouping/task-{1,2,3,3b}-report.md`, and
 every ruling is in that directory's `progress.md` — all of which are **local working
@@ -319,12 +322,6 @@ record.
   hover background cannot paint over it. `crates/editor/src/element.rs` was
   therefore **not** needed for Task 3 — the escape hatch the task allowed went
   unused.
-- **The plan undercounted the existing painted tests.** Global Constraint 3 and
-  the mechanics section say "six existing painted tests assert
-  `debug_bounds("GIT-BLAME-ENTRY…")` (`solo_diff_view.rs:1712-2005`)". At
-  `c0085392d9` there were **seven**; the seventh,
-  `test_the_blame_base_follows_the_source`, sat below the quoted line range. All
-  seven kept their names and stayed green.
 - **`before.png` is a reconstruction, not a build of `c0085392d9`.** Task 3 could
   not afford a cold ~20-minute debug compile in a checkout other agents were
   editing, so it disabled the two visual deltas in the current tree, built,
@@ -348,6 +345,46 @@ record.
   `crates/multi_buffer/src/`). The facts they asserted were correct and were
   re-verified by the implementer.
 
+### Corrections to the record
+
+The whole-feature review caught four false claims in the first version of this
+doc pass. They are listed here rather than silently edited, because one of them
+also lives in a commit message this repo does not rewrite:
+
+- **"a seventh painted test" — wrong, and it retracted a correct statement.** The
+  first version of this section claimed the plan undercounted the pre-existing
+  painted blame tests at six when there were seven. There are **six**: at
+  `c0085392d9` all fifteen `debug_bounds("GIT-BLAME-ENTRY…")` assertions sit
+  between `:1741` and `:1999`, across
+  `test_the_left_pane_paints_blame_for_a_working_tree_diff`,
+  `test_a_re_split_left_pane_still_paints_blame`,
+  `test_both_panes_paint_blame_for_a_commit_diff`,
+  `test_an_added_file_blames_only_the_right_pane`,
+  `test_a_deleted_file_blames_only_the_left_pane` and
+  `test_a_binary_file_blames_neither_pane`.
+  `test_the_blame_base_follows_the_source` (`:2192`) asserts no such selector at
+  all. The plan's Global Constraint 3 was right as written. **The commit message
+  of `96e9a1e5e0` still carries the wrong claim** — this paragraph is the
+  correction of record.
+- **`FORK.md` #140 said a `BlameEntry::range` key "collapses six of the eight"**
+  run-position tests. Two errors: there are **ten** such tests
+  (`crates/editor/src/git/blame.rs:1797-1958`, two of them added by Task 3b), and
+  swapping the identity test for range equality fails **five** of them — the sha
+  change, the buffer-row jump, the buffer change, the jump across a spacer, and
+  the break across an unblamed row. The header-block test survives, because it is
+  pinned by the separate block-row clause rather than by the adjacency test.
+  Corrected in #140 and in the test helper's own comment.
+- **"`BlockRows::next` collapses *every* block row to `RowInfo::default()`" is
+  false**, in #140, in the touched-files row, and in `Block::is_alignment_only`'s
+  own doc comment. `block_map.rs:2756-2763` forwards the real row info for the
+  first output row of a non-`FoldedBuffer` `is_replacement()` block — i.e. a
+  `Block::Custom(BlockPlacement::Replace)`, which `DisplayMap::fold` produces for
+  a block crease. Gutter consequence, now recorded in #140: a collapsed block
+  crease's first row is a blamed text row, so when it continues the run above it
+  it draws a blank gutter row where it used to draw the date.
+- **The commit list was stale by one** — `aff2e0800b` landed after the doc pass
+  and is now in both the Status line and the list above.
+
 ### Deferred, with the reasons
 
 Carried out of the reviews and deliberately not fixed here: the duplicated test
@@ -357,7 +394,11 @@ distinguishing its two halves; the fact that a filtered-out author's run head
 draws no hairline (unreachable while `TODO.md` C11 stands); and
 `alignment_rows.get(ix).copied().unwrap_or(false)`, which means a short flag
 slice reverts to pre-fix behaviour in a release build — documented, with a single
-production caller that builds the slice itself.
+production caller that builds the slice itself. Two cosmetic edges are accepted
+rather than deferred and are stated in `FORK.md` #140 so there is one copy of
+each: the hairline's one-row flicker at the viewport's top edge, and the absence
+of any painted coverage for the plain single-editor gutter (every painted
+assertion goes through the split-diff `-LEFT` / `-RIGHT` suffix).
 
 ### Task 4 (this pass)
 

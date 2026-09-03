@@ -472,9 +472,11 @@ impl Block {
     /// companion's — it stands for nothing in this buffer, and the two text
     /// rows it sits between are still consecutive lines of the same file.
     ///
-    /// [`BlockRows`] collapses every block row to `RowInfo::default()`, so a
-    /// consumer working from row info alone cannot tell such a row from a
-    /// header; this is the distinction, and it is the block map's to make.
+    /// [`BlockRows`] collapses a block row to `RowInfo::default()` — every one
+    /// except the first output row of a `Replace` custom block, which forwards
+    /// the real row info — so a consumer working from row info alone cannot
+    /// tell such a row from a header; this is the distinction, and it is the
+    /// block map's to make.
     /// See [`crate::git::blame::blame_run_positions`].
     ///
     /// Not to be confused with [`BlockStyle::Spacer`], one word away: that is

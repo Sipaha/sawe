@@ -151,7 +151,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/search/src/search.rs` | Registers `find_in_path::init` alongside the existing `project_search` registration. | `search` |
 | `crates/search/Cargo.toml` | Adds `schemars` (modal action/settings schema) + `solutions` (Solution/member scope resolution for the scope tabs) deps. | `search` |
 | `crates/editor/src/display_map.rs` | Adds `HighlightKey::FindInPathPreview` variant used to highlight the active match in the Find-in-Path preview editor. | `search` |
-| `crates/editor/src/display_map/block_map.rs` | **(decision #140)** `Block::is_alignment_only()` — an exhaustive match, `true` only for `Block::Spacer` — so a consumer can tell the split diff's padding rows from an excerpt or folded-buffer header without re-deriving the distinction. `BlockRows::next` collapses every block row to `RowInfo::default()`, so the row alone cannot answer it. | `editor` (blame run grouping) / `git_ui` |
+| `crates/editor/src/display_map/block_map.rs` | **(decision #140)** `Block::is_alignment_only()` — an exhaustive match, `true` only for `Block::Spacer` — so a consumer can tell the split diff's padding rows from an excerpt or folded-buffer header without re-deriving the distinction. `BlockRows::next` collapses a block row to `RowInfo::default()` (all but the first output row of a `Replace` custom block), so the row alone cannot answer it. | `editor` (blame run grouping) / `git_ui` |
 | `crates/file_finder/src/file_finder.rs` | IDEA parity: `ToggleFileFinder` seeds the picker query from the active editor's **selection** (`FileFinder::query_from_selection`), so selecting a path in a buffer and hitting `ctrl-shift-n` searches for it. Single-line selections only; suppressed entirely when `seed_search_query_from_cursor` is `never`. | `file_finder` |
 | `crates/editor/src/input.rs` | **(decision #83)** `Editor::newline` no longer extends its edit back to column 0 to clear the auto-indent whitespace of the line it leaves, so a blank line inside a block keeps the block's indent. | `editor` |
 | `crates/language/src/buffer.rs`, `crates/multi_buffer/src/multi_buffer.rs`, `crates/editor/src/selection.rs` | **(decision #83)** `Buffer::set_caret_positions` / `MultiBuffer::set_caret_positions` (local-only bookkeeping — no collab op, no notify) plumbed from `Editor::selections_did_change`; `Buffer::remove_trailing_whitespace` skips rows that hold a cursor. | `editor` / `project` |
@@ -2978,7 +2978,11 @@ and no severing block row intervened. Each clause is there for a case that actua
 `GitBlame::sync` leaves the original (now stale) range in **both** halves when an in-buffer
 edit splits an entry — so two rows carrying equal ranges are not necessarily adjacent lines of
 one run. The unit tests are built to catch the shortcut: every fixture entry is given the same
-`range`, so an implementation that grouped on it collapses six of the eight into one run.
+`range`, so swapping the identity test for range equality and leaving the rest of the rule
+alone fails five of the ten `blame_run_positions_*` tests — the sha change, the buffer-row
+jump, the buffer change, the jump across a spacer, and the break across an unblamed row. (Not
+the header-block test: that one is pinned by the separate block-row clause, which the swap
+leaves standing.)
 
 **The first blamed row of the viewport is always a head.** Runs are computed from the visible
 slice, so a run that started above the viewport has no head in view. Rather than reach outside
@@ -3001,8 +3005,9 @@ background, and the per-commit colour on the author name (#135) is already the "
 cue.
 
 **The alignment-spacer exemption, and the asymmetry that forced it.** `BlockRows::next`
-collapses *every* block row to `RowInfo::default()`, so the rule above could not tell an
-excerpt header from the spacer a split diff pads the shorter pane with — and a split diff pads
+collapses a block row to `RowInfo::default()` — every block row *except* the first output row
+of a `Replace` custom block, which forwards the real row info — so the rule above could not
+tell an excerpt header from the spacer a split diff pads the shorter pane with — and a split diff pads
 *both* panes, each opposite the other's insertions. The two panes of one commit's diff
 therefore cut the same commit's run in different places and printed a different number of
 labels for it, which is worse than either behaviour on its own. The fix classifies on the
@@ -3034,7 +3039,16 @@ How to apply:
   asserted through `VisualTestContext::debug_bounds` on per-row selectors — `GIT-BLAME-META…-<ix>`
   (present iff the row is a head), `GIT-BLAME-ROW…-<ix>` (every blamed row) and
   `GIT-BLAME-SEPARATOR…-<ix>`, alongside the pre-existing `GIT-BLAME-ENTRY[-LEFT|-RIGHT]`,
-  which are keyed by name alone and so cannot distinguish rows.
+  which are keyed by name alone and so cannot distinguish rows. Every one of those painted
+  assertions goes through the split-diff `-LEFT` / `-RIGHT` suffix, so the **plain
+  single-editor gutter** (`blame_pane_suffix` → `""`) has no painted coverage at all; a change
+  that only breaks the unsplit case will not be caught by this suite.
+- **Two known cosmetic edges, both consequences of a viewport-local computation.** Scrolling one
+  row at a time through a run boundary makes its hairline vanish when the head reaches `ix == 0`
+  and reappear at `ix == 1` — the same family as the sticky top label, and the price of the
+  viewport-top exemption. And the one row `BlockRows::next` does *not* collapse — the first
+  output row of a collapsed block crease — is a blamed text row, so when it continues the run
+  above it it now draws a blank gutter row where it used to draw the date.
 
 ### 141. The band's terminal half auto-starts a shell on a store event, because it has no `Panel` to give it an activity edge
 
