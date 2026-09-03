@@ -755,8 +755,9 @@ mod tests {
     use super::*;
     use crate::db::SolutionAgentDb;
     use crate::model::{
-        DEFAULT_BAND_HEIGHT, MAX_BAND_HEIGHT, MAX_DIVIDER_RATIO, MIN_BAND_HEIGHT,
-        MIN_DIVIDER_RATIO, clamp_band_height, effective_band_height,
+        BAND_RESERVED_HEIGHT, DEFAULT_BAND_HEIGHT, MAX_BAND_HEIGHT, MAX_DIVIDER_RATIO,
+        MIN_BAND_HEIGHT, MIN_DIVIDER_RATIO, band_reserved_height_terms, clamp_band_height,
+        effective_band_height,
     };
     use gpui::TestAppContext;
     use std::sync::Arc;
@@ -805,6 +806,30 @@ mod tests {
             MIN_BAND_HEIGHT,
             "an absurdly short viewport must still leave room for the compose \
              box and status row — the ceiling never drops below MIN_BAND_HEIGHT"
+        );
+    }
+
+    /// The reserve is hand-derived from a constant that lives in another crate,
+    /// and the assertions below pin `effective_band_height`'s *arithmetic*, not
+    /// that derivation — so a future change to `workspace::STATUS_BAR_HEIGHT`
+    /// would leave every one of them green while the reserve silently stopped
+    /// describing the real chrome. This is the assertion that fails instead.
+    #[test]
+    fn the_band_reserve_is_derived_from_the_live_status_bar_height() {
+        let (chrome_above, status_bar, project_zone_floor) = band_reserved_height_terms();
+        assert_eq!(
+            status_bar,
+            f32::from(workspace::STATUS_BAR_HEIGHT),
+            "the middle term must BE the status bar's height, not a copy of its \
+             current value"
+        );
+        assert_eq!(
+            BAND_RESERVED_HEIGHT,
+            chrome_above + status_bar + project_zone_floor,
+            "BAND_RESERVED_HEIGHT is 61px of title bar + member tab row, plus the \
+             status bar, plus 59px so the project zone is still an editor. If the \
+             status bar's height changed, this constant and the four ceiling \
+             assertions below move with it."
         );
     }
 

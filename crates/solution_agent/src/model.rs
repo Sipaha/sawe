@@ -1247,26 +1247,45 @@ pub const MAX_BAND_HEIGHT: f32 = 4096.0;
 /// something to be. Applied at render against the live viewport.
 pub const MAX_BAND_HEIGHT_FRACTION: f32 = 0.8;
 /// Window height the band must leave behind, in logical pixels, on top of
-/// the fraction cap. A pure fraction of the viewport is not enough on a
-/// short window: the band is a `flex_none` sibling of the project zone
-/// (`flex_1`, basis 0 — shrinks to 0 first) and of the status bar
-/// (`workspace::status_bar::STATUS_BAR_HEIGHT`, 33px, but *shrinkable*, not
-/// `flex_none`), so an over-tall band zeroes the project zone and then eats
-/// into the status bar.
+/// the fraction cap. A pure fraction of the viewport is not enough on a short
+/// window: in the workspace column the status bar is `flex_none` (it refuses
+/// to shrink — `workspace::status_bar`), the project zone is `flex_1` with
+/// basis 0 (so it is the first thing to shrink, all the way to nothing), and
+/// the band is shrinkable but only *after* the project zone has been zeroed.
+/// So the thing this reserve protects is the project zone: without it an
+/// over-tall band leaves it a hairline, and the column then overflows the
+/// window rather than the status bar politely giving up its pixels.
 ///
-/// Derivation: ~95px of chrome the band never gets — measured live at
-/// 1280x384 as 61px above the band (the platform title bar plus the member
-/// tab row) and the 33px status bar below — and ~58px more so the project
-/// zone is still an editor rather than a hairline. Re-derive this if any of
-/// those chrome heights change; the status bar grew 30px → 33px when its
-/// contents were scaled up (2026-09-03), which is the 150 → 153 here.
+/// Derivation — [`band_reserved_height_terms`] returns these three, and
+/// `the_band_reserve_is_derived_from_the_live_status_bar_height` asserts the
+/// sum, so this comment cannot drift from the constant:
+///
+/// - `61.0` of chrome above the band, measured live at 1280x384: the platform
+///   title bar plus the member tab row.
+/// - `f32::from(workspace::STATUS_BAR_HEIGHT)` below it — 33.0 today. This is
+///   the term that moved when the status bar was scaled up (2026-09-03), and
+///   it is why this constant went 150 → 153.
+/// - `59.0` more so the project zone is still an editor rather than a
+///   hairline.
 ///
 /// This is a *coarse* guard, not the safety net: it cannot know the project
 /// zone's own content minimum. The layout invariant that actually keeps the
 /// status bar on screen is the `min_h_0` on the workspace column in
-/// `Workspace::render` plus the band being shrinkable — see the comments
-/// there.
+/// `Workspace::render` plus the band — not the status bar — being the
+/// shrinkable sibling; see the comments there.
 pub const BAND_RESERVED_HEIGHT: f32 = 153.0;
+
+/// The three terms [`BAND_RESERVED_HEIGHT`] is the sum of: chrome above the
+/// band, the status bar below it, and the slack that keeps the project zone an
+/// editor. Returned as data so the derivation is asserted rather than trusted —
+/// the previous comment claimed the status bar was shrinkable long after it
+/// had been made `flex_none`, which is exactly the drift a prose-only
+/// derivation invites. A function rather than a `const` because `Pixels`' inner
+/// `f32` is `pub(crate)` to gpui, so `f32::from(STATUS_BAR_HEIGHT)` cannot run
+/// in a const initializer.
+pub fn band_reserved_height_terms() -> (f32, f32, f32) {
+    (61.0, f32::from(workspace::STATUS_BAR_HEIGHT), 59.0)
+}
 
 /// Clamp a stored band height into the range a row may hold. Mirrors
 /// `clamp_divider_ratio`, including the NaN fold: `f32::clamp` propagates

@@ -35,9 +35,16 @@ pub const STATUS_BAR_HEIGHT: Pixels = px(33.);
 /// dozen crates that contribute status-bar items, which would drift the first
 /// time one of them was edited.
 ///
-/// The multiplier deliberately does NOT leak into the popovers the bar opens:
-/// `ui::ContextMenu` re-establishes `ui_font_size` for its own subtree, and
-/// tooltips are prepainted at window level, outside any rem override.
+/// The multiplier does not leak into the popovers the bar opens, but for two
+/// *different* reasons, and only one of them generalises. Tooltips are
+/// prepainted at window level (`Window::prepaint_tooltip`), outside any rem
+/// override, so any status item's tooltip is unscaled. A right-click menu is
+/// unscaled only because `ui::ContextMenu::render` wraps itself in its own
+/// `WithRemSize(ui_font_size)` — **deferral does not reset the rem by
+/// itself**: `DeferredDraw` captures the ambient rem size and restores it when
+/// the deferred subtree is drawn (`gpui::Window`), so a future status-bar item
+/// that defers something which is NOT a `ContextMenu` will inherit this 1.1×
+/// and must reset it the way `ContextMenu` does.
 const STATUS_BAR_UI_SCALE: f32 = 1.1;
 
 /// Describes how a status-bar item can be hidden by the user.
@@ -140,13 +147,17 @@ impl Render for StatusBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
 
-        // `WithRemSize` instead of `h_flex()`: it is a `Div` underneath with an
-        // extra rem-size override wrapped around layout/prepaint/paint, so its
-        // own padding and gap scale together with its children's.
-        WithRemSize::new(theme::theme_settings(cx).ui_font_size(cx) * STATUS_BAR_UI_SCALE)
-            .flex()
-            .flex_row()
-            .items_center()
+        // Two elements, not one. The outer `div` owns the row's *box* — the
+        // fixed height, the background and the window-decoration corners — and
+        // the inner `WithRemSize` owns everything laid out inside it at the
+        // scaled rem, including its own padding and gap. Splitting them keeps
+        // the row height independent of the scale (a taller bar is a decision,
+        // not a consequence) and gives the box a `debug_selector`, which
+        // `WithRemSize` cannot carry: it implements `Styled`/`ParentElement`
+        // but not `InteractiveElement`, so `STATUS_BAR_HEIGHT` would otherwise
+        // be unassertable from a paint test.
+        div()
+            .debug_selector(|| "STATUS-BAR".into())
             .w_full()
             .h(STATUS_BAR_HEIGHT)
             // The status bar is a fixed-height row and must never be the thing
@@ -154,9 +165,6 @@ impl Render for StatusBar {
             // shrinks silently (default `flex-shrink: 1`) and an over-tall
             // Solution band ate it a few pixels at a time.
             .flex_none()
-            .justify_between()
-            .gap(DynamicSpacing::Base08.rems(cx))
-            .p(DynamicSpacing::Base04.rems(cx))
             .bg(cx.theme().colors().status_bar_background)
             .map(|el| match window.window_decorations() {
                 Decorations::Server => el,
@@ -187,8 +195,20 @@ impl Render for StatusBar {
                     .border_b(px(1.0))
                     .border_color(cx.theme().colors().status_bar_background),
             })
-            .child(self.render_left_tools(&sidebar, cx))
-            .child(self.render_right_tools(&sidebar, cx))
+            .child(
+                WithRemSize::new(
+                    theme::theme_settings(cx).ui_font_size(cx) * STATUS_BAR_UI_SCALE,
+                )
+                .size_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(DynamicSpacing::Base08.rems(cx))
+                .p(DynamicSpacing::Base04.rems(cx))
+                .child(self.render_left_tools(&sidebar, cx))
+                .child(self.render_right_tools(&sidebar, cx)),
+            )
     }
 }
 
@@ -485,5 +505,101 @@ impl<T: StatusItemView> StatusItemViewHandle for Entity<T> {
 impl From<&dyn StatusItemViewHandle> for AnyView {
     fn from(val: &dyn StatusItemViewHandle) -> Self {
         val.to_any()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Workspace;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::Project;
+    use serde_json::json;
+    use util::path;
+
+    /// Smallest possible status-bar item: one default-size `IconButton`, whose
+    /// painted height IS `ButtonSize::Default` resolved against whatever rem
+    /// size the bar established. `IconButton` registers `ICON-{IconName:?}`
+    /// for `debug_bounds` on its own, so nothing test-only is needed.
+    struct ScaleProbeItem;
+
+    impl Render for ScaleProbeItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            IconButton::new("status-bar-scale-probe", IconName::Check)
+        }
+    }
+
+    impl StatusItemView for ScaleProbeItem {
+        fn set_active_pane_item(
+            &mut self,
+            _active_pane_item: Option<&dyn ItemHandle>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+        }
+
+        fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+            None
+        }
+    }
+
+    /// Both halves of the ~10% change, read off the tree that was actually
+    /// painted rather than off the constants that were supposed to produce it:
+    /// the row is [`STATUS_BAR_HEIGHT`] tall, and an item inside it is
+    /// [`STATUS_BAR_UI_SCALE`] times the size it would be anywhere else. The
+    /// second half is the one with no other guard — `STATUS_BAR_UI_SCALE` could
+    /// be deleted, or the `WithRemSize` wrapper dropped, and every other test in
+    /// this crate would stay green.
+    #[gpui::test]
+    async fn the_status_bar_paints_at_its_height_with_a_scaled_subtree(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "file.rs": "fn main() {}\n" }))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let probe = cx.new(|_| ScaleProbeItem);
+            workspace.status_bar().update(cx, |status_bar, cx| {
+                status_bar.add_left_item(probe, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let bar = cx
+            .debug_bounds("STATUS-BAR")
+            .expect("the status bar must paint");
+        assert_eq!(
+            bar.size.height, STATUS_BAR_HEIGHT,
+            "the row's painted height must be the declared one — \
+             `solution_agent::model::BAND_RESERVED_HEIGHT` is derived from it"
+        );
+
+        let button = cx
+            .debug_bounds("ICON-Check")
+            .expect("a status-bar item must paint inside the bar");
+        let ui_font_size = cx.update(|_window, cx| theme::theme_settings(cx).ui_font_size(cx));
+        let unscaled = ButtonSize::Default.rems().to_pixels(ui_font_size);
+        let expected = unscaled * STATUS_BAR_UI_SCALE;
+        // Half-pixel tolerance, not exact equality: painted bounds are snapped
+        // to the physical-pixel grid, so at the test window's scale factor an
+        // expected 21.175px lands as 21.0px. Tight enough to fail on a wrong
+        // scale factor (a 1.2 would be ~1.9px away), loose enough not to be a
+        // rounding test.
+        assert!(
+            (f32::from(button.size.height) - f32::from(expected)).abs() <= 0.5,
+            "an item in the bar must paint at {expected:?} (= {unscaled:?} × \
+             {STATUS_BAR_UI_SCALE}), got {:?}",
+            button.size.height
+        );
+        assert!(
+            button.size.height > unscaled,
+            "…and strictly larger than the same button outside the bar ({unscaled:?}), \
+             or the rem override is not being applied at all"
+        );
     }
 }
