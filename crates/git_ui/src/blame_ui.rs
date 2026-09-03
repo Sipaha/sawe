@@ -6,7 +6,7 @@ use crate::{
 };
 use editor::{
     BlameRenderer, Editor, SplitSide,
-    git::blame::BlameOptions,
+    git::blame::{BlameOptions, BlameRunPosition},
     git::blame_colors::{ColorMode, author_color, date_color},
     hover_markdown_style,
 };
@@ -70,6 +70,7 @@ impl BlameRenderer for GitBlameRenderer {
         editor: Entity<Editor>,
         ix: usize,
         sha_color: Hsla,
+        run_position: BlameRunPosition,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
@@ -82,6 +83,7 @@ impl BlameRenderer for GitBlameRenderer {
             editor,
             ix,
             sha_color,
+            run_position,
             &BlameOptions::default(),
             None,
             window,
@@ -99,6 +101,9 @@ impl BlameRenderer for GitBlameRenderer {
         editor: Entity<Editor>,
         ix: usize,
         sha_color: Hsla,
+        // Task 1 of the run-grouping work only plumbs the position through;
+        // acting on it is Task 2, so the gutter is unchanged for now.
+        _run_position: BlameRunPosition,
         options: &BlameOptions,
         date_range: Option<(i64, i64)>,
         window: &mut Window,

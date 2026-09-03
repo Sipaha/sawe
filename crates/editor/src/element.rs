@@ -24,7 +24,9 @@ use crate::{
         CurrentLineHighlight, DocumentColorsRenderMode, Minimap, MinimapThumb, MinimapThumbBorder,
         ScrollBeyondLastLine, ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
     },
-    git::blame::{BlameRenderer, GitBlame, GlobalBlameRenderer},
+    git::blame::{
+        BlameRenderer, BlameRunPosition, GitBlame, GlobalBlameRenderer, blame_run_positions,
+    },
     hover_popover::{
         self, HOVER_POPOVER_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
         POPOVER_RIGHT_OFFSET,
@@ -2160,6 +2162,7 @@ impl EditorElement {
         let blamed_rows: Vec<_> = blame.update(cx, |blame, cx| {
             blame.blame_for_rows(buffer_rows, cx).collect()
         });
+        let run_positions = blame_run_positions(buffer_rows, &blamed_rows);
 
         let width = if let Some(max_width) = max_width {
             AvailableSpace::Definite(max_width)
@@ -2176,6 +2179,14 @@ impl EditorElement {
             .enumerate()
             .flat_map(|(ix, blame_entry)| {
                 let (buffer_id, blame_entry) = blame_entry?;
+                // Falling back to `Head` keeps a row that somehow has no
+                // computed position rendering exactly as it did before runs
+                // existed, rather than dropping it out of the gutter.
+                let run_position = run_positions
+                    .get(ix)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(BlameRunPosition::Head);
                 let mut element = render_blame_entry(
                     ix,
                     &blame,
@@ -2185,6 +2196,7 @@ impl EditorElement {
                     self.editor.clone(),
                     workspace.clone(),
                     buffer_id,
+                    run_position,
                     &*blame_renderer,
                     window,
                     cx,
@@ -7156,6 +7168,7 @@ fn render_blame_entry(
     editor: Entity<Editor>,
     workspace: Entity<Workspace>,
     buffer: BufferId,
+    run_position: BlameRunPosition,
     renderer: &dyn BlameRenderer,
     window: &mut Window,
     cx: &mut App,
@@ -7185,6 +7198,7 @@ fn render_blame_entry(
         editor,
         ix,
         sha_color,
+        run_position,
         window,
         cx,
     )

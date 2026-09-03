@@ -122,6 +122,71 @@ pub struct GitBlame {
     options: BlameOptions,
 }
 
+/// Where a blamed gutter row sits inside a run of consecutive lines that came
+/// from the same commit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlameRunPosition {
+    /// The row opens a run: it is the one that identifies the commit.
+    Head,
+    /// The row continues the run opened above it.
+    Continuation,
+}
+
+/// Classifies each viewport row as opening or continuing a run of lines that
+/// share a commit.
+///
+/// Deliberately keyed on `RowInfo::buffer_row` adjacency rather than
+/// `BlameEntry::range`: `blame_for_rows` hands out a clone of the same entry
+/// for every line of a hunk, and `GitBlame::sync` leaves a stale `range` in
+/// both halves when an edit splits an entry, so two rows carrying equal ranges
+/// are not necessarily adjacent lines of one run.
+///
+/// `blamed_rows` is expected to be `GitBlame::blame_for_rows(rows)`, i.e. the
+/// same length as `rows` and positionally aligned with it; a row with no blame
+/// entry gets no position. Rows past the end of `blamed_rows` are treated as
+/// unblamed rather than panicking on the index.
+pub fn blame_run_positions(
+    rows: &[RowInfo],
+    blamed_rows: &[Option<(BufferId, BlameEntry)>],
+) -> Vec<Option<BlameRunPosition>> {
+    // The previous *blamed* row's identity, or `None` when the run was broken
+    // (start of the slice, or a block row in between).
+    let mut previous: Option<(BufferId, Oid, u32)> = None;
+
+    rows.iter()
+        .enumerate()
+        .map(|(ix, info)| {
+            let Some((buffer_id, entry)) = blamed_rows.get(ix).and_then(Option::as_ref) else {
+                // A block row (excerpt header, diff-hunk controls, folded-buffer
+                // header) is the one unblamed row that severs a run: it is real
+                // vertical space between the two lines. A soft-wrap
+                // continuation is the same line still, so it must not.
+                // Every other unblamed row keeps its `buffer_row`, so the
+                // adjacency check below already sees the gap it leaves.
+                let is_block_row = info.buffer_id.is_none() && info.wrapped_buffer_row.is_none();
+                if is_block_row {
+                    previous = None;
+                }
+                return None;
+            };
+
+            let position = match (previous, info.buffer_row) {
+                (Some((previous_buffer, previous_sha, previous_row)), Some(row))
+                    if previous_buffer == *buffer_id
+                        && previous_sha == entry.sha
+                        && previous_row.checked_add(1) == Some(row) =>
+                {
+                    BlameRunPosition::Continuation
+                }
+                _ => BlameRunPosition::Head,
+            };
+
+            previous = info.buffer_row.map(|row| (*buffer_id, entry.sha, row));
+            Some(position)
+        })
+        .collect()
+}
+
 pub trait BlameRenderer {
     /// The widest author name the gutter will draw, in monospace columns.
     /// Names wider than this are truncated by the renderer, so the gutter's
@@ -144,6 +209,7 @@ pub trait BlameRenderer {
         _: Entity<Editor>,
         _: usize,
         _: Hsla,
+        _: BlameRunPosition,
         window: &mut Window,
         _: &mut App,
     ) -> Option<AnyElement>;
@@ -163,6 +229,7 @@ pub trait BlameRenderer {
         editor: Entity<Editor>,
         ix: usize,
         sha_color: Hsla,
+        run_position: BlameRunPosition,
         _options: &BlameOptions,
         _date_range: Option<(i64, i64)>,
         window: &mut Window,
@@ -177,6 +244,7 @@ pub trait BlameRenderer {
             editor,
             ix,
             sha_color,
+            run_position,
             window,
             cx,
         )
@@ -230,6 +298,7 @@ impl BlameRenderer for () {
         _: Entity<Editor>,
         _: usize,
         _: Hsla,
+        _: BlameRunPosition,
         _: &mut Window,
         _: &mut App,
     ) -> Option<AnyElement> {
@@ -1599,5 +1668,179 @@ mod tests {
             previous: None,
             filename: String::new(),
         }
+    }
+
+    fn test_buffer_id(id: u64) -> BufferId {
+        BufferId::new(id).unwrap()
+    }
+
+    fn text_row(buffer_id: BufferId, buffer_row: u32) -> RowInfo {
+        RowInfo {
+            buffer_id: Some(buffer_id),
+            buffer_row: Some(buffer_row),
+            ..Default::default()
+        }
+    }
+
+    /// A soft-wrap continuation as `WrapRows` emits it: no buffer id, no
+    /// buffer row, but the wrapped row it belongs to.
+    fn soft_wrapped_row(buffer_row: u32) -> RowInfo {
+        RowInfo {
+            wrapped_buffer_row: Some(buffer_row),
+            ..Default::default()
+        }
+    }
+
+    /// A block row (excerpt header, diff-hunk controls, folded-buffer header)
+    /// as `BlockRows` emits it: every field `None`.
+    fn block_row() -> RowInfo {
+        RowInfo::default()
+    }
+
+    /// Every entry is built with the same `range`, so an implementation that
+    /// grouped on `BlameEntry::range` instead of row adjacency would collapse
+    /// all of these into one run and fail the tests below.
+    #[track_caller]
+    fn assert_run_positions(
+        spec: &[(RowInfo, Option<(BufferId, &str)>)],
+        expected: &[Option<BlameRunPosition>],
+    ) {
+        let rows = spec.iter().map(|(info, _)| *info).collect::<Vec<_>>();
+        let blamed_rows = spec
+            .iter()
+            .map(|(_, blame)| blame.map(|(buffer_id, sha)| (buffer_id, blame_entry(sha, 0..1))))
+            .collect::<Vec<_>>();
+
+        pretty_assertions::assert_eq!(blame_run_positions(&rows, &blamed_rows), expected);
+    }
+
+    #[test]
+    fn blame_run_positions_group_consecutive_rows_of_one_commit() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions(
+            &[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 1), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 2), Some((buffer, "1a1a1a"))),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::Continuation),
+                Some(BlameRunPosition::Continuation),
+            ],
+        );
+    }
+
+    #[test]
+    fn blame_run_positions_break_when_the_sha_changes() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions(
+            &[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 1), Some((buffer, "2b2b2b"))),
+                (text_row(buffer, 2), Some((buffer, "2b2b2b"))),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::Continuation),
+            ],
+        );
+    }
+
+    #[test]
+    fn blame_run_positions_break_when_buffer_rows_jump() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions(
+            &[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 5), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 6), Some((buffer, "1a1a1a"))),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::Continuation),
+            ],
+        );
+    }
+
+    #[test]
+    fn blame_run_positions_break_when_the_buffer_changes() {
+        let first = test_buffer_id(1);
+        let second = test_buffer_id(2);
+        assert_run_positions(
+            &[
+                (text_row(first, 0), Some((first, "1a1a1a"))),
+                (text_row(second, 1), Some((second, "1a1a1a"))),
+            ],
+            &[Some(BlameRunPosition::Head), Some(BlameRunPosition::Head)],
+        );
+    }
+
+    #[test]
+    fn blame_run_positions_break_across_a_block_row() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions(
+            &[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a"))),
+                (block_row(), None),
+                (text_row(buffer, 1), Some((buffer, "1a1a1a"))),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                None,
+                Some(BlameRunPosition::Head),
+            ],
+        );
+    }
+
+    #[test]
+    fn blame_run_positions_survive_a_soft_wrapped_row() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions(
+            &[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a"))),
+                (soft_wrapped_row(0), None),
+                (text_row(buffer, 1), Some((buffer, "1a1a1a"))),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                None,
+                Some(BlameRunPosition::Continuation),
+            ],
+        );
+    }
+
+    #[test]
+    fn blame_run_positions_break_across_an_unblamed_row() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions(
+            &[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 1), None),
+                (text_row(buffer, 2), Some((buffer, "1a1a1a"))),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                None,
+                Some(BlameRunPosition::Head),
+            ],
+        );
+    }
+
+    #[test]
+    fn blame_run_positions_head_the_first_row_of_a_mid_run_slice() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions(
+            &[
+                (text_row(buffer, 7), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 8), Some((buffer, "1a1a1a"))),
+            ],
+            &[
+                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::Continuation),
+            ],
+        );
     }
 }
