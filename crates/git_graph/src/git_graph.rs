@@ -141,8 +141,11 @@ use git::{
 };
 use git_ui::{
     commit_context_menu::{MultiCommitContext, build_multi_commit_context_menu},
+    commit_refs,
     commit_view::CommitView,
-    git_panel::{CommitSelection, CommitSelectionSource, Event as GitPanelEvent, GitPanel},
+    git_panel::{
+        CommitRefs, CommitSelection, CommitSelectionSource, Event as GitPanelEvent, GitPanel,
+    },
 };
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClickEvent, DefiniteLength, DismissEvent, ElementId, Entity,
@@ -174,7 +177,7 @@ use theme::AccentColors;
 use theme_settings::ThemeSettings;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
-    Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, HeaderResizeInfo,
+    ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, HeaderResizeInfo,
     RedistributableColumnsState, Table, TableInteractionState, TableRenderContext,
     TableResizeBehavior, Tooltip, bind_redistributable_columns, prelude::*,
     render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
@@ -362,34 +365,6 @@ pub struct ShowAffectedPathsInLog {
 pub enum GraphMode {
     Full,
     FileHistory,
-}
-
-/// Strip the prefixes git can emit in `%D` decorations
-/// (`HEAD -> `, `tag: `, `refs/heads/`, `refs/remotes/<remote>/`) so
-/// the bare branch name is what reaches downstream callers — matters
-/// for branch-protection glob matching, where `release/*` should
-/// match the branch `release/v1` regardless of upstream-tracking
-/// shape.
-fn strip_ref_namespace(name: &str) -> &str {
-    let s = name.trim();
-    if let Some(after) = s.strip_prefix("HEAD -> ") {
-        return strip_ref_namespace(after);
-    }
-    if let Some(after) = s.strip_prefix("tag: ") {
-        return after;
-    }
-    if let Some(after) = s.strip_prefix("refs/heads/") {
-        return after;
-    }
-    if let Some(after) = s.strip_prefix("refs/remotes/") {
-        // refs/remotes/<remote>/<branch> — drop the remote segment so
-        // the policy match is on the branch portion alone.
-        if let Some((_remote, rest)) = after.split_once('/') {
-            return rest;
-        }
-        return after;
-    }
-    s
 }
 
 fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
@@ -1299,6 +1274,22 @@ impl GitGraph {
         Some(self.graph_data.commits.get(data_idx)?.data.sha)
     }
 
+    /// The graph row backing the *first* selected commit — the one the git
+    /// panel's Commit tab describes, and therefore the one whose ref
+    /// decorations travel with the selection.
+    ///
+    /// Selected the same way [`Self::selected_commit_shas`] picks its first
+    /// element, including dropping the synthetic local-changes row, so the two
+    /// cannot describe different commits.
+    fn first_selected_commit(&self) -> Option<&Rc<CommitEntry>> {
+        let mut view_idxs: Vec<usize> = self.selected_entry_idxs.iter().copied().collect();
+        view_idxs.sort_unstable();
+        view_idxs
+            .into_iter()
+            .filter_map(|view_idx| self.view_to_data_idx(view_idx))
+            .find_map(|data_idx| self.graph_data.commits.get(data_idx))
+    }
+
     /// Shas of every selected row, in graph order.
     ///
     /// The selection is held in view space, where row 0 can be the synthetic
@@ -1342,11 +1333,22 @@ impl GitGraph {
             this.observe_git_panel(&panel, window, cx);
 
             let shas = this.selected_commit_shas();
+            let refs = this
+                .first_selected_commit()
+                .map(|commit| CommitRefs {
+                    names: commit.data.ref_names.clone(),
+                    accent_idx: commit.color_idx,
+                })
+                .unwrap_or_default();
             let repository = this.get_repository(cx);
             panel.update(cx, |panel, cx| match repository {
                 Some(repository) if !shas.is_empty() => {
                     panel.show_commit_selection(
-                        CommitSelection { repository, shas },
+                        CommitSelection {
+                            repository,
+                            shas,
+                            refs,
+                        },
                         source,
                         window,
                         cx,
@@ -2239,9 +2241,7 @@ impl GitGraph {
     /// Checks whether a ref name from git's `%D` decoration
     ///  format refers to the currently checked-out branch.
     fn is_head_ref(ref_name: &str, head_branch_name: &Option<SharedString>) -> bool {
-        head_branch_name.as_ref().is_some_and(|head| {
-            ref_name == head.as_ref() || ref_name.strip_prefix("HEAD -> ") == Some(head.as_ref())
-        })
+        commit_refs::is_head_ref(ref_name, head_branch_name.as_ref())
     }
 
     /// Resolve the active repository's working-directory path. Reads
@@ -2252,14 +2252,10 @@ impl GitGraph {
             .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
     }
 
-    /// `truncate` belongs to the caller, not the chip. Today the graph's
-    /// Description column is the only caller and it always passes `true`,
-    /// because a long ref there must shrink so the commit subject stays
-    /// visible. The flag survives because `Chip::truncate` sets `min_w_0`,
-    /// which is wrong in any row that wraps: every chip would collapse to a
-    /// bare ellipsis rather than wrap to the next line. The `false` caller was
-    /// the commit-detail sidebar's wrapping ref-chip row, deleted when the
-    /// Commit tab replaced it.
+    /// The graph's Description column always truncates: a long ref there must
+    /// shrink so the commit subject stays visible. The chip itself, and the
+    /// glyphs it can carry, are shared with the git panel's Commit tab — see
+    /// [`git_ui::commit_refs`] for why they cannot live here.
     fn render_chip(
         &self,
         name: &SharedString,
@@ -2268,37 +2264,7 @@ impl GitGraph {
         work_dir: Option<&std::path::Path>,
         truncate: bool,
     ) -> impl IntoElement {
-        // S-SOL-PRT — render protected refs with a lock glyph in
-        // place of the standard chip icon. We strip the ref-namespace
-        // prefix git emits in `%D` decorations (`refs/heads/`,
-        // `HEAD -> `, `refs/remotes/origin/`, etc.) before consulting
-        // the policy so the glob patterns match the bare branch name.
-        let bare = strip_ref_namespace(name.as_ref());
-        let is_protected = work_dir
-            .map(|wd| {
-                matches!(
-                    solutions::branch_protection::check(wd, bare, "delete_branch"),
-                    solutions::branch_protection::Decision::Forbidden { .. }
-                )
-            })
-            .unwrap_or(false);
-        Chip::new(name.clone())
-            .label_size(LabelSize::Small)
-            .map(|chip| if truncate { chip.truncate() } else { chip })
-            .map(|chip| {
-                if is_head {
-                    chip.icon(IconName::Check)
-                        .bg_color(accent_color.opacity(0.25))
-                        .border_color(accent_color.opacity(0.5))
-                } else if is_protected {
-                    chip.icon(IconName::LockOutlined)
-                        .bg_color(accent_color.opacity(0.12))
-                        .border_color(accent_color.opacity(0.5))
-                } else {
-                    chip.bg_color(accent_color.opacity(0.08))
-                        .border_color(accent_color.opacity(0.25))
-                }
-            })
+        commit_refs::ref_chip(name, accent_color, is_head, work_dir, truncate)
     }
 
     fn render_table_rows(
@@ -2500,21 +2466,10 @@ impl GitGraph {
                         ));
                     }
                     if hidden > 0 {
-                        let hidden_names = commit
-                            .data
-                            .ref_names
-                            .iter()
-                            .skip(visible)
-                            .map(|n| n.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        row = row.child(
-                            Chip::new(SharedString::from(format!("+{hidden}")))
-                                .label_size(LabelSize::Small)
-                                .bg_color(accent_color.opacity(0.08))
-                                .border_color(accent_color.opacity(0.25))
-                                .tooltip(Tooltip::text(SharedString::from(hidden_names))),
-                        );
+                        row = row.child(commit_refs::overflow_chip(
+                            &commit.data.ref_names[visible..],
+                            accent_color,
+                        ));
                     }
                     row
                 });
@@ -3048,8 +3003,7 @@ impl GitGraph {
                     upstream: upstream
                         .and_then(|upstream| upstream.stripped_ref_name())
                         .map(|ref_name| SharedString::from(ref_name.to_string())),
-                    upstream_gone: upstream
-                        .is_some_and(|upstream| upstream.tracking.is_gone()),
+                    upstream_gone: upstream.is_some_and(|upstream| upstream.tracking.is_gone()),
                     ahead: upstream
                         .and_then(|upstream| upstream.tracking.status())
                         .map_or(0, |status| status.ahead),
@@ -8463,6 +8417,7 @@ mod tests {
                 CommitSelection {
                     repository,
                     shas: vec![oid(9)],
+                    refs: Default::default(),
                 },
                 CommitSelectionSource::UserGesture,
                 window,

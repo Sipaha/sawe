@@ -14,6 +14,7 @@
 
 use super::*;
 
+use crate::commit_refs;
 use git::repository::{CommitDetails, CommitDiff, CommitFile};
 use git::status::{StatusCode, TrackedStatus};
 use gpui::{
@@ -209,6 +210,11 @@ enum CommitTabSection {
     /// The commit message and the identity line under it, or the placeholder
     /// standing in for them while the details load or after they failed.
     Message,
+    /// The refs *pointing at* the commit, as chips — the same chips the graph
+    /// row one line below paints. Renders nothing at all when no ref points at
+    /// the commit, which is the overwhelmingly common case; see
+    /// [`GitPanel::render_commit_refs_row`].
+    Refs,
     /// IDEA's tag row: a tag icon and the names of the tags *pointing at* the
     /// commit, with no `In N tags:` prose — a tag is a name, not a count.
     /// Renders nothing at all until the tags are loaded and non-empty — see
@@ -226,16 +232,23 @@ enum CommitTabSection {
 /// rule follows from this order: it hangs off the *message*, the section
 /// painted directly under the tree, so that it always separates the two.
 ///
-/// The two containment rows come last because they are metadata about the
-/// commit of the same class as the identity row the message section ends with
-/// — IDEA puts them under the sha/author/date line for the same reason — and
-/// because they are the sections that can render nothing, which at the bottom
-/// costs no rule and no gap. Tags sit above branches, matching IDEA: the tag
-/// row is the shorter, more specific fact, and a commit that has one usually
-/// has exactly one.
-const COMMIT_TAB_SECTIONS: [CommitTabSection; 4] = [
+/// The metadata rows come last because they are facts about the commit of the
+/// same class as the identity row the message section ends with — IDEA puts
+/// them under the sha/author/date line for the same reason — and because they
+/// are the sections that can render nothing, which at the bottom costs no rule
+/// and no gap. Tags sit above branches, matching IDEA: the tag row is the
+/// shorter, more specific fact, and a commit that has one usually has exactly
+/// one.
+///
+/// The ref chips lead that block. They name the refs that *are* this commit,
+/// where the two rows under them describe what the commit is reachable from, so
+/// they are the more specific fact again; and they are the row the user is
+/// comparing against the graph, which paints the same chips at the same height
+/// as the subject.
+const COMMIT_TAB_SECTIONS: [CommitTabSection; 5] = [
     CommitTabSection::Diff,
     CommitTabSection::Message,
+    CommitTabSection::Refs,
     CommitTabSection::Tags,
     CommitTabSection::Branches,
 ];
@@ -786,6 +799,22 @@ fn format_tags_pointing_at(tags: &[SharedString], expanded: bool) -> Option<Cont
     })
 }
 
+/// The tags `git tag --points-at` found that the commit's ref chips do not
+/// already name.
+///
+/// Both describe the tags pointing at the commit, so painting both in full
+/// would say the same thing twice a few pixels apart. Subtracting rather than
+/// suppressing the row outright keeps it for the tag created since the graph
+/// last decorated its rows, which is the only fact the row still has that the
+/// chips do not.
+fn uncharted_tags(tags: &[SharedString], ref_names: &[SharedString]) -> Vec<SharedString> {
+    let charted: HashSet<&str> = commit_refs::tag_names(ref_names).collect();
+    tags.iter()
+        .filter(|tag| !charted.contains(tag.as_ref()))
+        .cloned()
+        .collect()
+}
+
 /// The line's three pieces share one style; a helper keeps them provably
 /// identical rather than repeating the builder chain three times.
 fn identity_label(text: SharedString) -> Label {
@@ -944,6 +973,36 @@ pub struct CommitSelection {
     /// Non-empty. A single sha renders the commit's details; more than one
     /// renders a bare "N commits selected" summary.
     pub shas: Vec<Oid>,
+    /// The refs pointing at `shas[0]`, as the graph row for that same commit
+    /// paints them. Empty for a commit no ref points at, and for a caller that
+    /// has no decorations to hand.
+    pub refs: CommitRefs,
+}
+
+/// The ref decorations of one commit, travelling with the selection that names
+/// it.
+///
+/// They come from the graph's own row data — git's `%D`, already fetched and
+/// already laid out into lanes — rather than from a query the panel makes for
+/// itself. Two reasons. The panel would otherwise run a third `git` process per
+/// selection to re-derive what the row one line below it is already painting;
+/// and the two surfaces are read together, so anything that let them answer
+/// differently (a cache refreshed on one side only, a different `--decorate`
+/// shape) would show up as the graph and its own detail pane disagreeing about
+/// which branch a commit is on.
+///
+/// Only the first sha is described. A multi-commit selection renders a bare
+/// count with no room for refs, so carrying every row's decorations would be
+/// work for a surface that never paints them.
+#[derive(Clone, Default)]
+pub struct CommitRefs {
+    /// Git's `%D` decorations verbatim and in git's order — `main`,
+    /// `origin/main`, `HEAD -> feature/x`, `tag: 2.41.0`.
+    pub names: Vec<SharedString>,
+    /// Index into the theme's accents of the lane colour the graph painted this
+    /// commit's chips with, so the detail pane's chips are the same colour as
+    /// the row's.
+    pub accent_idx: usize,
 }
 
 /// What made the git graph push a selection at the Commit tab.
@@ -1826,10 +1885,25 @@ impl GitPanel {
                             ),
                     ),
                 },
+                CommitTabSection::Refs => match self.render_commit_refs_row(state, cx) {
+                    Some(row) => body.child(row),
+                    None => body,
+                },
                 CommitTabSection::Tags => {
                     let expanded = state.tags_expanded;
                     let formatted = match &state.tags {
-                        LoadState::Loaded(tags) => format_tags_pointing_at(tags, expanded),
+                        // Only the tags the chip row above did not already
+                        // name. The two rows answer the same question — which
+                        // tags point at this commit — from different sources:
+                        // the chips from the graph's decorations, this row from
+                        // a live `git tag --points-at`. Subtracting rather than
+                        // suppressing keeps the row for the tag the decorations
+                        // are too old to know about, which is the only case
+                        // where it still has something to say.
+                        LoadState::Loaded(tags) => format_tags_pointing_at(
+                            &uncharted_tags(tags, &state.selection.refs.names),
+                            expanded,
+                        ),
                         _ => None,
                     };
                     match formatted {
@@ -1934,6 +2008,76 @@ impl GitPanel {
                     .on_drag(DraggedCommitMessageEdge, |_, _, _, cx| cx.new(|_| Empty)),
             ))
             .into_any_element()
+    }
+
+    /// The refs pointing at the commit, as the chips the graph's own row for it
+    /// paints — see [`crate::commit_refs`], which both surfaces build them
+    /// with, and [`CommitRefs`] for why the panel is handed them rather than
+    /// asking git itself.
+    ///
+    /// `None`, and therefore no element at all, when nothing points at the
+    /// commit. That is most commits, and an empty row would still spend its
+    /// padding out of the changed-files tree's budget — the same reason the two
+    /// containment rows below render nothing rather than an empty line.
+    ///
+    /// One line, never wrapped, for the reason the identity row above it gives:
+    /// a wrapped row is vertical budget taken from the tree. What does not fit
+    /// collapses into the graph's own `+N` chip, whose tooltip still names every
+    /// ref, at the graph's own `git.log.compact_refs_threshold`. The graph
+    /// applies that threshold only under its `compact_refs` view toggle and this
+    /// row applies it always: the toggle is a control of the graph's, this row
+    /// is narrower than the graph's Description column, and a chip row that can
+    /// grow without bound is one a long-lived release branch would eat the tab
+    /// with.
+    fn render_commit_refs_row(&self, state: &CommitTabState, cx: &App) -> Option<AnyElement> {
+        let names = &state.selection.refs.names;
+        if names.is_empty() {
+            return None;
+        }
+
+        let repository = state.selection.repository.read(cx);
+        let head_branch_name: Option<SharedString> = repository
+            .snapshot()
+            .branch
+            .as_ref()
+            .map(|branch| SharedString::from(branch.name().to_string()));
+        let work_dir = repository.work_directory_abs_path.to_path_buf();
+        let accent_color = commit_refs::accent_color(state.selection.refs.accent_idx, cx);
+
+        // A zero threshold would hide every chip behind a `+N`, which is a
+        // worse row than no row; one chip is the least this can usefully paint.
+        let threshold = (project::project_settings::ProjectSettings::get_global(cx)
+            .git
+            .log
+            .compact_refs_threshold as usize)
+            .max(1);
+        let visible = names.len().min(threshold);
+
+        Some(
+            h_flex()
+                .id("commit-tab-refs")
+                .debug_selector(|| "COMMIT-TAB-REFS".into())
+                .flex_shrink_0()
+                .w_full()
+                .px_2()
+                .pb_1p5()
+                .gap_1()
+                .overflow_hidden()
+                .children(names.iter().take(visible).map(|name| {
+                    commit_refs::ref_chip(
+                        name,
+                        accent_color,
+                        commit_refs::is_head_ref(name.as_ref(), head_branch_name.as_ref()),
+                        Some(work_dir.as_path()),
+                        true,
+                    )
+                }))
+                .children(
+                    (names.len() > visible)
+                        .then(|| commit_refs::overflow_chip(&names[visible..], accent_color)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// IDEA's containment rows, under the identity row: the tag row and the
@@ -2116,7 +2260,7 @@ mod tests {
 
         assert_eq!(
             COMMIT_TAB_SECTIONS.len(),
-            4,
+            5,
             "a further section would need its own place in the rule's ordering"
         );
         assert_eq!(
@@ -2135,6 +2279,13 @@ mod tests {
              identity row the message section ends with, and IDEA puts it under \
              that row; it is also one of the two sections that can render \
              nothing, which is only free at the bottom"
+        );
+        assert_eq!(
+            position(CommitTabSection::Refs),
+            position(CommitTabSection::Message) + 1,
+            "the ref chips lead the metadata block: they name what the commit \
+             *is*, where the two rows under them describe what it is reachable \
+             from, and they are the row the user reads against the graph"
         );
         assert_eq!(
             position(CommitTabSection::Tags),
@@ -2761,6 +2912,33 @@ mod tests {
         )
     }
 
+    /// A git panel over [`commit_tab_test_workspace`] that is a *real dock
+    /// panel*, so that what the Commit tab paints reaches
+    /// [`VisualTestContext::debug_bounds`]. A panel that is merely constructed
+    /// is never drawn and registers no bounds at all, which would let every
+    /// paint assertion below pass for the wrong reason.
+    async fn commit_tab_painted_panel(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GitPanel>,
+        Entity<Repository>,
+        Arc<project::FakeFs>,
+        VisualTestContext,
+    ) {
+        let (workspace, repository, mut cx) = commit_tab_test_workspace(cx).await;
+        let fs = workspace.read_with(&cx, |workspace, cx| {
+            fs::Fs::as_fake(workspace.project().read(cx).fs().as_ref())
+        });
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = GitPanel::new(workspace, window, cx);
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+            panel
+        });
+        cx.run_until_parked();
+        (panel, repository, fs, cx)
+    }
+
     /// A git panel over [`commit_tab_test_workspace`], for the tab's
     /// load-lifecycle tests.
     async fn commit_tab_panel(
@@ -2777,6 +2955,121 @@ mod tests {
         });
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         (panel, repository, fs, cx)
+    }
+
+    /// The gap this row closes: the graph labelled the selected row
+    /// `origin/hotfix/2.41.1` and the detail pane beside it said nothing about
+    /// any ref at all.
+    ///
+    /// Asserted against the painted tree rather than against
+    /// `state.selection.refs`, which would pass just as happily with the row
+    /// never rendered.
+    #[gpui::test]
+    async fn test_the_commit_tab_paints_the_refs_pointing_at_the_commit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, repository, _fs, mut cx) = commit_tab_painted_panel(cx).await;
+        let cx = &mut cx;
+        cx.update(|_window, cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .log
+                        .get_or_insert_default()
+                        .compact_refs_threshold = Some(2);
+                });
+            });
+        });
+
+        let decorated: Oid = "823a3f8a".parse().expect("valid abbreviated sha");
+        let bare: Oid = "1a2b3c4d".parse().expect("valid abbreviated sha");
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec![decorated],
+                    refs: CommitRefs {
+                        names: vec![
+                            "HEAD -> main".into(),
+                            "origin/main".into(),
+                            "tag: 2.41.0".into(),
+                        ],
+                        accent_idx: 0,
+                    },
+                },
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-REFS").is_some(),
+            "a commit something points at must say so in the detail pane"
+        );
+        assert!(
+            cx.debug_bounds("CHIP-HEAD -> main").is_some()
+                && cx.debug_bounds("CHIP-origin/main").is_some(),
+            "and it says so with the graph's own chips, verbatim — which is \
+             what distinguishes the local branch from the remote one"
+        );
+        assert!(
+            cx.debug_bounds("CHIP-tag: 2.41.0").is_none() && cx.debug_bounds("CHIP-+1").is_some(),
+            "past `git.log.compact_refs_threshold` the rest collapses into the \
+             graph's `+N` chip instead of widening the row"
+        );
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec![bare],
+                    refs: CommitRefs::default(),
+                },
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-REFS").is_none(),
+            "a commit no ref points at gets no row at all — an empty one would \
+             still spend its padding out of the changed-files tree's budget"
+        );
+        assert!(
+            cx.debug_bounds("CHIP-HEAD -> main").is_none(),
+            "and the previous commit's chips go with it"
+        );
+    }
+
+    /// The chip row and the tag row answer the same question from different
+    /// sources. Whatever the chips already name must not be repeated.
+    #[test]
+    fn test_the_tag_row_drops_the_tags_the_chips_already_name() {
+        let refs: Vec<SharedString> = vec!["origin/main".into(), "tag: 2.41.0".into()];
+        assert_eq!(
+            uncharted_tags(&["2.41.0".into(), "2.41.1".into()], &refs),
+            vec![SharedString::from("2.41.1")],
+            "the tag the chips show is dropped; the one they are too old to \
+             know about is exactly what the row is still for"
+        );
+        assert_eq!(
+            uncharted_tags(&["2.41.0".into()], &refs),
+            Vec::<SharedString>::new(),
+            "and when the chips name every tag the row has nothing left to say"
+        );
+        assert_eq!(
+            uncharted_tags(&["2.41.0".into()], &[]),
+            vec![SharedString::from("2.41.0")],
+            "with no decorations to hand the row is the only thing showing the \
+             tag, so it keeps it"
+        );
     }
 
     /// Branches and tags load in one task, so the staleness re-check that task
@@ -2800,6 +3093,7 @@ mod tests {
                 CommitSelection {
                     repository: repository.clone(),
                     shas: vec![first],
+                    refs: Default::default(),
                 },
                 CommitSelectionSource::UserGesture,
                 window,
@@ -2855,6 +3149,7 @@ mod tests {
                 CommitSelection {
                     repository: repository.clone(),
                     shas: vec![sha],
+                    refs: Default::default(),
                 },
                 CommitSelectionSource::UserGesture,
                 window,

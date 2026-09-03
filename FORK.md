@@ -105,6 +105,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/project_panel/src/project_panel.rs` | **(2026-06-23, decision #27)** No longer hosts a project dropdown; filters `state.visible_entries` to worktrees under the **solution-wide active member's** `local_path` (resolved via a private `active_solution` helper + `SolutionStore::active_member`) after each `update_visible_entries`, and subscribes to `ActiveMemberChanged`; resets `max_width_item_index` and recomputes `last_worktree_root_id` post-filter. | `solutions_ui` / `solutions` |
 | `crates/git_ui/src/git_panel.rs` | **(2026-06-23, decision #27)** No longer hosts a project dropdown; `refresh_active_repository_for_selector` overrides `active_repository` with the active member's matching repo; subscribes to `ActiveMemberChanged`. (Per-member dropdown-badge change-count map retired with the selector.) **(decision #75)** That override now resolves through `solutions::active_member_repository`, and `set_active_repository` is the single seam every piece of per-repository panel state hangs off — the History tab's rows and subscriptions used to be cleared there, and since decision #100 the Commit tab is closed there for the same reason. **(decision #100)** The tab set is now `Changes \| Commit`; History is deleted. | `solutions_ui` / `solutions` |
 | `crates/git_ui/src/git_panel/commit_tab.rs` | **New (decision #100).** The git panel's Commit tab: `CommitSelection` / `CommitSelectionSource`, the `CommitTabState` the panel hangs off an `Option`, the two guarded background loads (`Repository::show` / `load_commit_diff`), and the changed-files tree / message split / markdown style / client-side +/− fold **relocated verbatim** from the git graph's deleted commit-details sidebar. A private `mod`: `git_panel.rs` re-exports only `CommitSelection` and `CommitSelectionSource`, which is all `git_graph` needs to name. | `git_ui` / `git_graph` |
+| `crates/git_ui/src/commit_refs.rs` | **New (decision #138).** The ref-decoration chip both the git graph's rows and the git panel's Commit tab paint: `ref_chip` (with the S-SOL-PRT lock glyph and the HEAD check), `overflow_chip`, `strip_ref_namespace`, `is_head_ref`, `tag_names`, `accent_color`. Lives in `git_ui` because `git_graph` depends on it and never the reverse. |  `git_ui` / `git_graph` |
+| `crates/ui/src/components/chip.rs` | **(decision #138)** Registers a `CHIP-{label}` debug selector (a no-op outside `test` / `test-support`), the way `IconButton` registers `ICON-{icon}`, so a paint test can assert which chips a row put on screen. | `git_ui` (Commit tab ref chips) |
 | `crates/git/Cargo.toml` | `test-support` feature now also activates `db/test-support` — the `db::static_connection!` macro's expansion references `db::open_test_db`, which only exists under that feature; without it, crates that enable `git/test-support` but not `db/test-support` fail to compile. Pre-existing latent workspace bug, fixed in-tree. **(2026-08-31)** It now also activates `gpui/test-support`, for the same reason one level along: `CommitDataReader::for_test`, gated `#[cfg(any(test, feature = "test-support"))]`, calls `BackgroundExecutor::simulate_random_delay`, which exists only under that feature — so `git_hosting_providers`, whose dev-deps enable `git/test-support`, could not compile its own test targets (E0599). Fixed in `git`'s feature list rather than in the consumer, so the arm and the method it needs stay in lockstep for every consumer. See `docs/findings/2026-08-31-cfg-universes-and-the-warning-gate.md`. | build / upstream-fix |
 | `crates/git/src/repository.rs` | Adds `branches_containing` / `tags_containing` / `tags_pointing_at` / `load_commit_against_parent` methods on `GitRepository` (default no-op impls + real impls in `RealGitRepository`) for the S-DET commit-view metadata surface. Adds the module-level `parse_ref_name_lines` parser shared by all three ref queries (named `parse_contains_output` until `--points-at` joined them). Also: `load_commit_template` special-cases `ErrorKind::NotFound` on the `git config --get` spawn — treats "cwd disappeared" (e.g. an open repo whose underlying directory was removed mid-session via `git worktree remove`) as "no template available" with a debug log, instead of propagating ENOENT through to `detach_and_log_err`. | `git_ui` (S-DET) / general robustness |
 | `crates/git/src/blame.rs` | `Blame::for_path_at_revision` + a `BlameTarget` enum, so `git blame` can annotate a commit-ish instead of only working-tree content piped on stdin (decision #58). **(decision #135)** Also `display_author` + `UNKNOWN_AUTHOR`, the shortened author name the blame gutter draws — it lives here because both the renderer (`git_ui`) and the gutter's width reservation (`editor`) have to agree on it. | `editor` (diff-pane blame, blame gutter width) / `git_ui` (blame gutter) |
@@ -2877,3 +2879,60 @@ cross — so deleting the cross would have collapsed the pill onto the label wit
 extent. The row now takes `ButtonSize::Default.rems()`, the same metric the `+` and overflow
 `IconButton`s next to it use, which both matches them and scales with the override.
 `h_full()` inside a status-bar item is a no-op; state the height.
+
+### 138. The Commit tab's ref chips come from the graph's row, not from a query of its own
+
+The maintainer, on the detail pane beside the commit graph: *«а где упоминание ветки, которая
+на этом коммите есть?»* — the pane showed `15c849d · Pavel Simonov · 03 Sep 2026` and the
+message, while the graph row directly below it labelled the same commit `origin/hotfix/2.41.1`.
+
+What: `CommitSelection` (`crates/git_ui/src/git_panel/commit_tab.rs`) gained a `refs:
+CommitRefs` — git's `%D` decorations for `shas[0]`, plus the lane accent index the graph
+painted that row's chips with — and the tab gained a `CommitTabSection::Refs` that renders them
+as chips between the identity line and the two containment rows. The chip itself moved to a new
+`crates/git_ui/src/commit_refs.rs`, which both surfaces now build from: `GitGraph::render_chip`
+and `is_head_ref` are one-line delegations, and the graph's `+N` overflow chip and
+`strip_ref_namespace` moved there whole.
+
+Why the panel is *handed* the decorations instead of asking git: it already runs a debounced
+`git branch --contains` + `git tag --points-at` pair per selection, and the answer to "what
+points at this commit" is sitting decorated in the graph row one line below — re-deriving it
+would be a third process per arrow-key press to recompute what is already on screen. The
+stronger reason is that the two surfaces are read *together*: anything that let them answer
+separately (one cache refreshed and not the other, a different `--decorate` shape) shows up to
+the user as the graph and its own detail pane disagreeing about which branch a commit is on.
+The decorations also survive where the queries do not — on a collab repository
+`branches_containing` / `tags_pointing_at` have no proto message and answer empty, while
+`InitialGraphCommitData::ref_names` arrives over the wire with the rest of the row.
+
+Why the containment rows did **not** answer the maintainer's question, which is what made this
+a gap and not a bug: `In N branches:` is `git branch --list --contains`, *local* branches only,
+so a commit whose only ref is `origin/hotfix/2.41.1` is contained in nothing and the row is
+correctly absent. Containment and identity are different questions and the pane was only
+answering the first one.
+
+How to apply:
+
+- **Do not invent a per-ref-kind icon or colour.** Git's own text is the encoding — a bare name
+  is a local branch, `<remote>/<name>` is remote-tracking, `tag: <name>` is a tag — and the chip
+  label is that text verbatim, in both surfaces. The one glyph a chip carries says something the
+  text does not: `Check` for the checked-out branch, `LockOutlined` for a branch this Solution's
+  policy protects (S-SOL-PRT).
+- **The row never wraps.** A wrapped row is vertical budget taken from the changed-files tree,
+  which is the same reason the identity row above it truncates. What does not fit collapses into
+  the graph's own `+N` chip, whose tooltip still names every ref, at the graph's own
+  `git.log.compact_refs_threshold`. The pane applies that threshold unconditionally where the
+  graph gates it behind its `compact_refs` view toggle: the toggle is a control of the graph's,
+  and the pane is narrower than the graph's Description column.
+- **The tag row subtracts what the chips already name** (`uncharted_tags`). Both describe the
+  tags pointing at the commit, from different sources; painting both in full says the same thing
+  twice a few pixels apart. Subtracting rather than suppressing the row outright keeps it for a
+  tag created since the graph last decorated its rows, which is the only fact it still has that
+  the chips do not.
+- The graph's push site picks the first selected row the same way `selected_commit_shas` picks
+  its first element (`first_selected_commit`), including dropping the synthetic local-changes
+  row, so the shas and the decorations cannot describe different commits. A multi-commit
+  selection renders a bare count, so only the first row's decorations travel.
+- `ui::Chip` now registers a `CHIP-{label}` debug selector, the way `IconButton` registers
+  `ICON-{icon}`, so a paint test can assert *which* chips a row put on screen rather than
+  asserting the predicate that decides them.

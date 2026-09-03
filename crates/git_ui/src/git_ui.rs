@@ -46,6 +46,7 @@ mod askpass_modal;
 pub mod branch_picker;
 pub(crate) mod commit_blob;
 mod commit_modal;
+pub mod commit_refs;
 pub mod commit_tooltip;
 pub mod commit_view;
 mod conflict_view;

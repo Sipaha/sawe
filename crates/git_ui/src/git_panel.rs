@@ -84,7 +84,7 @@ use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFon
 mod changes_list;
 pub(crate) mod commit_tab;
 
-pub use commit_tab::{CommitSelection, CommitSelectionSource};
+pub use commit_tab::{CommitRefs, CommitSelection, CommitSelectionSource};
 
 actions!(
     git_panel,
@@ -9744,6 +9744,7 @@ mod tests {
         CommitSelection {
             repository: repository.clone(),
             shas,
+            refs: Default::default(),
         }
     }
 
@@ -9820,6 +9821,7 @@ mod tests {
                 CommitSelection {
                     repository: repository.clone(),
                     shas: vec![sha],
+                    refs: Default::default(),
                 },
                 CommitSelectionSource::UserGesture,
                 window,
@@ -9857,6 +9859,7 @@ mod tests {
                 CommitSelection {
                     repository: repository.clone(),
                     shas: shas.clone(),
+                    refs: Default::default(),
                 },
                 CommitSelectionSource::UserGesture,
                 window,
@@ -9896,6 +9899,7 @@ mod tests {
                 CommitSelection {
                     repository: repository.clone(),
                     shas: vec![test_sha("823a3f8a")],
+                    refs: Default::default(),
                 },
                 CommitSelectionSource::UserGesture,
                 window,

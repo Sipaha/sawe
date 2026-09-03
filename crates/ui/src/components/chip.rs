@@ -129,6 +129,13 @@ impl RenderOnce for Chip {
                     .truncate(),
             )
             .id(self.label.clone())
+            // Named after its label so a paint test can assert *which* chips a
+            // row put on screen, the way `IconButton` registers `ICON-{icon}`.
+            // A no-op outside `test` / `test-support`.
+            .debug_selector({
+                let label = self.label.clone();
+                move || format!("CHIP-{label}")
+            })
             .when_some(self.tooltip, |this, tooltip| this.tooltip(tooltip))
     }
 }
