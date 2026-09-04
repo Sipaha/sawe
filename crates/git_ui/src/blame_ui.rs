@@ -121,6 +121,12 @@ impl BlameRenderer for GitBlameRenderer {
         // hover, the tooltip, the context menu and click-to-open — so the run
         // costs the repetition and nothing else.
         let is_continuation = matches!(run_position, BlameRunPosition::Continuation);
+        // A run that starts above the first visible row keeps its label up
+        // there: the rows on screen are continuations and stay blank, rather
+        // than the label sliding down to whichever row the scroll happened to
+        // leave on top. So the only head with nothing above it is the first
+        // row of the display, and it is the only one with no boundary to mark.
+        let opens_a_boundary = matches!(run_position, BlameRunPosition::Head);
 
         let metadata = if is_continuation {
             None
@@ -194,18 +200,19 @@ impl BlameRenderer for GitBlameRenderer {
         // labelled row following four blank ones read the same. A hairline on
         // the head row's top edge is that boundary.
         //
-        // Skipped at `ix == 0` because the renderer is handed viewport rows:
-        // the top one is a run head whenever the row scrolled off above it
-        // came from another commit, and a line drawn there sits on the edge of
-        // the visible gutter, where it reads as a frame around the editor
-        // rather than as a break between two commits.
+        // Drawn wherever a run really begins, on screen or scrolled to — the
+        // classification is in display-row space, not viewport space, so the
+        // line neither appears nor vanishes as a boundary crosses the top
+        // edge. The one head that draws none is the first row of the display,
+        // which separates nothing: a line on the very top edge with no run
+        // above it reads as a frame around the editor.
         //
         // Absolutely positioned rather than a `border_t_1`: a head row is
         // 22.5px of intrinsic text height inside a 23px row pitch, so a border
         // would both grow the row past its line and push the date down a pixel
         // relative to the code it annotates. Out of flow, the line lands on the
         // row's top edge and changes no other geometry.
-        let run_separator = (!is_continuation && ix > 0).then(|| {
+        let run_separator = opens_a_boundary.then(|| {
             div()
                 .absolute()
                 .top_0()

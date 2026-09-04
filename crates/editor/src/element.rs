@@ -24,10 +24,7 @@ use crate::{
         CurrentLineHighlight, DocumentColorsRenderMode, Minimap, MinimapThumb, MinimapThumbBorder,
         ScrollBeyondLastLine, ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
     },
-    git::blame::{
-        BlameRenderer, BlameRunPosition, GitBlame, GlobalBlameRenderer,
-        blame_run_positions_in_viewport,
-    },
+    git::blame::{BlameRenderer, BlameRunPosition, GitBlame, GlobalBlameRenderer},
     hover_popover::{
         self, HOVER_POPOVER_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
         POPOVER_RIGHT_OFFSET,
@@ -2161,15 +2158,17 @@ impl EditorElement {
 
         let blame = self.editor.read(cx).blame.clone()?;
         let workspace = self.editor.read(cx).workspace()?;
-        let blamed_rows: Vec<_> = blame.update(cx, |blame, cx| {
-            blame.blame_for_rows(buffer_rows, cx).collect()
+        let (blamed_rows, run_positions) = blame.update(cx, |blame, cx| {
+            let blamed_rows: Vec<_> = blame.blame_for_rows(buffer_rows, cx).collect();
+            let run_positions = blame.run_positions_in_viewport(
+                &snapshot.display_snapshot,
+                start_row,
+                buffer_rows,
+                &blamed_rows,
+                cx,
+            );
+            (blamed_rows, run_positions)
         });
-        let run_positions = blame_run_positions_in_viewport(
-            &snapshot.display_snapshot,
-            start_row,
-            buffer_rows,
-            &blamed_rows,
-        );
 
         let width = if let Some(max_width) = max_width {
             AvailableSpace::Definite(max_width)

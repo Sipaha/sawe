@@ -2032,7 +2032,7 @@ mod tests {
     /// and blank rows say nothing at the boundary itself. The hairline does.
     /// Asserted on the painted tree and on both sides: present on the row that
     /// opens the second run, absent on both continuation rows, and absent on
-    /// the first row of the viewport, where a line would read as a frame edge
+    /// the first row of the *file*, where a line would read as a frame edge
     /// rather than as a break.
     #[gpui::test]
     async fn test_a_run_boundary_draws_a_hairline_above_the_head_row(cx: &mut TestAppContext) {
@@ -2041,7 +2041,7 @@ mod tests {
 
         assert!(
             cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-0").is_none(),
-            "the top row of the viewport has no run above it to be separated \
+            "the first row of the file has no run above it to be separated \
              from, and a line there reads as a frame around the editor"
         );
         assert!(
@@ -2082,6 +2082,73 @@ mod tests {
             separator.size.height > gpui::px(0.) && separator.size.height < head.size.height / 2.,
             "a hairline, not a band: {:?}",
             separator.size.height
+        );
+    }
+
+    /// Scrolls `editor` so that `row` is the first display row laid out, and
+    /// asserts it landed there: a scroll silently clamped back to the top
+    /// would leave every assertion about "the top row" holding for the wrong
+    /// reason.
+    #[track_caller]
+    fn scroll_to_row(editor: &Entity<editor::Editor>, row: u32, cx: &mut VisualTestContext) {
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_scroll_position(gpui::point(0., row as f64), window, cx);
+        });
+        cx.run_until_parked();
+        let landed = editor.update(cx, |editor, cx| editor.scroll_position(cx).y);
+        assert_eq!(landed, row as f64, "the pane scrolled to display row {row}");
+    }
+
+    /// The gutter label belongs to the line a run starts on, not to whichever
+    /// line the scroll leaves on top. Scrolled one line into a two-line run,
+    /// the visible half of it is continuation rows: no date, no author, no
+    /// hairline — the label stays on the row that is now above the viewport,
+    /// exactly as IntelliJ leaves the tail of a scrolled-through run blank.
+    ///
+    /// Both sides of it, at two offsets, because the defect was a label that
+    /// moved: at offset 1 the second run's head is one row down and keeps its
+    /// metadata and its hairline, and at offset 2 that same head is the top
+    /// row and keeps both there too. A rule reading the visible rows alone
+    /// passes the second half and fails the first.
+    #[gpui::test]
+    async fn test_a_run_scrolled_past_its_head_leaves_its_rows_blank(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        let view = open_two_run_commit_diff(&context, &mut cx).await;
+        let rhs = view.read_with(&cx, |view, cx| view.editor.read(cx).rhs_editor().clone());
+
+        scroll_to_row(&rhs, 1, &mut cx);
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_none(),
+            "the top row continues a run whose head is now above the viewport, \
+             so the date and the author stay up there with it"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-0").is_none(),
+            "and there is no boundary on that row to draw a hairline for — one \
+             appearing as the run's head scrolls past is the flicker"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-1").is_some()
+                && cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-1").is_some(),
+            "while the second run's head, now one row down, still names its \
+             commit and still marks its boundary"
+        );
+
+        scroll_to_row(&rhs, 2, &mut cx);
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_some(),
+            "scrolled one line further, that same head is the top row, and a \
+             run's head names its commit wherever the viewport happens to sit"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-0").is_some(),
+            "including its hairline: the row above it came from another \
+             commit, so the boundary is real even on the top edge"
+        );
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-1").is_none()
+                && cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-1").is_none(),
+            "and the row below it continues that run"
         );
     }
 

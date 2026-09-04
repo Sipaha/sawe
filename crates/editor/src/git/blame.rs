@@ -127,14 +127,43 @@ pub struct GitBlame {
 /// from the same commit.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BlameRunPosition {
-    /// The row opens a run: it is the one that identifies the commit.
+    /// The row opens a run and something precedes it — another commit's run,
+    /// a block row, an unblamed line. It identifies the commit, and the
+    /// boundary above it is real enough to draw.
     Head,
+    /// The row opens the first run of the display, with nothing above it at
+    /// all. It identifies its commit like any head, but there is no boundary
+    /// there: a line drawn on the top edge would frame the gutter rather than
+    /// separate two commits.
+    DocumentHead,
     /// The row continues the run opened above it.
     Continuation,
 }
 
-/// Classifies each viewport row as opening or continuing a run of lines that
-/// share a commit.
+/// What sits immediately above the first row of a slice — the one thing a
+/// slice of rows cannot see about itself, and the reason the classification
+/// used to be viewport-relative: a run that starts above the visible rows has
+/// to keep its label up there and leave the rows below it blank, exactly as a
+/// run whose head is on screen does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BlameRunPredecessor {
+    /// Nothing does: the slice starts the display.
+    DisplayStart,
+    /// Something a run cannot be continued from: a block row, an unblamed
+    /// line, or a blamed row that a later row of the slice already severed.
+    Severed,
+    /// A blamed row whose run the slice's first row may continue.
+    Blamed {
+        buffer_id: BufferId,
+        sha: Oid,
+        buffer_row: u32,
+    },
+}
+
+/// Classifies each row as opening or continuing a run of lines that share a
+/// commit, and reports what the rows *below* this slice would see above them
+/// — the same [`BlameRunPredecessor`] this call takes, so the classification
+/// of one slice and the classification of the rows above it compose.
 ///
 /// Deliberately keyed on `RowInfo::buffer_row` adjacency rather than
 /// `BlameEntry::range`: `blame_for_rows` hands out a clone of the same entry
@@ -150,13 +179,14 @@ pub enum BlameRunPosition {
 /// `alignment_rows` is aligned with `rows` too and flags the rows that belong
 /// to a block the block map inserted purely to keep this pane level with its
 /// companion — see [`crate::display_map::Block::is_alignment_only`] and
-/// [`blame_run_positions_in_viewport`], which derives it. A shorter slice
-/// reads as "not an alignment row", which is the pre-split behaviour.
+/// [`alignment_rows_in_range`], which derives it. A shorter slice reads as
+/// "not an alignment row", which is the pre-split behaviour.
 pub fn blame_run_positions(
     rows: &[RowInfo],
     blamed_rows: &[Option<(BufferId, BlameEntry)>],
     alignment_rows: &[bool],
-) -> Vec<Option<BlameRunPosition>> {
+    predecessor: BlameRunPredecessor,
+) -> (Vec<Option<BlameRunPosition>>, BlameRunPredecessor) {
     // Positional alignment is the whole basis of the classification: a
     // `blamed_rows` that drifted out of step with `rows` would silently make
     // every row a `Head` again rather than fail anywhere visible.
@@ -172,67 +202,93 @@ pub fn blame_run_positions(
     );
 
     // The previous *blamed* row's identity, or `None` when the run was broken
-    // (start of the slice, or a block row in between).
-    let mut previous: Option<(BufferId, Oid, u32)> = None;
+    // (a block row in between, or nothing above at all).
+    let mut previous = match predecessor {
+        BlameRunPredecessor::Blamed {
+            buffer_id,
+            sha,
+            buffer_row,
+        } => Some((buffer_id, sha, buffer_row)),
+        BlameRunPredecessor::DisplayStart | BlameRunPredecessor::Severed => None,
+    };
+    // Whether nothing at all has been seen yet. Soft-wrap continuations and
+    // alignment spacers do not clear it: a wrap is the same line still, and a
+    // spacer stands for text on the *other* side of a split diff, so letting
+    // either count as "something above" would make the two panes disagree
+    // about whether their first row opens the display.
+    let mut nothing_above = matches!(predecessor, BlameRunPredecessor::DisplayStart);
 
-    rows.iter()
-        .enumerate()
-        .map(|(ix, info)| {
-            let Some((buffer_id, entry)) = blamed_rows.get(ix).and_then(Option::as_ref) else {
-                // A block row (excerpt header, diff-hunk controls, folded-buffer
-                // header) is the one unblamed row that severs a run: it is real
-                // vertical space standing for something between the two lines.
-                // An alignment spacer is the exception — it stands for text on
-                // the *other* side of a split diff, so severing on it would let
-                // the two panes cut one commit's run in different places. A
-                // soft-wrap continuation is the same line still, so it must not
-                // sever either. Every other unblamed row keeps its `buffer_row`,
-                // so the adjacency check below already sees the gap it leaves.
-                let is_block_row = info.buffer_id.is_none() && info.wrapped_buffer_row.is_none();
-                let is_alignment_row = alignment_rows.get(ix).copied().unwrap_or(false);
-                if is_block_row && !is_alignment_row {
-                    previous = None;
-                }
-                return None;
-            };
+    let mut positions = Vec::with_capacity(rows.len());
+    for (ix, info) in rows.iter().enumerate() {
+        let is_alignment_row = alignment_rows.get(ix).copied().unwrap_or(false);
+        let Some((buffer_id, entry)) = blamed_rows.get(ix).and_then(Option::as_ref) else {
+            // A block row (excerpt header, diff-hunk controls, folded-buffer
+            // header) is the one unblamed row that severs a run: it is real
+            // vertical space standing for something between the two lines.
+            // An alignment spacer is the exception — it stands for text on
+            // the *other* side of a split diff, so severing on it would let
+            // the two panes cut one commit's run in different places. A
+            // soft-wrap continuation is the same line still, so it must not
+            // sever either. Every other unblamed row keeps its `buffer_row`,
+            // so the adjacency check below already sees the gap it leaves.
+            let is_block_row = info.buffer_id.is_none() && info.wrapped_buffer_row.is_none();
+            let is_wrap_row = info.wrapped_buffer_row.is_some();
+            if is_block_row && !is_alignment_row {
+                previous = None;
+            }
+            if !is_wrap_row && !(is_block_row && is_alignment_row) {
+                nothing_above = false;
+            }
+            positions.push(None);
+            continue;
+        };
 
-            let position = match (previous, info.buffer_row) {
-                (Some((previous_buffer, previous_sha, previous_row)), Some(row))
-                    if previous_buffer == *buffer_id
-                        && previous_sha == entry.sha
-                        && previous_row.checked_add(1) == Some(row) =>
-                {
-                    BlameRunPosition::Continuation
-                }
-                _ => BlameRunPosition::Head,
-            };
+        let position = match (previous, info.buffer_row) {
+            (Some((previous_buffer, previous_sha, previous_row)), Some(row))
+                if previous_buffer == *buffer_id
+                    && previous_sha == entry.sha
+                    && previous_row.checked_add(1) == Some(row) =>
+            {
+                BlameRunPosition::Continuation
+            }
+            _ if nothing_above => BlameRunPosition::DocumentHead,
+            _ => BlameRunPosition::Head,
+        };
 
-            previous = info.buffer_row.map(|row| (*buffer_id, entry.sha, row));
-            Some(position)
-        })
-        .collect()
+        previous = info.buffer_row.map(|row| (*buffer_id, entry.sha, row));
+        nothing_above = false;
+        positions.push(Some(position));
+    }
+
+    let trailing = match (nothing_above, previous) {
+        (true, _) => BlameRunPredecessor::DisplayStart,
+        (false, Some((buffer_id, sha, buffer_row))) => BlameRunPredecessor::Blamed {
+            buffer_id,
+            sha,
+            buffer_row,
+        },
+        (false, None) => BlameRunPredecessor::Severed,
+    };
+    (positions, trailing)
 }
 
-/// [`blame_run_positions`] for the rows a renderer is about to lay out, with
-/// the alignment flags read off `snapshot` rather than restated by the caller.
-///
-/// `rows` must be `snapshot.row_infos(start_row)` truncated to its own length,
-/// which is what makes a viewport index addressable as a display row.
-pub fn blame_run_positions_in_viewport(
+/// The alignment flags [`blame_run_positions`] wants for `len` display rows
+/// starting at `start_row`, read off the block map rather than restated by a
+/// caller.
+fn alignment_rows_in_range(
     snapshot: &DisplaySnapshot,
     start_row: DisplayRow,
-    rows: &[RowInfo],
-    blamed_rows: &[Option<(BufferId, BlameEntry)>],
-) -> Vec<Option<BlameRunPosition>> {
-    let mut alignment_rows = vec![false; rows.len()];
-    let end_row = DisplayRow(start_row.0.saturating_add(rows.len() as u32));
+    len: usize,
+) -> Vec<bool> {
+    let mut alignment_rows = vec![false; len];
+    let end_row = DisplayRow(start_row.0.saturating_add(len as u32));
     for (block_row, block) in snapshot.blocks_in_range(start_row..end_row) {
         if !block.is_alignment_only() {
             continue;
         }
         // `blocks_in_range` yields a block whose *start* may sit above the
-        // viewport, and a block spans `height()` rows from there, so neither
-        // end of the span can be assumed to be in range.
+        // range, and a block spans `height()` rows from there, so neither end
+        // of the span can be assumed to be in range.
         for row in block_row.0..block_row.0.saturating_add(block.height()) {
             if let Some(offset) = row.checked_sub(start_row.0)
                 && let Some(flag) = alignment_rows.get_mut(offset as usize)
@@ -241,7 +297,86 @@ pub fn blame_run_positions_in_viewport(
             }
         }
     }
-    blame_run_positions(rows, blamed_rows, &alignment_rows)
+    alignment_rows
+}
+
+/// How far above the visible rows the search for a run's real start gives up.
+///
+/// The scan doubles its reach and stops at the first row that settles the
+/// question, so it costs one row in the ordinary case; it only keeps widening
+/// while every row above is a soft-wrap continuation or an alignment spacer,
+/// neither of which settles anything. A stretch of those longer than this is
+/// pathological, and giving up reads as [`BlameRunPredecessor::DisplayStart`]
+/// — a labelled head with no hairline, which is what the gutter drew for its
+/// top row before it could see above itself at all.
+const MAX_RUN_PREDECESSOR_LOOKBACK: u32 = 1024;
+
+impl GitBlame {
+    /// [`blame_run_positions`] for the rows a renderer is about to lay out,
+    /// with the alignment flags and the run's real start read off `snapshot`
+    /// rather than restated by the caller.
+    ///
+    /// `rows` must be `snapshot.row_infos(start_row)` truncated to its own
+    /// length, which is what makes a viewport index addressable as a display
+    /// row, and `blamed_rows` must be `self.blame_for_rows(rows)`.
+    pub fn run_positions_in_viewport(
+        &mut self,
+        snapshot: &DisplaySnapshot,
+        start_row: DisplayRow,
+        rows: &[RowInfo],
+        blamed_rows: &[Option<(BufferId, BlameEntry)>],
+        cx: &mut App,
+    ) -> Vec<Option<BlameRunPosition>> {
+        let predecessor = self.run_predecessor_above(snapshot, start_row, cx);
+        let alignment_rows = alignment_rows_in_range(snapshot, start_row, rows.len());
+        blame_run_positions(rows, blamed_rows, &alignment_rows, predecessor).0
+    }
+
+    /// Classifies the rows above `start_row` — as many of them as it takes to
+    /// answer what the first visible row is looking at — and hands back what
+    /// they leave for it.
+    ///
+    /// The rows above are run through [`blame_run_positions`] rather than
+    /// through a second reading of the same rule: whether a block row severs,
+    /// whether a spacer or a wrap does not, and what identity survives to the
+    /// next row are all decided in exactly one place.
+    fn run_predecessor_above(
+        &mut self,
+        snapshot: &DisplaySnapshot,
+        start_row: DisplayRow,
+        cx: &mut App,
+    ) -> BlameRunPredecessor {
+        let mut lookback = 1;
+        loop {
+            let scan_start = DisplayRow(start_row.0.saturating_sub(lookback));
+            let count = start_row.0.saturating_sub(scan_start.0) as usize;
+            if count == 0 {
+                return BlameRunPredecessor::DisplayStart;
+            }
+            let scanned = snapshot
+                .row_infos(scan_start)
+                .take(count)
+                .collect::<Vec<_>>();
+            let scanned_blame = self.blame_for_rows(&scanned, cx).collect::<Vec<_>>();
+            let alignment_rows = alignment_rows_in_range(snapshot, scan_start, scanned.len());
+            // Seeded as if the scanned window started the display: coming back
+            // out the other end still saying so is precisely "these rows
+            // settled nothing", which is the signal to widen.
+            let (_, predecessor) = blame_run_positions(
+                &scanned,
+                &scanned_blame,
+                &alignment_rows,
+                BlameRunPredecessor::DisplayStart,
+            );
+            if predecessor != BlameRunPredecessor::DisplayStart
+                || scan_start.0 == 0
+                || lookback >= MAX_RUN_PREDECESSOR_LOOKBACK
+            {
+                return predecessor;
+            }
+            lookback = lookback.saturating_mul(2);
+        }
+    }
 }
 
 pub trait BlameRenderer {
@@ -1757,11 +1892,34 @@ mod tests {
         RowInfo::default()
     }
 
+    /// Runs one fixture through the classification. The third element of each
+    /// entry is the row's alignment flag, as `alignment_rows_in_range` derives
+    /// it from the block map: `true` only for the rows of a `Block::Spacer`.
+    fn run_positions(
+        spec: &[(RowInfo, Option<(BufferId, &str)>, bool)],
+        predecessor: BlameRunPredecessor,
+    ) -> (Vec<Option<BlameRunPosition>>, BlameRunPredecessor) {
+        let rows = spec.iter().map(|(info, _, _)| *info).collect::<Vec<_>>();
+        let blamed_rows = spec
+            .iter()
+            .map(|(_, blame, _)| blame.map(|(buffer_id, sha)| (buffer_id, blame_entry(sha, 0..1))))
+            .collect::<Vec<_>>();
+        let alignment_rows = spec
+            .iter()
+            .map(|(_, _, alignment)| *alignment)
+            .collect::<Vec<_>>();
+
+        blame_run_positions(&rows, &blamed_rows, &alignment_rows, predecessor)
+    }
+
     /// Every entry is built with the same `range`, so an implementation that
     /// grouped on `BlameEntry::range` instead of row adjacency would collapse
-    /// these fixtures into one run — failing five of the ten tests below (the
+    /// these fixtures into one run — failing most of the tests below (the
     /// header-block case survives it, being pinned by the separate block-row
     /// clause rather than by the adjacency test).
+    ///
+    /// The fixture is taken to start the display, so its first blamed row is a
+    /// `DocumentHead`: it opens a run with nothing above it.
     #[track_caller]
     fn assert_run_positions(
         spec: &[(RowInfo, Option<(BufferId, &str)>)],
@@ -1774,28 +1932,40 @@ mod tests {
         assert_run_positions_with_alignment(&spec, expected);
     }
 
-    /// The third element of each entry is the row's alignment flag, as
-    /// `blame_run_positions_in_viewport` derives it from the block map:
-    /// `true` only for the rows of a `Block::Spacer`.
     #[track_caller]
     fn assert_run_positions_with_alignment(
         spec: &[(RowInfo, Option<(BufferId, &str)>, bool)],
         expected: &[Option<BlameRunPosition>],
     ) {
-        let rows = spec.iter().map(|(info, _, _)| *info).collect::<Vec<_>>();
-        let blamed_rows = spec
-            .iter()
-            .map(|(_, blame, _)| blame.map(|(buffer_id, sha)| (buffer_id, blame_entry(sha, 0..1))))
-            .collect::<Vec<_>>();
-        let alignment_rows = spec
-            .iter()
-            .map(|(_, _, alignment)| *alignment)
-            .collect::<Vec<_>>();
-
         pretty_assertions::assert_eq!(
-            blame_run_positions(&rows, &blamed_rows, &alignment_rows),
+            run_positions(spec, BlameRunPredecessor::DisplayStart).0,
             expected
         );
+    }
+
+    /// The composition the gutter actually performs: `context` are the display
+    /// rows above the visible ones, classified first, and what they leave
+    /// behind is what `spec` — the visible slice — is classified against. This
+    /// is `GitBlame::run_predecessor_above` followed by
+    /// `GitBlame::run_positions_in_viewport`, with the display-row scan (which
+    /// needs a real `DisplaySnapshot`) standing in as a literal fixture.
+    #[track_caller]
+    fn assert_run_positions_below(
+        context: &[(RowInfo, Option<(BufferId, &str)>, bool)],
+        spec: &[(RowInfo, Option<(BufferId, &str)>, bool)],
+        expected: &[Option<BlameRunPosition>],
+    ) {
+        let (_, predecessor) = run_positions(context, BlameRunPredecessor::DisplayStart);
+        pretty_assertions::assert_eq!(run_positions(spec, predecessor).0, expected);
+    }
+
+    /// Shorthand for a fixture with no alignment spacers in it.
+    fn plain<'a>(
+        spec: &[(RowInfo, Option<(BufferId, &'a str)>)],
+    ) -> Vec<(RowInfo, Option<(BufferId, &'a str)>, bool)> {
+        spec.iter()
+            .map(|(info, blame)| (*info, *blame, false))
+            .collect()
     }
 
     #[test]
@@ -1808,7 +1978,7 @@ mod tests {
                 (text_row(buffer, 2), Some((buffer, "1a1a1a"))),
             ],
             &[
-                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::DocumentHead),
                 Some(BlameRunPosition::Continuation),
                 Some(BlameRunPosition::Continuation),
             ],
@@ -1825,7 +1995,7 @@ mod tests {
                 (text_row(buffer, 2), Some((buffer, "2b2b2b"))),
             ],
             &[
-                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::DocumentHead),
                 Some(BlameRunPosition::Head),
                 Some(BlameRunPosition::Continuation),
             ],
@@ -1842,7 +2012,7 @@ mod tests {
                 (text_row(buffer, 6), Some((buffer, "1a1a1a"))),
             ],
             &[
-                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::DocumentHead),
                 Some(BlameRunPosition::Head),
                 Some(BlameRunPosition::Continuation),
             ],
@@ -1858,7 +2028,10 @@ mod tests {
                 (text_row(first, 0), Some((first, "1a1a1a"))),
                 (text_row(second, 1), Some((second, "1a1a1a"))),
             ],
-            &[Some(BlameRunPosition::Head), Some(BlameRunPosition::Head)],
+            &[
+                Some(BlameRunPosition::DocumentHead),
+                Some(BlameRunPosition::Head),
+            ],
         );
     }
 
@@ -1876,7 +2049,7 @@ mod tests {
                 (text_row(buffer, 1), Some((buffer, "1a1a1a"))),
             ],
             &[
-                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::DocumentHead),
                 None,
                 Some(BlameRunPosition::Head),
             ],
@@ -1898,7 +2071,7 @@ mod tests {
                 (text_row(buffer, 1), Some((buffer, "1a1a1a")), false),
             ],
             &[
-                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::DocumentHead),
                 None,
                 Some(BlameRunPosition::Continuation),
             ],
@@ -1918,7 +2091,7 @@ mod tests {
                 (text_row(buffer, 9), Some((buffer, "1a1a1a")), false),
             ],
             &[
-                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::DocumentHead),
                 None,
                 Some(BlameRunPosition::Head),
             ],
@@ -1935,7 +2108,7 @@ mod tests {
                 (text_row(buffer, 1), Some((buffer, "1a1a1a"))),
             ],
             &[
-                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::DocumentHead),
                 None,
                 Some(BlameRunPosition::Continuation),
             ],
@@ -1952,25 +2125,293 @@ mod tests {
                 (text_row(buffer, 2), Some((buffer, "1a1a1a"))),
             ],
             &[
-                Some(BlameRunPosition::Head),
+                Some(BlameRunPosition::DocumentHead),
                 None,
                 Some(BlameRunPosition::Head),
             ],
         );
     }
 
+    /// The rule the gutter is scrolled through: a slice that begins in the
+    /// middle of a run is a slice of continuations. The label stays on the row
+    /// the run really starts on — off screen, and so unwritten — instead of
+    /// sliding down to whichever row the scroll left on top.
     #[test]
-    fn blame_run_positions_head_the_first_row_of_a_mid_run_slice() {
+    fn blame_run_positions_continue_a_run_the_rows_above_started() {
         let buffer = test_buffer_id(1);
-        assert_run_positions(
-            &[
+        assert_run_positions_below(
+            &plain(&[(text_row(buffer, 6), Some((buffer, "1a1a1a")))]),
+            &plain(&[
                 (text_row(buffer, 7), Some((buffer, "1a1a1a"))),
                 (text_row(buffer, 8), Some((buffer, "1a1a1a"))),
+            ]),
+            &[
+                Some(BlameRunPosition::Continuation),
+                Some(BlameRunPosition::Continuation),
             ],
+        );
+    }
+
+    /// The other side of it: a slice whose first row is where a run really
+    /// begins keeps its head, and its boundary. Scrolling one line further
+    /// must not cost the label or the hairline.
+    #[test]
+    fn blame_run_positions_head_a_slice_that_starts_at_a_run() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_below(
+            &plain(&[(text_row(buffer, 6), Some((buffer, "1a1a1a")))]),
+            &plain(&[
+                (text_row(buffer, 7), Some((buffer, "2b2b2b"))),
+                (text_row(buffer, 8), Some((buffer, "2b2b2b"))),
+            ]),
             &[
                 Some(BlameRunPosition::Head),
                 Some(BlameRunPosition::Continuation),
             ],
+        );
+    }
+
+    /// The block row above the slice severs the run there just as it would
+    /// inside it, so the first visible row opens a run of its own — and,
+    /// having something above it, marks a boundary.
+    #[test]
+    fn blame_run_positions_head_below_a_block_row_above_the_slice() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_below(
+            &plain(&[
+                (text_row(buffer, 6), Some((buffer, "1a1a1a"))),
+                (block_row(), None),
+            ]),
+            &plain(&[(text_row(buffer, 7), Some((buffer, "1a1a1a")))]),
+            &[Some(BlameRunPosition::Head)],
+        );
+    }
+
+    /// A soft-wrap continuation above the slice is the tail of the line above
+    /// it, not a line of its own, so the run reaches across it — the case a
+    /// one-row look above would get wrong every time a wrapped line is the
+    /// first thing scrolled off.
+    #[test]
+    fn blame_run_positions_continue_across_a_soft_wrap_above_the_slice() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_below(
+            &plain(&[
+                (text_row(buffer, 6), Some((buffer, "1a1a1a"))),
+                (soft_wrapped_row(6), None),
+            ]),
+            &plain(&[(text_row(buffer, 7), Some((buffer, "1a1a1a")))]),
+            &[Some(BlameRunPosition::Continuation)],
+        );
+    }
+
+    /// And an alignment spacer above the slice stands for text on the other
+    /// side of a split diff, so it does not sever the run either: the pane
+    /// with the spacer and the pane without it have to agree about where the
+    /// run's head is, on screen or above it.
+    #[test]
+    fn blame_run_positions_continue_across_an_alignment_spacer_above_the_slice() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_below(
+            &[
+                (text_row(buffer, 6), Some((buffer, "1a1a1a")), false),
+                (block_row(), None, true),
+            ],
+            &plain(&[(text_row(buffer, 7), Some((buffer, "1a1a1a")))]),
+            &[Some(BlameRunPosition::Continuation)],
+        );
+    }
+
+    /// An unblamed line above the slice is a line all the same: the run cannot
+    /// reach across it, and the first visible row has something above it to be
+    /// separated from.
+    #[test]
+    fn blame_run_positions_head_below_an_unblamed_row_above_the_slice() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_below(
+            &plain(&[
+                (text_row(buffer, 6), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 7), None),
+            ]),
+            &plain(&[(text_row(buffer, 8), Some((buffer, "1a1a1a")))]),
+            &[Some(BlameRunPosition::Head)],
+        );
+    }
+
+    /// The first row of the display opens a run with nothing above it. It is
+    /// the one head that marks no boundary — a hairline there separates the
+    /// gutter from the toolbar, not one commit from another.
+    #[test]
+    fn blame_run_positions_open_the_display_at_its_first_row() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_below(
+            &[],
+            &plain(&[
+                (text_row(buffer, 0), Some((buffer, "1a1a1a"))),
+                (text_row(buffer, 1), Some((buffer, "1a1a1a"))),
+            ]),
+            &[
+                Some(BlameRunPosition::DocumentHead),
+                Some(BlameRunPosition::Continuation),
+            ],
+        );
+    }
+
+    /// A split diff whose first line is padded on one side puts a spacer above
+    /// that pane's first blamed row. It stands for the other pane's text, so
+    /// the row still opens the display: otherwise one pane would draw a
+    /// hairline across its top edge and the other would not.
+    #[test]
+    fn blame_run_positions_open_the_display_across_a_leading_spacer() {
+        let buffer = test_buffer_id(1);
+        assert_run_positions_below(
+            &[(block_row(), None, true)],
+            &plain(&[(text_row(buffer, 0), Some((buffer, "1a1a1a")))]),
+            &[Some(BlameRunPosition::DocumentHead)],
+        );
+    }
+
+    /// The display-space half of the rule, which the fixtures above cannot
+    /// reach: `run_predecessor_above` has to *find* the rows it classifies,
+    /// and the row directly above the visible ones is very often a soft-wrap
+    /// continuation that settles nothing. A scan that looked up exactly one
+    /// row would read that as "nothing above", relabel the middle of a run,
+    /// and draw a hairline across the top of the gutter — the very defect
+    /// this is all here to remove — so the scan widens until it finds a row
+    /// that answers the question.
+    #[gpui::test]
+    async fn test_run_positions_reach_past_wrapped_rows_above_the_viewport(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::display_map::{DisplayMap, DisplayRow, FoldPlaceholder};
+        use gpui::{font, px};
+        use project::project_settings::DiagnosticSeverity;
+
+        init_test(cx);
+
+        let long_line = "wrapped ".repeat(40);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/my-repo"),
+            json!({
+                ".git": {},
+                "file.txt": format!("first\n{long_line}\nthird\nfourth\n"),
+            }),
+        )
+        .await;
+        // One commit over every line, so anything but `Continuation` below
+        // the wrap is the classification losing the run, not the fixture.
+        fs.set_blame_for_repo(
+            Path::new(path!("/my-repo/.git")),
+            vec![(
+                repo_path("file.txt"),
+                Blame {
+                    entries: vec![blame_entry("1a1a1a", 0..4)],
+                    ..Default::default()
+                },
+            )],
+        );
+
+        let project = Project::test(fs, [path!("/my-repo").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/my-repo/file.txt"), cx)
+            })
+            .await
+            .expect("the fixture file opens");
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+        let display_map = cx.new(|cx| {
+            DisplayMap::new(
+                multi_buffer.clone(),
+                font("Helvetica"),
+                px(14.),
+                Some(px(120.)),
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        let snapshot = display_map.update(cx, |map, cx| map.snapshot(cx));
+
+        let blame =
+            cx.new(|cx| GitBlame::new(multi_buffer, project, HashMap::default(), false, true, cx));
+        cx.executor().run_until_parked();
+
+        // The second buffer line has to actually wrap, or the rows above the
+        // viewport would be plain text rows and one look up would do.
+        let start_row = snapshot
+            .row_infos(DisplayRow(0))
+            .position(|info| info.buffer_row == Some(2))
+            .expect("the third line is on screen somewhere") as u32;
+        assert!(
+            start_row > 2,
+            "the long line must occupy more than one display row, else the \
+             scan above the viewport is never exercised: {start_row}"
+        );
+
+        let start_row = DisplayRow(start_row);
+        let rows = snapshot.row_infos(start_row).take(2).collect::<Vec<_>>();
+        blame.update(cx, |blame, cx| {
+            let blamed_rows = blame.blame_for_rows(&rows, cx).collect::<Vec<_>>();
+            pretty_assertions::assert_eq!(
+                blame.run_positions_in_viewport(&snapshot, start_row, &rows, &blamed_rows, cx),
+                vec![
+                    Some(BlameRunPosition::Continuation),
+                    Some(BlameRunPosition::Continuation),
+                ],
+                "the run started on the first line and the rows between are \
+                 wrap continuations, so the visible rows continue it"
+            );
+        });
+    }
+
+    /// What a slice leaves for the rows below it, which is what
+    /// `GitBlame::run_predecessor_above` reads and what its widening loop
+    /// keys on: `DisplayStart` back out of a scan means those rows settled
+    /// nothing, so the scan has to reach further up.
+    #[test]
+    fn blame_run_positions_report_what_the_rows_below_look_at() {
+        let buffer = test_buffer_id(1);
+        let sha = blame_entry("1a1a1a", 0..1).sha;
+
+        assert_eq!(
+            run_positions(
+                &plain(&[(text_row(buffer, 6), Some((buffer, "1a1a1a")))]),
+                BlameRunPredecessor::DisplayStart,
+            )
+            .1,
+            BlameRunPredecessor::Blamed {
+                buffer_id: buffer,
+                sha,
+                buffer_row: 6,
+            },
+            "a blamed row is what the row under it may continue"
+        );
+        assert_eq!(
+            run_positions(
+                &plain(&[
+                    (text_row(buffer, 6), Some((buffer, "1a1a1a"))),
+                    (block_row(), None),
+                ]),
+                BlameRunPredecessor::DisplayStart,
+            )
+            .1,
+            BlameRunPredecessor::Severed,
+            "a block row cuts the run before the rows below it ever see it"
+        );
+        assert_eq!(
+            run_positions(
+                &[
+                    (block_row(), None, true),
+                    (soft_wrapped_row(0), None, false),
+                ],
+                BlameRunPredecessor::DisplayStart,
+            )
+            .1,
+            BlameRunPredecessor::DisplayStart,
+            "spacers and wraps settle nothing, so the scan must widen past them"
         );
     }
 }
