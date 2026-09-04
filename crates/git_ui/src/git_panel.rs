@@ -1046,6 +1046,16 @@ pub struct GitPanel {
     /// each time the user arrow-keyed to another commit — the bug
     /// `editor::split_editor_view::LastSplitRatio` exists to prevent.
     commit_message_height: Option<Pixels>,
+    /// Width the Commit tab's ref row was last laid out at, measured by the
+    /// `canvas` in `commit_tab::GitPanel::render_commit_refs_row` and fed back
+    /// into it as the budget deciding how many chips fit on the collapsed line.
+    ///
+    /// Out here rather than on `CommitTabState` for the same reason as
+    /// `commit_message_height`, and for one more: this is a property of the
+    /// PANEL's width, not of the selected commit, so keeping it across
+    /// selections is what stops every arrow-key press from painting one
+    /// unmeasured frame.
+    commit_refs_row_width: Option<Pixels>,
 
     _settings_subscription: Subscription,
     git_access: GitAccess,
@@ -1297,6 +1307,7 @@ impl GitPanel {
                 active_tab: GitPanelTab::Changes,
                 commit_tab: None,
                 commit_message_height: None,
+                commit_refs_row_width: None,
                 _settings_subscription,
                 git_access: GitAccess::Yes,
                 _store_subscription,

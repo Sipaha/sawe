@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use gpui::{Hsla, SharedString};
+use gpui::{Hsla, Pixels, SharedString, TextRun, Window, px};
 use ui::{Chip, LabelSize, Tooltip, prelude::*};
 
 /// Strip the prefixes git can emit in `%D` decorations
@@ -71,22 +71,26 @@ pub fn tag_names(ref_names: &[SharedString]) -> impl Iterator<Item = &str> {
         .filter(|name| !name.is_empty())
 }
 
-/// One decoration's chip.
+/// Which of the two glyphs [`ref_chip`] gives a decoration, if either.
 ///
-/// `truncate` belongs to the caller, not the chip. [`Chip::truncate`] sets
-/// `min_w_0`, which is right in a single-line row that must give a long ref
-/// back to the text beside it, and wrong in a row that wraps: there every chip
-/// would collapse to a bare ellipsis.
-pub fn ref_chip(
-    name: &SharedString,
-    accent_color: Hsla,
-    is_head: bool,
-    work_dir: Option<&Path>,
-    truncate: bool,
-) -> Chip {
-    // S-SOL-PRT — render protected refs with a lock glyph in place of the
-    // standard chip icon. The ref-namespace prefixes git emits in `%D` are
-    // stripped first so the policy's globs match the bare branch name.
+/// Split out so [`ref_chip_width`] answers "is there a glyph" from the same
+/// code that decides to paint one — a width prediction that disagrees with the
+/// chip is a budget that lies.
+enum ChipGlyph {
+    /// The checked-out branch: a check.
+    Head,
+    /// S-SOL-PRT — a branch this Solution's policy protects: a lock.
+    Protected,
+    /// Everything else: no glyph, git's own text is the whole label.
+    None,
+}
+
+fn chip_glyph(name: &SharedString, is_head: bool, work_dir: Option<&Path>) -> ChipGlyph {
+    if is_head {
+        return ChipGlyph::Head;
+    }
+    // The ref-namespace prefixes git emits in `%D` are stripped first so the
+    // policy's globs match the bare branch name.
     let bare = strip_ref_namespace(name.as_ref());
     let is_protected = work_dir.is_some_and(|work_dir| {
         matches!(
@@ -94,23 +98,94 @@ pub fn ref_chip(
             solutions::branch_protection::Decision::Forbidden { .. }
         )
     });
+    if is_protected {
+        ChipGlyph::Protected
+    } else {
+        ChipGlyph::None
+    }
+}
+
+/// One decoration's chip.
+///
+/// `truncate` belongs to the caller, not the chip. [`Chip::truncate`] sets
+/// `min_w_0`, which is right in a single-line row that must give a long ref
+/// back to the text beside it, and wrong in a row whose caller has already
+/// measured what fits: there it would shrink chips that were chosen precisely
+/// because they do not have to.
+pub fn ref_chip(
+    name: &SharedString,
+    accent_color: Hsla,
+    is_head: bool,
+    work_dir: Option<&Path>,
+    truncate: bool,
+) -> Chip {
     Chip::new(name.clone())
         .label_size(LabelSize::Small)
         .map(|chip| if truncate { chip.truncate() } else { chip })
-        .map(|chip| {
-            if is_head {
-                chip.icon(IconName::Check)
-                    .bg_color(accent_color.opacity(0.25))
-                    .border_color(accent_color.opacity(0.5))
-            } else if is_protected {
-                chip.icon(IconName::LockOutlined)
-                    .bg_color(accent_color.opacity(0.12))
-                    .border_color(accent_color.opacity(0.5))
-            } else {
-                chip.bg_color(accent_color.opacity(0.08))
-                    .border_color(accent_color.opacity(0.25))
-            }
+        .map(|chip| match chip_glyph(name, is_head, work_dir) {
+            ChipGlyph::Head => chip
+                .icon(IconName::Check)
+                .bg_color(accent_color.opacity(0.25))
+                .border_color(accent_color.opacity(0.5)),
+            ChipGlyph::Protected => chip
+                .icon(IconName::LockOutlined)
+                .bg_color(accent_color.opacity(0.12))
+                .border_color(accent_color.opacity(0.5)),
+            ChipGlyph::None => chip
+                .bg_color(accent_color.opacity(0.08))
+                .border_color(accent_color.opacity(0.25)),
         })
+}
+
+/// The width the chip's own box adds around its label: `px_1` either side plus
+/// the 1px border either side. In rems, because that is how [`Chip`] spells its
+/// padding — a pixel constant here would lie at any UI font size but the
+/// default.
+fn chip_chrome_width(window: &Window) -> Pixels {
+    rems(0.25).to_pixels(window.rem_size()) * 2. + px(2.)
+}
+
+/// The width `label` shapes to inside a chip: the BUFFER font — [`Chip`] calls
+/// `Label::buffer_font` — at [`LabelSize::Small`].
+fn shaped_chip_label_width(label: &SharedString, window: &Window, cx: &App) -> Pixels {
+    let font = theme::theme_settings(cx).buffer_font(cx).clone();
+    let font_size = ui::TextSize::Small.rems(cx).to_pixels(window.rem_size());
+    let run = TextRun {
+        len: label.len(),
+        font,
+        color: cx.theme().colors().text,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(label.clone(), font_size, &[run], None)
+        .width
+}
+
+/// The width [`ref_chip`] will lay out at, untruncated.
+///
+/// This is a caller's width budget talking to the chip's own styling, so both
+/// sides read one description of the box rather than repeating literals — the
+/// same discipline `solutions_ui::project_tab::tab_width_for_label` keeps with
+/// the project strip. A chip whose padding changed without this following would
+/// silently make the budget lie, and the row would clip a name it promised to
+/// show whole.
+pub fn ref_chip_width(
+    name: &SharedString,
+    is_head: bool,
+    work_dir: Option<&Path>,
+    window: &Window,
+    cx: &App,
+) -> Pixels {
+    let glyph = match chip_glyph(name, is_head, work_dir) {
+        ChipGlyph::None => px(0.),
+        // `IconSize::XSmall` plus the chip's `gap_0p5`.
+        _ => IconSize::XSmall.rems().to_pixels(window.rem_size())
+            + rems(0.125).to_pixels(window.rem_size()),
+    };
+    chip_chrome_width(window) + glyph + shaped_chip_label_width(name, window, cx)
 }
 
 /// The `+N` chip that stands in for the decorations a row had no width for.

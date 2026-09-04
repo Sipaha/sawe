@@ -176,3 +176,224 @@ with:
 - The 64px cap is not a whole number of chip lines (19px + 4px gap), so the expanded block clips
   its last visible line mid-height. That is inherited from the containment rows, which share the
   constant.
+
+---
+
+# Follow-up: the collapsed row fits whole names and counts the rest
+
+**Ruling** (coordinator, on the nine-ref screenshot above): *«A row that fits everything by
+making every name unreadable communicates less than one that shows three names and says there
+are six more.»* Collapsed must fit as many chips as the width allows, each with its **full
+name**; per-chip truncation drops back to being the last-resort backstop it was written as; and
+the toggle must say how many are hidden. Expanded behaviour unchanged. Priorities: no ref name
+unreachable > constant height > number of chips visible.
+
+**Status:** shipped on `main`, second commit. Files: `crates/git_ui/src/git_panel/commit_tab.rs`,
+`crates/git_ui/src/commit_refs.rs`, `crates/git_ui/src/git_panel.rs` (one field).
+
+## What it does now
+
+The collapsed row is a measured fit, built on the pattern this fork already uses for the project
+strip (`solutions_ui::project_tab_strip`, `cc05f6ef6d`), because that is the same problem:
+
+1. **Measure.** A `canvas` covering the row reports its box into
+   `GitPanel::commit_refs_row_width` and hops the notify out of the draw with a guarded
+   `cx.defer` (`Window::invalidate_view` throws away a notify raised mid-draw). Safe to feed back
+   into `render` because the measured quantity does not depend on the decision it drives: the row
+   is `w_full`, so its width is the panel's however many chips end up inside it. The field lives
+   on `GitPanel`, not `CommitTabState`, so walking the log does not re-enter the unmeasured
+   state once per commit.
+2. **Predict.** `commit_refs::ref_chip_width` — new, next to `ref_chip`, sharing one
+   `chip_glyph` decision with it so a chip and its prediction cannot disagree about the check /
+   lock glyph. Widths are shaped with the chip's real font (`Label::buffer_font`, `TextSize::Small`)
+   and the box metrics are read in **rems**, so the budget does not lie at a non-default UI font
+   size. Same discipline as `project_tab::tab_width_for_label`.
+3. **Fit.** `ref_chips_that_fit(widths, gap, budget, toggle)` — a pure function, a greedy
+   **prefix**, with the toggle's width charged to the budget only when something actually spills,
+   `REF_ROW_BUDGET_SAFETY_MARGIN` (4px) of slack, and a floor of one chip. No parameter says
+   which ref is interesting, so nothing about the selection can reshuffle which chips are on
+   screen.
+4. **Paint.** The chips that fit, whole, plus a `Show N more` button; `Show less` on the way
+   back. `Chip::truncate` stays on permanently but is inert while the prefix fits (nothing
+   overflows, so flexbox never shrinks anything); it fires only where the fit can promise
+   nothing — the single ref wider than the whole row, and the one pre-measurement frame.
+
+**Wording:** `Show 7 more` collapsed, `Show less` expanded. `Show less` is verbatim the
+containment rows' word, so the pair still reads as one family; the collapsed label carries the
+count because, unlike `In 12 branches: …`, a chip row cut at the width states no total anywhere
+else, and `Show all` would leave "all of what?" unanswered. `commit_refs::overflow_chip` (`+N`)
+stays the graph's: a chip that is secretly clickable is a weaker affordance than a labelled
+button, and a count whose names live only in a tooltip is the shape of the original bug.
+
+## The invariant `uncharted_tags` now states
+
+> **A tag may only be subtracted from the tag row by a chip the user can see.**
+
+`uncharted_tags(tags, ref_names)` takes the decorations the ref row **painted this frame** — the
+prefix when collapsed, all of them when expanded — never the commit's whole decoration list.
+`GitPanel::ref_row_fit` computes that count once per frame, above the section loop, and
+`render_commit_tab` hands the same slice to both the ref row and the tag row, so the two cannot
+derive it separately. Subtract against the full list instead and a tag past the fold is
+suppressed on the tag row *and* unpainted on the chip row — `1a73d7d001`'s bug in a new costume.
+
+Live consequence, visible in the screenshots below: collapsed, `tag: probe-2.41.0` is behind
+`Show 7 more`, so the tag row picks it up and paints `probe-2.41.0`; expanded, it is a chip, so
+the tag row stands down rather than saying the same thing twice a few pixels lower. The name is
+on screen in **both** states; only which row carries it changes.
+
+## Tests
+
+`cargo test -p git_ui` → **408 passed, 0 failed** (was 405; +3 net).
+
+| Test | What it pins |
+|---|---|
+| `test_the_commit_tab_paints_every_ref_pointing_at_the_commit` *(kept)* | Three short refs at `compact_refs_threshold = 2`: all three painted, no `+N`, all on one line, **`origin/main` painted within 1px of `commit_refs::ref_chip_width`'s prediction** (whole name, and the budget's arithmetic pinned against the paint the way `tabs_lay_out_at_their_predicted_width` does), and **no toggle at all** — nothing folded, so no control offering to show what is not missing. Undecorated commit still gets no row. |
+| `test_the_commit_tab_ref_row_rests_at_one_height_for_every_commit` *(kept)* | Unchanged contract: one ref vs nine, equal height and equal bottom edge; expanding grows it; the next selection collapses it again. |
+| `test_the_commit_tab_ref_row_counts_the_refs_that_do_not_fit` *(replaces `…wraps_into_a_capped_scroll_box_when_expanded`)* | Twelve refs. The painted chips are a greedy **prefix**; they are all on one line; the first is painted at its full predicted width; the button is looked up **by its label**, so `Show {12−painted} more` is a painted assertion of the count; after the click all twelve are painted, wrapped, and the block is exactly the 64px cap; `Show less` restores exactly the prefix. |
+| `test_a_tag_past_the_fold_stays_on_the_tag_row` *(new)* | The coupling, both sides, painted: with the tag behind the fold, `CHIP-tag: 2.41.0` is absent and `COMMIT-TAB-TAGS` is present; after expanding, the chip is present and the tag row is gone. |
+| `test_a_single_ref_wider_than_the_row_ellipsizes_inside_it` *(new)* | The backstop: one ref wider than the whole row stays **inside** the row (`chip.right() <= row.right()`) instead of being cut off mid-word, and the row still rests at the same height. |
+| `test_ref_chips_that_fit` *(new, pure)* | The fold arithmetic: exact fit; one pixel short; a budget that would hold two chips if the toggle were free (it is not); a row too narrow for even one chip → still one; empty list → zero. |
+
+### Mutation table (second round)
+
+| # | Mutation applied | Result | Reverted |
+|---|---|---|---|
+| 8 | `uncharted_tags(tags, &state.selection.refs.names)` — subtract against the whole list again | **FAILED** — `test_a_tag_past_the_fold_stays_on_the_tag_row` | yes |
+| 9 | `fit.truncate` → `true` (chips always truncatable) | **SURVIVED** — see note; the flag was then deleted | n/a, folded into the fix |
+| 10 | `names.iter().take(painted)` → all names (paint every chip on the line) | **FAILED** — the fold test, the height test and the tag-coupling test | yes |
+| 11 | `ref_row_fit` ignores the measurement and returns `names.len()` | **FAILED** — same three | yes |
+| 12 | `Show {hidden + 1} more` (the toggle miscounts) | **FAILED** — all three tests that click it by label | yes |
+| 13 | `let budget = budget - toggle - gap` → `budget` (the fit forgets its own toggle) | **FAILED** — `test_ref_chips_that_fit` and the fold test | yes |
+| 14 | Collapsed toggle never rendered (no way back to the folded refs) | **FAILED** — all three | yes |
+| 15 | `truncate: false` on the chips (backstop removed) | **FAILED** — `test_a_single_ref_wider_than_the_row_ellipsizes_inside_it` | yes |
+| 2′ | Collapsed wraps too (`if true { flex_wrap() … }`) | **SURVIVED** — see note | yes |
+| 5′ | `refs_expanded: true` in `CommitTabState::new` | **FAILED** — four tests | yes |
+| 6′ | Drop the `names.is_empty() → None` guard | **FAILED** — the every-ref test | yes |
+
+**Survivor 9 was a design signal, not a gap.** With the fit painting only a prefix that fits,
+`truncate` is unobservable: nothing overflows, so flexbox never shrinks anything. The
+`RefRowFit { painted, truncate }` struct was therefore carrying a flag with no behaviour, and
+`truncate: true` is also the *more* forgiving failure mode if a prediction is ever slightly off
+(a fraction of a pixel of shrink beats a name clipped mid-word). So the flag was deleted, the
+fit now returns a plain `usize`, and the chips are built with `truncate: true` unconditionally —
+mutation 15 is what guards that.
+
+**Survivor 2′ is defensive and currently untestable.** `overflow_hidden` + nowrap is the guard
+against a *lying* budget: if a chip ever shapes wider than predicted, a wrapping row would grow a
+second line and the ref count would be setting the height again. Tests cannot construct that lie
+— the canvas re-measures and corrects any width I plant within the same `run_until_parked` —
+so the mutation is invisible to them. Left in with the reasoning at the call site.
+
+## Verification commands
+
+```
+$ CARGO_BUILD_JOBS=4 cargo build --bin sawe
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 01s
+    errors: 0 warnings: 0
+
+$ CARGO_BUILD_JOBS=4 cargo check --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 26.77s
+    errors+warnings: 0
+
+$ CARGO_BUILD_JOBS=4 cargo test -p git_ui
+    test result: ok. 408 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+## Live check (second probe)
+
+`script/run-mcp --debug --headless --runtime-dir /tmp/refs-height-probe2`, a throwaway clone
+whose HEAD commit carries **nine** decorations (`HEAD -> main`, two tags, four
+`origin/…` branches, `origin/main`, `origin/HEAD`), the next carries one, the one below none.
+
+| Selection | Rule y (top of the message block = bottom edge of the changed-files tree) | Ref-chip band |
+|---|---|---|
+| 9 refs, at rest | 416 | 648–668 (20px, one line) |
+| 1 ref, at rest | 441 | 673–693 (20px, one line) |
+| no refs | 469 | — (no row) |
+| 9 refs, expanded | 399 | 631–~694 (the 64px cap, scrolling) |
+
+**What the collapsed row actually says now** (`2026-09-04-refs-height-fold-nine-collapsed.png`,
+read directly): `✓ HEAD -> main` and `tag: probe-2.41.1` — both **whole, legible, at natural
+width** — then `Show 7 more` in accent blue. Directly below, the tag row prints the bookmark
+glyph and `probe-2.41.0`: that is the tag that fell behind the fold, and the tag row is where it
+surfaces. Then `In 1 branch: main`. Compare the previous shot, where the same commit showed
+`✓…  t…  t…  …  r…  r…  h…  fea…` and the tag row was silent.
+
+`2026-09-04-refs-height-fold-nine-expanded.png`: after the click — `✓ HEAD -> main`,
+`tag: probe-2.41.1`, `tag: probe-2.41.0`, `origin/release/2.42` … wrapped over three lines, the
+third clipped by the 64px cap (it scrolls), `Show less` at the right, **and the tag row gone**,
+because `probe-2.41.0` is now a chip. `2026-09-04-refs-height-fold-one-ref.png`: a single
+`origin/only-one` chip, no toggle, the same 20px band.
+
+**Does the tree stay put walking the log?** The ref row itself is a 20px band for every commit —
+that part is exact and is what the height test asserts. The pane below it moved 25px between
+the nine-ref commit (rule 416) and the one-ref commit (rule 441), and that is the **tag row**,
+not the ref row: the nine-ref commit is tagged, one of its tags is behind the fold, so the tag
+row paints a line the untagged commit does not have. That is the ruling's own priority order
+working as ordered — reachability first, constant height second — and it is the mechanism that
+keeps `probe-2.41.0` on screen at all. A commit with no decorations still drops the ref row
+entirely (469), deliberate and unchanged.
+
+## Revised replacement wording for FORK.md #139 (supersedes the block above; still not applied)
+
+Replace the bullet beginning **"The row paints every ref — wrapped, capped and scrolling — and
+applies no threshold."** with:
+
+> - **The row keeps every ref reachable and applies no threshold, but only paints what fits: whole
+>   names on one line, `Show N more` for the rest.** *(Amended twice. It first read "the row never
+>   wraps", folding the overflow into the graph's `+N` chip at `git.log.compact_refs_threshold`;
+>   `1a73d7d001` replaced that with an always-wrapped, capped, scrolling row; `<sha2>` made the
+>   collapsed row a measured fit with a counted expand. Each amendment is stated rather than
+>   quietly overwritten, because the reasoning that produced it is the reasoning a future reader
+>   will re-derive.)* The threshold was wrong twice over: a pane whose job is to answer "which
+>   branch is this commit on" must not fold the answer into a tooltip, and applying it
+>   *unconditionally* made the pane disagree with the graph row a few pixels below, which caps only
+>   under its own `compact_refs` view toggle (`ViewOptions::default()` leaves it **off**). But
+>   bounding the *row* instead — wrap, cap, scroll, always — tied its height to the selected
+>   commit's ref count, and the row is stacked against the changed-files tree: walking the log
+>   moved the tree 42px between a nine-ref commit and a one-ref one. And simply squeezing every
+>   chip onto one line answers even less than `+N` did: nine refs became `t…`, `r…`, `fea…`. So the
+>   collapsed row **measures**: a `canvas` reports its width into `GitPanel::commit_refs_row_width`
+>   (with the mandatory guarded `cx.defer` notify — a notify raised mid-draw is discarded),
+>   `commit_refs::ref_chip_width` predicts each chip from the chip's own metrics in rems, and
+>   `ref_chips_that_fit` takes a greedy prefix, charging the toggle to the budget only when
+>   something spills. What is left goes behind `Show N more`; `Show less` returns. Expanded is the
+>   `1a73d7d001` layout — `flex_wrap()` + `max_h(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT)` +
+>   `overflow_y_scroll()` — now reached only by a click. `refs_expanded` lives on `CommitTabState`,
+>   so every new selection comes up collapsed; the chip block carries a `min_h(ButtonSize::Default)`
+>   floor so a row with a toggle measures the same as one without; and `Chip::truncate` stays on as
+>   a backstop that fires only for a single ref wider than the whole row. This mirrors
+>   `solutions_ui::project_tab_strip` deliberately — same measurement, same greedy prefix, same
+>   safety margin — because it is the same problem, and `commit_refs::overflow_chip` (`+N`) is now
+>   the graph's alone.
+
+And in the `uncharted_tags` bullet, replace the sentence **"`uncharted_tags` subtracts against
+the whole decoration list, which is only sound because the row now paints the whole list."**
+with:
+
+> `uncharted_tags` takes the decorations the ref row **painted this frame** — the fitted prefix
+> when collapsed, all of them when expanded — never the commit's whole decoration list. The
+> invariant is *a tag may only be subtracted from the tag row by a chip the user can see*:
+> `GitPanel::ref_row_fit` computes that count once, above the section loop, and the same slice
+> reaches both rows, so the ref row and the tag row cannot derive it separately. Subtracting
+> against the full list suppresses the tag row for a tag that is behind `Show N more` — the same
+> name-lost-to-a-fold bug `1a73d7d001` fixed when the fold was a `+N` chip's tooltip.
+> `test_a_tag_past_the_fold_stays_on_the_tag_row` is the guard, and it asserts both sides: the
+> collapsed pane carries the name on the tag row, the expanded pane carries it as a chip and the
+> tag row stands down.
+
+## Concerns (updated)
+
+- The tag row's *presence* now depends on where the ref row's fold lands (see the 25px above).
+  That is reachability winning over constant height, as ruled — but it means dragging the panel
+  narrower can make the tag row appear. Nothing is lost either way; it is a row appearing, never
+  a name disappearing.
+- Two chips of the nine fit at the shipped panel width. If that reads as too few, the lever is
+  the panel width itself or a shorter chip label — not the fold, which is now honest about what
+  it hides.
+- `ref_chip_width` calls `solutions::branch_protection::check` once per chip per frame, the same
+  call `ref_chip` already makes, so a decorated commit now pays it twice per chip per frame. It
+  is a policy lookup, not I/O; if it ever shows up in a profile the fix is to hoist the glyph
+  decision into the row and pass it to both.
+- The 64px cap is still not a whole number of chip lines, so the expanded block clips its last
+  visible line mid-height. Inherited from the containment rows, which share the constant.
