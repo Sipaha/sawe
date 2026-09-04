@@ -27,6 +27,42 @@ use util::ResultExt as _;
 use crate::actions::{EditCatalogProject, RemoveMember, RenameMember};
 use crate::solution_tab::dot_color_for_id;
 
+/// Horizontal padding on each side of a tab's content (`px_3`).
+pub(crate) const TAB_PADDING_X: gpui::Pixels = px(12.0);
+/// Side of the square colour dot that leads every tab.
+pub(crate) const TAB_DOT_SIZE: gpui::Pixels = px(8.0);
+/// Gap between the colour dot and the label (`gap_2`).
+pub(crate) const TAB_GAP: gpui::Pixels = px(8.0);
+/// Narrowest a tab may render, so a one-character project name still gives
+/// the pointer something to hit.
+pub(crate) const TAB_MIN_WIDTH: gpui::Pixels = px(80.0);
+/// Widest a tab may render; past this the label truncates with an ellipsis.
+pub(crate) const TAB_MAX_WIDTH: gpui::Pixels = px(200.0);
+
+/// The width a tab will lay out at, given the shaped width of its label.
+///
+/// This is the strip's width budget talking to the tab's own styling, so both
+/// sides read the constants above rather than repeating literals — a tab whose
+/// padding changed without this following would silently make the budget lie.
+/// `project_tab_strip::tabs_lay_out_at_their_predicted_width` pins the two
+/// together against the geometry a real frame paints.
+pub(crate) fn tab_width_for_label(label_width: gpui::Pixels) -> gpui::Pixels {
+    let natural = TAB_PADDING_X + TAB_DOT_SIZE + TAB_GAP + label_width + TAB_PADDING_X;
+    natural.clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+}
+
+/// What a [`PendingProjectTab`] adds on top of a plain tab: one more `TAB_GAP`
+/// and the trailing spinner / warning glyph (`IconSize::XSmall`, 12px).
+pub(crate) const PENDING_TAB_TRAILING_WIDTH: gpui::Pixels = px(20.0);
+
+/// Paint selector for a real (landed) project tab. Named per member so a test
+/// can ask which members actually made it onto the strip rather than trusting
+/// the split the strip computed — see
+/// `docs/findings/2026-09-02-paint-tests-with-debug-bounds.md`.
+pub(crate) fn project_tab_selector(member_id: MemberId) -> String {
+    format!("PROJECT-TAB-{}", member_id.0)
+}
+
 #[derive(IntoElement)]
 pub struct ProjectTab {
     solution_id: SolutionId,
@@ -64,6 +100,18 @@ impl Render for DraggedProjectTab {
             .border_color(cx.theme().colors().border)
             .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(self.dot))
             .child(Label::new(self.name.clone()))
+    }
+}
+
+impl DraggedProjectTab {
+    /// EXPERIMENT (drag-out-of-overflow-menu): lets the overflow menu build
+    /// the same drag payload a real tab does.
+    pub(crate) fn new(member_id: MemberId, name: SharedString) -> Self {
+        Self {
+            member_id,
+            name,
+            dot: dot_color_for_id(member_id.0),
+        }
     }
 }
 
@@ -114,11 +162,15 @@ impl RenderOnce for ProjectTab {
 
         let row = h_flex()
             .id(row_id)
+            .debug_selector({
+                let member_id = self.member_id;
+                move || project_tab_selector(member_id)
+            })
             .h_full()
-            .px_3()
-            .gap_2()
-            .min_w(px(80.0))
-            .max_w(px(200.0))
+            .px(TAB_PADDING_X)
+            .gap(TAB_GAP)
+            .min_w(TAB_MIN_WIDTH)
+            .max_w(TAB_MAX_WIDTH)
             .items_center()
             .when_some(active_bg, |this, bg| this.bg(bg))
             .border_b_2()
@@ -128,7 +180,13 @@ impl RenderOnce for ProjectTab {
                 inactive_border
             })
             .cursor_pointer()
-            .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(dot))
+            .child(
+                div()
+                    .w(TAB_DOT_SIZE)
+                    .h(TAB_DOT_SIZE)
+                    .rounded_full()
+                    .bg(dot),
+            )
             .child(
                 Label::new(self.name.clone())
                     .truncate()
@@ -269,6 +327,12 @@ impl PendingProjectTab {
             catalog_removable,
         }
     }
+
+    /// The label this ghost tab paints, so the strip can budget its width
+    /// before consuming the tab into the element tree.
+    pub(crate) fn name(&self) -> &SharedString {
+        &self.name
+    }
 }
 
 /// Paint selector for a pending tab whose clone FAILED. Explicit rather
@@ -329,14 +393,20 @@ impl RenderOnce for PendingProjectTab {
             .child(
                 h_flex()
                     .h_full()
-                    .px_3()
-                    .gap_2()
-                    .min_w(px(80.0))
-                    .max_w(px(200.0))
+                    .px(TAB_PADDING_X)
+                    .gap(TAB_GAP)
+                    .min_w(TAB_MIN_WIDTH)
+                    .max_w(TAB_MAX_WIDTH)
                     .items_center()
                     .border_b_2()
                     .border_color(cx.theme().colors().border_transparent)
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .w(TAB_DOT_SIZE)
+                            .h(TAB_DOT_SIZE)
+                            .rounded_full()
+                            .bg(dot),
+                    )
                     .child(Label::new(self.name).truncate().color(Color::Muted))
                     .child(trailing),
             )

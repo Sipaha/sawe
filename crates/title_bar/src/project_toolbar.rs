@@ -572,10 +572,32 @@ impl Render for ProjectToolbar {
                         .child(Divider::vertical().color(DividerColor::Border)),
                 )
             })
-            .when_some(project_tab_strip, |this, strip| this.child(strip))
-            .child(div().flex_1())
+            // The strip takes the row's slack instead of a bare `flex_1`
+            // spacer sitting after a content-sized strip. That slack IS the
+            // strip's width budget — `ProjectTabStrip` measures this box to
+            // decide how many tabs fit — and a content-sized strip could never
+            // learn it, which is why the strip used to truncate at a fixed six
+            // tabs with ~790px of the row still empty. `min_w_0` lets it shrink
+            // past its content on a narrow window so the trailing git / run-
+            // config / dock cluster stays on screen instead of being pushed off
+            // the right edge (it was, below ~1050px).
+            .when_some(project_tab_strip, |this, strip| {
+                this.child(div().flex_1().min_w_0().h_full().child(strip))
+            })
+            // …but the trailing cluster still needs to be pushed right when
+            // there is no strip at all (a window with no active solution).
+            .when(self.project_tab_strip.is_none(), |this| {
+                this.child(div().flex_1())
+            })
+            // `flex_none` on the trailing widgets, so the row's slack is the
+            // ONE quantity that absorbs a resize. Without it these shrink
+            // whenever the strip's content is momentarily wider than its box,
+            // which both squeezed the branch/run-config widgets for a frame
+            // after every resize and made the width the strip measures larger
+            // than the width it may actually use.
             .child(
                 h_flex()
+                    .flex_none()
                     .gap_1()
                     .children(
                         self.render_update_button(cx)
@@ -594,14 +616,14 @@ impl Render for ProjectToolbar {
                             .map(IntoElement::into_any_element),
                     ),
             )
-            .children(run_config)
+            .children(run_config.map(|strip| div().flex_none().child(strip)))
             // Last child in the row, so the right dock's toggles sit flush
             // against the trailing padding — the mirror of the left dock's
             // toggle at `pl_2`, and on the side those panels open on. Placing
             // them after the run-config strip rather than inside the git
             // cluster keeps them pinned to the window edge instead of drifting
             // as the strip's width and the conditional git widgets change.
-            .child(trailing_dock_buttons)
+            .child(div().flex_none().child(trailing_dock_buttons))
             .pr_1p5()
     }
 }
