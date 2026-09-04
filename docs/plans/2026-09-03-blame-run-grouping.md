@@ -5,6 +5,15 @@ Status: **complete** (2026-09-03) — commits `c0085392d9`, `e9e3978a7e`, `3e044
 Tracked: `TODO.md` **C10** (now deleted), `FORK.md` **#135** ("Not done" paragraph, now
 amended) — the decision that records what shipped is `FORK.md` **#140**.
 
+**Superseded in part (2026-09-04, `0ea7416dbd`):** rule **R2** below — "the first blamed row of
+the viewport is always a run head" — was reversed. Its stated cost ("the metadata line appears
+to stick to the top of the viewport") turned out to be the whole defect, not an acceptable
+price; a run's head is now found in display space by seeding the classification with the rows
+above the viewport. R3's hairline survives unchanged, but the viewport-relative exemption that
+was later added to it (suppress the rule on viewport row 0) is gone too — the display's first
+row is now identified as such. R2 is left standing in the plan text below, per the note above;
+read `FORK.md` **#140** and **#149** for the rule in force.
+
 Everything below the "What actually shipped" heading at the end of this file is the
 record; everything above it is the plan as written before dispatch, left unedited so the
 divergences are readable.

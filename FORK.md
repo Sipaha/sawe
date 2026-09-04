@@ -2920,33 +2920,63 @@ How to apply:
   label is that text verbatim, in both surfaces. The one glyph a chip carries says something the
   text does not: `Check` for the checked-out branch, `LockOutlined` for a branch this Solution's
   policy protects (S-SOL-PRT).
-- **The row paints every ref — wrapped, capped and scrolling — and applies no threshold.**
-  *(Amended 2026-09-03, `1a73d7d001`. This bullet previously read "the row never wraps" and
-  folded the overflow into the graph's `+N` chip at `git.log.compact_refs_threshold`; that is
-  now wrong in both halves and is stated here rather than quietly replaced, because the
-  reasoning that produced it is the reasoning a future reader will re-derive.)* Two things were
-  wrong with the threshold. A pane whose job is to answer "which branch is this commit on" must
-  not fold the answer into a tooltip — folding is defensible on a log row, which is a list, and
-  not on the detail pane the list points at. And applying it *unconditionally* made the pane
-  disagree with the graph row a few pixels below it: the graph caps only under its own
-  `compact_refs` view toggle, which `ViewOptions::default()` leaves **off**, so the pane was
-  enforcing a control the user had never touched, on the surface with more room for the answer
-  rather than less. The objection the threshold answered — a chip row growing without bound eats
-  the changed-files tree — is answered instead by bounding the *row*, not the list:
-  `render_commit_refs_row` is `flex_wrap()` with `max_h(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT)`
-  (64px, the same cap the expanded containment rows use) and `overflow_y_scroll()`, and each
-  chip is built with `truncate: true`, so a narrow pane shortens every name rather than hiding
-  any. `commit_refs::overflow_chip` still exists and is now the graph's alone.
+- **The row keeps every ref reachable and applies no threshold, but paints only what fits:
+  whole names on one line, `Show N more` for the rest.** *(Amended twice. It first read "the row
+  never wraps", folding the overflow into the graph's `+N` chip at
+  `git.log.compact_refs_threshold`; `1a73d7d001` replaced that with an always-wrapped, capped,
+  scrolling row; `acc78db74e` put the wrapping behind an explicit expand and `43ba41c05a` made
+  the collapsed row a measured fit with a counted toggle. Each amendment is stated rather than
+  quietly overwritten, because the reasoning that produced it is the reasoning a future reader
+  will re-derive.)* The threshold was wrong twice over. A pane whose job is to answer "which
+  branch is this commit on" must not fold the answer into a tooltip — folding is defensible on a
+  log row, which is a list, and not on the detail pane the list points at. And applying it
+  *unconditionally* made the pane disagree with the graph row a few pixels below it: the graph
+  caps only under its own `compact_refs` view toggle, which `ViewOptions::default()` leaves
+  **off**, so the pane was enforcing a control the user had never touched, on the surface with
+  more room for the answer rather than less. But bounding the *row* instead — wrap, cap, scroll,
+  always — tied the row's height to the selected commit's ref count, and the row is stacked
+  directly against the changed-files tree, so walking the log moved the tree: measured live, that
+  layout — which is structurally what the row's *expanded* state paints today — gave a nine-ref
+  commit a 63px band against a one-ref commit's 20px. That is the defect of #149, self-inflicted
+  by the pane. And simply squeezing every chip onto one line answers
+  even less than `+N` did — nine refs came out as `✓…`, `t…`, `r…`, `fea…`. So the collapsed row
+  **measures**: a `canvas` over it reports its width into `GitPanel::commit_refs_row_width` (with
+  the mandatory bounds-guarded `cx.defer` notify — a notify raised mid-draw is discarded),
+  `commit_refs::ref_chip_width` predicts each chip from the chip's own metrics in rems, sharing
+  one `chip_glyph` decision with `ref_chip` so a chip and its prediction cannot disagree about
+  the check / lock glyph, and `ref_chips_that_fit(widths, gap, budget, toggle)` takes a greedy
+  **prefix**, charging the toggle to the budget only when something actually spills and flooring
+  at one chip. What is left goes behind `Show N more`; `Show less` returns. Expanded is exactly
+  the `1a73d7d001` layout — `flex_wrap()` + `max_h(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT)`
+  (64px, the same cap the expanded containment rows use) + `overflow_y_scroll()` — now reached
+  only by a click. `refs_expanded` lives on `CommitTabState`, so every new selection comes up
+  collapsed and an expansion left on one commit cannot set the height of the next. The chip
+  block carries a `min_h(ButtonSize::Default.rems())` floor so a row *with* a toggle measures
+  the same as one without, and `Chip::truncate` stays on permanently as a **backstop** — inert
+  while the prefix fits, firing only for a single ref wider than the whole row and for the one
+  pre-measurement frame. This mirrors `solutions_ui::project_tab_strip` deliberately (same
+  measurement, same greedy prefix, same safety margin) because it is the same problem.
+  `commit_refs::overflow_chip` still exists and is now the graph's alone: a chip that is secretly
+  clickable is a weaker affordance than a labelled button, and a count whose names live only in
+  a tooltip is the shape of the original bug.
 - **The tag row subtracts what the chips already name** (`uncharted_tags`). Both describe the
   tags pointing at the commit, from different sources; painting both in full says the same thing
   twice a few pixels apart. Subtracting rather than suppressing the row outright keeps it for a
   tag created since the graph last decorated its rows, which is the only fact it still has that
-  the chips do not. **This is coupled to the bullet above and the coupling is load-bearing:**
-  `uncharted_tags` subtracts against the **whole** decoration list, which is only sound because
-  the row now paints the whole list. While the row applied the threshold, a tag past it was
-  subtracted here *and* folded into a `+N` chip there, so its name appeared nowhere in the pane
-  but a tooltip — the bug `1a73d7d001` fixed. If a cap ever returns to that row, `uncharted_tags`
-  must be given the painted slice instead of the full list, in the same commit.
+  the chips do not. **This is coupled to the bullet above and the coupling is load-bearing.**
+  The invariant, which is the bug this whole thread started from: *a tag may only be subtracted
+  from the tag row by a chip the user can see.* So `uncharted_tags(tags, ref_names)` takes the
+  decorations the ref row **painted this frame** — the fitted prefix when collapsed, all of them
+  when expanded — never the commit's whole decoration list. `GitPanel::ref_row_fit` computes
+  that count once, *above* the section loop, and `render_commit_tab` hands the same slice to the
+  ref row and the tag row, so the two cannot derive it separately. Subtract against the full
+  list and a tag behind `Show N more` is suppressed here *and* unpainted there — which is
+  precisely what happened while the row applied the threshold, when a tag past it was subtracted
+  here and folded into a `+N` chip's tooltip there, the bug `1a73d7d001` fixed. Live consequence
+  of getting it right: a tag behind the fold is printed by the tag row, and expanding the ref
+  row into a chip for it makes the tag row stand down — the name is on screen in both states,
+  only the row carrying it changes. `test_a_tag_past_the_fold_stays_on_the_tag_row` is the
+  guard, and it asserts both sides.
 - The graph's push site picks the first selected row the same way `selected_commit_shas` picks
   its first element (`first_selected_commit`), including dropping the synthetic local-changes
   row, so the shas and the decorations cannot describe different commits. A multi-commit
@@ -2966,7 +2996,7 @@ background, tooltip, right-click menu, left-click `OpenAtCommit`.
 cannot see its neighbours; the only place that holds both the viewport's display-row metadata
 (`&[RowInfo]`) and the flattened per-row entries (`GitBlame::blame_for_rows`) is
 `EditorElement::layout_blame_entries`. So `crates/editor/src/git/blame.rs` gained
-`BlameRunPosition { Head, Continuation }` and a pure `blame_run_positions`, and both gutter
+`BlameRunPosition { Head, DocumentHead, Continuation }` and a pure `blame_run_positions`, and both gutter
 methods of the trait gained the position as an argument — one argument rather than a parallel
 "run-aware" method, because two paths that can disagree about the same row is the failure mode
 worth designing out. `git_ui` decides only what a `Continuation` looks like.
@@ -3001,11 +3031,37 @@ jump, the buffer change, the jump across a spacer, and the break across an unbla
 the header-block test: that one is pinned by the separate block-row clause, which the swap
 leaves standing.)
 
-**The first blamed row of the viewport is always a head.** Runs are computed from the visible
-slice, so a run that started above the viewport has no head in view. Rather than reach outside
-the slice, the topmost blamed row is treated as a head: scrolling into the middle of a large
-commit shows who wrote it instead of a blank column. The visible consequence is that the label
-appears to stick to the top of the viewport while scrolling through one long run.
+**A run's head is a display-row fact, not a viewport one.** *(Amended 2026-09-04, `0ea7416dbd`.
+This paragraph previously read "the first blamed row of the viewport is always a head" — runs
+were computed from the visible slice, so a run starting above the viewport had its label
+reprinted on whatever row the scroll left on top, and the label slid down the gutter as the
+user scrolled. That is stated rather than quietly replaced, because the reasoning that produced
+it — "don't reach outside the slice" — is the reasoning a future reader will re-derive. See
+#149: the label moving under a scroll is the same defect class as the strip moving under a
+selection.)* The classification is now **seeded** with what sits above the rows being drawn:
+`BlameRunPredecessor { DisplayStart, Severed, Blamed { buffer_id, sha, buffer_row } }` is both a
+parameter and the second return value of `blame_run_positions`, so classifying the rows above a
+slice and classifying the slice **compose**, and `GitBlame::run_predecessor_above` obtains the
+seed by running the rows above the viewport through *the same function* rather than through a
+second reading of the rule. A run that begins above the visible rows therefore keeps its label
+up there and leaves its visible tail blank, the way IntelliJ does. The scan above the viewport
+doubles its reach (1, 2, 4, … display rows) and stops as soon as the scanned window classifies
+to anything but `DisplayStart` — one row settles it unless the rows above are soft-wrap
+continuations or alignment spacers, which stand for nothing in this buffer and settle nothing —
+capped at `MAX_RUN_PREDECESSOR_LOOKBACK` (1024 rows), beyond which it gives up and reads as
+`DisplayStart`. That cap is a bound on work, not on correctness, and nothing tests the give-up
+path: reaching it needs 1024 consecutive wrap-or-spacer rows above the viewport.
+
+Three shapes were ruled out and should stay ruled out. **Prepending the context rows to the
+slice and dropping the prefix from the result** has the same single-source-of-truth property but
+clones the whole viewport's `blamed_rows` on every frame of a scroll; the seed carries the same
+information in three words. **A `preceding` parameter computed by
+`EditorElement::layout_blame_entries`** puts "look one row up, and keep looking while the rows
+are wraps or spacers" — a clause of the boundary rule — back in the caller, which is the split
+this entry exists to prevent. **Answering it from the `SumTree` in buffer-row space** (does
+`buffer_row - 1` carry the same sha?) skips the display-space question entirely: a fold, an
+excerpt header or a hunk block between two lines has to sever the run, and none of them is
+visible from buffer rows — it would be a second, weaker copy of the rule.
 
 **The hairline is absolutely positioned, not a border**, and it is added *after* the row in the
 child list. A head row is 22.5px of intrinsic text height inside a 23px row pitch and has no
@@ -3014,8 +3070,16 @@ take the hit area with it), so a `border_t_1` would both grow the row and push i
 pixel relative to the code line it annotates — jitter between labelled and unlabelled rows. Out
 of flow, it lands on the row's top edge and changes no other geometry. After the row rather
 than before it, because the row paints its hover background across its whole box and would
-swallow a hairline drawn underneath. `ix > 0` exempts the topmost visible row, where a rule
-reads as a frame around the editor rather than as a break. The colour is
+swallow a hairline drawn underneath. **Which rows get one is read off the position alone**:
+`BlameRunPosition::Head` opens a boundary, `DocumentHead` — the third variant, "opens a run with
+nothing above it at all", which only the display's first row can be — does not. *(Amended
+2026-09-04, `0ea7416dbd`. This previously read "`ix > 0` exempts the topmost visible row"; the
+exemption's motivation survives — a rule on the top edge frames the editor rather than breaking
+anything — but keyed on the viewport it made a **real** boundary's hairline vanish as it
+scrolled to the top edge and reappear one row later. The renderer no longer reasons about `ix`.)*
+`DocumentHead` survives a leading alignment spacer, for the same reason spacers do not sever a
+run: otherwise the padded pane of a split diff would draw a hairline across its top edge while
+its companion did not. The colour is
 `border_variant` — the token the tree already uses for a divider *inside* a surface
 (`ui::Divider`, `ListSeparator`) — not a per-commit tint: a tint would fight the per-row hover
 background, and the per-commit colour on the author name (#135) is already the "same commit"
@@ -3030,10 +3094,10 @@ therefore cut the same commit's run in different places and printed a different 
 labels for it, which is worse than either behaviour on its own. The fix classifies on the
 block, not on the row: `Block::is_alignment_only()` (`display_map/block_map.rs`) is an
 exhaustive match that is `true` only for `Block::Spacer` — whose sole producer is
-`BlockMap::spacer_blocks`, i.e. split-view padding — and
-`blame_run_positions_in_viewport(snapshot, start_row, rows, blamed_rows)` walks
-`blocks_in_range`, expands each alignment-only block over its `height()` rows, and hands the
-flags to the still-pure classifier. Headers keep severing; a spacer does not. A spacer does
+`BlockMap::spacer_blocks`, i.e. split-view padding — and `alignment_rows_in_range`, which
+`GitBlame::run_positions_in_viewport` calls, walks `blocks_in_range`, expands each
+alignment-only block over its `height()` rows, and hands the flags to the still-pure
+classifier. Headers keep severing; a spacer does not. A spacer does
 **not** paper over a genuine row jump — the adjacency check still runs.
 
 How to apply:
@@ -3059,13 +3123,17 @@ How to apply:
   which are keyed by name alone and so cannot distinguish rows. Every one of those painted
   assertions goes through the split-diff `-LEFT` / `-RIGHT` suffix, so the **plain
   single-editor gutter** (`blame_pane_suffix` → `""`) has no painted coverage at all; a change
-  that only breaks the unsplit case will not be caught by this suite.
-- **Two known cosmetic edges, both consequences of a viewport-local computation.** Scrolling one
-  row at a time through a run boundary makes its hairline vanish when the head reaches `ix == 0`
-  and reappear at `ix == 1` — the same family as the sticky top label, and the price of the
-  viewport-top exemption. And the one row `BlockRows::next` does *not* collapse — the first
+  that only breaks the unsplit case will not be caught by this suite. One exception to
+  "testable without git" is deliberate: the *scan* above the viewport, as opposed to the rule
+  it feeds, cannot be reached from hand-made `RowInfo` vectors, so
+  `test_run_positions_reach_past_wrapped_rows_above_the_viewport` is a `#[gpui::test]` that
+  builds a real `DisplayMap` with a wrap width. It exists because a mutation that reduced the
+  doubling scan to a single row survived every other test in the suite.
+- **One known cosmetic edge.** The one row `BlockRows::next` does *not* collapse — the first
   output row of a collapsed block crease — is a blamed text row, so when it continues the run
-  above it it now draws a blank gutter row where it used to draw the date.
+  above it it draws a blank gutter row where it used to draw the date. (The other two edges
+  this bullet used to list, a hairline flickering at `ix == 0` and the label sticking to the
+  top of the viewport, were both the viewport-local computation and are gone with it.)
 
 ### 141. The band's terminal half auto-starts a shell on a state edge, because it has no `Panel` to give it an activity edge
 
@@ -3350,7 +3418,7 @@ its path from `repo_root.file_name()` — the real directory name — and the pe
 directory is keyed by the numeric `solution_id`). So a folder created under the old rule keeps
 working; only a rename moves it.
 
-### 146. The project tab strip fits tabs to a measured width, and its overflow menu is a drag source
+### 146. The project tab strip fits tabs to a measured width, and nothing but order and width decides what it paints
 
 What: `ProjectTabStrip` decides how many tabs to paint from the width it was actually given, not
 from a count. `MAX_VISIBLE_TABS = 6` is deleted; a `canvas` over the strip's own box records
@@ -3367,6 +3435,32 @@ blank while six projects hid behind the `…`. Compounding it, `ProjectToolbar` 
 a **content-sized** child next to a separate `flex_1` spacer, so the strip could not have measured
 its budget even if it had wanted to.
 
+**The strip is the user's layout, and it does not move on its own** (#149). The painted set is a
+pure function of the stored member order and the available width; *which member is active is not
+an input*, and the painted tabs are always a **prefix** of the stored order —
+`members.split_at(count)`, never an arbitrary subsequence. The maintainer's reason, which is the
+whole specification: «Я хочу на панели видеть в первую очередь самые важные проекты, а в `…`
+ожидаю что будут незначительные. Самопроизвольные скачки тут только все портят.» Two attempts to
+make the selection visible got this wrong and are **both reverted**: `cc05f6ef6d` promoted a
+clicked overflow project to the head of the member order (`promote_to_front`, deleted), and
+`f3ef02f0f2` replaced that with a width **reservation** for the active member
+(`visible_indices(widths, budget, more_button, active)`, deleted) — which paid for the active
+member up front and so spilled whatever tab sat at the fold the moment an overflow project was
+selected. Each let a navigation gesture rearrange the arrangement the user had built. The rule is
+now carried by the **signature**: `fit_count(widths, budget, more_button) -> usize` has no active
+member to consult, so the jump is unrepresentable rather than merely absent, and `render` no
+longer computes an active index at all. Activating a project that lives in the `…` therefore
+changes nothing about the strip.
+
+The active project's feedback lives on the `…` **button** instead — which is where it has to live
+once the active project can be invisible. When the active member is in the overflow set, the
+`IconButton` takes `icon_color(Color::Accent)` (the accent the menu's own `IconName::Check`
+already uses) plus `Indicator::dot().color(Color::Accent)` with
+`indicator_border_color(Some(title_bar_background))` — verbatim the idiom `workspace::status_bar`
+uses to mark the sidebar toggle when something is behind it — and its tooltip says the active
+project is in there. No new colour was invented, and the dot is absolutely positioned inside
+`IconWithIndicator`, so it costs zero layout width and `MORE_BUTTON_WIDTH` stays honest.
+
 Two structural facts make the fix safe, and both are the reason to keep it this shape:
 
 - **The strip is now the toolbar's `flex_1().min_w_0()` child and the trailing widgets are
@@ -3382,21 +3476,31 @@ Two structural facts make the fix safe, and both are the reason to keep it this 
   project out of the `…` menu onto the strip" work at all, and it needed no change to
   `ui::ContextMenu`. The only mechanical requirement is that the row be a `custom_entry` rather
   than a `toggleable_entry`, since the latter offers nowhere to hang `on_drag`; the row hand-builds
-  what `toggleable_entry` would have drawn.
+  what `toggleable_entry` would have drawn. **The drag is the only gesture that rewrites the
+  order** — clicking a row activates the project and moves nothing.
 
 The menu's rows also mark the active project with the standard `IconName::Check` in
 `Color::Accent` that this fork's other `ContextMenu` lists use, kept in the tree and made
 `invisible()` when inactive so labels stay aligned. Not hypothetical: `solutions.set_active_member`
 (or opening a file in a hidden member) activates a project without touching the order, which
-before this left no tab highlighted anywhere in the window. Clicking a row additionally promotes
-that project to the front of the member order (`promote_to_front`) — the coarse version of the
-drag, for when the user only wants it on the strip.
+before this left no tab highlighted anywhere in the window. That check is also fully reachable
+again — under the reservation the active member was never in the overflow list at steady state,
+so the marked row was reachable in principle only.
 
-How to apply: assert this against painted geometry, never against a width literal — the tests
-compare `fit_count`'s prediction with what a real frame painted, which is what catches the drift
-this arrangement exists to prevent (a tab styled with a different padding than the budget
-assumes). Note the strip needs **two** draws in a test: one to measure its box, one to render the
-split that measurement decided.
+How to apply: assert this against painted geometry, never against a width literal or a predicate
+— the tests compare `fit_count`'s prediction with what a real frame painted, which is what
+catches the drift this arrangement exists to prevent (a tab styled with a different padding than
+the budget assumes), and the stability rule is asserted as an equality of the whole
+`Vec<(MemberId, Bounds<Pixels>)>` before and after an activation
+(`activating_a_project_in_the_overflow_changes_nothing_on_the_strip`) — same members, same
+order, same origin and size to the pixel — which is what catches a reservation creeping back in.
+State that geometry cannot see (a tab's active highlight, the `…`'s marker) has to be carried in
+a **state-named** `debug_selector` — `overflow_more_selector` — because `IconButton`'s own
+`ICON-{Icon}` selector and an `invisible()` element both paint identical bounds in either state.
+That pins which state the strip decided to paint, not the accent hue or the dot's pixels; those
+are covered by screenshots only (`.agents/reports/2026-09-04-strip-stable.md`). Note the strip
+needs **two** draws in a test: one to measure its box, one to render the split that measurement
+decided.
 
 ### 147. A project switch holds the previous git graph until the incoming log can paint
 
@@ -3474,3 +3578,52 @@ release, and unrecoverable without deleting the user's runtime dir. Note what th
 not buy: `debug_assert_eq!` is live in dev and test builds, so a **debug** editor still aborts
 (deliberately — dev builds should be loud), and it is the release editor that gets the crash-loop
 protection.
+
+### 149. The UI does not rearrange itself as a side effect of selection or scrolling
+
+**The rule.** In this fork, moving the cursor, selecting a row, activating a project or scrolling
+must not change *where things are*. Selection and scrolling are how the user reads; a surface
+that reflows underneath them takes the thing being read out from under the eye. A change that
+"helpfully" promotes, reserves space for, reflows or resizes on selection is a **regression**
+even when each individual step reads as an improvement — because the improvement is judged on a
+still frame and the cost is paid in motion.
+
+The maintainer's own statement of it, about the project strip, generalises to all four surfaces
+below: «Я хочу на панели видеть в первую очередь самые важные проекты, а в `…` ожидаю что будут
+незначительные. Самопроизвольные скачки тут только все портят.»
+
+**Why this is a numbered decision and not a style note.** Four separate surfaces shipped this
+defect in three weeks, each from a different, individually sound-looking motive, and three of
+them shipped as *fixes* for something else:
+
+| Surface | What moved | The motive that produced it | Fixed by |
+|---|---|---|---|
+| Project tab strip (#146) | A clicked overflow project jumped to the head of the order; then a width reservation for the active member spilled whatever tab sat at the fold | "the active project must be visible" | `f3ef02f0f2`, `a73629b981` |
+| Blame label (#140) | A run's date and author slid down the gutter with the scroll | "a run scrolled past its head should still say who wrote it" | `0ea7416dbd` |
+| Blame hairline (#140) | A real boundary's hairline vanished at the top edge and returned one row later | "a rule on the viewport's top edge frames the editor" | `0ea7416dbd` |
+| Commit tab's ref row (#139) | The row's height followed the selected commit's ref count, moving the changed-files tree below it | "no ref name may be unreachable" | `acc78db74e`, `43ba41c05a` |
+
+**How to apply.**
+
+- **Separate the two questions.** Every one of these had a real need behind it, and in all four
+  the answer was to satisfy it *without* moving anything: put the feedback somewhere that has
+  room for it (the `…` button's accent glyph + dot, #146), compute the fact in the coordinate
+  space it actually lives in rather than the one currently on screen (display rows, not viewport
+  rows, #140), or give the user an explicit control for the growth (`Show N more`, #139). "Make
+  it visible" and "move it" are not the same requirement.
+- **Prefer making the jump unrepresentable to making it absent.** `fit_count` has no `active`
+  parameter and `blame_run_positions` takes no viewport index — a future reintroduction has to
+  add the input back, which is a reviewable act, rather than flip a condition.
+- **Assert it as an equality across the gesture, on painted geometry.** Not "the right item is
+  selected", but "the painted `Vec<(id, Bounds)>` is identical before and after" (#146), "the
+  gutter is blank at two different scroll offsets" (#140), "the row's height and bottom edge are
+  equal for a one-ref and a nine-ref commit" (#139). A predicate assertion cannot see a jump; see
+  `docs/findings/2026-09-02-paint-tests-with-debug-bounds.md`.
+- **The exceptions are gestures whose whole purpose is to rearrange**, and they should be few and
+  deliberate: dragging a project tab (#146) and clicking `Show N more` / `Show less` (#139).
+  Growth is the user's to ask for.
+
+Adjacent but distinct: #147 (a project switch holds the previous graph rather than flashing a
+placeholder) is about not showing a *transient* state during a switch. Same family — the window
+should be still unless the user asked for motion — but that one is about time, and this one is
+about position.
