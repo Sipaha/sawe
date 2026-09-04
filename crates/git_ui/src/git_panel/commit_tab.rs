@@ -809,11 +809,16 @@ fn format_tags_pointing_at(tags: &[SharedString], expanded: bool) -> Option<Cont
 /// chips do not.
 ///
 /// `ref_names` is the whole decoration list, and this is only sound because
-/// [`GitPanel::render_commit_refs_row`] paints the whole decoration list. While
-/// that row applied `git.log.compact_refs_threshold`, a tag past the threshold
-/// was subtracted here *and* folded into a `+N` chip there, so its name
-/// appeared nowhere in the pane but a tooltip. If a cap ever comes back to that
-/// row, this must take the painted slice instead.
+/// [`GitPanel::render_commit_refs_row`] builds a chip for every name on it in
+/// *both* of its states. Collapsing that row changes its layout — one line
+/// whose chips truncate, instead of a wrapped block — and never its list, which
+/// is what keeps this subtraction honest: a tag the collapsed line has no width
+/// to spell out is still a chip in the row, and the row's `Show all` is what
+/// gives it room. While that row applied `git.log.compact_refs_threshold` it
+/// dropped names from the LIST, and a tag past the threshold was subtracted
+/// here *and* folded into a `+N` chip there, so its name appeared nowhere in
+/// the pane but a tooltip. If a cap on the list ever comes back to that row,
+/// this must take the painted slice instead.
 fn uncharted_tags(tags: &[SharedString], ref_names: &[SharedString]) -> Vec<SharedString> {
     let charted: HashSet<&str> = commit_refs::tag_names(ref_names).collect();
     tags.iter()
@@ -1092,6 +1097,11 @@ pub(super) struct CommitTabState {
     /// the two rows hide different amounts and the user expands the one they
     /// are reading.
     tags_expanded: bool,
+    /// Whether the ref-chip row is wrapping onto as many lines as it needs
+    /// instead of the one line it rests on. Lives here with the other two, so
+    /// re-pointing the tab at another commit collapses it again — which is what
+    /// makes the row's resting height the same for every commit.
+    refs_expanded: bool,
     text: Option<CommitDetailText>,
     pub(super) collapsed_dirs: HashSet<SharedString>,
     scroll_handle: UniformListScrollHandle,
@@ -1113,6 +1123,7 @@ impl CommitTabState {
             tags: LoadState::Idle,
             branches_expanded: false,
             tags_expanded: false,
+            refs_expanded: false,
             text: None,
             collapsed_dirs: HashSet::default(),
             scroll_handle: UniformListScrollHandle::new(),
@@ -2036,30 +2047,50 @@ impl GitPanel {
     /// padding out of the changed-files tree's budget — the same reason the two
     /// containment rows below render nothing rather than an empty line.
     ///
-    /// **Every** ref, wrapped; no `+N`. This row exists to answer "which branch
-    /// is this commit on", and a row that folds the answer into a `+N` chip's
-    /// tooltip does not answer it. It also disagreed with the graph row a few
-    /// pixels away: the graph paints every ref unless the user turns its own
-    /// `compact_refs` view toggle on, which defaults off — so applying
-    /// `git.log.compact_refs_threshold` here unconditionally was the pane
-    /// enforcing a control the user had not touched, on the surface with more
-    /// room for the answer rather than less.
+    /// **Every** ref, and no `+N`: the chip list is the whole decoration list,
+    /// always. This row exists to answer "which branch is this commit on", and
+    /// a row that folds the answer into a `+N` chip's tooltip does not answer
+    /// it — it also disagreed with the graph row a few pixels away, which paints
+    /// every ref unless the user turns its own `compact_refs` view toggle on,
+    /// so applying `git.log.compact_refs_threshold` here unconditionally was the
+    /// pane enforcing a control the user had never touched.
     ///
-    /// The threshold's real objection stands and is answered differently: a chip
-    /// row that grows without bound would eat the changed-files tree, so the row
-    /// is capped at [`COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT`] and scrolls past
-    /// it — the same treatment an expanded containment row already gets — rather
-    /// than dropping ref names. Chips truncate individually, so a narrow pane
-    /// shortens each name instead of hiding any.
+    /// What the *layout* does with that list is the user's call, and only the
+    /// user's: collapsed — which is where every selection starts, because
+    /// `refs_expanded` is per-`CommitTabState` — the row is one line whose chips
+    /// truncate, and its height is therefore the same for a commit carrying one
+    /// ref and a commit carrying nine. That is the whole point of the collapsed
+    /// state: the row sits directly above the changed-files tree, so a height
+    /// derived from the selected commit's ref count makes the tree jump up and
+    /// down as the user walks the log, which is a worse defect than a truncated
+    /// chip. `Show all` is the same affordance, wording and cap the two
+    /// containment rows below use — expanded, the chips wrap and the block
+    /// scrolls inside [`COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT`], so even the
+    /// deliberate growth cannot push the tree past its floor.
     ///
-    /// Load-bearing for the tag row below: [`uncharted_tags`] subtracts the
-    /// tags "the chips already name" against the whole decoration list, which is
-    /// only correct because this row paints the whole decoration list. Re-adding
-    /// a cap here without teaching that subtraction about it makes a folded tag
-    /// vanish from the pane entirely — it was exactly that, and
+    /// The toggle is absent for a single ref, where there is nothing a second
+    /// line could add — the containment rows hide theirs on the same principle.
+    /// It cannot be hidden on *fit*, though: chip widths depend on a panel width
+    /// the user drags, so "does this fit" is knowable only during layout, and a
+    /// notify from there is dropped (`Window::invalidate_view` mid-draw). With
+    /// the toggle coming and going, the row's height would follow the ref count
+    /// again by another route, which is why the chip block carries a
+    /// [`ButtonSize::Default`] floor: the row measures the same whether or not
+    /// a button is sitting in it.
+    ///
+    /// Load-bearing for the tag row below: [`uncharted_tags`] subtracts the tags
+    /// "the chips already name" against the whole decoration list, which is only
+    /// correct because this row builds a chip for every name on it in both
+    /// states. Collapsing may leave a chip with no width to spell its name out,
+    /// but `Show all` gives it one; dropping names from the *list* is what made
+    /// a tag vanish from the pane entirely, and
     /// `test_the_commit_tab_paints_every_ref_pointing_at_the_commit` is the
     /// guard.
-    fn render_commit_refs_row(&self, state: &CommitTabState, cx: &App) -> Option<AnyElement> {
+    fn render_commit_refs_row(
+        &self,
+        state: &CommitTabState,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let names = &state.selection.refs.names;
         if names.is_empty() {
             return None;
@@ -2073,27 +2104,70 @@ impl GitPanel {
             .map(|branch| SharedString::from(branch.name().to_string()));
         let work_dir = repository.work_directory_abs_path.to_path_buf();
         let accent_color = commit_refs::accent_color(state.selection.refs.accent_idx, cx);
+        let expanded = state.refs_expanded;
 
         Some(
             h_flex()
                 .id("commit-tab-refs")
                 .debug_selector(|| "COMMIT-TAB-REFS".into())
                 .flex_shrink_0()
-                .flex_wrap()
                 .w_full()
                 .px_2()
                 .pb_1p5()
                 .gap_1()
-                .max_h(px(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT))
-                .overflow_y_scroll()
-                .children(names.iter().map(|name| {
-                    commit_refs::ref_chip(
-                        name,
-                        accent_color,
-                        commit_refs::is_head_ref(name.as_ref(), head_branch_name.as_ref()),
-                        Some(work_dir.as_path()),
-                        true,
-                    )
+                .when(expanded, |this| this.items_start())
+                .child(
+                    h_flex()
+                        .id("commit-tab-refs-chips")
+                        .debug_selector(|| "COMMIT-TAB-REFS-CHIPS".into())
+                        .min_w_0()
+                        .gap_1()
+                        // The floor a `Show all` button would impose anyway, in
+                        // rems so it tracks the UI font the way the button does.
+                        // Without it the row would be one height with a toggle
+                        // and another without, i.e. commit-dependent again.
+                        .min_h(ButtonSize::Default.rems())
+                        .map(|this| {
+                            if expanded {
+                                this.flex_wrap()
+                                    .max_h(px(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT))
+                                    .overflow_y_scroll()
+                            } else {
+                                this.overflow_hidden()
+                            }
+                        })
+                        .children(names.iter().map(|name| {
+                            commit_refs::ref_chip(
+                                name,
+                                accent_color,
+                                commit_refs::is_head_ref(name.as_ref(), head_branch_name.as_ref()),
+                                Some(work_dir.as_path()),
+                                true,
+                            )
+                        })),
+                )
+                // Outside the scrolling block, for the reason
+                // `render_commit_containment_line` gives: `Show less` has to
+                // stay reachable without scrolling back up to it.
+                .children((names.len() > 1).then(|| {
+                    div()
+                        .flex_shrink_0()
+                        .debug_selector(|| "COMMIT-TAB-REFS-TOGGLE".into())
+                        .child(
+                            Button::new(
+                                "commit-tab-refs-toggle",
+                                if expanded { "Show less" } else { "Show all" },
+                            )
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .color(Color::Accent)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.commit_tab.as_mut() {
+                                    state.refs_expanded = !state.refs_expanded;
+                                    cx.notify();
+                                }
+                            })),
+                        )
                 }))
                 .into_any_element(),
         )
@@ -2266,7 +2340,7 @@ impl GitPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{UpdateGlobal as _, VisualTestContext};
+    use gpui::{Modifiers, UpdateGlobal as _, VisualTestContext};
 
     #[test]
     fn test_commit_tab_paints_files_above_message() {
@@ -2958,6 +3032,45 @@ mod tests {
         (panel, repository, fs, cx)
     }
 
+    /// Point a painted Commit tab at `sha` carrying `names`, the way the graph
+    /// does when the user walks the log, and let the frame land.
+    fn select_commit_with_refs(
+        panel: &Entity<GitPanel>,
+        repository: &Entity<Repository>,
+        sha: &str,
+        names: Vec<SharedString>,
+        cx: &mut VisualTestContext,
+    ) {
+        let sha: Oid = sha.parse().expect("valid abbreviated sha");
+        cx.update_window_entity(panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec![sha],
+                    refs: CommitRefs {
+                        names,
+                        accent_idx: 0,
+                    },
+                },
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    /// Click the ref row's `Show all` / `Show less` through the painted button,
+    /// rather than by flipping `refs_expanded` behind its back — the affordance
+    /// existing and working is half of what these tests are pinning.
+    fn click_ref_row_toggle(cx: &mut VisualTestContext) {
+        let toggle = cx
+            .debug_bounds("COMMIT-TAB-REFS-TOGGLE")
+            .expect("a row holding more than one ref offers the expand");
+        cx.simulate_click(toggle.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
     /// A git panel over [`commit_tab_test_workspace`], for the tab's
     /// load-lifecycle tests.
     async fn commit_tab_panel(
@@ -2986,6 +3099,14 @@ mod tests {
     /// chip whose tooltip holds the answer is not an answer, and it disagreed
     /// with the graph row a few pixels away, which paints every ref unless the
     /// user turns its own `compact_refs` toggle on.
+    ///
+    /// What this test means now that the row rests on one line: the *list* is
+    /// still every decoration, in the collapsed state as much as the expanded
+    /// one, and that is exactly the property [`uncharted_tags`] subtracts
+    /// against. A collapsed line may be too narrow to spell a name out — chips
+    /// truncate — but no name is dropped from the row, and `Show all` is there
+    /// to give it room. Dropping names is what made the tag below vanish from
+    /// the pane entirely.
     ///
     /// Asserted against the painted tree rather than against
     /// `state.selection.refs`, which would pass just as happily with the row
@@ -3057,6 +3178,25 @@ mod tests {
             "and there is no `+N` chip left to hide a ref name behind"
         );
 
+        let head = cx
+            .debug_bounds("CHIP-HEAD -> main")
+            .expect("the head chip is painted");
+        let tag = cx
+            .debug_bounds("CHIP-tag: 2.41.0")
+            .expect("the tag chip is painted");
+        assert_eq!(
+            head.origin.y, tag.origin.y,
+            "and at rest they are all on ONE line: the row sits above the \
+             changed-files tree, so a height that follows the ref count walks \
+             the tree up and down the panel as the user walks the log"
+        );
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-REFS-TOGGLE").is_some(),
+            "with more than one ref there is a `Show all`, the same affordance \
+             and wording the containment rows below use — that is what makes \
+             the one-line rest state honest rather than lossy"
+        );
+
         cx.update_window_entity(&panel, |panel, window, cx| {
             panel.show_commit_selection(
                 CommitSelection {
@@ -3082,44 +3222,142 @@ mod tests {
         );
     }
 
-    /// The other half of "every ref, no `+N`": the row that grows instead of
-    /// folding has to grow *somewhere bounded*, or it eats the changed-files
-    /// tree below it — which is the objection the old
-    /// `git.log.compact_refs_threshold` cap existed to answer, and which is now
-    /// answered by wrapping into a scroll box instead of by dropping names.
+    /// The row's resting height must not depend on which commit is selected.
+    /// It sits directly above the changed-files tree, so a height that follows
+    /// the ref count walks the tree up and down the panel as the user walks the
+    /// log — «самопроизвольные скачки тут только все портят». Growing the row
+    /// is a thing the user asks for, never a thing the selection does.
     ///
-    /// Twelve refs is past what one line of the panel holds, so this pins both
-    /// halves at once: the third chip sits on a second line at the first chip's
-    /// left edge (it wrapped rather than overflowing sideways), and the row is
-    /// exactly [`COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT`] tall rather than the
-    /// six lines its content wants. The chips past the cap are still painted —
-    /// they are scrolled, not dropped, which is the whole difference from `+N`.
+    /// Asserted as an equality between two selections rather than against a
+    /// literal: the number is a function of the UI font and the chip's own
+    /// metrics, and pinning it would break on a density change while saying
+    /// nothing about the jump this exists to prevent. The row's BOTTOM edge is
+    /// included, because that is the edge the tree below starts at.
     #[gpui::test]
-    async fn test_the_commit_tab_wraps_a_long_ref_row_into_a_capped_scroll_box(
+    async fn test_the_commit_tab_ref_row_rests_at_one_height_for_every_commit(
         cx: &mut gpui::TestAppContext,
     ) {
         let (panel, repository, _fs, mut cx) = commit_tab_painted_panel(cx).await;
         let cx = &mut cx;
-        let decorated: Oid = "823a3f8a".parse().expect("valid abbreviated sha");
-        let names: Vec<SharedString> = (0..12)
+        let many: Vec<SharedString> = (0..9)
             .map(|index| SharedString::from(format!("origin/release/2.4{index}")))
             .collect();
-        cx.update_window_entity(&panel, |panel, window, cx| {
-            panel.show_commit_selection(
-                CommitSelection {
-                    repository: repository.clone(),
-                    shas: vec![decorated],
-                    refs: CommitRefs {
-                        names: names.clone(),
-                        accent_idx: 0,
-                    },
-                },
-                CommitSelectionSource::UserGesture,
-                window,
-                cx,
+
+        select_commit_with_refs(&panel, &repository, "823a3f8a", vec!["main".into()], cx);
+        let one_ref = cx
+            .debug_bounds("COMMIT-TAB-REFS")
+            .expect("a decorated commit gets a ref row");
+
+        select_commit_with_refs(&panel, &repository, "1a2b3c4d", many.clone(), cx);
+        let nine_refs = cx
+            .debug_bounds("COMMIT-TAB-REFS")
+            .expect("a decorated commit gets a ref row");
+
+        assert_eq!(
+            one_ref.size.height, nine_refs.size.height,
+            "one ref and nine must rest at the same height: one_ref={one_ref:?} \
+             nine_refs={nine_refs:?}"
+        );
+        assert_eq!(
+            one_ref.bottom(),
+            nine_refs.bottom(),
+            "and therefore end at the same y — the changed-files tree below \
+             starts on that edge and must not move when the selection does"
+        );
+
+        click_ref_row_toggle(cx);
+        let expanded = cx
+            .debug_bounds("COMMIT-TAB-REFS")
+            .expect("expanding keeps the row");
+        assert!(
+            expanded.size.height > nine_refs.size.height,
+            "growing the row is something the user asks for — and when they do, \
+             it grows: expanded={expanded:?} at_rest={nine_refs:?}"
+        );
+
+        select_commit_with_refs(&panel, &repository, "823a3f8a", vec!["main".into()], cx);
+        let after = cx
+            .debug_bounds("COMMIT-TAB-REFS")
+            .expect("a decorated commit gets a ref row");
+        assert_eq!(
+            after.size.height, one_ref.size.height,
+            "and the next commit comes up collapsed again: `refs_expanded` lives \
+             on `CommitTabState`, so an expansion left behind on one commit \
+             cannot set the height of the next one"
+        );
+    }
+
+    /// The other half of "every ref, no `+N`": the growth the row used to do by
+    /// itself is now the user's `Show all`, and it grows *somewhere bounded* —
+    /// wrapped into a scroll box capped at
+    /// [`COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT`], the same bargain an expanded
+    /// containment row makes — rather than by dropping ref names.
+    ///
+    /// Twelve refs is far past what one line of the panel holds, which is what
+    /// makes both halves visible at once: at rest every chip is still on the
+    /// first line (squeezed, because chips truncate individually), and after the
+    /// click the third chip has wrapped onto a second line at the row's left
+    /// edge while the twelfth is painted wider than the collapsed line could
+    /// ever give it. Nothing is dropped in either state — that is the whole
+    /// difference from `+N`.
+    #[gpui::test]
+    async fn test_the_commit_tab_ref_row_wraps_into_a_capped_scroll_box_when_expanded(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, repository, _fs, mut cx) = commit_tab_painted_panel(cx).await;
+        let cx = &mut cx;
+        // Spelled out rather than generated: `debug_bounds` takes a
+        // `&'static str`, and deriving the ref names back out of the selectors
+        // is what keeps the two lists from drifting apart.
+        const CHIPS: [&str; 12] = [
+            "CHIP-origin/release/2.40",
+            "CHIP-origin/release/2.41",
+            "CHIP-origin/release/2.42",
+            "CHIP-origin/release/2.43",
+            "CHIP-origin/release/2.44",
+            "CHIP-origin/release/2.45",
+            "CHIP-origin/release/2.46",
+            "CHIP-origin/release/2.47",
+            "CHIP-origin/release/2.48",
+            "CHIP-origin/release/2.49",
+            "CHIP-origin/release/2.410",
+            "CHIP-origin/release/2.411",
+        ];
+        let names: Vec<SharedString> = CHIPS
+            .iter()
+            .map(|selector| {
+                SharedString::from(
+                    selector
+                        .strip_prefix("CHIP-")
+                        .expect("every selector names its chip")
+                        .to_string(),
+                )
+            })
+            .collect();
+        select_commit_with_refs(&panel, &repository, "823a3f8a", names.clone(), cx);
+
+        for selector in CHIPS {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "at rest the row still holds a chip for every decoration \
+                 ({selector} is missing) — the collapsed line truncates names, \
+                 it does not drop them, and `uncharted_tags` subtracts against \
+                 exactly this list"
             );
-        });
-        cx.run_until_parked();
+        }
+        let first_at_rest = cx
+            .debug_bounds("CHIP-origin/release/2.40")
+            .expect("the first ref is painted");
+        let last_at_rest = cx
+            .debug_bounds("CHIP-origin/release/2.411")
+            .expect("the twelfth ref is painted");
+        assert_eq!(
+            first_at_rest.origin.y, last_at_rest.origin.y,
+            "and all twelve rest on the one line, whatever it costs the \
+             individual name: first={first_at_rest:?} last={last_at_rest:?}"
+        );
+
+        click_ref_row_toggle(cx);
 
         let first = cx
             .debug_bounds("CHIP-origin/release/2.40")
@@ -3129,24 +3367,39 @@ mod tests {
             .expect("the third ref is painted");
         assert!(
             third.origin.y > first.origin.y && third.origin.x == first.origin.x,
-            "the third chip wrapped onto a new line at the row's left edge \
-             rather than being pushed off the right of a single line: \
-             first={first:?} third={third:?}"
+            "expanded, the third chip wrapped onto a new line at the row's left \
+             edge rather than being squeezed into the first: first={first:?} \
+             third={third:?}"
         );
 
-        let row = cx
-            .debug_bounds("COMMIT-TAB-REFS")
+        let chips = cx
+            .debug_bounds("COMMIT-TAB-REFS-CHIPS")
             .expect("a decorated commit gets a ref row");
         assert_eq!(
-            row.size.height,
+            chips.size.height,
             px(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT),
-            "and the row stops at the cap instead of taking all six lines its \
-             chips want out of the changed-files tree's budget"
+            "and it stops at the cap instead of taking all six lines its chips \
+             want out of the changed-files tree's budget"
         );
+
+        let last = cx
+            .debug_bounds("CHIP-origin/release/2.411")
+            .expect("the twelfth ref is painted");
         assert!(
-            cx.debug_bounds("CHIP-origin/release/2.411").is_some(),
-            "the refs past the cap are still painted, only scrolled — that is \
-             the difference between capping the row and capping the list"
+            last.size.width > last_at_rest.size.width,
+            "the refs past the first line are what the expand is FOR: the \
+             twelfth chip is painted in both states, and only the expanded one \
+             gives it the width to say its name — expanded={last:?} \
+             at_rest={last_at_rest:?}"
+        );
+
+        click_ref_row_toggle(cx);
+        let collapsed_again = cx
+            .debug_bounds("CHIP-origin/release/2.411")
+            .expect("the twelfth ref is painted");
+        assert_eq!(
+            collapsed_again.origin.y, first_at_rest.origin.y,
+            "and `Show less` puts the row back on its one line"
         );
     }
 
