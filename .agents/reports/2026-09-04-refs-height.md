@@ -342,7 +342,7 @@ applies no threshold."** with:
 > - **The row keeps every ref reachable and applies no threshold, but only paints what fits: whole
 >   names on one line, `Show N more` for the rest.** *(Amended twice. It first read "the row never
 >   wraps", folding the overflow into the graph's `+N` chip at `git.log.compact_refs_threshold`;
->   `1a73d7d001` replaced that with an always-wrapped, capped, scrolling row; `<sha2>` made the
+>   `1a73d7d001` replaced that with an always-wrapped, capped, scrolling row; `43ba41c05a` made the
 >   collapsed row a measured fit with a counted expand. Each amendment is stated rather than
 >   quietly overwritten, because the reasoning that produced it is the reasoning a future reader
 >   will re-derive.)* The threshold was wrong twice over: a pane whose job is to answer "which
