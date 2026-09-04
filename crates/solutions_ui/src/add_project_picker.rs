@@ -98,11 +98,7 @@ pub struct AddProjectDelegate {
 }
 
 impl AddProjectDelegate {
-    fn new(
-        solution_id: SolutionId,
-        popover: WeakEntity<AddProjectPicker>,
-        cx: &mut App,
-    ) -> Self {
+    fn new(solution_id: SolutionId, popover: WeakEntity<AddProjectPicker>, cx: &mut App) -> Self {
         let store = SolutionStore::global(cx);
         let catalog_entries = store.read_with(cx, |s, _| {
             let already_member: collections::HashSet<CatalogId> = s
@@ -352,7 +348,11 @@ mod tests {
     #[gpui::test]
     async fn enter_confirms_the_first_filtered_match(cx: &mut TestAppContext) {
         let (picker, _dir, cx) = build_picker(
-            vec![catalog(1, "alpha"), catalog(2, "bundles"), catalog(3, "bunker")],
+            vec![
+                catalog(1, "alpha"),
+                catalog(2, "bundles"),
+                catalog(3, "bunker"),
+            ],
             cx,
         );
 
@@ -377,7 +377,11 @@ mod tests {
     #[gpui::test]
     async fn down_then_enter_confirms_the_second_match(cx: &mut TestAppContext) {
         let (picker, _dir, cx) = build_picker(
-            vec![catalog(1, "alpha"), catalog(2, "bundles"), catalog(3, "bunker")],
+            vec![
+                catalog(1, "alpha"),
+                catalog(2, "bundles"),
+                catalog(3, "bunker"),
+            ],
             cx,
         );
 

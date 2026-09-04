@@ -76,12 +76,8 @@ impl SolutionPickerDropdown {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = SolutionPickerDelegate::new(
-            workspace,
-            multi_workspace,
-            cx.entity().downgrade(),
-            cx,
-        );
+        let delegate =
+            SolutionPickerDelegate::new(workspace, multi_workspace, cx.entity().downgrade(), cx);
         let picker = cx.new(|cx| {
             Picker::list(delegate, window, cx)
                 // `modal(true)` would wrap the list in `elevation_3`, a
@@ -189,12 +185,7 @@ impl SolutionPickerDelegate {
     fn first_solution_match(&self) -> usize {
         self.matches
             .iter()
-            .position(|index| {
-                matches!(
-                    self.candidates.get(*index),
-                    Some(PickerEntry::Solution(_))
-                )
-            })
+            .position(|index| matches!(self.candidates.get(*index), Some(PickerEntry::Solution(_))))
             .unwrap_or(0)
     }
 
