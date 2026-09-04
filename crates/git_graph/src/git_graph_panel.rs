@@ -15,20 +15,50 @@
 use anyhow::Result;
 use gpui::{
     App, AsyncWindowContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
-    Render, Styled, Subscription, WeakEntity, Window, div,
+    Render, Styled, Subscription, Task, WeakEntity, Window, div,
 };
 use project::git_store::{GitStore, GitStoreEvent, RepositoryId};
 use solution_agent::solution_band::SolutionBand;
+use std::time::Duration;
 use ui::prelude::*;
 use workspace::{UtilityKind, Workspace};
 
-use crate::{GitGraph, ToggleFocus};
+use crate::{GitGraph, GraphViewEvent, ToggleFocus};
+
+/// How long the panel goes on painting the previous project's graph while the
+/// incoming one's `git log` is still in flight.
+///
+/// Measured on this fork's own repository (79 531 commits reachable from all
+/// refs) with a cold log cache: ~150 ms from the active-member change to the
+/// first painted rows, of which the first ~145 ms had nothing to draw; a
+/// 30-commit repository takes ~40 ms. So a normal switch never reaches this
+/// cap — it exists because an *unbounded* hold would leave the wrong
+/// project's history on screen indefinitely whenever the log never resolves
+/// (a `git log` that hangs on a network filesystem, a repository that goes
+/// away mid-switch). A stale log that looks current is worse than the blank
+/// frame this whole mechanism removes, so past the cap the panel shows the
+/// incoming graph's own honest "Loading" state instead.
+const STALE_GRAPH_HOLD: Duration = Duration::from_millis(400);
+
+/// A graph built for the repository the user has just switched to, kept off
+/// screen while its `git log` is still in flight so the previous project's
+/// rows stay painted instead of blanking out. Promoted by
+/// [`GitGraphPanel::promote_pending`].
+struct PendingGraph {
+    repo_id: RepositoryId,
+    graph: Entity<GitGraph>,
+    /// Fires when the incoming log settles ([`GraphViewEvent::LoadSettled`]).
+    _subscription: Subscription,
+    /// Promotes the graph anyway once [`STALE_GRAPH_HOLD`] expires.
+    _hold_expiry: Task<()>,
+}
 
 pub struct GitGraphPanel {
     workspace: WeakEntity<Workspace>,
     git_store: Entity<GitStore>,
     graph: Option<Entity<GitGraph>>,
     active_repo_id: Option<RepositoryId>,
+    pending: Option<PendingGraph>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -84,6 +114,7 @@ impl GitGraphPanel {
             git_store,
             graph: None,
             active_repo_id: None,
+            pending: None,
             focus_handle,
             _subscriptions: subscriptions,
         };
@@ -116,15 +147,102 @@ impl GitGraphPanel {
         Some(repo.read(cx).id)
     }
 
+    /// Re-point the panel at `repo_id`.
+    ///
+    /// The incoming [`GitGraph`] starts its `git log` the moment it is
+    /// constructed but is NOT shown until that log can paint something: until
+    /// then the previous project's graph stays on screen. Swapping straight
+    /// away is what made a project switch flash an empty panel — the new
+    /// graph has no rows for as long as the log takes (~40 ms on a small
+    /// repository, ~150 ms on a 79 531-commit one, several painted frames
+    /// either way), so the user saw the old history disappear, a "Loading"
+    /// placeholder, and only then the new history.
     fn set_active_repo(
         &mut self,
         repo_id: Option<RepositoryId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_repo_id == repo_id {
+        if let Some(pending) = self.pending.as_ref()
+            && Some(pending.repo_id) == repo_id
+        {
             return;
         }
+        if self.active_repo_id == repo_id {
+            // Switched back to what is still on screen before the incoming log
+            // resolved: drop the wait rather than promote a graph the user has
+            // just navigated away from.
+            if self.pending.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let Some(repo_id) = repo_id else {
+            // No repository to load: "No active repository" is the final
+            // answer, not an intermediate state worth holding the old graph
+            // for.
+            self.pending = None;
+            self.install_graph(None, None, window, cx);
+            return;
+        };
+        let graph = cx.new(|cx| {
+            GitGraph::new(
+                repo_id,
+                self.git_store.clone(),
+                self.workspace.clone(),
+                None,
+                window,
+                cx,
+            )
+        });
+        // Nothing on screen to protect, or the repository's log cache is
+        // already warm (a switch back to a project visited earlier this
+        // session): showing it now costs no blank frame, and waiting would
+        // only delay it.
+        if self.graph.is_none() || graph.read(cx).load_settled(cx) {
+            self.pending = None;
+            self.install_graph(Some(repo_id), Some(graph), window, cx);
+            return;
+        }
+        let subscription = cx.subscribe_in(
+            &graph,
+            window,
+            |this, _graph, _event: &GraphViewEvent, window, cx| {
+                this.promote_pending(window, cx);
+            },
+        );
+        let hold_expiry = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(STALE_GRAPH_HOLD).await;
+            this.update_in(cx, |this, window, cx| this.promote_pending(window, cx))
+                .ok();
+        });
+        self.pending = Some(PendingGraph {
+            repo_id,
+            graph,
+            _subscription: subscription,
+            _hold_expiry: hold_expiry,
+        });
+    }
+
+    /// Show the graph that has been waiting off screen. Called both when its
+    /// log settles — including when it settles as an *error*, so a switch that
+    /// fails replaces the old history with that error rather than going on
+    /// showing another project's commits — and when [`STALE_GRAPH_HOLD`]
+    /// expires.
+    fn promote_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        self.install_graph(Some(pending.repo_id), Some(pending.graph), window, cx);
+    }
+
+    fn install_graph(
+        &mut self,
+        repo_id: Option<RepositoryId>,
+        graph: Option<Entity<GitGraph>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Re-pointing the graph drops the `Entity<GitGraph>` that owns the
         // focused handle, so that handle leaves the dispatch tree: the
         // window's focus points at a dead id, `render`'s `is_focused` guard
@@ -139,11 +257,7 @@ impl GitGraphPanel {
         // reason as `console_panel::ConsolePanel::close_tab`.
         let held_focus = self.focus_handle.contains_focused(window, cx);
         self.active_repo_id = repo_id;
-        self.graph = repo_id.map(|id| {
-            let git_store = self.git_store.clone();
-            let workspace = self.workspace.clone();
-            cx.new(|cx| GitGraph::new(id, git_store, workspace, None, window, cx))
-        });
+        self.graph = graph;
         if held_focus {
             self.focus_handle.focus(window, cx);
         }
@@ -520,6 +634,246 @@ mod tests {
             .expect("window is open");
     }
 
+    /// The intermediate frame is the whole point: a project switch used to
+    /// blank the graph and only then fill it, so this drives the switch with
+    /// the incoming `git log` deliberately held in flight and reads the
+    /// PAINTED tree — asserting the predicate (`panel.active_repo_id`) would
+    /// pass on exactly the behaviour being fixed, since the old code did
+    /// re-point the panel correctly and merely painted nothing while doing it.
+    ///
+    /// All three sides are asserted, because each of them alone is satisfied
+    /// by a broken panel: it must keep the previous rows while the log is in
+    /// flight, it must swap to the new ones once the log lands, and it must
+    /// not go on showing the previous project's history when the switch
+    /// *fails*.
+    #[gpui::test]
+    async fn switching_projects_paints_the_old_graph_until_the_new_log_lands(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, panel, _band, fs) = bootstrap_with_logs(cx, &[1, 2]).await;
+        toggle(&window, cx);
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let first_row: &'static str = crate::commit_row_selector(0).leak();
+        let second_row: &'static str = crate::commit_row_selector(1).leak();
+        assert!(
+            cx.debug_bounds(first_row).is_some(),
+            "precondition: the first project's log is painted"
+        );
+        assert!(
+            cx.debug_bounds(second_row).is_none(),
+            "precondition: it is the ONE-commit repository, so a second row \
+             on screen later can only have come from the other project"
+        );
+
+        // Hold the incoming `git log`, which is what a real switch spends its
+        // blank on, and switch.
+        fs.block_graph_load(std::path::Path::new("/repo-1/.git"));
+        let second_repo = repository_other_than_active(&panel, cx);
+        switch_to(&window, &panel, second_repo, cx);
+
+        assert!(
+            cx.debug_bounds(first_row).is_some(),
+            "the previous project's rows must still be painted while the \
+             incoming log is in flight — this is the blank the fix removes"
+        );
+        assert!(
+            cx.debug_bounds(second_row).is_none(),
+            "and they are the OLD rows: the incoming two-commit log has not \
+             arrived yet"
+        );
+        assert!(
+            cx.debug_bounds(crate::GRAPH_PLACEHOLDER_SELECTOR).is_none(),
+            "so no 'Loading' placeholder is on screen either"
+        );
+
+        fs.release_graph_load(std::path::Path::new("/repo-1/.git"));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(second_row).is_some(),
+            "once the log lands the panel must actually swap: holding the old \
+             graph forever would be the worse bug"
+        );
+    }
+
+    /// The failure side, split out because it needs a third repository: a
+    /// switch whose `git log` errors must replace the previous project's
+    /// history with the error, not keep painting commits from a project the
+    /// user has navigated away from.
+    #[gpui::test]
+    async fn a_failed_switch_drops_the_previous_projects_rows(cx: &mut TestAppContext) {
+        let (window, panel, _band, fs) = bootstrap_with_logs(cx, &[1, 2]).await;
+        toggle(&window, cx);
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let first_row: &'static str = crate::commit_row_selector(0).leak();
+        assert!(
+            cx.debug_bounds(first_row).is_some(),
+            "precondition: the first project's log is painted"
+        );
+
+        let failing = std::path::Path::new("/repo-1/.git");
+        fs.set_graph_error(failing, Some("fatal: bad default revision".into()));
+        fs.block_graph_load(failing);
+        let second_repo = repository_other_than_active(&panel, cx);
+        switch_to(&window, &panel, second_repo, cx);
+        assert!(
+            cx.debug_bounds(first_row).is_some(),
+            "precondition: the hold is in effect while the failing log runs"
+        );
+
+        fs.release_graph_load(failing);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(first_row).is_none(),
+            "a switch that errors must not leave the previous project's \
+             commits on screen looking current"
+        );
+        assert!(
+            cx.debug_bounds(crate::GRAPH_PLACEHOLDER_SELECTOR).is_some(),
+            "the incoming graph's own error state is what replaces them"
+        );
+    }
+
+    /// The hold is bounded. A `git log` that never resolves would otherwise
+    /// leave another project's history on screen for the rest of the session,
+    /// which is a worse lie than the blank frame the hold exists to remove.
+    #[gpui::test]
+    async fn a_log_that_never_resolves_gives_the_panel_back(cx: &mut TestAppContext) {
+        let (window, panel, _band, fs) = bootstrap_with_logs(cx, &[1, 2]).await;
+        toggle(&window, cx);
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let first_row: &'static str = crate::commit_row_selector(0).leak();
+        fs.block_graph_load(std::path::Path::new("/repo-1/.git"));
+        let second_repo = repository_other_than_active(&panel, cx);
+        switch_to(&window, &panel, second_repo, cx);
+        assert!(
+            cx.debug_bounds(first_row).is_some(),
+            "precondition: the hold is in effect"
+        );
+
+        cx.executor()
+            .advance_clock(STALE_GRAPH_HOLD + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(first_row).is_none(),
+            "past the cap the previous project's rows must be gone"
+        );
+        assert!(
+            cx.debug_bounds(crate::GRAPH_PLACEHOLDER_SELECTOR).is_some(),
+            "replaced by the incoming graph's own honest 'Loading' state"
+        );
+    }
+
+    /// A switch back to a project whose log the repository has already cached
+    /// must not wait on anything: there is no blank to protect against, and
+    /// delaying it by even one event cycle would be a regression in the case
+    /// that used to be instant.
+    #[gpui::test]
+    async fn a_warm_log_is_shown_without_waiting(cx: &mut TestAppContext) {
+        let (window, panel, _band, _fs) = bootstrap_with_logs(cx, &[1, 2]).await;
+        toggle(&window, cx);
+        let second_repo = repository_other_than_active(&panel, cx);
+        switch_to(&window, &panel, second_repo, cx);
+        cx.run_until_parked();
+        let first_repo = repository_other_than_active(&panel, cx);
+
+        window
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.set_active_repo(Some(first_repo), window, cx);
+                    assert!(
+                        panel.pending.is_none(),
+                        "a cached log has nothing to wait for"
+                    );
+                    assert_eq!(panel.active_repo_id, Some(first_repo));
+                });
+            })
+            .expect("window is open");
+    }
+
+    /// Switching back to the project that is still on screen, before the
+    /// incoming log resolves, must cancel the wait rather than promote a
+    /// graph the user has navigated away from.
+    #[gpui::test]
+    async fn switching_back_mid_hold_cancels_the_pending_graph(cx: &mut TestAppContext) {
+        let (window, panel, _band, fs) = bootstrap_with_logs(cx, &[1, 2]).await;
+        toggle(&window, cx);
+        fs.block_graph_load(std::path::Path::new("/repo-1/.git"));
+        let first_repo = panel
+            .read_with(cx, |panel, _cx| panel.active_repo_id)
+            .expect("the bootstrap resolved a repository");
+        let second_repo = repository_other_than_active(&panel, cx);
+        switch_to(&window, &panel, second_repo, cx);
+
+        window
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    assert!(panel.pending.is_some(), "precondition: the hold is on");
+                    panel.set_active_repo(Some(first_repo), window, cx);
+                    assert!(panel.pending.is_none(), "the wait is dropped");
+                    assert_eq!(
+                        panel.active_repo_id,
+                        Some(first_repo),
+                        "and the panel still tracks what it is painting"
+                    );
+                });
+            })
+            .expect("window is open");
+
+        fs.release_graph_load(std::path::Path::new("/repo-1/.git"));
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _cx| panel.active_repo_id),
+            Some(first_repo),
+            "the abandoned log must not swap itself in when it finally lands"
+        );
+    }
+
+    /// The repository the panel is NOT currently pointed at.
+    fn repository_other_than_active(
+        panel: &Entity<GitGraphPanel>,
+        cx: &mut TestAppContext,
+    ) -> RepositoryId {
+        panel.read_with(cx, |panel, cx| {
+            panel
+                .git_store
+                .read(cx)
+                .repositories()
+                .keys()
+                .copied()
+                .find(|id| Some(*id) != panel.active_repo_id)
+                .expect("the fixture has a second repository")
+        })
+    }
+
+    /// Drive the switch the way `SolutionStoreEvent::ActiveMemberChanged`
+    /// does, then let the panel react — but WITHOUT `run_until_parked`, which
+    /// would also run the held `git log` to completion and skip past the
+    /// frame under test.
+    fn switch_to(
+        window: &gpui::WindowHandle<Workspace>,
+        panel: &Entity<GitGraphPanel>,
+        repo_id: RepositoryId,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.set_active_repo(Some(repo_id), window, cx)
+                });
+            })
+            .expect("window is open");
+        // NOT `run_until_parked`'s job here: the held `git log` is parked on
+        // its gate, so this only flushes effects and paints the frame the
+        // assertions read.
+        cx.run_until_parked();
+    }
+
     fn toggle(window: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) {
         window
             .update(cx, |workspace, window, cx| {
@@ -552,6 +906,23 @@ mod tests {
         Entity<GitGraphPanel>,
         Entity<SolutionBand>,
     ) {
+        let (window, panel, band, _fs) = bootstrap_with_logs(cx, &vec![0; repository_count]).await;
+        (window, panel, band)
+    }
+
+    /// As [`bootstrap_with_repositories`], but each repository's `git log`
+    /// answers with the given number of commits, and the fake filesystem is
+    /// handed back so a test can hold or fail one of those logs.
+    async fn bootstrap_with_logs(
+        cx: &mut TestAppContext,
+        commit_counts: &[usize],
+    ) -> (
+        gpui::WindowHandle<Workspace>,
+        Entity<GitGraphPanel>,
+        Entity<SolutionBand>,
+        std::sync::Arc<FakeFs>,
+    ) {
+        let repository_count = commit_counts.len();
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
@@ -575,11 +946,17 @@ mod tests {
                 roots.push(root);
             }
         }
+        for (index, commit_count) in commit_counts.iter().enumerate() {
+            fs.set_graph_commits(
+                &std::path::PathBuf::from(format!("/repo-{index}/.git")),
+                commit_chain(index, *commit_count),
+            );
+        }
         let root_paths = roots
             .iter()
             .map(|root| root.as_path())
             .collect::<Vec<&std::path::Path>>();
-        let project = Project::test(fs, root_paths, cx).await;
+        let project = Project::test(fs.clone(), root_paths, cx).await;
         cx.run_until_parked();
 
         let window = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
@@ -607,6 +984,34 @@ mod tests {
             })
             .expect("window is open");
         cx.run_until_parked();
-        (window, panel, band)
+        (window, panel, band, fs)
+    }
+
+    /// A linear history of `len` commits whose shas are unique to
+    /// `repo_index`, so a row painted from one repository's log can never be
+    /// mistaken for the other's.
+    fn commit_chain(
+        repo_index: usize,
+        len: usize,
+    ) -> Vec<std::sync::Arc<git::repository::InitialGraphCommitData>> {
+        let sha = |commit_index: usize| {
+            let mut bytes = [0u8; 20];
+            bytes[0] = repo_index as u8 + 1;
+            bytes[1] = commit_index as u8 + 1;
+            git::Oid::from_bytes(&bytes).expect("20 bytes is a valid oid")
+        };
+        (0..len)
+            .map(|commit_index| {
+                std::sync::Arc::new(git::repository::InitialGraphCommitData {
+                    sha: sha(commit_index),
+                    parents: if commit_index + 1 < len {
+                        smallvec::smallvec![sha(commit_index + 1)]
+                    } else {
+                        smallvec::smallvec![]
+                    },
+                    ref_names: Vec::new(),
+                })
+            })
+            .collect()
     }
 }

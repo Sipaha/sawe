@@ -105,6 +105,14 @@ pub struct FakeGitRepositoryState {
     /// else in the fake honours.
     pub tags_pointing_at: HashMap<String, Vec<SharedString>>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
+    /// When set, [`GitRepository::initial_graph_data`] parks on this channel
+    /// before it produces anything, so a test can hold a `git log` in flight
+    /// across a paint and assert what the UI shows while the load has NOT
+    /// resolved. Without it every load resolves inside the same
+    /// `run_until_parked` that starts it, and the intermediate state — the one
+    /// a user actually sees on a project switch — is unobservable.
+    /// Released by [`crate::FakeFs::release_graph_load`].
+    pub graph_load_gate: Option<(async_channel::Sender<()>, async_channel::Receiver<()>)>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     /// Per-commit file diffs, keyed by the sha the caller asks for. A sha with
     /// no entry answers with an empty diff — the fake's original behaviour, and
@@ -139,6 +147,7 @@ impl FakeGitRepositoryState {
             oids: Default::default(),
             remotes: HashMap::default(),
             graph_commits: Vec::new(),
+            graph_load_gate: None,
             commit_data: Default::default(),
             commit_diffs: Default::default(),
             commit_history: Vec::new(),
@@ -1545,13 +1554,23 @@ impl GitRepository for FakeGitRepository {
         let fs = self.fs.clone();
         let dot_git_path = self.dot_git_path.clone();
         async move {
-            let (graph_commits, simulated_error) =
+            let (graph_commits, simulated_error, gate) =
                 fs.with_git_state(&dot_git_path, false, |state| {
                     (
                         state.graph_commits.clone(),
                         state.simulated_graph_error.clone(),
+                        state
+                            .graph_load_gate
+                            .as_ref()
+                            .map(|(_sender, receiver)| receiver.clone()),
                     )
                 })?;
+
+            if let Some(gate) = gate {
+                // A closed channel means the test released the gate (or dropped
+                // the state) while we were being scheduled — proceed either way.
+                gate.recv().await.ok();
+            }
 
             if let Some(error) = simulated_error {
                 anyhow::bail!("{}", error);

@@ -378,6 +378,17 @@ pub struct InitialGitGraphData {
     subscribers: Vec<async_channel::Sender<Result<Vec<Arc<InitialGraphCommitData>>, SharedString>>>,
 }
 
+impl InitialGitGraphData {
+    /// Whether the `git log` behind this entry is still running. A view that
+    /// has never been rendered cannot learn this from its own copy of the
+    /// commits (it has none yet), so it asks the cache directly — that is how
+    /// `git_graph::GitGraph::load_settled` tells "no rows yet" apart from
+    /// "no rows, ever".
+    pub fn is_loading(&self) -> bool {
+        !self.fetch_task.is_ready()
+    }
+}
+
 pub struct GraphDataResponse<'a> {
     pub commits: &'a [Arc<InitialGraphCommitData>],
     pub is_loading: bool,

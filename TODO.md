@@ -241,6 +241,31 @@ defaults.
 *Done when:* colour modes / author filter / date toggle are reachable and actually change the
 gutter, or the dead layer and its doc comments are gone.
 
+### C12. The Uncommitted-Changes view re-targets by emptying itself first
+`GitGraphPanel` no longer blanks on a project switch — it holds the previous project's graph
+until the incoming `git log` can paint (commit `<this one>`). Its neighbour on the same event
+does the opposite: `ProjectDiff`'s `ActiveMemberChanged` subscription
+(`crates/git_ui/src/project_diff.rs:693`) calls `BranchDiff::set_repo`
+(`crates/project/src/git_store/branch_diff.rs:117`), which drops `tree_diff`, clears both
+commits and emits `FileListChanged`; `ProjectDiff::refresh` (`:1034`) then removes every
+excerpt whose path the incoming repo does not also have, before the new buffers load.
+
+Whether that is *visible* depends on how much of the incoming repository's status is already
+in the git store's snapshot — for `DiffBase::Head` it usually is, so this may swap without a
+blank. **Unmeasured**: read from the code while fixing the graph, not observed in a running
+editor. Left alone because the fix is not the graph's: the graph could hold a whole
+alternative view off screen and swap entities, while the diff view owns one multibuffer whose
+excerpts are the content, so "keep the old rows until the new ones are ready" there means
+staging excerpt edits in `refresh`, not deferring a view swap.
+
+The git panel's Changes list is fine either way, and is worth recording so nobody "fixes" it:
+`update_visible_entries` (`crates/git_ui/src/git_panel/changes_list.rs:100`) clears and
+refills within one synchronous call after `UPDATE_DEBOUNCE`, so the old list stays painted
+until the new one is complete — the same shape the graph now has.
+
+*Done when:* a measurement says whether the Changes view blanks on a member switch, and if it
+does, `refresh` swaps excerpts instead of emptying and refilling.
+
 ---
 
 ## D. Tooling gaps

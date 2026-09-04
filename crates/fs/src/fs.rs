@@ -2284,6 +2284,35 @@ impl FakeFs {
         .unwrap();
     }
 
+    /// Hold this repository's next `git log` until
+    /// [`FakeFs::release_graph_load`], so a test can paint a frame while the
+    /// load is genuinely still in flight. Ordinarily the fake resolves inside
+    /// the same `run_until_parked` that starts the fetch, which makes the
+    /// intermediate "no rows yet" state — the one this fork's project switch
+    /// used to flash — impossible to assert against.
+    pub fn block_graph_load(&self, dot_git: &Path) {
+        self.with_git_state(dot_git, true, |state| {
+            state.graph_load_gate = Some(async_channel::bounded(1));
+        })
+        .unwrap();
+    }
+
+    /// Let a [`FakeFs::block_graph_load`] load run to completion. A no-op if
+    /// nothing is holding it.
+    pub fn release_graph_load(&self, dot_git: &Path) {
+        let sender = self
+            .with_git_state(dot_git, true, |state| {
+                state
+                    .graph_load_gate
+                    .take()
+                    .map(|(sender, _receiver)| sender)
+            })
+            .unwrap();
+        if let Some(sender) = sender {
+            sender.try_send(()).ok();
+        }
+    }
+
     pub fn set_graph_error(&self, dot_git: &Path, error: Option<String>) {
         self.with_git_state(dot_git, true, |state| {
             state.simulated_graph_error = error;

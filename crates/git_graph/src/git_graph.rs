@@ -212,6 +212,12 @@ fn log_table_row(cells: [AnyElement; LOG_COLUMN_COUNT]) -> Vec<AnyElement> {
 /// Paint-tree selector for the synthetic *Local Changes* row.
 const LOCAL_CHANGES_ROW_SELECTOR: &str = "GIT-GRAPH-LOCAL-CHANGES-ROW";
 
+/// Paint-tree selector for the placeholder the graph paints instead of a
+/// table: "Loading", "No commits found" or "Error loading: …". The message
+/// itself is state-dependent and so untestable by name, but its presence is
+/// what a test needs to tell a blank graph apart from a painted one.
+const GRAPH_PLACEHOLDER_SELECTOR: &str = "GIT-GRAPH-PLACEHOLDER";
+
 /// Paint-tree selector for the Description cell of the commit at `data_idx`.
 fn commit_row_selector(data_idx: usize) -> String {
     format!("GIT-GRAPH-COMMIT-ROW-{data_idx}")
@@ -2209,6 +2215,11 @@ impl GitGraph {
                         cx.notify();
                     }
                 }
+                // Every one of the three arms above is a load that has stopped
+                // being "no rows yet": commits arrived, the log finished, or it
+                // failed. `GitGraphPanel` holds the previous project's graph on
+                // screen until it hears this about the incoming one.
+                cx.emit(GraphViewEvent::LoadSettled);
             }
             RepositoryEvent::HeadChanged
             | RepositoryEvent::BranchListChanged
@@ -2229,6 +2240,41 @@ impl GitGraph {
             RepositoryEvent::GraphEvent(_, _) => {}
             _ => {}
         }
+    }
+
+    /// Whether this view has anything to paint besides the "Loading"
+    /// placeholder: rows, a log that finished (even empty), or an error.
+    ///
+    /// Deliberately answered from the repository's cache rather than from
+    /// this view's own `graph_data`: a graph that has never been rendered has
+    /// not run [`GitGraph::resolve_commit_count`], so its local copy is still
+    /// empty even when the log resolved long ago — which is exactly the state
+    /// [`crate::git_graph_panel::GitGraphPanel`] asks about, since it holds
+    /// the incoming graph off screen until this is true.
+    pub fn load_settled(&self, cx: &App) -> bool {
+        if !self.graph_data.commits.is_empty() {
+            return true;
+        }
+        let Some(repository) = self.get_repository(cx) else {
+            // No repository behind this view: the placeholder IS the answer,
+            // and nothing will ever arrive to change it.
+            return true;
+        };
+        let extra_args = self.combined_extra_args();
+        let extra_paths = self.filters.paths_args();
+        repository
+            .read(cx)
+            .get_graph_data(
+                self.log_source.clone(),
+                self.log_order,
+                &extra_args,
+                &extra_paths,
+            )
+            // No cache entry means `fetch_initial_graph_data` found no
+            // repository to register one against — same story as above.
+            .is_none_or(|data| {
+                data.error.is_some() || !data.commit_data.is_empty() || !data.is_loading()
+            })
     }
 
     fn fetch_initial_graph_data(&mut self, cx: &mut App) {
@@ -3594,6 +3640,7 @@ impl Render for GitGraph {
                 .color(Color::Muted)
                 .size(LabelSize::Large);
             div()
+                .debug_selector(|| GRAPH_PLACEHOLDER_SELECTOR.into())
                 .size_full()
                 .h_flex()
                 .gap_1()
@@ -3917,6 +3964,16 @@ impl Render for GitGraph {
             }))
     }
 }
+
+/// What [`GitGraph`] tells its container about the `git log` behind it.
+pub enum GraphViewEvent {
+    /// The initial load has produced its first rows, finished, or failed —
+    /// the view now paints something other than the bare "Loading"
+    /// placeholder. See [`GitGraph::load_settled`].
+    LoadSettled,
+}
+
+impl EventEmitter<GraphViewEvent> for GitGraph {}
 
 impl EventEmitter<ItemEvent> for GitGraph {}
 
