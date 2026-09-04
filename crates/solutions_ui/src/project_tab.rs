@@ -63,6 +63,18 @@ pub(crate) fn project_tab_selector(member_id: MemberId) -> String {
     format!("PROJECT-TAB-{}", member_id.0)
 }
 
+/// Paint selector for a tab's ACTIVE/INACTIVE state, carried by the colour dot
+/// (an element the tab already paints, so naming it adds nothing to the tree).
+///
+/// The state is in the NAME because it is invisible to `debug_bounds`
+/// otherwise: active and inactive tabs differ only in background, border colour
+/// and label colour, none of which are geometry, so a state-blind selector
+/// would pass for both.
+pub(crate) fn project_tab_state_selector(member_id: MemberId, is_active: bool) -> String {
+    let state = if is_active { "ACTIVE" } else { "INACTIVE" };
+    format!("PROJECT-TAB-{state}-{}", member_id.0)
+}
+
 #[derive(IntoElement)]
 pub struct ProjectTab {
     solution_id: SolutionId,
@@ -182,6 +194,11 @@ impl RenderOnce for ProjectTab {
             .cursor_pointer()
             .child(
                 div()
+                    .debug_selector({
+                        let member_id = self.member_id;
+                        let is_active = self.is_active;
+                        move || project_tab_state_selector(member_id, is_active)
+                    })
                     .w(TAB_DOT_SIZE)
                     .h(TAB_DOT_SIZE)
                     .rounded_full()

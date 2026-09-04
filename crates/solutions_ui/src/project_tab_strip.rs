@@ -17,10 +17,13 @@
 //!     since `MultiWorkspace` calls `cx.notify()` on that transition.
 //!
 //! Overflow: as many tabs as the strip's MEASURED width can hold render
-//! inline; the rest spill into a trailing `more` `PopoverMenu` that marks
-//! the active project with a check, can be DRAGGED out onto the strip, and
-//! on click promotes the picked project to the front of the member order so
-//! it lands on the visible strip.
+//! inline; the rest spill into a trailing `more` `PopoverMenu` that marks the
+//! active project with a check and whose rows can be DRAGGED out onto the
+//! strip to reorder. Clicking a row only ACTIVATES that project: selecting is
+//! a navigation gesture and must not rewrite the tab order the user arranged
+//! — dragging is the gesture that reorders. The click is still visible because
+//! the active member is RESERVED a slot in the width budget below, so it is
+//! painted wherever it sits in the stored order.
 //!
 //! The strip used to cap the visible tabs at a fixed count (six) regardless
 //! of how wide the window was, which on a 1920px window left ~790px — 41% of
@@ -180,47 +183,65 @@ fn overflow_menu_row(
         .into_any_element()
 }
 
-/// Move `member` to the head of the order, keeping everyone else's relative
-/// order. This is what an overflow-menu click does: the first slot is the one
-/// position guaranteed to be inside the visible budget no matter how narrow
-/// the strip is, so it is the only placement that can promise the picked
-/// project actually becomes a tab. Returns the order unchanged when `member`
-/// is missing.
-pub(crate) fn promote_to_front(order: &[MemberId], member: MemberId) -> Vec<MemberId> {
-    if !order.contains(&member) {
-        return order.to_vec();
-    }
-    let mut promoted = vec![member];
-    promoted.extend(order.iter().copied().filter(|m| *m != member));
-    promoted
-}
-
-/// How many of `widths` fit inside `budget`, given that spilling even one
-/// entry costs `more_button` for the trailing `…`.
+/// Which members are painted as tabs, as indices into `widths`, in member
+/// order.
 ///
-/// A pure function over plain numbers so the boundary cases — everything
-/// fits, nothing fits, the `…` itself is what pushes the last tab out — are
-/// unit-testable without a rendered frame.
-fn fit_count(widths: &[Pixels], budget: Pixels, more_button: Pixels) -> usize {
+/// Greedy prefix out of `budget`, with one twist: the ACTIVE member's width is
+/// RESERVED before the prefix is walked, so the project the user is on is
+/// always among the painted tabs. That reservation is what lets a click in the
+/// `…` menu be pure navigation — the strip can show the picked project without
+/// moving it, which a plain prefix could not.
+///
+/// Reserving rather than prepending is the whole point: the active tab is paid
+/// for out of the same pixels as every other tab and keeps its stored position
+/// among them, so the painted set is always a SUBSEQUENCE of the member order
+/// and nothing is special-cased by index. What a reservation does cost is one
+/// tab at the fold, which drops into the `…` — that is the intended trade.
+///
+/// A pure function over plain numbers so the boundary cases — everything fits,
+/// nothing fits, the `…` itself is what pushes the last tab out, the active
+/// member sitting far past the fold — are unit-testable without a rendered
+/// frame.
+fn visible_indices(
+    widths: &[Pixels],
+    budget: Pixels,
+    more_button: Pixels,
+    active: Option<usize>,
+) -> Vec<usize> {
     let total: Pixels = widths.iter().copied().fold(px(0.0), |a, b| a + b);
     if total <= budget {
-        return widths.len();
+        return (0..widths.len()).collect();
     }
     // Something has to spill, so the `…` is going to be painted and its width
     // comes out of the budget before any tab is placed.
     let budget = budget - more_button;
+    let active = active.filter(|index| *index < widths.len());
+
+    let mut chosen: Vec<usize> = Vec::new();
     let mut used = px(0.0);
-    let mut fitted = 0;
-    for width in widths {
+    if let Some(index) = active {
+        used += widths.get(index).copied().unwrap_or(px(0.0));
+        chosen.push(index);
+    }
+    for (index, width) in widths.iter().enumerate() {
+        if Some(index) == active {
+            continue;
+        }
+        // Break, not continue: the visible tabs are the LEADING ones, so a
+        // narrow tab further down the order never jumps the fold.
         if used + *width > budget {
             break;
         }
         used += *width;
-        fitted += 1;
+        chosen.push(index);
     }
     // Never hide every project: a strip narrower than one tab still shows the
     // first one (it scrolls) rather than collapsing to a bare `…`.
-    fitted.max(1).min(widths.len())
+    if chosen.is_empty() && !widths.is_empty() {
+        chosen.push(0);
+    }
+    chosen.sort_unstable();
+    chosen
 }
 
 /// Walk a `Workspace`'s worktrees and return the first one that maps to
@@ -348,7 +369,13 @@ impl Render for ProjectTabStrip {
                 )
             })
             .fold(px(0.0), |a, b| a + b);
-        let visible_count = match self.measured_bounds {
+        // The active member is folded into the budget rather than pinned to a
+        // slot: `visible_indices` reserves its width and otherwise fills the
+        // strip from the front, so it is painted in its STORED position among
+        // whichever leading tabs still fit.
+        let active_index =
+            active_member.and_then(|active| members.iter().position(|(id, _)| *id == active));
+        let visible_positions: Vec<usize> = match self.measured_bounds {
             Some(bounds) => {
                 let widths: Vec<Pixels> = members
                     .iter()
@@ -360,12 +387,31 @@ impl Render for ProjectTabStrip {
                     - plus_cell
                     - PLUS_DIVIDER_WIDTH
                     - BUDGET_SAFETY_MARGIN;
-                fit_count(&widths, budget, MORE_BUTTON_WIDTH)
+                visible_indices(&widths, budget, MORE_BUTTON_WIDTH, active_index)
             }
-            None => UNMEASURED_VISIBLE_TABS.min(members.len()),
+            // Pre-measurement frame: a generous prefix, plus the active member
+            // wherever it is, so the very first frame after a switch never
+            // flashes a strip with nothing highlighted.
+            None => {
+                let mut chosen: Vec<usize> =
+                    (0..UNMEASURED_VISIBLE_TABS.min(members.len())).collect();
+                if let Some(index) = active_index.filter(|index| !chosen.contains(index)) {
+                    chosen.push(index);
+                    chosen.sort_unstable();
+                }
+                chosen
+            }
         };
-        let (visible, overflow): (&[(MemberId, SharedString)], &[(MemberId, SharedString)]) =
-            members.split_at(visible_count.min(members.len()));
+        let visible: Vec<(MemberId, SharedString)> = visible_positions
+            .iter()
+            .filter_map(|index| members.get(*index).cloned())
+            .collect();
+        let overflow: Vec<(MemberId, SharedString)> = members
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !visible_positions.contains(index))
+            .map(|(_, entry)| entry.clone())
+            .collect();
 
         let tabs = visible.iter().map(|(member_id, name)| {
             let is_active = active_member == Some(*member_id);
@@ -389,10 +435,9 @@ impl Render for ProjectTabStrip {
         // `ContextMenu` still supplies the `ListItem` chrome, hover highlight
         // and click routing around it, so it reads as an ordinary entry.
         //
-        // The active member really can be down here: the user can drag it past
-        // the fold, the window can narrow, and any path that activates a member
-        // without touching the order (`solutions.set_active_member`, opening a
-        // file) leaves it hidden — with no tab highlighted anywhere.
+        // The active member is normally NOT down here — the budget reserves it a
+        // slot — but the check still earns its keep on the frame before the
+        // strip has been measured, and it names the state the menu is showing.
         //
         // A row can be DRAGGED out of the menu onto the strip, which is the
         // gesture the maintainer asked for. This works — verified live — and it
@@ -404,11 +449,12 @@ impl Render for ProjectTabStrip {
         // end-drop zone) it is released over, reusing the drop handlers the
         // visible tabs already have. Nothing about the menu had to change.
         //
-        // Clicking a row instead promotes that member to the FRONT of the order
-        // and activates it — the coarse version of the same gesture, for when
-        // the user just wants the project on the strip and does not care where.
-        // Both paths persist through `SolutionStore::reorder_members`, the one
-        // ordering this fork has.
+        // CLICKING a row only activates the project. It used to also promote it
+        // to the front of the member order, which made a selection permanently
+        // rewrite the tab arrangement the user had built — selecting is
+        // navigation, and `reorder_members` is what the DRAG is for. The click
+        // is still visible because `visible_indices` reserves the active
+        // member's width, so the strip paints it in place.
         let overflow_popover = (!overflow.is_empty()).then(|| {
             let overflow_entries: Vec<(MemberId, SharedString, bool)> = overflow
                 .iter()
@@ -420,7 +466,6 @@ impl Render for ProjectTabStrip {
                     )
                 })
                 .collect();
-            let order_for_menu = order.clone();
             let more_button = IconButton::new("project-tab-strip-more", IconName::Ellipsis)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
@@ -429,29 +474,20 @@ impl Render for ProjectTabStrip {
                 .trigger(more_button)
                 .menu(move |window, cx| {
                     let overflow_entries = overflow_entries.clone();
-                    let order_for_menu = order_for_menu.clone();
                     Some(ContextMenu::build(
                         window,
                         cx,
                         move |mut menu, _window, _cx| {
                             for (member_id, name, is_active) in overflow_entries {
-                                let order = order_for_menu.clone();
                                 let row_name = name.clone();
                                 menu = menu.custom_entry(
                                     move |_window, _cx| {
                                         overflow_menu_row(member_id, &row_name, is_active)
                                     },
-                                    {
-                                        let order = order.clone();
-                                        move |_window, cx| {
-                                            let new_order = promote_to_front(&order, member_id);
-                                            SolutionStore::global(cx).update(cx, |store, cx| {
-                                                store
-                                                    .reorder_members(solution_id, new_order, cx)
-                                                    .log_err();
-                                                store.set_active_member(solution_id, member_id, cx);
-                                            });
-                                        }
+                                    move |_window, cx| {
+                                        SolutionStore::global(cx).update(cx, |store, cx| {
+                                            store.set_active_member(solution_id, member_id, cx);
+                                        });
                                     },
                                 );
                             }
@@ -585,16 +621,15 @@ impl Render for ProjectTabStrip {
 mod fit_tests {
     use super::*;
 
-    fn id(n: i64) -> MemberId {
-        MemberId(n)
-    }
-
     #[test]
     fn everything_fitting_costs_no_overflow_button() {
         let widths = [px(100.), px(100.), px(100.)];
         // Exactly enough room, and the `…` is not subtracted because nothing
         // spills — the case the old fixed cap could never express.
-        assert_eq!(fit_count(&widths, px(300.), px(33.)), 3);
+        assert_eq!(
+            visible_indices(&widths, px(300.), px(33.), None),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
@@ -602,30 +637,60 @@ mod fit_tests {
         let widths = [px(100.), px(100.), px(100.)];
         // 299px cannot hold all three, so the `…` is paid for first and only
         // (299 - 33) / 100 = 2 tabs remain.
-        assert_eq!(fit_count(&widths, px(299.), px(33.)), 2);
+        assert_eq!(visible_indices(&widths, px(299.), px(33.), None), vec![0, 1]);
     }
 
     #[test]
     fn a_strip_narrower_than_one_tab_still_shows_one() {
         let widths = [px(120.), px(120.)];
-        assert_eq!(fit_count(&widths, px(40.), px(33.)), 1);
+        assert_eq!(visible_indices(&widths, px(40.), px(33.), None), vec![0]);
     }
 
     #[test]
     fn no_members_fit_nothing() {
-        assert_eq!(fit_count(&[], px(500.), px(33.)), 0);
+        assert!(visible_indices(&[], px(500.), px(33.), None).is_empty());
     }
 
     #[test]
-    fn promote_to_front_moves_the_picked_member_and_keeps_the_rest_in_order() {
-        let order = vec![id(1), id(2), id(3), id(4)];
+    fn the_active_member_is_reserved_a_slot_past_the_fold() {
+        let widths = [px(100.), px(100.), px(100.), px(100.)];
+        // Budget for two tabs once the `…` is paid for. Without an active
+        // member that is the leading pair; with the last member active, its
+        // width is reserved first and only one leading tab is left over — and
+        // the result is still in member order, not "active first".
+        assert_eq!(visible_indices(&widths, px(233.), px(33.), None), vec![0, 1]);
         assert_eq!(
-            promote_to_front(&order, id(3)),
-            vec![id(3), id(1), id(2), id(4)]
+            visible_indices(&widths, px(233.), px(33.), Some(3)),
+            vec![0, 3]
         );
-        // Already first, and an unknown id, are both no-ops.
-        assert_eq!(promote_to_front(&order, id(1)), order);
-        assert_eq!(promote_to_front(&order, id(99)), order);
+    }
+
+    #[test]
+    fn an_active_member_that_already_fits_changes_nothing() {
+        let widths = [px(100.), px(100.), px(100.), px(100.)];
+        // The reservation is not a special case for "past the fold": an active
+        // member inside the prefix must produce exactly the unreserved split.
+        assert_eq!(
+            visible_indices(&widths, px(233.), px(33.), Some(1)),
+            visible_indices(&widths, px(233.), px(33.), None)
+        );
+    }
+
+    #[test]
+    fn an_active_member_wider_than_the_whole_budget_is_still_painted() {
+        let widths = [px(100.), px(100.), px(200.)];
+        // Nothing else can fit beside it, but the tab the user is on must never
+        // be the one that vanishes.
+        assert_eq!(visible_indices(&widths, px(150.), px(33.), Some(2)), vec![2]);
+    }
+
+    #[test]
+    fn an_out_of_range_active_index_is_ignored() {
+        let widths = [px(100.), px(100.), px(100.)];
+        assert_eq!(
+            visible_indices(&widths, px(299.), px(33.), Some(99)),
+            vec![0, 1]
+        );
     }
 }
 
@@ -640,7 +705,7 @@ mod fit_tests {
 #[cfg(test)]
 mod paint_tests {
     use super::*;
-    use crate::project_tab::project_tab_selector;
+    use crate::project_tab::{project_tab_selector, project_tab_state_selector};
     use gpui::{Bounds, TestAppContext, VisualTestContext};
 
     /// Hosts a `ProjectTabStrip` at an exact width. The strip's whole contract
@@ -782,6 +847,50 @@ mod paint_tests {
         painted
     }
 
+    /// The member order as the STORE holds it — the thing a selection must
+    /// never touch. Read back from the store rather than inferred from the
+    /// paint, because "the strip shows it in place" and "the order was
+    /// rewritten and it happens to look the same" are different bugs.
+    fn stored_order(solution_id: SolutionId, cx: &mut VisualTestContext) -> Vec<MemberId> {
+        cx.update(|_window, cx| {
+            SolutionStore::global(cx)
+                .read(cx)
+                .find_solution(solution_id)
+                .expect("the probe solution exists")
+                .members
+                .iter()
+                .map(|member| member.id)
+                .collect()
+        })
+    }
+
+    /// The painted tabs, left to right, must be the stored order with the
+    /// spilled members deleted — a subsequence, never a permutation.
+    fn assert_keeps_relative_order(painted: &[(MemberId, Bounds<Pixels>)], order: &[MemberId]) {
+        let painted_ids: Vec<MemberId> = painted.iter().map(|(id, _)| *id).collect();
+        let expected: Vec<MemberId> = order
+            .iter()
+            .copied()
+            .filter(|id| painted_ids.contains(id))
+            .collect();
+        assert_eq!(
+            painted_ids, expected,
+            "the visible tabs must keep their stored relative order"
+        );
+    }
+
+    /// The `…` menu's rows for the members that are currently spilled. Opens
+    /// the popover; the caller asserts against the row selectors.
+    fn open_overflow_menu(cx: &mut VisualTestContext) {
+        let more = cx
+            .debug_bounds("ICON-Ellipsis")
+            .expect("the overflow button must paint");
+        cx.simulate_mouse_move(more.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_click(more.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
     /// The width the next member would need if it were promoted onto the
     /// strip — used to assert that a spill really was forced by the width and
     /// not by a leftover cap.
@@ -918,50 +1027,147 @@ mod paint_tests {
         }
     }
 
-    /// Problem 1: the menu has to say which project is the active one, and
-    /// must not say it about the others.
+    /// The rule this change exists for, on the state that motivates it: a
+    /// project whose stored position is far PAST the fold is still painted,
+    /// in place, when it becomes active — and the order is not touched to
+    /// achieve that.
+    ///
+    /// The strip used to have no answer here (nothing highlighted anywhere,
+    /// which is why the menu grew a check) and then the wrong one (promote it
+    /// to the front, rewriting the user's arrangement). The answer is that the
+    /// budget RESERVES the active member's width, so it keeps its own slot.
     #[gpui::test]
-    async fn the_overflow_menu_marks_the_active_project_and_only_that_one(
+    async fn the_active_project_is_painted_in_place_even_when_it_sits_past_the_fold(
         cx: &mut TestAppContext,
     ) {
         let (member_ids, solution_id, cx) = strip_at_width(px(660.), cx).await;
-        let painted = painted_tabs(&member_ids, cx);
-        let hidden: Vec<MemberId> = member_ids[painted.len()..].to_vec();
-        let active = *hidden.first().expect("some project must have spilled");
-        let other = *hidden.get(1).expect("at least two projects must have spilled");
+        let before = painted_tabs(&member_ids, cx);
+        assert!(
+            before.len() < member_ids.len(),
+            "precondition: something must have spilled"
+        );
+        let order_before = stored_order(solution_id, cx);
+        // Deliberately the LAST member — the furthest possible from the fold,
+        // so nothing here can pass by accident of being one slot over.
+        let active = *member_ids.last().expect("twelve members exist");
+        assert!(
+            bounds_of(cx, project_tab_selector(active)).is_none(),
+            "precondition: the last project starts off the strip"
+        );
 
-        // Activate a project that is NOT on the strip — exactly the state that
-        // leaves no tab highlighted anywhere, which is why the menu has to mark
-        // it. `set_active_member` does not touch the order, so it stays hidden.
         cx.update(|_window, cx| {
             SolutionStore::global(cx).update(cx, |store, cx| {
                 store.set_active_member(solution_id, active, cx);
             })
         });
         cx.run_until_parked();
-
-        let more = cx
-            .debug_bounds("ICON-Ellipsis")
-            .expect("the overflow button must paint");
-        cx.simulate_mouse_move(more.center(), None, gpui::Modifiers::none());
-        cx.run_until_parked();
-        cx.simulate_click(more.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        redraw(cx);
 
         assert!(
-            bounds_of(cx, overflow_menu_row_selector(active, true)).is_some(),
-            "the active project's row must paint as marked"
+            bounds_of(cx, project_tab_state_selector(active, true)).is_some(),
+            "the active project must be painted on the strip, highlighted"
         );
         assert!(
-            bounds_of(cx, overflow_menu_row_selector(active, false)).is_none(),
-            "…and must not also paint as unmarked"
+            bounds_of(cx, project_tab_state_selector(active, false)).is_none(),
+            "…and must not also paint as an ordinary tab"
+        );
+        assert_eq!(
+            stored_order(solution_id, cx),
+            order_before,
+            "activating a project must not rewrite the member order"
+        );
+
+        let painted = painted_tabs(&member_ids, cx);
+        assert_keeps_relative_order(&painted, &order_before);
+        assert_eq!(
+            painted.last().map(|(id, _)| *id),
+            Some(active),
+            "the LAST member must paint at the right end of the strip — being \
+             active is a reservation in the budget, not a promotion to the head: \
+             {painted:?}"
+        );
+        assert_eq!(
+            painted.first().map(|(id, _)| *id),
+            before.first().map(|(id, _)| *id),
+            "the head of the strip must not have moved"
+        );
+
+        // …and because it is on the strip, it is NOT in the menu any more.
+        open_overflow_menu(cx);
+        assert!(
+            bounds_of(cx, overflow_menu_row_selector(active, true)).is_none()
+                && bounds_of(cx, overflow_menu_row_selector(active, false)).is_none(),
+            "the active project is on the strip, so it must not also be listed \
+             in the overflow menu"
+        );
+        let still_hidden = *member_ids
+            .iter()
+            .find(|id| bounds_of(cx, project_tab_selector(**id)).is_none())
+            .expect("something is still spilled at 660px");
+        assert!(
+            bounds_of(cx, overflow_menu_row_selector(still_hidden, false)).is_some(),
+            "a project that really is hidden must have an unmarked row"
+        );
+    }
+
+    /// The overflow row still knows how to say "this is the one you're on".
+    /// Since the budget now keeps the active member ON the strip, that state is
+    /// unreachable through the menu at steady state — it is the fallback for
+    /// the frame before the strip has been measured — so the row is rendered
+    /// directly here, both sides, rather than left as untested code.
+    struct RowHost {
+        member_id: MemberId,
+        name: SharedString,
+        is_active: bool,
+    }
+
+    impl Render for RowHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(240.))
+                .h(px(24.))
+                .child(overflow_menu_row(self.member_id, &self.name, self.is_active))
+        }
+    }
+
+    async fn row_painted_as(is_active: bool, cx: &mut TestAppContext) -> (MemberId, &mut VisualTestContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let member_id = MemberId(7);
+        let (_host, cx) = cx.add_window_view(|_window, _cx| RowHost {
+            member_id,
+            name: SharedString::from("ecos-base"),
+            is_active,
+        });
+        cx.run_until_parked();
+        (member_id, cx)
+    }
+
+    #[gpui::test]
+    async fn an_overflow_row_paints_the_active_mark(cx: &mut TestAppContext) {
+        let (member_id, cx) = row_painted_as(true, cx).await;
+        assert!(
+            bounds_of(cx, overflow_menu_row_selector(member_id, true)).is_some(),
+            "an active row must paint marked"
         );
         assert!(
-            bounds_of(cx, overflow_menu_row_selector(other, false)).is_some(),
-            "a non-active project's row must paint as unmarked"
+            bounds_of(cx, overflow_menu_row_selector(member_id, false)).is_none(),
+            "…and must not also paint unmarked"
+        );
+    }
+
+    #[gpui::test]
+    async fn an_overflow_row_paints_unmarked_when_it_is_not_active(cx: &mut TestAppContext) {
+        let (member_id, cx) = row_painted_as(false, cx).await;
+        assert!(
+            bounds_of(cx, overflow_menu_row_selector(member_id, false)).is_some(),
+            "an inactive row must paint unmarked"
         );
         assert!(
-            bounds_of(cx, overflow_menu_row_selector(other, true)).is_none(),
+            bounds_of(cx, overflow_menu_row_selector(member_id, true)).is_none(),
             "…and must not be marked as active"
         );
     }
@@ -978,7 +1184,7 @@ mod paint_tests {
     async fn a_project_can_be_dragged_out_of_the_overflow_menu_onto_the_strip(
         cx: &mut TestAppContext,
     ) {
-        let (member_ids, _solution_id, cx) = strip_at_width(px(660.), cx).await;
+        let (member_ids, solution_id, cx) = strip_at_width(px(660.), cx).await;
         let painted = painted_tabs(&member_ids, cx);
         let target = painted
             .get(1)
@@ -987,14 +1193,9 @@ mod paint_tests {
         let hidden = *member_ids
             .get(painted.len())
             .expect("some project must have spilled");
+        let order_before = stored_order(solution_id, cx);
 
-        let more = cx
-            .debug_bounds("ICON-Ellipsis")
-            .expect("the overflow button must paint");
-        cx.simulate_mouse_move(more.center(), None, gpui::Modifiers::none());
-        cx.run_until_parked();
-        cx.simulate_click(more.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        open_overflow_menu(cx);
 
         let row = bounds_of(cx, overflow_menu_row_selector(hidden, false))
             .expect("the hidden project must have a row in the menu");
@@ -1044,33 +1245,59 @@ mod paint_tests {
             "a project dropped on a tab takes that tab's slot, exactly as a \
              tab-to-tab reorder does: {positions:?}"
         );
+
+        // Dragging is the gesture that DOES rewrite the order — the whole
+        // reason clicking must not. Asserted against the store, exactly as the
+        // click test asserts the opposite.
+        let mut expected: Vec<MemberId> =
+            order_before.iter().copied().filter(|id| *id != hidden).collect();
+        let target_slot = expected
+            .iter()
+            .position(|id| *id == target.0)
+            .expect("the drop target is still a member");
+        expected.insert(target_slot, hidden);
+        let order_after = stored_order(solution_id, cx);
+        assert_ne!(
+            order_after, order_before,
+            "a drag must persist a new member order"
+        );
+        assert_eq!(
+            order_after, expected,
+            "the dragged member takes the drop target's slot in the stored order"
+        );
     }
 
-    /// Problem 2: picking a hidden project from the menu has to actually put it
-    /// on the strip. Asserted by painting a frame afterwards and looking for
-    /// its tab, not by reading the member order back out of the store.
+    /// The correction: picking a project from the `…` menu ACTIVATES it and
+    /// does nothing else. It used to also move that project to the head of the
+    /// member order, so a navigation gesture permanently rewrote the tab
+    /// arrangement the user had built.
+    ///
+    /// Both halves are asserted: the picked project is painted (and painted as
+    /// the active one, which is invisible to `debug_bounds` unless the state is
+    /// in the selector), and the stored order is byte-for-byte what it was.
     #[gpui::test]
-    async fn picking_a_hidden_project_from_the_menu_puts_it_on_the_strip(
+    async fn picking_a_project_from_the_overflow_menu_activates_it_without_reordering(
         cx: &mut TestAppContext,
     ) {
-        let (member_ids, _solution_id, cx) = strip_at_width(px(660.), cx).await;
-        let painted = painted_tabs(&member_ids, cx);
+        let (member_ids, solution_id, cx) = strip_at_width(px(660.), cx).await;
+        let painted_before = painted_tabs(&member_ids, cx);
         let hidden = *member_ids
-            .get(painted.len())
+            .get(painted_before.len())
             .expect("some project must have spilled");
+        let order_before = stored_order(solution_id, cx);
+        let previously_active = cx
+            .update(|_window, cx| SolutionStore::global(cx).read(cx).active_member(solution_id))
+            .expect("the strip seeds an active member on its first frame");
         assert!(
             bounds_of(cx, project_tab_selector(hidden)).is_none(),
             "precondition: the project starts off the strip"
         );
+        assert!(
+            bounds_of(cx, project_tab_state_selector(previously_active, true)).is_some(),
+            "precondition: some other project starts out highlighted"
+        );
 
-        let more = cx
-            .debug_bounds("ICON-Ellipsis")
-            .expect("the overflow button must paint");
-        cx.simulate_mouse_move(more.center(), None, gpui::Modifiers::none());
-        cx.run_until_parked();
-        cx.simulate_click(more.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-
+        open_overflow_menu(cx);
         let row = bounds_of(cx, overflow_menu_row_selector(hidden, false))
             .expect("the hidden project must have a row in the menu");
         cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
@@ -1080,16 +1307,38 @@ mod paint_tests {
         redraw(cx);
 
         assert!(
-            bounds_of(cx, project_tab_selector(hidden)).is_some(),
-            "picking a project from the overflow menu must bring it onto the strip"
+            bounds_of(cx, project_tab_state_selector(hidden, true)).is_some(),
+            "picking a project must bring it onto the strip AND highlight it"
         );
-        // …and it is first, which is the placement that makes that promise
-        // hold at any strip width.
+        assert!(
+            bounds_of(cx, project_tab_state_selector(hidden, false)).is_none(),
+            "…and it must not also paint as an ordinary tab"
+        );
+        assert!(
+            bounds_of(cx, project_tab_state_selector(previously_active, false)).is_some(),
+            "the project we came from must still be painted, unhighlighted"
+        );
+        assert!(
+            bounds_of(cx, project_tab_state_selector(previously_active, true)).is_none(),
+            "…and must not still claim to be active"
+        );
+
+        // The regression that shipped in cc05f6ef6d: selecting rewrote the
+        // order. It must now be untouched, exactly.
+        assert_eq!(
+            stored_order(solution_id, cx),
+            order_before,
+            "selecting a project from the overflow menu must not reorder the \
+             members — dragging is the gesture that reorders"
+        );
+
         let painted = painted_tabs(&member_ids, cx);
+        assert_keeps_relative_order(&painted, &order_before);
         assert_eq!(
             painted.first().map(|(id, _)| *id),
-            Some(hidden),
-            "the picked project must land at the head of the strip"
+            painted_before.first().map(|(id, _)| *id),
+            "the picked project must not be promoted to the head of the strip: \
+             {painted:?}"
         );
     }
 }
