@@ -127,7 +127,7 @@ scrolling — and applies no threshold."** with:
 > - **The row paints every ref and applies no threshold — on one line at rest, wrapped only when
 >   the user asks.** *(Amended twice. It first read "the row never wraps", folding the overflow
 >   into the graph's `+N` chip at `git.log.compact_refs_threshold`; `1a73d7d001` replaced that
->   with an always-wrapped, capped, scrolling row; `<sha>` kept the list and put the wrapping
+>   with an always-wrapped, capped, scrolling row; `acc78db74e` kept the list and put the wrapping
 >   behind an explicit expand. Both amendments are stated rather than quietly overwritten,
 >   because the reasoning that produced each is the reasoning a future reader will re-derive.)*
 >   Two things were wrong with the threshold. A pane whose job is to answer "which branch is this
