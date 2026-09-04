@@ -144,8 +144,33 @@ impl SolutionStore {
 
         // The clone folder is derived from the catalog project's NAME (it used
         // to be derived from the catalog id, which WAS the slug of the name —
-        // same string, different source).
-        let folder = crate::slug::slugify(&cat.name);
+        // same string, different source), by the same rule creation and rename
+        // use.
+        //
+        // Uniquified against the solution's existing member folders but
+        // deliberately NOT against disk: the clone below wipes a stale target
+        // left by a cancelled or failed add, and a disk check would step
+        // around that garbage into `-2` instead of reclaiming it. The
+        // in-memory check is what keeps two *live* members from sharing a
+        // directory — without it the second add's wipe deleted the first
+        // member's checkout.
+        let folder = match crate::folder_name::derive(&cat.name) {
+            Ok(folder) => folder,
+            Err(err) => return cx.background_spawn(async move { Err(anyhow::Error::new(err)) }),
+        };
+        let taken: Vec<String> = sol
+            .members
+            .iter()
+            .filter_map(|m| Some(m.local_path.file_name()?.to_string_lossy().into_owned()))
+            .collect();
+        let Some(folder) = crate::folder_name::uniquify(&folder, |candidate| {
+            !taken.iter().any(|t| t.eq_ignore_ascii_case(candidate))
+        }) else {
+            let cat_name = cat.name;
+            return cx.background_spawn(async move {
+                bail!("no free directory name left for {cat_name}")
+            });
+        };
         let target = sol.root.join(&folder);
         let remote_url = cat.remote_url.clone();
         let default_branch = cat.default_branch.clone();
@@ -373,9 +398,26 @@ impl SolutionStore {
             bail!("empty project name");
         }
         let sol = self.find_solution(solution_id)?;
-        let taken: Vec<String> = sol.members.iter().map(|m| m.name.clone()).collect();
-        let folder = crate::slug::unique_slug(trimmed, &taken);
-        let local_path = sol.root.join(&folder);
+        let folder = crate::folder_name::derive(trimmed)?;
+        // Uniquify against the sibling members' *folders* (not their display
+        // names, which a rename lets drift away from the folder) and against
+        // disk, so a leftover directory is never adopted as a new project.
+        let taken: Vec<crate::rename::TakenFolder> = sol
+            .members
+            .iter()
+            .filter_map(|member| {
+                Some(crate::rename::TakenFolder {
+                    folder: member.local_path.file_name()?.to_string_lossy().into_owned(),
+                    owner: member.name.clone(),
+                })
+            })
+            .collect();
+        let local_path = crate::rename::first_available_folder(&sol.root, &folder, &taken)?;
+        let folder = local_path
+            .file_name()
+            .context("member path has no file name")?
+            .to_string_lossy()
+            .into_owned();
         let position = sol.members.len() as i32;
         std::fs::create_dir_all(&local_path)
             .with_context(|| format!("creating {}", local_path.display()))?;
@@ -842,8 +884,8 @@ mod tests {
         );
         assert_eq!(
             member_path.file_name().and_then(|n| n.to_str()),
-            Some("frontend"),
-            "slug from name"
+            Some("Frontend"),
+            "folder derived from the name, case preserved"
         );
         assert!(
             member_path.join(".git").exists(),

@@ -62,6 +62,42 @@ pub fn ensure_folder_available(
     }
 }
 
+/// The *creation* counterpart of [`ensure_folder_available`]: instead of
+/// failing on a collision it walks the `-2`, `-3`, … ladder and returns the
+/// first free directory. Same availability predicate, different policy —
+/// a rename must land exactly where the user asked (silently moving a
+/// solution's data into `Sawe-2` would be a lie), while a create has nothing
+/// to move and no reason to refuse.
+///
+/// Going through `ensure_folder_available` is the point: the old creation
+/// path uniquified against the in-memory folder list only, so a leftover
+/// directory on disk (or the compat symlink of an unfinished rename) was
+/// silently *adopted* by `create_dir_all` as the new solution's root.
+pub fn first_available_folder(
+    parent: &Path,
+    folder: &str,
+    taken: &[TakenFolder],
+) -> Result<PathBuf, FolderNameError> {
+    let mut first_error = None;
+    let picked = crate::folder_name::uniquify(folder, |candidate| {
+        match ensure_folder_available(parent, candidate, None, taken) {
+            Ok(_) => true,
+            Err(err) => {
+                first_error.get_or_insert(err);
+                false
+            }
+        }
+    });
+    match picked {
+        Some(candidate) => Ok(parent.join(candidate)),
+        // Unreachable short of a thousand collisions; report the reason the
+        // name the user actually asked for was refused.
+        None => Err(first_error.unwrap_or(FolderNameError::ExistsOnDisk {
+            folder: folder.to_string(),
+        })),
+    }
+}
+
 #[cfg(unix)]
 fn is_same_dir(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;

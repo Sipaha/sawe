@@ -95,9 +95,10 @@ mod tests {
             })
             .expect("create");
 
-        // `create_solution` appends the slug ("s") to the base, so the actual
-        // root is `dir/s`. A path under that root must match.
-        let worktree_path = dir.path().join("s").join("some-project");
+        // `create_solution` appends the derived folder ("S" — case is
+        // preserved) to the base, so the actual root is `dir/S`. A path under
+        // that root must match.
+        let worktree_path = dir.path().join("S").join("some-project");
         let result = store.read_with(cx, |store, _cx| {
             active_solution_for_paths(store, [worktree_path])
         });

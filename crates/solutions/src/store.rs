@@ -337,7 +337,7 @@ impl SolutionStore {
         let id = SolutionId(self.next_id_without_db());
         let root = std::env::temp_dir()
             .join("spke-test-solutions")
-            .join(crate::slug::slugify(name));
+            .join(crate::folder_name::derive(name).unwrap_or_else(|_| format!("solution-{}", id.0)));
         self.config.solutions.push(Solution {
             id,
             name: name.into(),
@@ -373,7 +373,7 @@ impl SolutionStore {
             .catalog
             .iter()
             .find(|c| c.id == cid)
-            .map(|c| crate::slug::slugify(&c.name))
+            .and_then(|c| crate::folder_name::derive(&c.name).ok())
             .unwrap_or_else(|| format!("member-{}", member_id.0));
         let sol = self
             .config
@@ -1181,8 +1181,9 @@ mod tests {
         });
         let paths = store.read_with(cx, |s, _| s.paths_for_open(sol_id).expect("paths"));
         assert_eq!(paths.len(), 2);
-        assert!(paths[0].ends_with("a"));
-        assert!(paths[1].ends_with("b"));
+        // Folder names preserve the catalog name's case (`folder_name::derive`).
+        assert!(paths[0].ends_with("A"), "{:?}", paths[0]);
+        assert!(paths[1].ends_with("B"), "{:?}", paths[1]);
     }
 
     #[gpui::test]

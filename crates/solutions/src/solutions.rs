@@ -18,7 +18,6 @@ mod persistence;
 pub mod remote_url;
 pub mod rename;
 mod settings;
-mod slug;
 mod store;
 mod tabs_snapshot;
 

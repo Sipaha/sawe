@@ -95,9 +95,9 @@ async fn rename_solution_and_member_over_mcp_survives_a_restart(cx: &mut TestApp
         .pointer("/result/structuredContent/solution_id")
         .and_then(Value::as_i64)
         .unwrap_or_else(|| panic!("solutions.create returned: {resp}"));
-    // `solutions.create` slugifies the folder name (`old-solution`); only a
-    // *rename* derives it with `folder_name::derive` (`New-Solution`). Read the
-    // root back rather than assuming either spelling.
+    // `solutions.create` and `solutions.rename` now derive the folder with the
+    // same `folder_name::derive` rule (`Old-Solution` -> `New-Solution`). Read
+    // the root back rather than assuming the spelling.
     let resp = call_tool(
         &mut stream,
         11,

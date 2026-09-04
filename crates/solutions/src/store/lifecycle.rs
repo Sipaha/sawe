@@ -1,6 +1,5 @@
 use super::{SolutionStore, SolutionStoreEvent};
 use crate::model::{Solution, SolutionId};
-use crate::slug::unique_slug;
 use anyhow::{Context as _, Result, bail};
 use gpui::Context;
 use std::path::PathBuf;
@@ -12,17 +11,23 @@ impl SolutionStore {
         root_base: PathBuf,
         cx: &mut gpui::Context<Self>,
     ) -> Result<SolutionId> {
-        // The folder name is derived from the display name; the id is a counter
-        // that has nothing to do with either, so uniquify against the folder
-        // names already in use rather than against ids.
-        let taken: Vec<String> = self
+        // The folder name is derived from the display name by the same rule a
+        // rename uses; the id is a counter that has nothing to do with either,
+        // so uniquify against the folder names already in use rather than
+        // against ids.
+        let folder = crate::folder_name::derive(name)?;
+        let taken: Vec<crate::rename::TakenFolder> = self
             .config
             .solutions
             .iter()
-            .filter_map(|s| s.root.file_name().map(|f| f.to_string_lossy().into_owned()))
+            .filter_map(|solution| {
+                Some(crate::rename::TakenFolder {
+                    folder: solution.root.file_name()?.to_string_lossy().into_owned(),
+                    owner: solution.name.clone(),
+                })
+            })
             .collect();
-        let folder = unique_slug(name, &taken);
-        let root = root_base.join(&folder);
+        let root = crate::rename::first_available_folder(&root_base, &folder, &taken)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
 
         let id = match self.db.as_ref() {
@@ -354,6 +359,108 @@ impl SolutionStore {
 
 #[cfg(test)]
 mod tests {
+    /// The regression this whole change exists for: the folder a Solution
+    /// gets when it is *created* with a name must be the folder it gets when
+    /// it is *renamed* to that same name. Before unification, creation went
+    /// through `slug::slugify` and rename through `folder_name::derive`, so
+    /// `UpdateDeps` created `updatedeps` and renamed to `Update-Deps`.
+    #[gpui::test]
+    async fn create_and_rename_derive_the_same_folder(cx: &mut gpui::TestAppContext) {
+        for name in [
+            "UpdateDeps",
+            "ECOSRecords",
+            "ecosV2",
+            "Мой Проект",
+            "update-deps",
+            "Sawe",
+        ] {
+            let created_base = tempfile::tempdir().expect("tempdir");
+            let renamed_base = tempfile::tempdir().expect("tempdir");
+
+            // Two stores, because the collision check spans every solution in
+            // one store regardless of which parent directory it lives in —
+            // the created one would otherwise be "taken" for the rename.
+            let creating = cx.update(|cx| {
+                crate::store::SolutionStore::for_test(
+                    created_base.path().join("solutions.json"),
+                    cx,
+                )
+            });
+            let renaming = cx.update(|cx| {
+                crate::store::SolutionStore::for_test(
+                    renamed_base.path().join("solutions.json"),
+                    cx,
+                )
+            });
+
+            let created = creating
+                .update(cx, |store, cx| {
+                    store.create_solution(name, created_base.path().to_path_buf(), cx)
+                })
+                .expect("create");
+            let seeded = renaming
+                .update(cx, |store, cx| {
+                    store.create_solution("Seed", renamed_base.path().to_path_buf(), cx)
+                })
+                .expect("create seed");
+            renaming
+                .update(cx, |store, cx| store.rename_solution(seeded, name, cx))
+                .expect("rename");
+
+            let folder_of = |store: &crate::store::SolutionStore, id| {
+                store
+                    .find_solution(id)
+                    .expect("solution")
+                    .root
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+            };
+            let created_folder = creating.read_with(cx, |store, _| folder_of(store, created));
+            let renamed_folder = renaming.read_with(cx, |store, _| folder_of(store, seeded));
+            assert_eq!(
+                created_folder, renamed_folder,
+                "create and rename disagree on the folder for {name:?}"
+            );
+            assert_eq!(
+                created_folder.as_deref(),
+                crate::folder_name::derive(name).ok().as_deref(),
+                "neither path used the unified rule for {name:?}"
+            );
+        }
+    }
+
+    /// Creation must never adopt a directory that is already there — the old
+    /// path uniquified against the in-memory solution list only and then
+    /// `create_dir_all`'d straight into whatever was on disk.
+    #[gpui::test]
+    async fn create_solution_steps_around_an_existing_directory(cx: &mut gpui::TestAppContext) {
+        let base = tempfile::tempdir().expect("tempdir");
+        let squatter = base.path().join("Sawe");
+        std::fs::create_dir_all(&squatter).expect("mkdir");
+        std::fs::write(squatter.join("keep.txt"), b"pre-existing").expect("write");
+
+        let store = cx.update(|cx| {
+            crate::store::SolutionStore::for_test(base.path().join("solutions.json"), cx)
+        });
+        let id = store
+            .update(cx, |store, cx| {
+                store.create_solution("Sawe", base.path().to_path_buf(), cx)
+            })
+            .expect("create");
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.find_solution(id).expect("solution").root,
+                base.path().join("Sawe-2")
+            );
+        });
+        assert_eq!(
+            std::fs::read(squatter.join("keep.txt")).expect("read"),
+            b"pre-existing",
+            "the pre-existing directory must be untouched"
+        );
+    }
+
     #[gpui::test]
     async fn rename_solution_moves_the_root_and_rewrites_member_paths(
         cx: &mut gpui::TestAppContext,
