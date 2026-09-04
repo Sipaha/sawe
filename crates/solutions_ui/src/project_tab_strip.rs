@@ -145,20 +145,38 @@ impl Render for ProjectTabStrip {
                     .collect()
             })
             .unwrap_or_default();
-        let pending_tabs = store
-            .read(cx)
-            .pending_adds_for(solution_id)
+        // One borrow of the store covers both the pending list and the
+        // per-entry "is the catalog row unreferenced" answer that decides
+        // whether the failed tab may offer to delete it — the answer depends
+        // on every Solution's members, not just this one's.
+        let (pending, catalog_removable): (Vec<solutions::PendingAddView>, Vec<bool>) = {
+            let store = store.read(cx);
+            let pending: Vec<solutions::PendingAddView> = store
+                .pending_adds_for(solution_id)
+                .into_iter()
+                .filter(|p| !landed.contains(&p.catalog_id))
+                .collect();
+            let removable = pending
+                .iter()
+                .map(|p| store.catalog_project_is_unreferenced(p.catalog_id))
+                .collect();
+            (pending, removable)
+        };
+        let pending_tabs: Vec<PendingProjectTab> = pending
             .into_iter()
-            .filter(|p| !landed.contains(&p.catalog_id))
-            .map(|p| {
+            .zip(catalog_removable)
+            .map(|(p, catalog_removable)| {
                 PendingProjectTab::new(
+                    solution_id,
                     p.catalog_id,
                     SharedString::from(p.catalog_name),
                     SharedString::from(p.stage),
                     p.percent,
                     p.error.map(SharedString::from),
+                    catalog_removable,
                 )
-            });
+            })
+            .collect();
 
         let (visible, overflow): (&[(MemberId, SharedString)], &[(MemberId, SharedString)]) =
             if members.len() > MAX_VISIBLE_TABS {

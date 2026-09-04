@@ -13,6 +13,13 @@ impl SolutionStore {
         default_branch: Option<String>,
         cx: &mut gpui::Context<Self>,
     ) -> Result<CatalogId> {
+        // Normalise BEFORE the uniqueness checks, so `…/repo#` and `…/repo`
+        // collide the way the user expects rather than minting a second row
+        // whose only difference is the typo. A rejected URL never reaches the
+        // catalog, which is the whole point: a bad remote used to be found
+        // ~30s later by a failing clone, leaving a junk row behind.
+        let normalized_remote = crate::remote_url::normalize_remote_url(remote_url)?;
+        let remote_url = normalized_remote.as_str();
         // Both the name and the remote are unique keys, and a clash on either is
         // an ERROR, never a silent fixup. Registering a repo that was already in
         // the catalog used to mint a second row with a `-2` slug: the picker then
@@ -78,6 +85,13 @@ impl SolutionStore {
         new_remote_url: Option<String>,
         cx: &mut gpui::Context<Self>,
     ) -> Result<()> {
+        // Edit is the path a user takes to FIX a bad URL, so it gets the same
+        // normalisation as the add path — otherwise the typo they came here to
+        // correct could simply be retyped, and Edit would be a back door around
+        // the entry-time check.
+        let new_remote_url = new_remote_url
+            .map(|url| crate::remote_url::normalize_remote_url(&url))
+            .transpose()?;
         // Same uniqueness contract as `add_catalog_project` — otherwise Edit is
         // a back door that recreates exactly the duplicates the add path now
         // refuses. Checked against every OTHER entry (a no-op self-rename must

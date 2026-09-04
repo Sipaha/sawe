@@ -419,7 +419,18 @@ impl SolutionStore {
             .filter(|((s, _), _)| *s == sol_id)
             .map(|((_, cat_id), entry)| PendingAddView {
                 catalog_id: *cat_id,
-                catalog_name: entry.catalog_name.clone(),
+                // Prefer the catalog's CURRENT name over the one snapshotted
+                // when the add started: the recovery path for a failed add is
+                // "edit the project, then retry", and a tab still labelled with
+                // the old typo'd name after the edit reads as a second stuck
+                // entry. Falls back to the snapshot if the catalog row is gone.
+                catalog_name: self
+                    .config
+                    .catalog
+                    .iter()
+                    .find(|c| c.id == *cat_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| entry.catalog_name.clone()),
                 stage: entry.stage.clone(),
                 percent: entry.percent,
                 error: entry.error.clone(),
@@ -467,6 +478,40 @@ impl SolutionStore {
             self.in_flight_adds.remove(&key);
             cx.notify();
         }
+    }
+
+    /// Clear a failed add and immediately start it again. Retrying is a
+    /// separate entry point rather than "dismiss, then add from the picker"
+    /// because [`add_member`] refuses to start while an entry for the same
+    /// `(solution, catalog)` is still in the map — a caller that forgot the
+    /// clear would get a confusing "add already in progress" instead of a
+    /// retry. Errors (unknown ids, a genuinely in-flight entry) surface
+    /// through the returned task exactly as they do for `add_member`.
+    pub fn retry_failed_add(
+        &mut self,
+        solution_id: SolutionId,
+        catalog_id: CatalogId,
+        cache_root: PathBuf,
+        cx: &mut gpui::Context<Self>,
+    ) -> Task<Result<()>> {
+        self.clear_failed_add(solution_id, catalog_id, cx);
+        self.add_member(solution_id, catalog_id, cache_root, cx)
+    }
+
+    /// Is this catalog project safe to delete along with a failed add — i.e.
+    /// is the failed clone the ONLY thing referencing it? Drives whether the
+    /// failed tab offers "Remove Project from Catalog": a project that other
+    /// Solutions already cloned is not junk left over from this typo, and
+    /// [`remove_catalog_project`](Self::remove_catalog_project) would refuse
+    /// it anyway.
+    pub fn catalog_project_is_unreferenced(&self, catalog_id: CatalogId) -> bool {
+        self.config.catalog.iter().any(|c| c.id == catalog_id)
+            && !self
+                .config
+                .solutions
+                .iter()
+                .flat_map(|s| s.members.iter())
+                .any(|m| m.origin_catalog_id == Some(catalog_id))
     }
 }
 
@@ -596,6 +641,124 @@ mod tests {
         store.update(cx, |s, cx| s.clear_failed_add(sol_id, cat_id, cx));
         let pending = store.read_with(cx, |s, _| s.pending_adds_for(sol_id));
         assert!(pending.is_empty());
+    }
+
+    /// The whole escape path from the reported dead end: a mistyped remote
+    /// fails the clone, the user edits the catalog entry to fix the URL, and
+    /// retries from the failed tab. `retry_failed_add` exists because
+    /// `add_member` refuses to start while the failed entry is still in the
+    /// map, so "just add it again" is not the same thing.
+    #[gpui::test]
+    async fn retry_failed_add_clears_the_failure_and_clones_the_fixed_url(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempdir().expect("tempdir");
+        let bare = test_support::make_bare_with_one_commit(dir.path()).await;
+        let cache_root = dir.path().join("cache");
+        let cfg_path = dir.path().join("solutions.json");
+        let solutions_root = dir.path().join("solutions");
+        std::fs::create_dir_all(&solutions_root).expect("mkdir solutions");
+
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+        let bogus = dir.path().join("does-not-exist.git");
+        let cat_id = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project("Typo", bogus.to_str().expect("path str"), None, cx)
+            })
+            .expect("add catalog");
+        let sol_id = store
+            .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
+            .expect("create solution");
+
+        let task = store.update(cx, |s, cx| {
+            s.add_member(sol_id, cat_id, cache_root.clone(), cx)
+        });
+        assert!(task.await.is_err(), "the bogus remote must fail to clone");
+        assert!(
+            store.read_with(cx, |s, _| s.pending_adds_for(sol_id))[0]
+                .error
+                .is_some(),
+            "the failure must be parked as a row for the user to act on"
+        );
+
+        store
+            .update(cx, |s, cx| {
+                s.edit_catalog_project(
+                    cat_id,
+                    Some("Fixed".into()),
+                    Some("master".into()),
+                    Some(bare.to_string_lossy().into_owned()),
+                    cx,
+                )
+            })
+            .expect("edit catalog");
+        // The parked row picks up the corrected name straight away, so the
+        // user is not staring at the typo they just fixed.
+        assert_eq!(
+            store.read_with(cx, |s, _| s.pending_adds_for(sol_id))[0].catalog_name,
+            "Fixed",
+        );
+
+        let task = store.update(cx, |s, cx| {
+            s.retry_failed_add(sol_id, cat_id, cache_root, cx)
+        });
+        task.await.expect("retry must clone the fixed URL");
+
+        assert!(
+            store
+                .read_with(cx, |s, _| s.pending_adds_for(sol_id))
+                .is_empty(),
+            "a successful retry leaves no pending row behind"
+        );
+        let target = store.read_with(cx, |s, _| {
+            s.find_solution(sol_id).expect("solution").members[0]
+                .local_path
+                .clone()
+        });
+        assert!(target.join(".git").exists(), "the member must be cloned");
+    }
+
+    /// Drives whether the failed tab offers "Remove Project from Catalog".
+    #[gpui::test]
+    async fn catalog_project_is_unreferenced_flips_once_a_member_exists(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempdir().expect("tempdir");
+        let bare = test_support::make_bare_with_one_commit(dir.path()).await;
+        let cache_root = dir.path().join("cache");
+        let cfg_path = dir.path().join("solutions.json");
+        let solutions_root = dir.path().join("solutions");
+        std::fs::create_dir_all(&solutions_root).expect("mkdir solutions");
+
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+        let cat_id = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project(
+                    "Bare",
+                    bare.to_str().expect("path str"),
+                    Some("master".into()),
+                    cx,
+                )
+            })
+            .expect("add catalog");
+        let sol_id = store
+            .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
+            .expect("create solution");
+
+        assert!(
+            store.read_with(cx, |s, _| s.catalog_project_is_unreferenced(cat_id)),
+            "a project nothing has cloned yet is removable"
+        );
+        assert!(
+            !store.read_with(cx, |s, _| s
+                .catalog_project_is_unreferenced(CatalogId(9999))),
+            "an id that is not in the catalog at all is not 'removable'"
+        );
+
+        let task = store.update(cx, |s, cx| s.add_member(sol_id, cat_id, cache_root, cx));
+        task.await.expect("add_member");
+        assert!(
+            !store.read_with(cx, |s, _| s.catalog_project_is_unreferenced(cat_id)),
+            "once a Solution has cloned it, deleting the catalog row is not cleanup"
+        );
     }
 
     #[gpui::test]

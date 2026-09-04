@@ -15,6 +15,7 @@ pub mod migrate;
 mod model;
 pub mod path_migrations;
 mod persistence;
+pub mod remote_url;
 pub mod rename;
 mod settings;
 mod slug;
@@ -33,6 +34,7 @@ pub use member_repository::{
     repositories_under, set_active_member_repository,
 };
 pub use model::{CatalogId, CatalogProject, MemberId, Solution, SolutionId, SolutionMember};
+pub use remote_url::normalize_remote_url;
 pub use settings::{BranchProtectionMember, BranchProtectionSettings, SolutionsSettings};
 pub use store::{
     SolutionStore, SolutionStoreEvent, install_global_for_test,

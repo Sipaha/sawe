@@ -587,6 +587,118 @@ mod tests {
         assert_eq!(count, 1, "no rejected add may have landed a row");
     }
 
+    /// The reported bug: a stray `#` on a pasted https URL sailed into the
+    /// catalog and was only found ~30s later by a failing clone, leaving a
+    /// junk row behind. Both sides: the typo is folded away, and a URL that
+    /// cannot be fixed automatically is refused before any row is written.
+    #[gpui::test]
+    async fn add_catalog_project_normalizes_or_refuses_the_url(cx: &mut TestAppContext) {
+        let dir = tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("solutions.json");
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+
+        let id = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project(
+                    "Hazelcast",
+                    "  https://gitlab.example.ru/group/citeck-hazelcast#  ",
+                    None,
+                    cx,
+                )
+            })
+            .expect("the fragment is a typo, not a rejection");
+        assert_eq!(
+            store.read_with(cx, |s, _| s
+                .catalog()
+                .iter()
+                .find(|c| c.id == id)
+                .expect("row")
+                .remote_url
+                .clone()),
+            "https://gitlab.example.ru/group/citeck-hazelcast",
+            "the stored remote must be the cleaned-up URL, not what was typed"
+        );
+
+        // …and because it was normalised BEFORE the uniqueness check, retyping
+        // the same typo is now a plain duplicate rather than a second row.
+        let dupe = store.update(cx, |s, cx| {
+            s.add_catalog_project(
+                "Hazelcast Again",
+                "https://gitlab.example.ru/group/citeck-hazelcast#",
+                None,
+                cx,
+            )
+        });
+        assert!(
+            dupe.unwrap_err().to_string().contains("duplicate_remote"),
+            "the typo must collide with the entry it was a typo of"
+        );
+
+        let browse = store.update(cx, |s, cx| {
+            s.add_catalog_project(
+                "Browsed",
+                "https://gitlab.example.ru/group/other/-/tree/main",
+                None,
+                cx,
+            )
+        });
+        let message = browse.unwrap_err().to_string();
+        assert!(message.contains("invalid_remote"), "got: {message}");
+        assert!(
+            message.contains("https://gitlab.example.ru/group/other"),
+            "the refusal must name the clone URL it should have been, got: {message}"
+        );
+
+        assert_eq!(
+            store.read_with(cx, |s, _| s.catalog().len()),
+            1,
+            "no rejected add may leave a row behind"
+        );
+    }
+
+    /// Edit is the path a user takes to FIX a bad URL, so it must not be a
+    /// back door around the entry-time check.
+    #[gpui::test]
+    async fn edit_catalog_project_normalizes_or_refuses_the_url(cx: &mut TestAppContext) {
+        let dir = tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("solutions.json");
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+        let id = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project("Foo", "https://host/g/foo.git", None, cx)
+            })
+            .expect("add foo");
+
+        store
+            .update(cx, |s, cx| {
+                s.edit_catalog_project(id, None, None, Some("https://host/g/bar.git#".into()), cx)
+            })
+            .expect("a fragment is fixed up, not refused");
+        assert_eq!(
+            store.read_with(cx, |s, _| s.catalog()[0].remote_url.clone()),
+            "https://host/g/bar.git"
+        );
+
+        let refused = store.update(cx, |s, cx| {
+            s.edit_catalog_project(
+                id,
+                None,
+                None,
+                Some("https://host/g/bar/blob/main/README.md".into()),
+                cx,
+            )
+        });
+        assert!(
+            refused.unwrap_err().to_string().contains("invalid_remote"),
+            "a browse URL must be refused on edit too"
+        );
+        assert_eq!(
+            store.read_with(cx, |s, _| s.catalog()[0].remote_url.clone()),
+            "https://host/g/bar.git",
+            "a refused edit must leave the entry untouched"
+        );
+    }
+
     #[gpui::test]
     async fn edit_catalog_project_rejects_duplicate_name(cx: &mut TestAppContext) {
         let dir = tempdir().expect("tempdir");
