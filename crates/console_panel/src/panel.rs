@@ -1835,7 +1835,8 @@ mod tests {
     /// The console panel's `+` is terminals and tasks only. "New AI Chat" was
     /// pure duplication of the status-bar session strip's own `+`, and
     /// "Reopen Closed Chat…" moved onto that strip with the sessions it
-    /// recovers (`solution_agent::session_tab_strip::build_plus_menu`).
+    /// recovers (`solution_agent::session_tab_strip::render_reopen_button`,
+    /// a button of its own next to that strip's `+`).
     /// Asserted on the painted tree rather than on the builder's return
     /// value: an entry that stops painting for some other reason is the same
     /// bug to the user.

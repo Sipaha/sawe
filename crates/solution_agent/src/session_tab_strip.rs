@@ -30,21 +30,29 @@
 //! `open_rename_session_modal` for the mechanics; the overflow popover's
 //! rows are `submenu`s (not plain entries) so the same three actions stay
 //! reachable for a tab that has spilled past `MAX_VISIBLE_TABS`. The trailing
-//! `+` creates a session on a plain left click and opens "Reopen Closed
-//! Chat…" on a right click — the reopen picker used to hang off
-//! `ConsolePanel`'s `+`, which no longer offers AI-session entries at all;
-//! see `render_plus_button` for why the strip's `+` and not its tab context
-//! menu is the reopen flow's new home. There is no per-tab close cross — the right-click menu is the only close affordance
-//! (maintainer request, 2026-09-03), which is why that entry comes first.
+//! `+` creates a session on a plain left click, and the history button beside
+//! it opens the "Reopen Closed Chat…" picker — the reopen flow used to hang
+//! off `ConsolePanel`'s `+`, which no longer offers AI-session entries at all;
+//! see `render_reopen_button` for why it is a visible button rather than a
+//! gesture on the `+`. There is no per-tab close cross — the right-click menu
+//! is the only close affordance (maintainer request, 2026-09-03), which is
+//! why that entry comes first.
+//!
+//! The strip closes itself off from the status bar's other left-hand items
+//! with a vertical rule (`render_group_divider`), so the AI-dialog group reads
+//! as one group rather than as the first few of a dozen unrelated widgets.
 
 use std::cell::RefCell;
 
 use gpui::{
-    App, Context, ElementId, Entity, IntoElement, ParentElement, PromptLevel, Render, SharedString,
-    Styled, Subscription, WeakEntity, Window, div,
+    App, Context, ElementId, IntoElement, ParentElement, PromptLevel, Render, SharedString, Styled,
+    Subscription, WeakEntity, Window, div,
 };
 use solutions::{SolutionId, SolutionStore};
-use ui::{ContextMenu, Indicator, PopoverMenu, Tooltip, prelude::*, right_click_menu};
+use ui::{
+    ContextMenu, Divider, DividerColor, Indicator, PopoverMenu, Tooltip, prelude::*,
+    right_click_menu,
+};
 use util::ResultExt as _;
 use workspace::item::ItemHandle;
 use workspace::{HideStatusItem, MultiWorkspace, StatusItemView, Workspace};
@@ -230,61 +238,65 @@ fn open_rename_session_modal(
     });
 }
 
-/// Label of the `+` menu's only entry. A const because the tab-close
-/// confirmation prompt quotes it back to the user: the prompt used to name
-/// "Reopen Closed Chat" *in the console panel*, which stopped being true the
-/// moment the entry moved here, and a plain literal in two files is exactly
-/// how that went stale. Pinned by
+/// The reopen button's tooltip — and, verbatim, the name the tab-close
+/// confirmation prompt quotes back to the user. A const because those are two
+/// files apart: the prompt used to name "Reopen Closed Chat" *in the console
+/// panel*, which stopped being true the moment the flow moved here, and a
+/// plain literal in two places is exactly how that went stale. Pinned by
 /// `the_close_prompt_and_the_tooltip_point_at_the_same_affordance`.
-const REOPEN_ENTRY_LABEL: &str = "Reopen Closed Chat…";
+const REOPEN_TOOLTIP: &str = "Reopen Closed Chat…";
 
-/// The `+` button's tooltip. Names both gestures, because the right click is
-/// otherwise undiscoverable — there is no second icon advertising it (adding
-/// one would put chrome back on a strip that has been losing it).
-const PLUS_TOOLTIP: &str = "New AI Session — right-click for more";
+/// The `+` button's tooltip. Just the action it performs: the reopen flow was
+/// briefly a right-click on this same button, which forced the tooltip to
+/// advertise a gesture; it is a button of its own now (maintainer request,
+/// 2026-09-04 — the gesture was not discoverable), so there is nothing left
+/// for this one to point at.
+const PLUS_TOOLTIP: &str = "New AI Session";
 
-/// The gesture both the tooltip and the close prompt must name, so a reader
-/// of either is told the same thing.
-const REOPEN_GESTURE: &str = "right-click";
+/// `debug_selector` of the rule closing the AI group off from the status
+/// bar's other left-hand items. Shared with the paint test so a rename cannot
+/// leave the test asserting a selector nothing emits.
+const GROUP_DIVIDER_SELECTOR: &str = "SESSION-STRIP-GROUP-DIVIDER";
 
 /// Detail line of the tab-close confirmation prompt. Assembled from the same
-/// consts the `+`'s tooltip and menu entry use, so the promise it makes
-/// cannot drift from the affordance it points at the way its predecessor did
-/// (that one named "Reopen Closed Chat" *in the console panel*, and stayed
-/// wrong for as long as nothing read it). A function, not a literal at the
-/// call site, so the test can read exactly what the user is shown.
+/// const the reopen button's tooltip uses, so the promise it makes cannot
+/// drift from the affordance it points at the way its predecessor did (that
+/// one named "Reopen Closed Chat" *in the console panel*, and stayed wrong
+/// for as long as nothing read it). A function, not a literal at the call
+/// site, so the test can read exactly what the user is shown.
 fn close_prompt_detail() -> String {
     format!(
         "The agent is still working. Closing interrupts the current turn — the tab can be \
-         brought back with \"{REOPEN_ENTRY_LABEL}\": {REOPEN_GESTURE} the session strip's \
-         \"+\" button."
+         brought back with the session strip's \"{REOPEN_TOOLTIP}\" button, next to \"+\"."
     )
 }
 
-/// The `+`'s right-click menu. A free function rather than an inline closure
-/// so a paint test can render exactly the menu the button opens and read its
-/// `MENU_ITEM-*` debug selectors — the entry is the thing under test (it moved
-/// here out of the console panel's `+`), and asserting a predicate instead of
-/// the paint is a known repeat defect in this repo.
+/// The vertical rule that closes the AI-dialog group off from the status
+/// bar's other left-hand items.
 ///
-/// One entry, deliberately: creating a session is the frequent action and
-/// stays on the button's plain left click, so repeating it here would be the
-/// same duplication that put "New AI Chat" in the console panel's `+` in the
-/// first place.
-fn build_plus_menu(
-    solution_id: SolutionId,
-    weak_workspace: Option<WeakEntity<Workspace>>,
-    window: &mut Window,
-    cx: &mut App,
-) -> Entity<ContextMenu> {
-    ContextMenu::build(window, cx, move |menu, _window, _cx| {
-        let weak_workspace = weak_workspace.clone();
-        menu.entry(REOPEN_ENTRY_LABEL, None, move |window, cx| {
-            if let Some(weak_workspace) = weak_workspace.as_ref() {
-                open_reopen_session_modal(weak_workspace, solution_id, window, cx);
-            }
-        })
-    })
+/// Those items — search, LSP, diagnostics, file name, merge conflicts, the
+/// activity indicator — sit to this strip's **right**: `zed::zed`'s
+/// `initialize_workspace` registers the strip first in the left group, and
+/// `StatusBar::render_left_tools` paints left items in registration order. So
+/// the boundary the maintainer asked for ("between the AI tabs/buttons and
+/// the rest of the buttons on the left") is this group's *trailing* edge.
+///
+/// `ui::Divider::vertical()` is `w_px().h_full()`, and `h_full` is inert
+/// anywhere in this strip — no ancestor has a definite height, which is the
+/// same reason the tab pills set `.h(ButtonSize::Default.rems())` explicitly.
+/// Hosting it in a wrapper that *does* carry that height gives the rule the
+/// exact vertical extent of the row's tabs and buttons, so it cannot grow the
+/// status bar. The wrapper also carries the `debug_selector`: `Divider` is a
+/// `RenderOnce` with no `InteractiveElement`, so it cannot carry one itself.
+fn render_group_divider() -> impl IntoElement {
+    div()
+        .debug_selector(|| GROUP_DIVIDER_SELECTOR.into())
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(ButtonSize::Default.rems())
+        .px_1()
+        .child(Divider::vertical().color(DividerColor::Border))
 }
 
 pub struct SessionTabStrip {
@@ -615,32 +627,20 @@ impl SessionTabStrip {
             })
     }
 
-    /// The strip's trailing `+`. A plain left click creates a session — the
-    /// frequent action, kept at one click — while a **right** click opens
-    /// [`build_plus_menu`], which is where "Reopen Closed Chat…" now lives
-    /// (it used to hang off `ConsolePanel`'s `+`, which no longer offers
-    /// AI-session entries at all).
+    /// The strip's trailing `+`: one plain left click creates a session, and
+    /// that is all it does. It briefly also carried "Reopen Closed Chat…" on
+    /// a right click (10120c6a27); the maintainer ruled that undiscoverable
+    /// on 2026-09-04, so the reopen flow became
+    /// [`Self::render_reopen_button`] and the gesture was removed rather than
+    /// kept alongside it — two paths to one action is how the tooltip, the
+    /// menu entry and the close prompt started disagreeing in the first
+    /// place.
     ///
-    /// The `+` and not the per-tab context menu, because the `+` is the only
-    /// affordance on this strip that still paints when the Solution has
-    /// **zero** session tabs — and that is exactly the state a user who just
-    /// closed their last chat is in. A right click also keeps the strip's
-    /// affordance count at one: a second icon next to the `+` would add
-    /// chrome to a strip the maintainer has been stripping chrome off (the
-    /// per-tab close cross went in 0c569d6c95). The tooltip carries the
-    /// right-click hint so it is discoverable without one.
-    ///
-    /// The trigger is the same `IconButton` at the same `IconSize::Small` it
-    /// has always been, so the strip's row height
-    /// (`ButtonSize::Default.rems()`, shared with the tab pills) — and with
-    /// it the status bar's height — is unchanged.
-    fn render_plus_button(
-        &self,
-        solution_id: SolutionId,
-        weak_workspace: Option<WeakEntity<Workspace>>,
-        _cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let button = IconButton::new("session-tab-strip-plus", IconName::Plus)
+    /// Same `IconButton` at the same `IconSize::Small` it has always been, so
+    /// the strip's row height (`ButtonSize::Default.rems()`, shared with the
+    /// tab pills) — and with it the status bar's height — is unchanged.
+    fn render_plus_button(&self, _cx: &Context<Self>) -> impl IntoElement {
+        IconButton::new("session-tab-strip-plus", IconName::Plus)
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(Tooltip::text(PLUS_TOOLTIP))
@@ -652,20 +652,45 @@ impl SessionTabStrip {
                         log::error!("session_tab_strip: console_panel::NewChat unavailable: {err}")
                     }
                 }
-            });
-        // `RightClickMenu::trigger` takes a `FnOnce` but is stored behind an
-        // `Fn`, so the element is handed over through a cell — the same idiom
-        // `render_tab` uses for its own right-click menu.
-        let button_cell = RefCell::new(Some(button.into_any_element()));
-        right_click_menu("session-tab-strip-plus-menu")
-            .trigger(move |_, _, _| {
-                button_cell
-                    .borrow_mut()
-                    .take()
-                    .unwrap_or_else(|| div().into_any_element())
             })
-            .menu(move |window, cx| {
-                build_plus_menu(solution_id, weak_workspace.clone(), window, cx)
+    }
+
+    /// The reopen-a-closed-chat button, immediately right of the `+`.
+    ///
+    /// It sits on the strip rather than in any menu because the state it
+    /// serves is "I just closed my last chat": the Solution then has **zero**
+    /// session tabs, so a per-tab context menu has nothing to hang off, and
+    /// the strip's own buttons are the only thing still painted. It is a
+    /// visible icon rather than a gesture on the `+` because the gesture was
+    /// not discoverable — the tooltip was the only thing advertising it, and
+    /// a tooltip you have to already hover the right pixel to read is not an
+    /// affordance.
+    ///
+    /// `HistoryRerun` (a clock with a counter-clockwise arrow) is the fork's
+    /// existing "go back through history" glyph — `file_finder` marks history
+    /// matches with it, `git_ui::undo_modal` heads its list with it, and the
+    /// debugger's back-in-history button *is* it. A second `+`-family icon
+    /// would have read as "new", which is the neighbouring button's job.
+    ///
+    /// Sized exactly like the `+`, so it adds width to the strip and nothing
+    /// to the status bar's height.
+    fn render_reopen_button(
+        &self,
+        solution_id: SolutionId,
+        weak_workspace: Option<WeakEntity<Workspace>>,
+        _cx: &Context<Self>,
+    ) -> impl IntoElement {
+        IconButton::new("session-tab-strip-reopen", IconName::HistoryRerun)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text(REOPEN_TOOLTIP))
+            .on_click(move |_, window, cx| {
+                let Some(weak_workspace) = weak_workspace.as_ref() else {
+                    // No hosting workspace means the strip is painted outside
+                    // a Solution window, where there is no session to reopen.
+                    return;
+                };
+                open_reopen_session_modal(weak_workspace, solution_id, window, cx);
             })
     }
 }
@@ -818,16 +843,31 @@ impl Render for SessionTabStrip {
                 })
         });
 
-        div()
+        let group = div()
             .id("session-tab-strip")
             .flex()
             .items_center()
+            .min_w_0()
             .h_full()
             .gap_1()
             .overflow_x_scroll()
             .children(tabs)
             .when_some(overflow_popover, |this, popover| this.child(popover))
-            .child(self.render_plus_button(solution_id, weak_workspace.clone(), cx))
+            .child(self.render_plus_button(cx))
+            .child(self.render_reopen_button(solution_id, weak_workspace.clone(), cx));
+
+        // The rule is a sibling of the scrolling group, not its last child:
+        // inside `overflow_x_scroll` it would slide out of view as soon as
+        // enough tabs were open, and a boundary marker that scrolls away is
+        // worse than none. It only exists on this branch — the early return
+        // above (no active Solution, so nothing AI-related paints at all)
+        // leaves a bare `div`, because a rule with an empty group on one side
+        // is chrome rather than structure.
+        h_flex()
+            .h_full()
+            .min_w_0()
+            .child(group)
+            .child(render_group_divider())
             .into_any_element()
     }
 }
@@ -1129,10 +1169,15 @@ mod tests {
     /// Boot a Solution whose worktree the strip can resolve (a live
     /// `MultiWorkspace`, so the real `Render` reaches past its
     /// `active_solution_id` early return) with **zero** sessions, and paint
-    /// it. Returns the dispatch counter and the visual context.
+    /// it. Returns the `NewChat` dispatch counter, the `Workspace` the strip
+    /// hosts its modals on, and the visual context.
     async fn paint_strip_with_no_tabs(
         cx: &mut TestAppContext,
-    ) -> (Rc<RefCell<usize>>, gpui::VisualTestContext) {
+    ) -> (
+        Rc<RefCell<usize>>,
+        Entity<Workspace>,
+        gpui::VisualTestContext,
+    ) {
         let (_solution_id, tmp, project) =
             crate::store::tests::setup_solution_and_project(cx).await;
         cx.update(|cx| {
@@ -1146,6 +1191,10 @@ mod tests {
         let multi_workspace = multi_workspace
             .root(cx)
             .expect("the multi-workspace window's root");
+        // The strip hosts the reopen picker on the Solution's active
+        // workspace (`workspace_weak`), so that is where a click's modal
+        // lands — not in the harness window the strip itself paints in.
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
         let new_chat_dispatches = Rc::new(RefCell::new(0usize));
         let window = cx.add_window(|_window, cx| StripHarness {
@@ -1169,29 +1218,28 @@ mod tests {
         );
         // The tempdir backs the Solution's on-disk root for the whole test.
         std::mem::forget(tmp);
-        (new_chat_dispatches, visual)
+        (new_chat_dispatches, workspace, visual)
     }
 
     /// The `+`'s plain left click must still create a session in one click —
-    /// and must NOT open the right-click menu. Both sides asserted: a
-    /// regression that swapped the gestures would otherwise show up as only
-    /// one of "no dispatch" or "a menu appeared".
+    /// and must NOT open the reopen picker, which now lives on the button
+    /// immediately next to it. Both sides asserted: a regression that wired
+    /// the two buttons to each other's handler would otherwise show up as
+    /// only one of "no dispatch" or "a modal appeared".
     #[gpui::test]
-    async fn left_clicking_the_plus_creates_a_session_and_opens_no_menu(cx: &mut TestAppContext) {
-        let (new_chat_dispatches, mut cx) = paint_strip_with_no_tabs(cx).await;
+    async fn left_clicking_the_plus_creates_a_session_and_opens_no_picker(cx: &mut TestAppContext) {
+        let (new_chat_dispatches, workspace, mut cx) = paint_strip_with_no_tabs(cx).await;
 
         let plus = cx
             .debug_bounds("ICON-Plus")
             .expect("the strip's `+` must paint even with no session tabs");
-        // Height guard: the `+` gained a right-click menu wrapper, and must
-        // still be the same `ButtonSize::Default` row the tab pills use —
-        // growing it would grow the status bar.
+        // Height guard: the `+` must stay the same `ButtonSize::Default` row
+        // the tab pills and the new reopen button use — growing it would grow
+        // the status bar.
         assert_eq!(plus.size.height, px(22.));
 
-        // Rest the cursor on the button first, mirroring the right-click
-        // test below (where `RightClickMenu`'s `is_hovered` gate makes it
-        // mandatory) and the `windows.click_at`/`hover_at` pairing the MCP
-        // layer uses.
+        // Rest the cursor on the button first — the `windows.click_at` /
+        // `hover_at` pairing the MCP layer uses, and what a real pointer does.
         cx.simulate_event(gpui::MouseMoveEvent {
             position: plus.center(),
             pressed_button: None,
@@ -1205,32 +1253,65 @@ mod tests {
             1,
             "a plain left click on `+` must dispatch console_panel::NewChat"
         );
-        assert!(
-            cx.debug_bounds("MENU_ITEM-Reopen Closed Chat…").is_none(),
-            "a left click must not open the `+`'s menu"
+        assert_eq!(
+            workspace.read_with(&cx, |workspace, cx| workspace.active_modal_kind(cx)),
+            None,
+            "a left click on `+` must not open the reopen picker"
         );
     }
 
-    /// The reopen-a-closed-chat flow moved off `ConsolePanel`'s `+` popover
-    /// onto this strip's `+`, and the case that decided *where* on the strip
-    /// is a Solution with **zero** session tabs: a user who just closed their
-    /// last chat has no tab left to right-click, so a tab context menu would
-    /// have stranded the recovery path. Right-clicks the painted `+` and
-    /// reads the menu that actually painted — and checks the left-click
-    /// action did not also fire, since the two gestures share one element.
+    /// The reopen-a-closed-chat flow is a **visible button** next to the `+`
+    /// (maintainer request, 2026-09-04 — as a right-click gesture on the `+`
+    /// it was not discoverable). The case that decides where it can live is a
+    /// Solution with **zero** session tabs: a user who just closed their last
+    /// chat has no tab to right-click and no tab strip to read, so the
+    /// recovery path has to be one of the buttons that still paints. Clicks
+    /// the button that actually painted and checks the picker opened — and
+    /// that the neighbouring `+` did not also fire.
     #[gpui::test]
-    async fn right_clicking_the_plus_reopens_a_closed_chat_even_with_no_tabs(
-        cx: &mut TestAppContext,
-    ) {
-        let (new_chat_dispatches, mut cx) = paint_strip_with_no_tabs(cx).await;
+    async fn the_reopen_button_opens_the_picker_even_with_no_tabs(cx: &mut TestAppContext) {
+        let (new_chat_dispatches, workspace, mut cx) = paint_strip_with_no_tabs(cx).await;
+
+        let reopen = cx
+            .debug_bounds("ICON-HistoryRerun")
+            .expect("the strip's reopen button must paint even with no session tabs");
+        // Same row metric as the `+` and the tab pills: this button is new, so
+        // it is the one that could silently make the status bar taller.
+        assert_eq!(reopen.size.height, px(22.));
+
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: reopen.center(),
+            pressed_button: None,
+            modifiers: gpui::Modifiers::default(),
+        });
+        cx.simulate_click(reopen.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(&cx, |workspace, cx| workspace.active_modal_kind(cx)),
+            Some("ReopenSession"),
+            "clicking the reopen button must open the closed-chat picker"
+        );
+        assert_eq!(
+            *new_chat_dispatches.borrow(),
+            0,
+            "the reopen button must not also create a session"
+        );
+    }
+
+    /// The right-click gesture the `+` briefly carried (10120c6a27) is gone:
+    /// the visible button above replaced it, and leaving both would be two
+    /// paths to one action. Asserted on the painted tree, since "the menu
+    /// builder was deleted" is exactly the kind of predicate that stays true
+    /// while some other wrapper keeps opening a menu.
+    #[gpui::test]
+    async fn right_clicking_the_plus_opens_nothing(cx: &mut TestAppContext) {
+        let (new_chat_dispatches, workspace, mut cx) = paint_strip_with_no_tabs(cx).await;
 
         let plus = cx
             .debug_bounds("ICON-Plus")
             .expect("the strip's `+` must paint even with no session tabs");
         let position = plus.center();
-        // `RightClickMenu` only fires for a mouse-down over an already-hovered
-        // hitbox (`hitbox_id.is_hovered`), so rest the cursor first — the same
-        // reason `windows.drag_at` hovers its start point.
         cx.simulate_event(gpui::MouseMoveEvent {
             position,
             pressed_button: None,
@@ -1245,36 +1326,107 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // `debug_bounds` takes a `'static` selector; leaking a test-local
+        // string keeps this derived from `REOPEN_TOOLTIP` instead of retyping
+        // the label the const exists to stop people retyping.
+        let reopen_menu_item: &'static str = format!("MENU_ITEM-{REOPEN_TOOLTIP}").leak();
         assert!(
-            cx.debug_bounds("MENU_ITEM-Reopen Closed Chat…").is_some(),
-            "a right click on `+` must offer the reopen picker with no tabs open"
+            cx.debug_bounds(reopen_menu_item).is_none(),
+            "the `+` must no longer carry a reopen menu — the button next to it is the one path"
+        );
+        assert_eq!(
+            workspace.read_with(&cx, |workspace, cx| workspace.active_modal_kind(cx)),
+            None,
+            "a right click on `+` must not open the picker either"
         );
         assert_eq!(
             *new_chat_dispatches.borrow(),
             0,
-            "a right click must not also create a session"
+            "a right click must not create a session"
         );
     }
 
-    /// The close prompt promises a way to get the tab back; the tooltip is
-    /// where the user learns that gesture exists. Its predecessor pointed at
-    /// "Reopen Closed Chat" *in the console panel* and went stale the moment
-    /// the entry moved, so both strings are now assembled from the same
-    /// consts and this pins that they agree.
+    /// The close prompt promises a way to get the tab back; the reopen
+    /// button's tooltip is what the user reads on the thing that keeps that
+    /// promise. Its predecessor pointed at "Reopen Closed Chat" *in the
+    /// console panel* and went stale the moment the flow moved, so both
+    /// strings come off one const and this pins that they still agree — and
+    /// that neither still advertises the right-click gesture that no longer
+    /// exists.
     #[test]
     fn the_close_prompt_and_the_tooltip_point_at_the_same_affordance() {
         let detail = close_prompt_detail();
         assert!(
-            detail.contains(REOPEN_ENTRY_LABEL),
-            "the close prompt must name the menu entry verbatim: {detail}"
+            detail.contains(REOPEN_TOOLTIP),
+            "the close prompt must name the reopen button verbatim: {detail}"
         );
         assert!(
-            detail.contains(REOPEN_GESTURE) && PLUS_TOOLTIP.contains(REOPEN_GESTURE),
-            "the prompt and the tooltip must name the same gesture: {detail} / {PLUS_TOOLTIP}"
+            !detail.contains("right-click") && !PLUS_TOOLTIP.contains("right-click"),
+            "the reopen right-click on `+` is gone; neither string may still promise it: \
+             {detail} / {PLUS_TOOLTIP}"
+        );
+        assert_ne!(
+            PLUS_TOOLTIP, REOPEN_TOOLTIP,
+            "two buttons, two names — a shared tooltip would make them indistinguishable"
         );
         assert!(
             !detail.contains("console panel"),
             "the console panel no longer hosts this flow: {detail}"
+        );
+    }
+
+    /// The group rule paints beside a live AI group. Paired with
+    /// [`the_group_divider_is_absent_when_the_strip_has_no_ai_group`] below,
+    /// which covers the other side.
+    #[gpui::test]
+    async fn the_group_divider_paints_beside_the_ai_group(cx: &mut TestAppContext) {
+        let (_new_chat_dispatches, _workspace, mut cx) = paint_strip_with_no_tabs(cx).await;
+
+        let plus = cx
+            .debug_bounds("ICON-Plus")
+            .expect("the AI group must have content for the rule to close off");
+        let divider = cx
+            .debug_bounds(GROUP_DIVIDER_SELECTOR)
+            .expect("the rule separating the AI group from the rest of the left items must paint");
+        assert!(
+            divider.origin.x > plus.origin.x,
+            "the rule closes the group's *trailing* edge: the strip is the leftmost status-bar \
+             item, so the other left-hand items are to its right ({divider:?} vs {plus:?})"
+        );
+        // The rule is exactly as tall as the row it bounds, so it cannot be
+        // what makes the status bar grow.
+        assert_eq!(divider.size.height, px(22.));
+    }
+
+    /// …and it is absent when there is no AI group at all. "Empty" here is
+    /// the strip's `active_solution_id` early return — outside a Solution
+    /// window nothing AI-related paints, and a rule with nothing on one side
+    /// is chrome rather than structure. The `+` assertion is what makes this
+    /// meaningful: it proves the empty branch is the one that rendered.
+    #[gpui::test]
+    async fn the_group_divider_is_absent_when_the_strip_has_no_ai_group(cx: &mut TestAppContext) {
+        let (_solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+        drop(project);
+
+        // No `MultiWorkspace`, so `active_solution_id` is `None` and `render`
+        // takes its early return.
+        let (_strip, cx) = cx.add_window_view(|_window, cx| SessionTabStrip::new(None, cx));
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ICON-Plus").is_none()
+                && cx.debug_bounds("ICON-HistoryRerun").is_none(),
+            "this test is only meaningful when the AI group painted nothing"
+        );
+        assert!(
+            cx.debug_bounds(GROUP_DIVIDER_SELECTOR).is_none(),
+            "the rule must not paint with an empty group on one side of it"
         );
     }
 
