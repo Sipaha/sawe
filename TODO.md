@@ -243,7 +243,7 @@ gutter, or the dead layer and its doc comments are gone.
 
 ### C12. The Uncommitted-Changes view re-targets by emptying itself first
 `GitGraphPanel` no longer blanks on a project switch — it holds the previous project's graph
-until the incoming `git log` can paint (commit `<this one>`). Its neighbour on the same event
+until the incoming `git log` can paint (commit `262b06ab6b`). Its neighbour on the same event
 does the opposite: `ProjectDiff`'s `ActiveMemberChanged` subscription
 (`crates/git_ui/src/project_diff.rs:693`) calls `BranchDiff::set_repo`
 (`crates/project/src/git_store/branch_diff.rs:117`), which drops `tree_diff`, clears both
