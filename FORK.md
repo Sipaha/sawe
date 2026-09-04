@@ -107,6 +107,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/git_ui/src/git_panel/commit_tab.rs` | **New (decision #100).** The git panel's Commit tab: `CommitSelection` / `CommitSelectionSource`, the `CommitTabState` the panel hangs off an `Option`, the two guarded background loads (`Repository::show` / `load_commit_diff`), and the changed-files tree / message split / markdown style / client-side +/− fold **relocated verbatim** from the git graph's deleted commit-details sidebar. A private `mod`: `git_panel.rs` re-exports only `CommitSelection` and `CommitSelectionSource`, which is all `git_graph` needs to name. | `git_ui` / `git_graph` |
 | `crates/git_ui/src/commit_refs.rs` | **New (decision #139).** The ref-decoration chip both the git graph's rows and the git panel's Commit tab paint: `ref_chip` (with the S-SOL-PRT lock glyph and the HEAD check), `overflow_chip`, `strip_ref_namespace`, `is_head_ref`, `tag_names`, `accent_color`. Lives in `git_ui` because `git_graph` depends on it and never the reverse. |  `git_ui` / `git_graph` |
 | `crates/ui/src/components/chip.rs` | **(decision #139)** Registers a `CHIP-{label}` debug selector (a no-op outside `test` / `test-support`), the way `IconButton` registers `ICON-{icon}`, so a paint test can assert which chips a row put on screen. | `git_ui` (Commit tab ref chips) |
+| `crates/ui/src/components/data_table.rs` | **First local change (decision #148).** The two *lazy* paint paths (`Table::uniform_list`, `Table::variable_row_height_list`) route their per-frame closure output through `coerce_rendered_row`, which logs + `debug_assert_eq!`s + pads/truncates to the column count instead of letting `TableRow::from_vec`'s `panic!` abort the process during layout. `TableRow::from_vec` itself is untouched. | `git_graph` (log table) |
 | `crates/git/Cargo.toml` | `test-support` feature now also activates `db/test-support` — the `db::static_connection!` macro's expansion references `db::open_test_db`, which only exists under that feature; without it, crates that enable `git/test-support` but not `db/test-support` fail to compile. Pre-existing latent workspace bug, fixed in-tree. **(2026-08-31)** It now also activates `gpui/test-support`, for the same reason one level along: `CommitDataReader::for_test`, gated `#[cfg(any(test, feature = "test-support"))]`, calls `BackgroundExecutor::simulate_random_delay`, which exists only under that feature — so `git_hosting_providers`, whose dev-deps enable `git/test-support`, could not compile its own test targets (E0599). Fixed in `git`'s feature list rather than in the consumer, so the arm and the method it needs stay in lockstep for every consumer. See `docs/findings/2026-08-31-cfg-universes-and-the-warning-gate.md`. | build / upstream-fix |
 | `crates/git/src/repository.rs` | Adds `branches_containing` / `tags_containing` / `tags_pointing_at` / `load_commit_against_parent` methods on `GitRepository` (default no-op impls + real impls in `RealGitRepository`) for the S-DET commit-view metadata surface. Adds the module-level `parse_ref_name_lines` parser shared by all three ref queries (named `parse_contains_output` until `--points-at` joined them). Also: `load_commit_template` special-cases `ErrorKind::NotFound` on the `git config --get` spawn — treats "cwd disappeared" (e.g. an open repo whose underlying directory was removed mid-session via `git worktree remove`) as "no template available" with a debug log, instead of propagating ENOENT through to `detach_and_log_err`. | `git_ui` (S-DET) / general robustness |
 | `crates/git/src/blame.rs` | `Blame::for_path_at_revision` + a `BlameTarget` enum, so `git blame` can annotate a commit-ish instead of only working-tree content piped on stdin (decision #58). **(decision #135)** Also `display_author` + `UNKNOWN_AUTHOR`, the shortened author name the blame gutter draws — it lives here because both the renderer (`git_ui`) and the gutter's width reservation (`editor`) have to agree on it. | `editor` (diff-pane blame, blame gutter width) / `git_ui` (blame gutter) |
@@ -3137,39 +3138,60 @@ do not confuse the two installs in `zed.rs`: the band entity itself is set at
 it is resolvable from the panel's deferred arm; only the band's *utility occupant*
 (`set_solution_band_utility_item`) is installed after `ConsolePanel::load` is awaited.
 
-### 142. AI-session affordances live on the status-bar session strip; its `+` is left-click new, right-click reopen
+### 142. AI-session affordances live on the status-bar session strip, and the AI group is fenced off from the rest of it
 
 What: `ConsolePanel`'s `+` popover is terminal/task only ("New Terminal" · separator ·
 "Spawn Task…"). The AI entries it used to carry are gone: "New AI Chat" was pure duplication of
 the session strip's own `+` (both dispatch `console_panel::NewChat`), and "Reopen Closed Chat…"
-moved to the **right-click menu** of `SessionTabStrip`'s trailing `+`, whose plain left click
-still creates a session in one click. `ConsolePanel::open_reopen_session_modal` became the free
-function `solution_agent::reopen_session_modal::open_reopen_session_modal`, next to the modal it
-opens, and `console_panel` no longer names `solution_agent::reopen_session_modal` at all.
+moved to the session strip. `ConsolePanel::open_reopen_session_modal` became the free function
+`solution_agent::reopen_session_modal::open_reopen_session_modal`, next to the modal it opens,
+and `console_panel` no longer names `solution_agent::reopen_session_modal` at all.
 
-Why the `+` and not the tab context menu: the reopen picker is the only entry point to
+Why it belongs beside the `+` and not on a tab: the reopen picker is the only entry point to
 `SolutionAgentStore::list_closed_sessions`, and the state that needs it is "I just closed my last
-chat" — a tab context menu disappears with the tabs, while the `+` is the one strip affordance
-that still paints when the Solution has zero session tabs. Why a right click and not a second
-icon: the strip is deliberately *losing* chrome (the per-tab close cross went in the same batch,
-#138), and creating a session is the frequent action that has to stay one click while reopening
-is rare and can afford a gesture.
+chat" — a tab context menu disappears with the tabs, while the `+` end of the strip still paints
+when the Solution has zero session tabs.
 
-Because a hidden gesture is only as good as what advertises it, the tooltip, the menu entry and
-the tab-close confirmation prompt are assembled from the same three consts
-(`REOPEN_ENTRY_LABEL` / `PLUS_TOOLTIP` / `REOPEN_GESTURE`) and the prompt's text is a function
-(`close_prompt_detail()`) rather than a literal at the call site, so a test can read exactly what
-the user is shown. That is not decoration: the prompt previously pointed at "Reopen Closed Chat…"
-*in the console panel* and stayed wrong for as long as nothing read it.
+**Amended 2026-09-04 (`c9c9540eab`): it is a visible button, not a right-click gesture.** The
+first attempt (`10120c6a27`) put the picker on the `+`'s right-click menu, on the reasoning that
+the strip is deliberately *losing* chrome (the per-tab close cross went in the same batch, #138)
+and a rare action can afford a gesture. That reasoning was wrong in the way hidden gestures
+usually are — «мы еще потеряли кнопку для восстановления закрытых сессий» — so the picker is now
+its own `IconButton` (`render_reopen_button`, `IconName::HistoryRerun` — the fork's existing
+"back through history" glyph, already used by `file_finder`, `git_ui::undo_modal`, the debugger
+and `tasks_ui`; a second `+`-family icon would have read as "new", which is the button next to
+it) and the `+`'s right-click menu is **deleted** rather than kept as a second path to the same
+action. Two paths to one action is precisely what let the tooltip, the menu entry and the close
+prompt drift apart before. `REOPEN_ENTRY_LABEL` is now `REOPEN_TOOLTIP` (same string, now the
+button's tooltip) and `REOPEN_GESTURE` is gone — there is no gesture left to name.
+
+The wording is still assembled rather than retyped: `PLUS_TOOLTIP`, `REOPEN_TOOLTIP` and the
+tab-close confirmation prompt — a function, `close_prompt_detail()`, not a literal at the call
+site — are built from the same consts, so a test can read exactly what the user is shown. That is
+not decoration: the prompt once pointed at "Reopen Closed Chat…" *in the console panel* and
+stayed wrong for as long as nothing read it.
+
+**The AI group is fenced off with a rule** (`render_group_divider`, `Divider::vertical()` in
+`DividerColor::Border`), on the group's **trailing** edge — «разделитель вертикальный … между
+вкладками и кнопками относящимися к ИИ диалогам и остальными кнопками слева». There is nothing to
+the strip's left: `initialize_workspace` calls `add_left_item(session_tab_strip, …)` first and
+`StatusBar::render_left_tools` paints `left_items` in registration order, so the strip is the
+leftmost status-bar item and search / LSP / diagnostics sit to its right. The rule is a **sibling**
+of the tab row, not its last child: that row is `overflow_x_scroll()`, and a boundary marker that
+scrolls out of view with the tabs is worse than none. Its wrapper carries the
+`ButtonSize::Default.rems()` height, because `Divider::vertical()` is `w_px().h_full()` and
+`h_full` is inert in this strip — no ancestor of a status-bar item has a definite height (#138).
+Known and correct: `render_left_tools` is `min_w_0().overflow_x_hidden()`, so at the group's
+widest the rule clips before the search button does — a boundary is worth less than a destination.
 
 How to apply: an AI-session affordance belongs on the strip, not in the console panel — the two
-surfaces are different objects that happened to share a `+`. If you move or rename this entry,
-move the const, not a copy of the string. And note the mechanics of the two gestures on one
-element: `ui::right_click_menu` fires on `MouseDownEvent { button: Right }` only when its hitbox
-is **already hovered**, so a test must rest the cursor before sending the event; and
-`Window::dispatch_action` routes to the *focused* dispatch node and bubbles up from there, so a
-harness asserting the left click's dispatch must focus its root or the action goes nowhere the
-handler can see it.
+surfaces are different objects that happened to share a `+`. If you move or rename one, move the
+const, not a copy of the string. Two testing mechanics survive from the deleted gesture and still
+apply to the tab context menus: `ui::right_click_menu` fires on `MouseDownEvent { button: Right }`
+only when its hitbox is **already hovered**, so a test must rest the cursor before sending the
+event; and `Window::dispatch_action` routes to the *focused* dispatch node and bubbles up from
+there, so a harness asserting a click's dispatch must focus its root or the action goes nowhere
+the handler can see it.
 
 ### 143. Double-clicking a commit summons the git panel, and summoning is `open_panel`, not a dock-open check
 
@@ -3222,3 +3244,233 @@ a focus assertion back *inside the same update*, before the next draw: GPUI drop
 handle is not in the rendered dispatch tree, and `GitPanel`'s is not while the Commit tab is up,
 so an accidental `open_panel` → `focus_panel` slip is repaired by the following frame and
 invisible to anything that looks after it.
+
+### 144. A failed project add is recoverable from its own ghost tab, and a bad remote URL is refused before the clone
+
+What: when `add_member` fails, the project strip keeps a muted ghost tab with a warning glyph
+(`PendingProjectTab`). That tab now has a right-click menu — `Cancel Clone` while the clone is
+still in flight; `Retry Clone` / `Edit Project…` / `Dismiss` / `Remove Project from Catalog` once
+it has failed — and separately, `SolutionStore::{add,edit}_catalog_project` normalise and
+sanity-check the remote URL through `solutions::normalize_remote_url` before anything is written.
+
+The state this fixes was a dead end in the literal sense: the failed add parks a *pending entry*,
+not a member, and the three store methods that could clear it (`clear_failed_add`,
+`cancel_add_member`) or restart it had **no callers at all** — the ghost tab rendered a bare
+`div()` with a tooltip. `retry_failed_add` is new rather than "dismiss, then add again from the
+picker", because `add_member` refuses to start while an entry for the same `(solution, catalog)`
+is parked ("add already in progress"), so a caller that forgot the clear would get a confusing
+error instead of a retry.
+
+Why right-click and not a `×` or a retry button on the tab: this fork has been *removing* per-tab
+affordances in favour of the context menu (#138, #142), and an error tab is not different enough
+to reverse that. The discoverability cost is paid in the tooltip instead — `Tooltip::with_meta`
+adds a second line naming the gesture — which costs no pixels in the strip.
+
+**The catalog row is deliberately not rolled back.** A failed clone in one Solution is not
+evidence the project is junk (the catalog is shared across Solutions), the usual recovery is
+"fix the URL, then retry" and that needs the row to still exist, and silently deleting a row the
+user just asked for is the hidden magic `add_catalog_project`'s own comment rejects. So both
+outcomes are offered explicitly, one click each: `Dismiss` drops the failed entry only;
+`Remove Project from Catalog` drops it *and* deletes the catalog entry, and is rendered only when
+`catalog_project_is_unreferenced(catalog_id)` — a project other Solutions already use is not
+leftover from this typo, and `remove_catalog_project` would refuse it anyway.
+
+**The URL check lives at the store's choke point**, not in the modal: `add_catalog_project` and
+`edit_catalog_project` both call it, so the two modals *and* the `catalog.add_project` /
+`catalog.edit_project` MCP tools are covered by one call site, and edit cannot become a back door
+around the check. It runs **before** the uniqueness checks, so `…/repo#` now collides with
+`…/repo` instead of minting a second row. What it does:
+
+- **Normalises silently** only what is unambiguous — outer whitespace, and a URL *fragment*
+  (`#`, `#L42`) on URL-shaped input, since git has no use for one in any transport it supports.
+  The trailing `#` of a mis-copied browser URL is what started this.
+- **Refuses**, tagged `invalid_remote:` (stripped for humans by `humanize_catalog_error`, which
+  peels the same way it does for `duplicate_name` / `duplicate_remote`): empty input, control
+  characters, a space inside URL-shaped input, a bare `#`, and a forge **browse** URL
+  (`…/-/tree/main`, `…/blob/…`) — refused rather than rewritten, with a message that names the
+  clone URL it should have been.
+- **Leaves alone**, deliberately and documented in the module header: no scheme allow-list (a
+  bare filesystem path is a legitimate remote — the crate's own tests clone from a temp dir, and
+  a `C:\…` path must not be read as scp-like `host:path`), no host or reachability probe (that
+  is what the clone is for), `?query`, trailing `/` and `.git` (`same_remote` already folds
+  those).
+
+How to apply: two knock-ons in `AddCatalogProjectModal` are the shape of bug to expect from a
+validator added at the bottom. The Name auto-fill derives from the **normalised** URL and derives
+nothing at all from a URL the store would refuse — otherwise the typo becomes the project's
+*name*, where nothing would ever remove it. And because Name can now legitimately stay empty,
+`confirm` checks the URL **before** the empty-name guard; with the old order, Enter on a browse
+URL was a silent no-op. Both are pinned by tests, because both were introduced and then caught in
+a live probe rather than reasoned about.
+
+### 145. One folder-name derivation for creation, rename and members — case- and script-preserving, camelCase-splitting
+
+What: every on-disk folder name comes from `solutions::folder_name::derive(display_name)`.
+It NFC-normalises, drops control and illegal characters, collapses whitespace runs to one `-`,
+inserts a `-` at each camelCase/PascalCase boundary, trims `.`/space/`-` off both edges, cuts to
+`MAX_FOLDER_NAME_BYTES` (255) on a character boundary, and rejects an empty result or a Windows
+device name (`FolderNameError`). Case and script survive: `UpdateDeps` → `Update-Deps`,
+`Мой Проект` → `Мой-Проект`, `ECOSRecords` → `ECOS-Records`, `ecosV2` → `ecos-V2` (letter→digit is
+never a boundary, digit→upper is).
+
+Why it is one function: it used to be two. Creation went through an ASCII-lowercasing
+`slug::slugify` and only *rename* went through `folder_name::derive`, so `UpdateDeps` created
+`updatedeps` and renaming it to its own name **moved the directory**; a Cyrillic name created
+`repo-{hash}` because nothing ASCII survived; and `Sawe` and `sawe` collapsed onto one folder.
+`slug.rs` is deleted — after the three production callers moved to `derive`, `slugify` and
+`unique_slug` had no callers left. (The other `slugify`s in the repo — `agent_skills`,
+`run_config::file_format`, `util::markdown`, `channel_store` — are unrelated functions that share
+a name.)
+
+**Collisions: one predicate, two policies.** `rename::ensure_folder_available` is the single
+availability check — DB-owned names case-insensitively, a real directory on disk, and the compat
+symlink an unfinished rename leaves (#52). A **rename** calls it directly and *fails*: a rename
+moves live data, and silently landing in `Sawe-2` after the user typed `Sawe` would be a lie
+about where their Solution now is. A **creation** calls `rename::first_available_folder`, which
+walks a `-2`, `-3`, … ladder over that same predicate (`folder_name::uniquify`, bounded at
+`MAX_UNIQUIFY_ATTEMPTS` so a predicate that always answers "taken" cannot spin; it shortens the
+base to make room for the suffix rather than truncating afterwards, which would defeat the
+uniquification at the byte cap). The maintainer chose that split explicitly — «давай как при
+переименовании».
+
+That closed two real holes rather than just tidying one: the old `unique_slug` uniquified against
+the **in-memory** folder list and then `create_dir_all`'d, so a leftover directory (or an
+unfinished rename's symlink) was silently *adopted* as a new Solution's root; and
+`add_member_from_catalog` had **no dedupe at all**, so two catalog projects whose names derived to
+the same folder meant the second add's "wipe the stale target" step deleted the first member's
+checkout.
+
+How to apply: `add_member_from_catalog` remains the deliberate exception — it uniquifies against
+sibling members' folder names but **not** against disk, because the clone step wipes a stale
+target left by a cancelled or failed add and a disk check would step around that garbage into
+`-2` instead of reclaiming it. And **existing directories are not migrated**: `Solution.root` and
+`SolutionMember.local_path` are stored columns, every consumer reads the stored value, and there
+is no runtime re-derivation anywhere (the nearest thing, `claude_native::worktree_hook`, builds
+its path from `repo_root.file_name()` — the real directory name — and the per-solution MCP socket
+directory is keyed by the numeric `solution_id`). So a folder created under the old rule keeps
+working; only a rename moves it.
+
+### 146. The project tab strip fits tabs to a measured width, and its overflow menu is a drag source
+
+What: `ProjectTabStrip` decides how many tabs to paint from the width it was actually given, not
+from a count. `MAX_VISIBLE_TABS = 6` is deleted; a `canvas` over the strip's own box records
+`measured_bounds`, each tab's natural width comes from its shaped label through
+`project_tab::tab_width_for_label`, and `fit_count` takes tabs greedily out of the measured width
+minus the ghost tabs, the `+` cell, the rule and the `…` button — subtracting the `…` only when
+something actually spills, and never returning zero (a strip narrower than one tab shows one and
+scrolls).
+
+The old cap was not a bad budget, it was **no budget**: nothing in the strip ever looked at a
+width, so the count was identical at 1920px and at 1000px. Measured in an isolated probe with a
+12-member Solution, six tabs occupied ~745px of a 1920px row and ~790px — 41% of the row — sat
+blank while six projects hid behind the `…`. Compounding it, `ProjectToolbar` mounted the strip as
+a **content-sized** child next to a separate `flex_1` spacer, so the strip could not have measured
+its budget even if it had wanted to.
+
+Two structural facts make the fix safe, and both are the reason to keep it this shape:
+
+- **The strip is now the toolbar's `flex_1().min_w_0()` child and the trailing widgets are
+  `flex_none()`.** The measure→decide loop (the `cx.defer(notify)` pattern from
+  `docs/findings/2026-08-17-gpui-draw-phase-invalidation.md`, guarded on the bounds having
+  changed) cannot oscillate *because* a `flex_1` box's width does not depend on its content — the
+  measured quantity is independent of the decision it drives. Make the strip content-sized again
+  and that guarantee is gone. Making the trailing cluster `flex_none` also fixed a second,
+  pre-existing bug: below ~1050px the git widget, run-config strip and dock toggles used to be
+  pushed off the right edge entirely.
+- **A drag can start inside a `ContextMenu` and survive the menu's dismissal**, because
+  `active_drag` lives on the `App`, not in the menu's element tree. That is what makes "drag a
+  project out of the `…` menu onto the strip" work at all, and it needed no change to
+  `ui::ContextMenu`. The only mechanical requirement is that the row be a `custom_entry` rather
+  than a `toggleable_entry`, since the latter offers nowhere to hang `on_drag`; the row hand-builds
+  what `toggleable_entry` would have drawn.
+
+The menu's rows also mark the active project with the standard `IconName::Check` in
+`Color::Accent` that this fork's other `ContextMenu` lists use, kept in the tree and made
+`invisible()` when inactive so labels stay aligned. Not hypothetical: `solutions.set_active_member`
+(or opening a file in a hidden member) activates a project without touching the order, which
+before this left no tab highlighted anywhere in the window. Clicking a row additionally promotes
+that project to the front of the member order (`promote_to_front`) — the coarse version of the
+drag, for when the user only wants it on the strip.
+
+How to apply: assert this against painted geometry, never against a width literal — the tests
+compare `fit_count`'s prediction with what a real frame painted, which is what catches the drift
+this arrangement exists to prevent (a tab styled with a different padding than the budget
+assumes). Note the strip needs **two** draws in a test: one to measure its box, one to render the
+split that measurement decided.
+
+### 147. A project switch holds the previous git graph until the incoming log can paint
+
+What: `GitGraphPanel` builds the incoming `GitGraph` immediately — its `git log` starts at the
+same instant it used to — but keeps painting the *outgoing* graph until the incoming one settles
+(`GraphViewEvent::LoadSettled` / `GitGraph::load_settled`), capped at `STALE_GRAPH_HOLD` (400ms).
+
+The bug was not a one-frame clear and not a slow `git log`: the panel dropped the old entity and
+installed a rowless new one in the same effect cycle, so every frame until the first commits
+arrived painted the graph's "Loading" placeholder. Measured in an isolated probe with
+instrumented timestamps: ~144ms and **three painted frames** switching to a 79,531-commit
+repository with a cold log cache, ~36ms and one frame on a 30-commit one. A warm cache does not
+blank at all — `Repository::graph_data` memoises per `(source, order, args, paths)` — but the
+cache is evicted on `HeadChanged` / `BranchListChanged` / `TagListChanged` and after a push
+rescan, which is why it reads as "every time" in daily use.
+
+Chosen over a placeholder or a spinner because the wait is 40–150ms: at that length a flash of
+*something else* is still a flash, and 150ms of dimming is more visual noise than the bug. It also
+matches what the git panel's Changes list already does (`update_visible_entries` swaps atomically
+after a debounce), so the two neighbours now behave alike.
+
+"Keep the old rows" is exactly how this becomes a worse bug, so three guards are load-bearing:
+
+- **A failed switch does not keep the old history.** `LoadSettled` is emitted for `CountUpdated`,
+  `FullyLoaded` *and* `LoadingError`, so an erroring log replaces the previous project's commits
+  with its own error state rather than leaving them on screen looking current.
+- **The hold is bounded.** Past `STALE_GRAPH_HOLD` the panel shows the incoming graph's honest
+  "Loading" state — a hung `git log` or a repository removed mid-switch must not leave another
+  project's history up indefinitely.
+- **Nothing that used to be instant is delayed.** A warm log installs synchronously (answered
+  from the repository's cache via `GitGraph::load_settled`, not from the view's own rows, which a
+  never-rendered view does not have yet), as do "no repository at all" and the first graph in a
+  panel with nothing on screen to protect. Switching back mid-hold cancels the wait rather than
+  promoting a graph the user has navigated away from.
+
+How to apply: the assertions must read the painted tree, not `panel.active_repo_id` — the *old*
+code re-pointed the panel correctly and painted nothing while doing it, so a predicate test would
+have passed throughout. Making the intermediate state observable at all needed a harness
+primitive: `FakeFs::block_graph_load` / `release_graph_load` park the fake `git log` on a channel
+so `run_until_parked` draws the frame **without** resolving the load. Without it every load
+resolves inside the same `run_until_parked` that starts it and there is no intermediate frame to
+assert on. The same-shaped question for `ProjectDiff` is open and unmeasured — `TODO.md` C12.
+
+### 148. A lazily-rendered table row's arity is a contract, and breaking it aborts the editor into a crash loop
+
+What: the git graph's log table declares its column count once (`LOG_COLUMN_COUNT`) and builds
+every row — the header, the synthetic *Local Changes* row, the missing-commit fallback and the
+real commit row — through `log_table_row(cells: [AnyElement; LOG_COLUMN_COUNT])`. Because that
+takes a fixed-size **array**, a branch that emits the wrong number of cells is a compile error at
+the call site.
+
+Why it needs a contract rather than a fix: the synthetic row emitted four cells into a
+three-column table, `TableRow::from_vec`'s length check is an un-gated `panic!`, and the check
+runs inside `uniform_list`'s per-frame measure — so the first frame after the Pencil toggle
+aborted the process. Two of the three row branches had the bug, because the header, the
+`Table::new` arity, both fraction arrays and each row branch hard-coded the number independently,
+with **no shared declaration anywhere**. Deleting the stray cells would have left the next branch
+free to repeat it.
+
+**The crash loop is the part that makes this more than a panic.** `with_local_changes` is
+serialized with the file-history item, so the editor aborted again on every relaunch — confirmed
+2/2, recoverable only by wiping the runtime directory. That is the property to look for whenever a
+serialized flag changes what a row builder emits; `file_history_options.show_inline_diff` is a v1
+stub today and is the one to re-audit when inline-diff rendering lands, because it will then have
+exactly this shape.
+
+How to apply: `TableRow::from_vec`'s panic was deliberately **left alone** — its callers build
+rows eagerly at a site they control, where a panic is a usable stack trace pointing at the bug.
+What changed in `crates/ui` is narrower: the two *lazy* paint paths (`Table::uniform_list`,
+`Table::variable_row_height_list`) route their per-frame closure output through
+`coerce_rendered_row`, which logs, `debug_assert_eq!`s and then pads or truncates to the column
+count. Those closures run during layout, every frame, on data the table cannot validate when it
+is built — the one place where an arity bug is unreachable by construction-site review, fatal in
+release, and unrecoverable without deleting the user's runtime dir. Note what that does and does
+not buy: `debug_assert_eq!` is live in dev and test builds, so a **debug** editor still aborts
+(deliberately — dev builds should be loud), and it is the release editor that gets the crash-loop
+protection.

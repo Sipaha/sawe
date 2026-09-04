@@ -266,6 +266,30 @@ until the new one is complete — the same shape the graph now has.
 *Done when:* a measurement says whether the Changes view blanks on a member switch, and if it
 does, `refresh` swaps excerpts instead of emptying and refilling.
 
+### C13. No UI can edit or delete a catalog project that was added successfully
+`EditCatalogProject` and `DeleteCatalogProject` are registered workspace actions
+(`crates/solutions_ui/src/modals.rs`) whose modals are written and working. `EditCatalogProject`
+has exactly **one** dispatch site — the failed-add ghost tab's right-click menu (decision #144,
+`crates/solutions_ui/src/project_tab.rs`) — and `DeleteCatalogProject` has **none**: the ghost
+tab's "Remove Project from Catalog" calls `SolutionStore::remove_catalog_project` directly. Both
+doc comments still describe surfaces from before the Solutions panel was retired (decision #27),
+which took the general entry points with it: `EditCatalogProject`'s says "the failed in-flight add
+row in the Solutions panel" — half true, since that row now lives in the project strip —
+and `DeleteCatalogProject`'s says "the trash icon on a Catalog row", which exists nowhere.
+
+Consequence: a project added successfully whose remote URL later needs changing — the repository
+moved, the group was renamed, the URL was right at the time — cannot be edited or removed from
+anywhere in the UI. The only way to reach the edit modal is to make an add fail first, which is
+absurd as a workflow and impossible once the project already has a member in this Solution.
+
+*Done when:* there is a catalog-management surface that dispatches both actions, with
+`DeleteCatalogProject`'s existing cascade confirmation doing the work it was written for. Note
+that `AddProjectPicker` is **not** that surface as it stands, and the reason is the interesting
+part: it filters out any catalog project that is already a member of the current Solution
+(`crates/solutions_ui/src/add_project_picker.rs`, `!already_member.contains(&catalog_project.id)`),
+which is exactly the project whose URL you would want to fix. Hanging a menu off its rows would
+reach every catalog project *except* the ones already in use here.
+
 ---
 
 ## D. Tooling gaps
