@@ -1618,6 +1618,88 @@ async fn reset_context_swaps_acp_thread_without_bumping_count(cx: &mut TestAppCo
     });
 }
 
+/// `/clear` (and `/compact`, which swaps the thread the same way) closes the
+/// PRE-reset acp session, killing the subprocess every async `Agent` teammate
+/// was a child of. Those children never get a `stop_reason`, so unless the swap
+/// itself marks them killed they keep `is_messageable()` true forever: the
+/// teammate pill paints Live, the supervisor skips every tick on
+/// `has_live_background_work`, and the stuck-session watchdog stays shielded
+/// until the 1h stale backstop. Before the fix `set_acp_thread` only marked them
+/// on a `None` swap (the reconnect cold-ize), so this path leaked them.
+#[gpui::test]
+async fn reset_context_kills_the_orphaned_background_agents(cx: &mut TestAppContext) {
+    let (session_id, _old_thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("agent-orphaned-by-clear");
+    let parent_toolu = SharedString::from("toolu_clear_1");
+    let teammate = crate::stream::StreamId::Teammate(parent_toolu.clone());
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, cx| {
+            s.set_entries(
+                vec![crate::session_entry::SessionEntry {
+                    created_ms: 0,
+                    mod_seq: 0,
+                    subagent_id: Some(parent_toolu.clone()),
+                    kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Message(
+                            "streaming".to_string(),
+                        )],
+                    },
+                }],
+                cx,
+            );
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: PathBuf::new(),
+                    registered_at: chrono::Utc::now(),
+                    latest: None,
+                    last_offset: 0,
+                    parent_tool_use_id: Some(parent_toolu.clone()),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+            assert!(
+                s.background_agents.values().any(|a| a.is_messageable()),
+                "teammate counts as live background work before the reset"
+            );
+            assert!(s.streams.contains_key(&teammate), "teammate stream is live");
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.reset_context(session_id, cx))
+    })
+    .await
+    .expect("reset_context");
+
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                s.background_agents
+                    .get(&bg_id)
+                    .expect("agent still tracked")
+                    .killed,
+                "the thread swap orphaned the agent — it must be marked killed"
+            );
+            assert!(
+                !s.background_agents.values().any(|a| a.is_messageable()),
+                "has_live_background_work must be false after the swap"
+            );
+        });
+    });
+}
+
 #[gpui::test]
 async fn late_send_error_is_dropped_when_session_was_reset(cx: &mut TestAppContext) {
     // Race regression guard: `/clear` (reset_context) swapping the
@@ -1708,6 +1790,106 @@ async fn late_send_error_is_dropped_when_session_was_reset(cx: &mut TestAppConte
             );
         });
     });
+}
+
+/// The lost-`Stopped` recovery in `send_message_blocks` must be scoped to the
+/// turn that spawned it. `AcpThreadEvent::Stopped` is handled BEFORE the send
+/// task's own continuation runs, and its idle-flush starts the queued turn 2
+/// synchronously — on the same acp session, so the pre-existing
+/// `acp_session_id` guard does not catch it. Without a turn identity, turn 1's
+/// continuation sees "still Running" and force-flips the LIVE turn 2 to Idle
+/// (GC'ing its streams, emitting a bogus state change, and letting the next
+/// send bypass the queue and cancel it).
+#[gpui::test]
+async fn lost_stopped_recovery_does_not_flip_the_next_turn_to_idle(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+
+    // Unbounded so turn 2's prompt can park on the same gate after turn 1's
+    // release, rather than inheriting a closed channel and erroring out.
+    let (prompt_gate_tx, prompt_gate_rx) = async_channel::unbounded::<()>();
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::with_prompt_gate(
+                    connect_count.clone(),
+                    PromptGate(prompt_gate_rx),
+                )),
+            );
+        });
+    });
+
+    let session_id = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.create_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .await
+        .expect("create_session");
+
+    // Turn 1 parks on the gate. Hold the task: dropping it cancels the very
+    // continuation this test is about.
+    let turn_one = cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.send_message(session_id, "one".into(), cx)
+        })
+    });
+    cx.executor().run_until_parked();
+
+    // Typed while turn 1 runs ⇒ queued, and therefore flushed as turn 2 by the
+    // `Stopped` handler the moment turn 1 ends.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.send_message(session_id, "two".into(), cx)
+        })
+    })
+    .await
+    .expect("enqueue follow-up");
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
+        session.read_with(cx, |s, _| {
+            assert_eq!(
+                s.pending_messages.len(),
+                1,
+                "follow-up was queued, not sent"
+            );
+        });
+    });
+
+    prompt_gate_tx.send(()).await.expect("release turn 1");
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let session = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap();
+        session.read_with(cx, |s, _| {
+            assert!(
+                s.pending_messages.is_empty(),
+                "the queue was flushed as turn 2"
+            );
+            assert!(
+                matches!(s.state, SessionState::Running { .. }),
+                "turn 2 is live and must stay Running; turn 1's lost-Stopped \
+                 recovery must not force it Idle, got {:?}",
+                s.state
+            );
+        });
+    });
+
+    prompt_gate_tx.close();
+    drop(prompt_gate_tx);
+    let _ = turn_one.await;
+    cx.executor().run_until_parked();
 }
 
 /// `EntriesRemoved` covers thread-local truncation; the `cleared` arm

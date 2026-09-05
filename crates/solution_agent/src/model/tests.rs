@@ -122,7 +122,7 @@ fn build_session() -> SolutionSession {
         teammate_labels: HashMap::new(),
         background_agents: HashMap::new(),
         background_agent_order: Vec::new(),
-        pending_stop: std::collections::HashSet::new(),
+        pending_stop: indexmap::IndexSet::new(),
         background_shells: HashMap::new(),
         background_shell_order: Vec::new(),
         tab_order: None,
@@ -331,6 +331,34 @@ fn clear_closed_streams_drops_buffered_pending_stop() {
     assert!(
         session.pending_stop.is_empty(),
         "a context reset drops a buffered stop for an agent that never registered"
+    );
+}
+
+/// Only the async-`Agent` registration path ever drains `pending_stop`, and
+/// every inline `Task` / synchronous `Agent` teammate buffers an id there that
+/// nothing will ever claim. Unbounded, that is a slow leak for the whole life of
+/// a session. The buffer is capped and evicts oldest-first, so the id from the
+/// stop that is actually racing a registration right now always survives.
+#[test]
+fn buffer_pending_stop_is_bounded_and_keeps_the_newest() {
+    let mut session = build_session();
+    let id = |n: usize| crate::background_agent::BackgroundAgentId::new(format!("inline-task-{n}"));
+    let overflow = PENDING_STOP_CAPACITY + 10;
+    for n in 0..overflow {
+        session.buffer_pending_stop(id(n));
+    }
+    assert_eq!(
+        session.pending_stop.len(),
+        PENDING_STOP_CAPACITY,
+        "the buffer must stay bounded across a session's worth of inline teammates"
+    );
+    assert!(
+        !session.pending_stop.contains(&id(0)),
+        "the oldest, long-unclaimed id is the one evicted"
+    );
+    assert!(
+        session.take_pending_stop(&id(overflow - 1)),
+        "the newest stop — the one a registration could still be racing — survives"
     );
 }
 

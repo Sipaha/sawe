@@ -2845,6 +2845,45 @@ async fn successful_turn_clears_pending_usage_limit_resume_gate(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn cancelled_turn_keeps_pending_usage_limit_resume_gate(cx: &mut TestAppContext) {
+    // #7 (the third half): a `Stopped` is not automatically proof of a round
+    // trip. `Cancelled` is the user pressing Stop, which can land before any
+    // request ever went out — it proves nothing about the wall. Un-parking on it
+    // would send the next tick's judge straight into the still-live limit. The
+    // arm already computes `response_proves_wall_lifted` for exactly this
+    // distinction; the gate clear has to be gated on it too.
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| arm_resume_gate(store, session_id));
+    });
+
+    cx.update(|cx| {
+        acp_thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                acp::StopReason::Cancelled,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, _| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert!(
+                st.next_eligible_ms.is_some(),
+                "a manual Stop must NOT un-park a session waiting on the wall",
+            );
+            assert!(
+                store.backoff_timers.contains_key(&session_id),
+                "resume wake timer must survive a manual Stop",
+            );
+        });
+    });
+}
+
+#[gpui::test]
 async fn agent_activity_clears_usage_limit_gate_on_external_reset(cx: &mut TestAppContext) {
     // A usage limit can clear EARLY (the user tops up quota) rather than at the
     // announced reset time. `apply_usage_limit_stop` parks the supervisor in

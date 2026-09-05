@@ -1505,8 +1505,12 @@ impl SolutionAgentStore {
             // Fetch the ordered tab-strip list so we can stamp
             // `tab_order` on freshly-hydrated sessions. Sessions not
             // in this list get `tab_order = None` (closed/hidden tab).
-            let tabbed_ids: Vec<SolutionSessionId> =
-                db.list_open_tabs(solution_id).await.unwrap_or_default();
+            // Propagated, not defaulted: swallowing a transient sqlite error
+            // here hydrates EVERY session with `tab_order = None`, which paints
+            // an empty tab strip with nothing in the log to explain it. Failing
+            // the hydration (like `list_open_session_ids` above) keeps the
+            // restore atomic and surfaces the error to the caller.
+            let tabbed_ids: Vec<SolutionSessionId> = db.list_open_tabs(solution_id).await?;
             let tab_order_map: std::collections::HashMap<SolutionSessionId, i64> = tabbed_ids
                 .iter()
                 .enumerate()

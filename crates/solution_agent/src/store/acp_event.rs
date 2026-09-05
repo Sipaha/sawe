@@ -184,13 +184,6 @@ impl SolutionAgentStore {
                 }
             }
             acp_thread::AcpThreadEvent::Stopped(stop_reason) => {
-                // A turn that runs to `Stopped` is proof the agent responded —
-                // cancel any pending usage-limit / backoff resume gate so the
-                // session isn't kept waiting (and a stale wake timer doesn't
-                // fire a redundant judge) after the wall has cleared (#7). A
-                // re-hit of the wall arrives as `Error`, not `Stopped`, so the
-                // gate survives that case.
-                self.clear_resume_gate_on_agent_response(session_id, cx);
                 // Not every `Stopped` proves a round trip to the model
                 // actually completed. `StopReason` is `#[non_exhaustive]`
                 // upstream, so this match needs a wildcard arm even though
@@ -220,6 +213,16 @@ impl SolutionAgentStore {
                     _ => false,
                 };
                 if response_proves_wall_lifted {
+                    // A turn that ran to a PROVEN completion means the agent
+                    // responded — cancel any pending usage-limit / backoff resume
+                    // gate so the session isn't kept waiting (and a stale wake
+                    // timer doesn't fire a redundant judge) after the wall has
+                    // cleared (#7). A re-hit of the wall arrives as `Error`, not
+                    // `Stopped`, so the gate survives that case — and so does a
+                    // `Cancelled` stop, which can land before any request ever
+                    // went out: un-parking on the user's own Stop would send the
+                    // next tick's judge straight back into the live wall.
+                    self.clear_resume_gate_on_agent_response(session_id, cx);
                     // Stronger still: a completed turn also lifts a TERMINAL
                     // `Stopped(Quota)` stop (the wall parked with no reset time
                     // parsed, which disabled supervision outright) — the round

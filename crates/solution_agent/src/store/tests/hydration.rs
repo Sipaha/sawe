@@ -4344,3 +4344,57 @@ async fn a_flush_captured_before_a_predecessor_failed_does_not_advance_the_epoch
          been consumed and the rows re-covered"
     );
 }
+
+/// `hydrate_all_for_solution` used to swallow a failing `list_open_tabs` with
+/// `unwrap_or_default()`. A transient sqlite error there is not "no tabs": every
+/// session hydrates with `tab_order = None`, so the whole tab strip comes back
+/// empty — silently, since the default hides the error from the caller AND from
+/// the log. The neighbouring `list_open_session_ids` propagates with `?`; this
+/// one has to as well.
+///
+/// The failure is injected by renaming the `tab_order` column out from under the
+/// query on a second connection to the same shared in-memory DB — that breaks
+/// `select_open_tabs` (which names the column) while leaving
+/// `select_open_session_ids` (which does not) working, which is the exact
+/// asymmetry the old default hid.
+#[gpui::test]
+async fn hydrate_all_propagates_a_failing_open_tabs_query(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, _project) = setup_solution_and_project(cx).await;
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+    });
+    let executor = cx.executor();
+    let db = Arc::new(crate::db::SolutionAgentDb::open(executor).expect("open db"));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_persistence(db.clone(), cx);
+        });
+    });
+
+    // No session rows for this solution, so the hydration's own early-out
+    // (`open_ids.is_empty()`) is what the old code fell through to after
+    // defaulting — i.e. it returned `Ok(vec![])` and told nobody.
+    let sqlite_name = format!(
+        "SOLUTION_AGENT_TEST_{}",
+        std::thread::current().name().unwrap_or_default()
+    );
+    let breaker = sqlez::connection::Connection::open_memory(Some(&sqlite_name));
+    breaker
+        .exec("ALTER TABLE solution_sessions RENAME COLUMN tab_order TO tab_order_gone")
+        .expect("prepare rename")()
+    .expect("rename tab_order away");
+
+    let result = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.hydrate_all_for_solution(solution_id, cx)
+            })
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "a failing list_open_tabs must fail the hydration, not silently \
+         hydrate every session with tab_order = None; got {result:?}"
+    );
+}

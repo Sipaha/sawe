@@ -2562,8 +2562,10 @@ impl SolutionAgentStore {
     /// A subagent's `Stop` hook fired (`is_end_of_turn`, its `agent_id`) with
     /// nothing left to deliver — it is idle and done. Close its demux teammate
     /// stream immediately. If the `agentId:` announcement has not registered the
-    /// agent yet, buffer the stop (`pending_stop`) so `apply_subagent_lifecycle`
-    /// closes it on registration. Authoritative: replaces the JSONL-tail guess.
+    /// agent yet, buffer the stop (`SolutionSession::buffer_pending_stop`, a
+    /// bounded race window — most stops that land here belong to inline `Task`
+    /// teammates that never register at all) so `apply_subagent_lifecycle` closes
+    /// it on registration. Authoritative: replaces the JSONL-tail guess.
     pub fn close_teammate_on_stop(
         &mut self,
         session_id: SolutionSessionId,
@@ -2588,7 +2590,7 @@ impl SolutionAgentStore {
                     true
                 }
                 None => {
-                    s.pending_stop.insert(bg_id);
+                    s.buffer_pending_stop(bg_id);
                     false
                 }
             }
@@ -3301,7 +3303,7 @@ impl SolutionAgentStore {
                 let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
                 let new_acp_session_id = new_thread.read(cx).session_id().clone();
                 let new_count = current_count.saturating_add(1);
-                session_entity.update(cx, |s, cx| {
+                let background_agents_killed = session_entity.update(cx, |s, cx| {
                     s.acp_session_id = new_acp_session_id;
                     s.context_count = new_count;
                     s.state = SessionState::Idle;
@@ -3322,9 +3324,16 @@ impl SolutionAgentStore {
                     s.bump_epoch();
                     // `set_acp_thread` emits ThreadReplaced + notify;
                     // last so SessionView re-attaches against a fully
-                    // updated session struct.
-                    s.set_acp_thread(Some(new_thread.clone()), cx);
+                    // updated session struct. It also flips every still-running
+                    // background agent to `killed` — the pre-rotation subprocess
+                    // they were children of is closed a few lines below.
+                    s.set_acp_thread(Some(new_thread.clone()), cx)
                 });
+                if background_agents_killed {
+                    cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
+                        session_id,
+                    ));
+                }
                 // Re-subscribe to the new AcpThread's event stream.
                 // Dropping the old subscription unhooks us from the
                 // dead thread automatically.
@@ -3488,7 +3497,7 @@ impl SolutionAgentStore {
                 let old_acp_session_id = session_entity.read(cx).acp_session_id.clone();
                 let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
                 let new_acp_session_id = new_thread.read(cx).session_id().clone();
-                let had_pending = session_entity.update(cx, |s, cx| {
+                let (had_pending, background_agents_killed) = session_entity.update(cx, |s, cx| {
                     let had_pending = !s.pending_messages.is_empty();
                     if had_pending {
                         // `/clear` wipes the session's conversation —
@@ -3533,10 +3542,17 @@ impl SolutionAgentStore {
                     s.project = Some(project.clone());
                     // `set_acp_thread` emits ThreadReplaced + notify;
                     // last so SessionView re-attaches against a fully
-                    // wiped session struct.
-                    s.set_acp_thread(Some(new_thread.clone()), cx);
-                    had_pending
+                    // wiped session struct. It also flips every still-running
+                    // background agent to `killed` — the pre-clear subprocess
+                    // they were children of is closed a few lines below.
+                    let background_agents_killed = s.set_acp_thread(Some(new_thread.clone()), cx);
+                    (had_pending, background_agents_killed)
                 });
+                if background_agents_killed {
+                    cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
+                        session_id,
+                    ));
+                }
                 let new_sub = store.subscribe_to_session(session_id, new_thread, cx);
                 session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
                 store.persist_session_row(session_id, cx);

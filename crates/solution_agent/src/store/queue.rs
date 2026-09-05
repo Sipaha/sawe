@@ -746,9 +746,15 @@ impl SolutionAgentStore {
         // session right after this call returns see `Running`. Clear the
         // last-turn duration too — the "Done in Xs" indicator from the
         // previous turn is stale the moment a new turn begins.
+        //
+        // Identity of the turn this call is about to start. `Running.started_at`
+        // is stamped once per turn and never rewritten in place, so it is the
+        // cheapest handle the post-await recovery below can use to tell "MY turn
+        // is still Running" from "a LATER turn is Running".
+        let this_turn_started_at = std::time::Instant::now();
         session_entity.update(cx, |s, _| {
             s.state = SessionState::Running {
-                started_at: std::time::Instant::now(),
+                started_at: this_turn_started_at,
                 notified: false,
             };
             s.last_activity_at = Utc::now();
@@ -845,9 +851,20 @@ impl SolutionAgentStore {
                         // off the *fact* the turn ended (not a timeout, so a
                         // legitimately long turn is never cut short), then flush
                         // the queue exactly as the Stopped(EndTurn) path does.
-                        let still_running =
-                            matches!(s.read(cx).state, SessionState::Running { .. });
-                        if still_running {
+                        //
+                        // Scoped to THIS turn: the `Stopped` handler runs before
+                        // this continuation and can synchronously start the NEXT
+                        // turn off the queue (idle-flush → `send_message_blocks`
+                        // → `Running` again) on the SAME acp session, so a bare
+                        // "still Running" test would force a live turn 2 to Idle
+                        // — GC'ing its streams, emitting a bogus state change and
+                        // making the following send bypass the queue and cancel
+                        // it. Only the turn this task started may be recovered.
+                        let this_turn_still_running = matches!(
+                            s.read(cx).state,
+                            SessionState::Running { started_at, .. } if started_at == this_turn_started_at
+                        );
+                        if this_turn_still_running {
                             log::warn!(
                                 target: "solution_agent::queue",
                                 "session={session_id} turn task resolved Ok but state still \

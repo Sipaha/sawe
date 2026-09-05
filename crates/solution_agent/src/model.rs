@@ -29,6 +29,13 @@ const SHORT_ID_LEN: usize = 8;
 /// quoting.
 const SHORT_ID_ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
+/// Upper bound on [`SolutionSession::pending_stop`]. A buffered `Stop` is only
+/// claimable by the async-`Agent` registration that races it, so the useful
+/// depth is 1 — the cap is generous purely so an unlucky burst of concurrent
+/// async spawns can't drop a claimable id, while still bounding the set for the
+/// far more common inline teammate whose id is never claimed at all.
+const PENDING_STOP_CAPACITY: usize = 32;
+
 /// SPK-Editor-internal session id. Distinct from `acp::SessionId`,
 /// which is the per-subprocess ACP-level identifier.
 ///
@@ -570,7 +577,13 @@ pub struct SolutionSession {
     /// announcement registered it in `background_agents`. Drained at
     /// registration (`take_pending_stop`) to close the teammate stream. Same
     /// `BackgroundAgentId` namespace as `background_agents`.
-    pub pending_stop: std::collections::HashSet<background_agent::BackgroundAgentId>,
+    ///
+    /// Insertion-ordered and CAPPED at [`PENDING_STOP_CAPACITY`]: the only
+    /// consumer is the async-`Agent` registration path, so a stop whose agent
+    /// never registers (every inline `Task` and every synchronous `Agent` — the
+    /// common case) is unclaimable and would otherwise accumulate for the
+    /// session's whole life. See [`Self::buffer_pending_stop`].
+    pub pending_stop: indexmap::IndexSet<background_agent::BackgroundAgentId>,
     /// Background shells (`Bash(run_in_background=true)`) launched from
     /// this session. Keyed by [`background_shell::BackgroundShellId`].
     /// Output lives in an on-disk `.output` file tracked per-shell.
@@ -693,7 +706,7 @@ impl SolutionSession {
             teammate_labels: HashMap::new(),
             background_agents: HashMap::new(),
             background_agent_order: Vec::new(),
-            pending_stop: std::collections::HashSet::new(),
+            pending_stop: indexmap::IndexSet::new(),
             background_shells: HashMap::new(),
             background_shell_order: Vec::new(),
             tab_order: None,
@@ -745,18 +758,34 @@ impl SolutionSession {
     /// dropped by the outer flush's deduplication), which strands
     /// `SessionView::_thread_subscription` on the dead thread and
     /// silently halts conversation-list rendering for that session.
-    pub fn set_acp_thread(&mut self, thread: Option<Entity<AcpThread>>, cx: &mut Context<Self>) {
-        // Dropping the live thread means the owning `claude` subprocess is gone
-        // (the reconnect cold-ize; a crash). Every Managed Agent it dispatched
-        // is a CHILD of that process, so it died with it — no `stop_reason` will
-        // ever arrive for it. Mark them here, at the single point where the
-        // thread is dropped, so no reconnect path can forget to: otherwise their
-        // teammate tabs keep painting "running" for work that no longer exists,
-        // AND `has_live_background_work` keeps counting them, which suppresses
-        // the stuck-session watchdog for the rest of the session's life.
-        if thread.is_none() && self.acp_thread.is_some() {
-            self.mark_background_agents_killed();
-        }
+    ///
+    /// Returns whether the swap orphaned (and therefore killed) any background
+    /// agent, so the store can broadcast `SessionBackgroundAgentsChanged` to the
+    /// MCP/mobile subscribers that don't observe the session entity.
+    pub fn set_acp_thread(
+        &mut self,
+        thread: Option<Entity<AcpThread>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Losing the live thread means the owning `claude` subprocess is gone
+        // (the reconnect cold-ize; a crash) or is about to be closed (`/compact`
+        // and `/clear` swap in a thread on a FRESH acp session and then
+        // `close_session` the old one). Every Managed Agent it dispatched is a
+        // CHILD of that process, so it died with it — no `stop_reason` will ever
+        // arrive for it. Mark them at the single point where the old thread is
+        // let go, so no swap path can forget to: otherwise their teammate tabs
+        // keep painting "running" for work that no longer exists, AND
+        // `has_live_background_work` keeps counting them, which suppresses the
+        // stuck-session watchdog until the 1h stale backstop.
+        //
+        // Keyed on the thread actually CHANGING, not merely on the call: a
+        // re-attach of the same thread entity (cold-prefix hydration re-anchoring
+        // `live_base`) leaves the subprocess — and its children — alive.
+        let replaced_live_thread = self
+            .acp_thread
+            .as_ref()
+            .is_some_and(|current| thread.as_ref() != Some(current));
+        let killed_background_agents = replaced_live_thread && self.mark_background_agents_killed();
         self.live_base = if thread.is_some() {
             self.entries.len()
         } else {
@@ -765,6 +794,7 @@ impl SolutionSession {
         self.acp_thread = thread;
         cx.emit(SolutionSessionEvent::ThreadReplaced);
         cx.notify();
+        killed_background_agents
     }
 
     /// Flip every still-running background agent to `killed` (its owning
@@ -993,11 +1023,29 @@ impl SolutionSession {
         self.rebuild_streams();
     }
 
+    /// Remember a subagent `Stop` that arrived before the agent was registered,
+    /// so [`Self::take_pending_stop`] can honor it if the `agentId:`
+    /// announcement lands afterwards.
+    ///
+    /// The buffer is a RACE WINDOW, not a ledger. It is only ever read by the
+    /// async-`Agent` registration path, and that announcement follows the hook
+    /// by milliseconds when it comes at all; an inline `Task` or a synchronous
+    /// `Agent` never registers, so its id can never be claimed. Evicting the
+    /// oldest entry past [`PENDING_STOP_CAPACITY`] keeps a long session's
+    /// hundreds of inline teammates from accreting here, while leaving far more
+    /// headroom than any real interleaving of the two signals needs.
+    pub fn buffer_pending_stop(&mut self, id: crate::background_agent::BackgroundAgentId) {
+        self.pending_stop.insert(id);
+        while self.pending_stop.len() > PENDING_STOP_CAPACITY {
+            self.pending_stop.shift_remove_index(0);
+        }
+    }
+
     /// Remove and return whether a `Stop` was buffered for this agent (arrived
     /// before its registration). The registration site closes the teammate
     /// stream when this returns `true`.
     pub fn take_pending_stop(&mut self, id: &crate::background_agent::BackgroundAgentId) -> bool {
-        self.pending_stop.remove(id)
+        self.pending_stop.shift_remove(id)
     }
 
     /// Drop the whole close overlay so previously-closed streams reappear on the
