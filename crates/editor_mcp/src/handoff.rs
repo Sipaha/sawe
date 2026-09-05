@@ -2,9 +2,9 @@
 use anyhow::{Context as _, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use smol::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
+use smol::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use smol::net::unix::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Wire name of the tool the handoff calls on the existing instance. The
@@ -15,9 +15,25 @@ use std::time::Duration;
 /// of silently breaking `sawe <path>` on a second launch.
 pub const HANDOFF_TOOL_NAME: &str = "editor.handle_cli_args";
 
-/// JSON-RPC id the handoff sends, and the id it must match a frame against
-/// before treating that frame as the reply.
+/// The two tools that carry `--solution` into the running instance.
+///
+/// `editor.handle_cli_args` cannot do it: it lives in `crates/workspace`,
+/// which sits *below* `crates/solutions` in the crate graph, so the tool that
+/// opens paths cannot reach a `SolutionStore`. Rather than push the gap onto
+/// the operator, the hand-off makes the two calls the operator would have
+/// made — resolve the name against the running instance's own list, then ask
+/// it to open the id. Both dial the same global socket as the hand-off, so
+/// both must be in `GLOBAL_TOOLS`; `every_tool_the_handoff_calls_is_global`
+/// below pins that (FORK.md #112).
+const SOLUTIONS_LIST_TOOL_NAME: &str = "solutions.list";
+const SOLUTIONS_OPEN_TOOL_NAME: &str = "solutions.open";
+
+/// JSON-RPC ids this handoff sends. One per call rather than one reused id:
+/// `read_reply_frame` matches a frame by id, so a late reply to an earlier
+/// call must not be mistaken for the answer to the current one.
 const HANDOFF_REQUEST_ID: i64 = 1;
+const SOLUTIONS_LIST_REQUEST_ID: i64 = 2;
+const SOLUTIONS_OPEN_REQUEST_ID: i64 = 3;
 
 /// How long to wait for the reply frame once the request is on the wire.
 ///
@@ -60,9 +76,27 @@ pub enum HandoffOutcome {
     /// We acquired the lock — we are the canonical instance.
     BecameCanonical,
     /// Existing instance accepted the handoff. The caller should exit(0).
-    HandedOff { focused_window_id: Option<String> },
+    HandedOff {
+        focused_window_id: Option<String>,
+        /// A ready-to-print stderr line when `--solution` was asked for and the
+        /// running instance could not honour it; `None` when it was not asked
+        /// for, or it opened. Rendered here rather than in `main.rs` because
+        /// the reason is the running instance's own words and only this module
+        /// ever sees them.
+        solution_note: Option<String>,
+    },
     /// Lock held but socket unreachable after retries.
     LockBusyButUnreachable { lockholder_pid: Option<u32> },
+    /// The request was written to the running instance's socket and no usable
+    /// reply came back — the read timed out, the peer closed, or the frame did
+    /// not parse.
+    ///
+    /// Deliberately not an `Err`. "We never delivered the request" and "we
+    /// delivered it but did not see the reply" are different facts and only
+    /// the first is a loss: `READ_TIMEOUT` is 30s and an ordinary cold-project
+    /// open can exceed it, so reporting this as dropped work sent users off to
+    /// run the command again and collect a second window.
+    DeliveredButUnconfirmed { reason: String },
 }
 
 #[derive(Serialize)]
@@ -108,7 +142,36 @@ fn probe_lock() -> Result<Option<Option<u32>>> {
     Ok(Some(pid))
 }
 
-pub fn try_handoff_to_existing_instance(paths: Vec<PathBuf>) -> Result<HandoffOutcome> {
+/// What the hand-off managed to do about `--solution`.
+enum SolutionHandoff {
+    /// `solutions.open` opened it; the window it landed in, when the running
+    /// instance told us.
+    Opened { window_id: Option<String> },
+    /// The running instance's own `solutions.list` has no entry with that name
+    /// or id. The canonical path reaches the same conclusion and falls through
+    /// to the welcome screen; here there is no welcome screen to fall through
+    /// to, so the caller says it out loud instead.
+    Missing,
+    /// The instance answered and declined — an empty Solution (`solutions.open`
+    /// requires members, where the canonical path shows an `EmptySolutionPage`
+    /// instead), a store error, or the tool missing from its catalog.
+    Refused(String),
+    /// The call went out and no usable reply came back. Same distinction as
+    /// [`HandoffOutcome::DeliveredButUnconfirmed`].
+    Undelivered(String),
+}
+
+/// Hand this process's command line to the instance holding the MCP lock.
+///
+/// `solution` is `--solution <name-or-id>`, and it is carried rather than
+/// dropped: `editor.handle_cli_args` cannot open a Solution (see
+/// [`SOLUTIONS_LIST_TOOL_NAME`]), so the hand-off makes the two calls that
+/// can. The caller is responsible for only passing it when the canonical path
+/// would have honoured it — `main.rs::split_handoff_args` owns that rule.
+pub fn try_handoff_to_existing_instance(
+    paths: Vec<PathBuf>,
+    solution: Option<String>,
+) -> Result<HandoffOutcome> {
     let lock_status = probe_lock()?;
     let holder_pid = match lock_status {
         None => return Ok(HandoffOutcome::BecameCanonical),
@@ -125,60 +188,219 @@ pub fn try_handoff_to_existing_instance(paths: Vec<PathBuf>) -> Result<HandoffOu
         .collect();
 
     smol::block_on(async move {
-        for attempt in 1..=RETRY_COUNT {
-            match UnixStream::connect(&socket_path).await {
-                Ok(mut stream) => {
-                    let request = json!({
-                        "jsonrpc": "2.0",
-                        "id": HANDOFF_REQUEST_ID,
-                        "method": "tools/call",
-                        "params": {
-                            "name": HANDOFF_TOOL_NAME,
-                            "arguments": HandleCliArgsArgs {
-                                paths: path_strings.clone(),
-                                cwd: cwd.clone(),
-                                new_window: None,
-                                focus: Some(true),
-                            }
-                        }
-                    });
-                    let mut bytes = serde_json::to_vec(&request)?;
-                    bytes.push(b'\n');
-                    stream.write_all(&bytes).await.context("send handoff")?;
+        let Some(mut stream) = connect_with_retries(&socket_path).await else {
+            return Ok(HandoffOutcome::LockBusyButUnreachable {
+                lockholder_pid: holder_pid,
+            });
+        };
+        hand_off_on(&mut stream, path_strings, cwd, solution).await
+    })
+}
 
-                    let response =
-                        read_reply_frame(&mut stream, HANDOFF_REQUEST_ID, READ_TIMEOUT).await?;
-                    return interpret_reply(response);
-                }
-                Err(err) => {
-                    log::debug!(
-                        "editor_mcp: handoff attempt {attempt}/{RETRY_COUNT} failed: {err}"
+/// Connect to the running instance's socket, retrying while it may still be
+/// starting up. `None` once every attempt has failed.
+async fn connect_with_retries(socket_path: &Path) -> Option<UnixStream> {
+    for attempt in 1..=RETRY_COUNT {
+        match UnixStream::connect(socket_path).await {
+            Ok(stream) => return Some(stream),
+            Err(err) => {
+                log::debug!("editor_mcp: handoff attempt {attempt}/{RETRY_COUNT} failed: {err}");
+                if attempt == 1 {
+                    // Said on the terminal rather than only in the log,
+                    // because this is a command the user typed and the
+                    // alternative is several seconds of total silence before
+                    // either an opened file or an error. The healthy hand-off
+                    // never reaches this arm — it connects on the first
+                    // attempt and returns above — so an ordinary
+                    // `sawe <path>` stays silent.
+                    eprintln!(
+                        "sawe: the running instance is not answering yet; retrying for up to {}s…",
+                        remaining_retry_wait().as_secs()
                     );
-                    if attempt == 1 {
-                        // Said on the terminal rather than only in the log,
-                        // because this is a command the user typed and the
-                        // alternative is several seconds of total silence
-                        // before either an opened file or an error. The
-                        // healthy hand-off never reaches this arm — it
-                        // connects on the first attempt and returns above —
-                        // so an ordinary `sawe <path>` stays silent.
-                        eprintln!(
-                            "sawe: the running instance is not answering yet; retrying for up to {}s…",
-                            remaining_retry_wait().as_secs()
-                        );
-                    }
-                    if let Some(delay) = retry_delay(attempt) {
-                        // Main-thread retry loop, not a test.
-                        #[allow(clippy::disallowed_methods)]
-                        smol::Timer::after(delay).await;
-                    }
+                }
+                if let Some(delay) = retry_delay(attempt) {
+                    // Main-thread retry loop, not a test.
+                    #[allow(clippy::disallowed_methods)]
+                    smol::Timer::after(delay).await;
                 }
             }
         }
-        Ok(HandoffOutcome::LockBusyButUnreachable {
-            lockholder_pid: holder_pid,
-        })
-    })
+    }
+    None
+}
+
+/// Drive the whole hand-off over one already-connected socket.
+async fn hand_off_on<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    paths: Vec<String>,
+    cwd: Option<String>,
+    solution: Option<String>,
+) -> Result<HandoffOutcome> {
+    let mut solution_note = None;
+    if let Some(name_or_id) = solution.as_deref() {
+        match open_solution(stream, name_or_id).await? {
+            SolutionHandoff::Opened { window_id } => {
+                // The Solution's window is up and was asked for focus. A
+                // trailing `editor.handle_cli_args` would carry an empty path
+                // list — which that tool answers by activating whichever
+                // window it finds first — and would undo exactly the focus we
+                // just requested.
+                return Ok(HandoffOutcome::HandedOff {
+                    focused_window_id: window_id,
+                    solution_note: None,
+                });
+            }
+            SolutionHandoff::Missing => {
+                solution_note = Some(format!(
+                    "sawe: --solution {name_or_id}: the running instance has no Solution with \
+                     that name or id — nothing was opened for it."
+                ));
+            }
+            SolutionHandoff::Refused(reason) => {
+                solution_note = Some(format!(
+                    "sawe: --solution {name_or_id} could not be opened in the running instance: \
+                     {reason}"
+                ));
+            }
+            SolutionHandoff::Undelivered(reason) => {
+                return Ok(HandoffOutcome::DeliveredButUnconfirmed { reason });
+            }
+        }
+    }
+
+    let arguments = serde_json::to_value(HandleCliArgsArgs {
+        paths,
+        cwd,
+        new_window: None,
+        focus: Some(true),
+    })?;
+    match call_tool(stream, HANDOFF_REQUEST_ID, HANDOFF_TOOL_NAME, arguments).await? {
+        CallOutcome::Undelivered(reason) => Ok(HandoffOutcome::DeliveredButUnconfirmed { reason }),
+        CallOutcome::Failed(reason) => Err(anyhow!("{reason}")),
+        CallOutcome::Ok(structured) => {
+            let outcome: HandleCliArgsResult = serde_json::from_value(structured)?;
+            if !outcome.handled {
+                let detail = outcome.error.as_deref().unwrap_or("(no detail)");
+                return Err(anyhow!("existing instance refused handoff: {detail}"));
+            }
+            Ok(HandoffOutcome::HandedOff {
+                focused_window_id: outcome.focused_window_id,
+                solution_note,
+            })
+        }
+    }
+}
+
+/// Resolve `--solution <name-or-id>` against the running instance's own list
+/// and ask it to open the match.
+async fn open_solution<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    name_or_id: &str,
+) -> Result<SolutionHandoff> {
+    let listed = match call_tool(
+        stream,
+        SOLUTIONS_LIST_REQUEST_ID,
+        SOLUTIONS_LIST_TOOL_NAME,
+        json!({}),
+    )
+    .await?
+    {
+        CallOutcome::Ok(value) => value,
+        CallOutcome::Failed(reason) => {
+            return Ok(SolutionHandoff::Refused(format!(
+                "{SOLUTIONS_LIST_TOOL_NAME}: {reason}"
+            )));
+        }
+        CallOutcome::Undelivered(reason) => return Ok(SolutionHandoff::Undelivered(reason)),
+    };
+    let Some(solution_id) = resolve_solution_id(&listed, name_or_id) else {
+        return Ok(SolutionHandoff::Missing);
+    };
+    match call_tool(
+        stream,
+        SOLUTIONS_OPEN_REQUEST_ID,
+        SOLUTIONS_OPEN_TOOL_NAME,
+        json!({ "solution_id": solution_id, "focus": true }),
+    )
+    .await?
+    {
+        CallOutcome::Ok(value) => Ok(SolutionHandoff::Opened {
+            window_id: value
+                .get("window_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }),
+        CallOutcome::Failed(reason) => Ok(SolutionHandoff::Refused(format!(
+            "{SOLUTIONS_OPEN_TOOL_NAME}: {reason}"
+        ))),
+        CallOutcome::Undelivered(reason) => Ok(SolutionHandoff::Undelivered(reason)),
+    }
+}
+
+/// Pick out of a `solutions.list` reply the Solution that `--solution
+/// <name-or-id>` names.
+///
+/// Deliberately the same rule `main.rs::open_solution_by_name_or_id` applies
+/// on the canonical side — a numeric argument may match `id`, and any argument
+/// may match `name` — because the same argv must not select a different
+/// Solution depending on whether another editor happened to be running
+/// (FORK.md #114's parity rule). The numeric match is guarded on the argument
+/// actually parsing as a number, or a non-numeric `--solution` would match the
+/// first entry whose `id` is missing from the reply.
+fn resolve_solution_id(listed: &Value, name_or_id: &str) -> Option<i64> {
+    let by_id = name_or_id.parse::<i64>().ok();
+    listed
+        .get("solutions")?
+        .as_array()?
+        .iter()
+        .find(|solution| {
+            let id = solution.get("id").and_then(Value::as_i64);
+            (by_id.is_some() && id == by_id)
+                || solution.get("name").and_then(Value::as_str) == Some(name_or_id)
+        })?
+        .get("id")?
+        .as_i64()
+}
+
+/// What one `tools/call` round trip came back as.
+enum CallOutcome {
+    /// The call succeeded; the payload is `result.structuredContent`.
+    Ok(Value),
+    /// The reply arrived and says the call did not happen — a JSON-RPC `error`
+    /// member, a `result.isError: true`, or a result with no
+    /// `structuredContent`. The message is already a complete sentence.
+    Failed(String),
+    /// The request went out and no usable reply came back.
+    Undelivered(String),
+}
+
+/// Send one `tools/call` and classify what comes back.
+///
+/// An `Err` from here means the request itself could not be put on the wire,
+/// which is the only shape of failure that is unambiguously a loss.
+async fn call_tool<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    id: i64,
+    name: &str,
+    arguments: Value,
+) -> Result<CallOutcome> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments },
+    });
+    let mut bytes = serde_json::to_vec(&request)?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes).await.context("send handoff")?;
+
+    match read_reply_frame(stream, id, READ_TIMEOUT).await {
+        Ok(frame) => Ok(match structured_content(frame) {
+            Ok(value) => CallOutcome::Ok(value),
+            Err(err) => CallOutcome::Failed(err.to_string()),
+        }),
+        Err(err) => Ok(CallOutcome::Undelivered(err.to_string())),
+    }
 }
 
 /// One newline-delimited unit read off the socket.
@@ -265,8 +487,13 @@ async fn read_reply_frame<R: AsyncRead + Unpin>(
     smol::future::or(read, expire).await
 }
 
-/// Turn the matched reply frame into an outcome.
-fn interpret_reply(response: serde_json::Value) -> Result<HandoffOutcome> {
+/// Pull `result.structuredContent` out of the matched reply frame, or say
+/// which of the server's three failure shapes came back instead.
+///
+/// The `Err` message is a complete sentence on purpose: it is what the caller
+/// prints, and every branch here exists because its shape was once flattened
+/// into the generic "missing result.structuredContent" below.
+fn structured_content(response: serde_json::Value) -> Result<Value> {
     // Surface a JSON-RPC error verbatim. "Tool not found" here means
     // `HANDOFF_TOOL_NAME` fell off the global socket's catalog (see
     // `lifecycle::GLOBAL_TOOLS`), which the generic message below used to hide.
@@ -312,18 +539,10 @@ fn interpret_reply(response: serde_json::Value) -> Result<HandoffOutcome> {
             "existing instance reported a tool failure: {message}"
         ));
     }
-    let structured = result
+    result
         .and_then(|r| r.get("structuredContent"))
         .cloned()
-        .ok_or_else(|| anyhow!("missing result.structuredContent"))?;
-    let outcome: HandleCliArgsResult = serde_json::from_value(structured)?;
-    if !outcome.handled {
-        let detail = outcome.error.as_deref().unwrap_or("(no detail)");
-        return Err(anyhow!("existing instance refused handoff: {detail}"));
-    }
-    Ok(HandoffOutcome::HandedOff {
-        focused_window_id: outcome.focused_window_id,
-    })
+        .ok_or_else(|| anyhow!("missing result.structuredContent"))
 }
 
 #[cfg(test)]
@@ -331,12 +550,79 @@ mod tests {
     use super::*;
     use smol::io::Cursor;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
     const TEST_TIMEOUT: Duration = Duration::from_millis(250);
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         smol::block_on(future)
+    }
+
+    /// A socket whose replies are scripted ahead of time: writes are recorded
+    /// so a test can assert which tools were called, reads come out of the
+    /// script in order.
+    ///
+    /// The hand-off is strictly request-then-response, so pre-scripting the
+    /// replies is faithful: nothing it reads depends on what a real server
+    /// would have made of what it wrote. Running out of script is EOF, which
+    /// is how the "no reply came back" cases are provoked without waiting out
+    /// `READ_TIMEOUT`.
+    struct ScriptedPeer {
+        replies: Cursor<Vec<u8>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl ScriptedPeer {
+        fn new(replies: &[&str]) -> Self {
+            let mut bytes = Vec::new();
+            for reply in replies {
+                bytes.extend_from_slice(reply.as_bytes());
+                bytes.push(b'\n');
+            }
+            Self {
+                replies: Cursor::new(bytes),
+                written: Arc::default(),
+            }
+        }
+
+        fn requested_tools(&self) -> Vec<String> {
+            let written = self.written.lock().expect("written");
+            String::from_utf8_lossy(&written)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|frame| Some(frame.get("params")?.get("name")?.as_str()?.to_string()))
+                .collect()
+        }
+    }
+
+    impl AsyncRead for ScriptedPeer {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.replies).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ScriptedPeer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.lock().expect("written").extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     fn read_frames(script: &str) -> Result<serde_json::Value> {
@@ -363,12 +649,8 @@ mod tests {
         );
         let frame = read_frames(script).expect("reply found");
         assert_eq!(frame["id"].as_i64(), Some(1));
-        match interpret_reply(frame).expect("handed off") {
-            HandoffOutcome::HandedOff { focused_window_id } => {
-                assert_eq!(focused_window_id.as_deref(), Some("window:7"));
-            }
-            other => panic!("expected HandedOff, got {other:?}"),
-        }
+        let structured = structured_content(frame).expect("structured content");
+        assert_eq!(structured["focused_window_id"], "window:7");
     }
 
     #[test]
@@ -430,7 +712,7 @@ mod tests {
     }
 
     /// An error response carrying OUR id is returned by the reader (it is our
-    /// reply) and turned into a legible error by `interpret_reply`. This is the
+    /// reply) and turned into a legible error by `structured_content`. This is the
     /// shape that "Tool not found" arrives in when the tool falls off
     /// `GLOBAL_TOOLS` — the defect this module's constant is pinned against.
     #[test]
@@ -440,7 +722,7 @@ mod tests {
             "\n",
         );
         let frame = read_frames(script).expect("error frame is still our reply");
-        let err = interpret_reply(frame)
+        let err = structured_content(frame)
             .expect_err("error response")
             .to_string();
         assert!(
@@ -498,7 +780,7 @@ mod tests {
         ];
         for (name, result, expected) in cases {
             let frame = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result});
-            let err = interpret_reply(frame)
+            let err = structured_content(frame)
                 .expect_err(&format!("{name}: expected an error"))
                 .to_string();
             assert!(
@@ -525,18 +807,14 @@ mod tests {
                 "structuredContent": {"handled": true, "focused_window_id": "window:3"}
             }
         });
-        match interpret_reply(frame).expect("handed off") {
-            HandoffOutcome::HandedOff { focused_window_id } => {
-                assert_eq!(focused_window_id.as_deref(), Some("window:3"));
-            }
-            other => panic!("expected HandedOff, got {other:?}"),
-        }
+        let structured = structured_content(frame).expect("handed off");
+        assert_eq!(structured["focused_window_id"], "window:3");
     }
 
     #[test]
     fn reply_missing_structured_content_is_reported() {
         let frame = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}});
-        let err = interpret_reply(frame)
+        let err = structured_content(frame)
             .expect_err("no structuredContent")
             .to_string();
         assert!(
@@ -545,13 +823,17 @@ mod tests {
         );
     }
 
+    /// A refusal is a well-formed reply carrying `handled: false`, so it only
+    /// becomes an error once the hand-off has deserialized it — which is the
+    /// full round trip, not `structured_content` alone.
     #[test]
     fn refusal_is_reported_with_its_detail() {
-        let frame = serde_json::json!({
-            "jsonrpc":"2.0","id":1,
-            "result":{"structuredContent":{"handled":false,"error":"path resolution failed"}}
-        });
-        let err = interpret_reply(frame).expect_err("refused").to_string();
+        let mut peer = ScriptedPeer::new(&[
+            r#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"handled":false,"error":"path resolution failed"}}}"#,
+        ]);
+        let err = block_on(hand_off_on(&mut peer, vec!["/tmp/a".into()], None, None))
+            .expect_err("refused")
+            .to_string();
         assert!(err.contains("path resolution failed"), "got {err:?}");
     }
 
@@ -625,6 +907,168 @@ mod tests {
             remaining_retry_wait(),
             "the wait promised after the first failure must be the wait actually served"
         );
+    }
+
+    /// Defect 1: `--solution` used to be dropped in silence — the hand-off
+    /// carried paths only, so `sawe --solution probe-test` against a running
+    /// instance activated a window, opened nothing and exited 0. It is now
+    /// carried: resolve the name against the instance's own `solutions.list`,
+    /// then `solutions.open` the id it found.
+    #[test]
+    fn a_solution_is_resolved_and_opened_in_the_running_instance() {
+        let mut peer = ScriptedPeer::new(&[
+            r#"{"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"solutions":[{"id":4,"name":"other"},{"id":7,"name":"probe-test"}]}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"window_id":"window:9","focused":true,"opened_paths":["/ss/probe-test/a"]}}}"#,
+        ]);
+        let outcome = block_on(hand_off_on(
+            &mut peer,
+            Vec::new(),
+            None,
+            Some("probe-test".to_string()),
+        ))
+        .expect("the solution hand-off must succeed");
+        match outcome {
+            HandoffOutcome::HandedOff {
+                focused_window_id,
+                solution_note,
+            } => {
+                assert_eq!(focused_window_id.as_deref(), Some("window:9"));
+                assert_eq!(solution_note, None, "nothing was lost, so nothing is said");
+            }
+            other => panic!("expected HandedOff, got {other:?}"),
+        }
+        assert_eq!(
+            peer.requested_tools(),
+            vec![SOLUTIONS_LIST_TOOL_NAME, SOLUTIONS_OPEN_TOOL_NAME],
+            "the trailing empty-path `editor.handle_cli_args` would activate \
+             whichever window it found first and undo the focus we just asked for"
+        );
+    }
+
+    /// The two lookup rules `main.rs::open_solution_by_name_or_id` applies on
+    /// the canonical side, which this must match or the same argv selects a
+    /// different Solution depending on whether an editor was running.
+    #[test]
+    fn a_solution_is_resolved_by_id_or_by_name() {
+        let listed = serde_json::json!({
+            "solutions": [
+                {"id": 4, "name": "alpha"},
+                {"id": 7, "name": "probe-test"},
+                {"name": "no id at all"},
+            ]
+        });
+        assert_eq!(resolve_solution_id(&listed, "probe-test"), Some(7));
+        assert_eq!(resolve_solution_id(&listed, "7"), Some(7));
+        assert_eq!(resolve_solution_id(&listed, "alpha"), Some(4));
+        assert_eq!(resolve_solution_id(&listed, "nope"), None);
+        assert_eq!(
+            resolve_solution_id(&listed, "no id at all"),
+            None,
+            "an entry the reply gave no id for cannot be opened"
+        );
+        assert_eq!(
+            resolve_solution_id(&serde_json::json!({}), "probe-test"),
+            None
+        );
+    }
+
+    /// A `--solution` the running instance does not have is the one case the
+    /// canonical path answers with a welcome screen. There is no welcome
+    /// screen at the far end of a hand-off, so it has to be said out loud —
+    /// and the paths on the same command line still go, which is why the
+    /// `editor.handle_cli_args` call still happens.
+    #[test]
+    fn a_solution_the_instance_does_not_have_is_named_not_dropped() {
+        let mut peer = ScriptedPeer::new(&[
+            r#"{"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"solutions":[]}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"handled":true}}}"#,
+        ]);
+        let outcome = block_on(hand_off_on(
+            &mut peer,
+            Vec::new(),
+            None,
+            Some("probe-test".to_string()),
+        ))
+        .expect("hand-off still succeeds");
+        match outcome {
+            HandoffOutcome::HandedOff { solution_note, .. } => {
+                let note = solution_note.expect("the loss must be reported");
+                assert!(note.contains("probe-test"), "got {note:?}");
+                assert!(note.contains("no Solution"), "got {note:?}");
+            }
+            other => panic!("expected HandedOff, got {other:?}"),
+        }
+        assert_eq!(
+            peer.requested_tools(),
+            vec![SOLUTIONS_LIST_TOOL_NAME, HANDOFF_TOOL_NAME]
+        );
+    }
+
+    /// `solutions.open` refuses an empty Solution (the canonical path shows an
+    /// `EmptySolutionPage` instead), and the instance's own words are what the
+    /// user needs to see.
+    #[test]
+    fn a_solution_the_instance_refuses_carries_its_reason() {
+        let mut peer = ScriptedPeer::new(&[
+            r#"{"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"solutions":[{"id":7,"name":"probe-test"}]}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"type":"text","text":"solution 7 has no members"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"handled":true}}}"#,
+        ]);
+        let outcome = block_on(hand_off_on(
+            &mut peer,
+            Vec::new(),
+            None,
+            Some("probe-test".to_string()),
+        ))
+        .expect("hand-off still succeeds");
+        match outcome {
+            HandoffOutcome::HandedOff { solution_note, .. } => {
+                let note = solution_note.expect("the refusal must be reported");
+                assert!(note.contains("solution 7 has no members"), "got {note:?}");
+                assert!(note.contains(SOLUTIONS_OPEN_TOOL_NAME), "got {note:?}");
+            }
+            other => panic!("expected HandedOff, got {other:?}"),
+        }
+    }
+
+    /// Defect 3b: a request that went out and whose reply never came back is
+    /// NOT a dropped command line. `READ_TIMEOUT` is 30s and an ordinary cold
+    /// project open can exceed it, so calling this a failure sent users off to
+    /// run the command again and collect a second window.
+    #[test]
+    fn a_reply_that_never_arrives_is_distinguished_from_a_request_never_sent() {
+        let mut peer = ScriptedPeer::new(&[]);
+        let outcome = block_on(hand_off_on(&mut peer, vec!["/tmp/a".into()], None, None))
+            .expect("an unconfirmed delivery is an outcome, not an error");
+        match outcome {
+            HandoffOutcome::DeliveredButUnconfirmed { reason } => {
+                assert!(reason.contains("closed the connection"), "got {reason:?}");
+            }
+            other => panic!("expected DeliveredButUnconfirmed, got {other:?}"),
+        }
+        assert_eq!(
+            peer.requested_tools(),
+            vec![HANDOFF_TOOL_NAME],
+            "the request really did go out — that is the whole point"
+        );
+    }
+
+    /// FORK.md #112: every tool a non-agent client calls has to be on the
+    /// GLOBAL socket, or it comes back `-32601 Tool not found`. The hand-off
+    /// dials `socket_path()`, so all three of its callees are pinned here
+    /// against the allow-list the server actually splits on.
+    #[test]
+    fn every_tool_the_handoff_calls_is_global() {
+        for name in [
+            HANDOFF_TOOL_NAME,
+            SOLUTIONS_LIST_TOOL_NAME,
+            SOLUTIONS_OPEN_TOOL_NAME,
+        ] {
+            assert!(
+                crate::lifecycle::is_global_tool(name),
+                "{name} is solution-scoped, so the CLI hand-off would get 'Tool not found'"
+            );
+        }
     }
 
     /// Finding 3: the handoff's constant must equal the name the tool actually

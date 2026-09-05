@@ -38,9 +38,27 @@ fn is_first_instance() -> bool {
     unsafe { GetLastError() != ERROR_ALREADY_EXISTS }
 }
 
-pub fn handle_single_instance(opener: OpenListener, args: &Args) -> bool {
-    let is_first_instance = is_first_instance();
-    if is_first_instance {
+/// What the Windows single-instance gate did — and, crucially, whether it
+/// already delivered this process's command line to the first instance.
+///
+/// It used to answer only "are we the first instance?", a `bool` that conflated
+/// two very different losing cases. `main.rs` then printed "N argument(s) from
+/// the command line were NOT opened" on both, although the forwarding case has
+/// already written every path down the named pipe and the first instance opens
+/// them. A user who believed that line opened the files a second time by hand.
+pub enum SingleInstanceOutcome {
+    /// No other instance: this process owns the pipe and startup continues.
+    FirstInstance,
+    /// Another instance owns the pipe and was given this command line over it.
+    /// Nothing was lost, so nothing may be reported as lost.
+    ForwardedToFirstInstance,
+    /// Another instance owns the pipe and this command line did not reach it:
+    /// `--foreground` deliberately does not forward, or the pipe write failed.
+    NotForwarded,
+}
+
+pub fn handle_single_instance(opener: OpenListener, args: &Args) -> SingleInstanceOutcome {
+    if is_first_instance() {
         // We are the first instance, listen for messages sent from other instances
         std::thread::Builder::new()
             .name("EnsureSingleton".to_owned())
@@ -53,12 +71,21 @@ pub fn handle_single_instance(opener: OpenListener, args: &Args) -> bool {
                 })
             })
             .unwrap();
-    } else if !args.foreground {
-        // We are not the first instance, send args to the first instance
-        send_args_to_instance(args).log_err();
+        return SingleInstanceOutcome::FirstInstance;
     }
 
-    is_first_instance
+    if args.foreground {
+        return SingleInstanceOutcome::NotForwarded;
+    }
+
+    // We are not the first instance, send args to the first instance. A
+    // failure here is the one case on this branch where the arguments really
+    // are lost, and it is now distinguishable from the success it used to be
+    // lumped in with by `log_err()`.
+    match send_args_to_instance(args).log_err() {
+        Some(()) => SingleInstanceOutcome::ForwardedToFirstInstance,
+        None => SingleInstanceOutcome::NotForwarded,
+    }
 }
 
 fn with_pipe(f: &dyn Fn(String)) {

@@ -45,14 +45,68 @@ enum LinkPathState {
     /// executable, so a link to it that does not resolve is not reachable in
     /// practice and is not worth a branch.
     AlreadyOurs,
+    /// A symlink into *some* Sawe installation, but not this build's — the app
+    /// was moved (Downloads to /Applications), upgraded at a new path, or a
+    /// second release channel was installed over it. The payload is the stale
+    /// target it pointed at, so a caller (and a test) can say what was
+    /// re-pointed rather than only that something was.
+    StaleOurs(PathBuf),
     /// Something this fork did not create. Reported to the user, never removed.
     /// The payload completes the sentence "refusing to replace <path> because …".
     Foreign(String),
 }
 
+/// Whether `target` is the `cli` auxiliary executable of *a* Sawe bundle —
+/// i.e. an entry only a Sawe installation can have produced, whichever copy of
+/// Sawe produced it.
+///
+/// The shape is exact, not a substring test, because a wrong "ours" verdict
+/// unlinks somebody else's binary. `cli_path` on the only platform that runs
+/// this code is `NSBundle.URLForAuxiliaryExecutable` (`gpui_macos::platform`),
+/// which resolves inside the running bundle, and `script/bundle-mac` puts the
+/// CLI at `<Name>.app/Contents/MacOS/cli` on every channel. So all four
+/// components have to line up, and the bundle directory has to be one this
+/// fork actually ships: `Sawe.app`, `SaweDev.app`, `SawePreview.app`,
+/// `SaweNightly.app` (`crates/zed/Cargo.toml`'s `package.metadata.bundle-*`
+/// names, which is what `cargo bundle` uses for the directory).
+///
+/// Deliberately a check on the *stored link target* rather than on a resolved
+/// path: the case this exists for is a link whose target no longer exists, so
+/// resolving it would answer nothing. Nothing is read off the filesystem here.
+/// For the same reason the target must be absolute — a relative one names a
+/// different file depending on where the link sits, so it is not something
+/// `install_symlink` can ever have written and not something to reason about
+/// the identity of.
+fn is_a_sawe_cli_path(target: &Path) -> bool {
+    if !target.is_absolute() {
+        return false;
+    }
+    let mut components = target
+        .components()
+        .rev()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        });
+    let Some("cli") = components.next() else {
+        return false;
+    };
+    let Some("MacOS") = components.next() else {
+        return false;
+    };
+    let Some("Contents") = components.next() else {
+        return false;
+    };
+    matches!(
+        components.next(),
+        Some("Sawe.app" | "SaweDev.app" | "SawePreview.app" | "SaweNightly.app")
+    )
+}
+
 async fn inspect_link_path(cli_path: &Path, link_path: &Path) -> LinkPathState {
     match smol::fs::read_link(link_path).await {
         Ok(target) if target == cli_path => LinkPathState::AlreadyOurs,
+        Ok(target) if is_a_sawe_cli_path(&target) => LinkPathState::StaleOurs(target),
         Ok(target) => LinkPathState::Foreign(format!("it points to {}", target.display())),
         Err(error) if error.kind() == io::ErrorKind::NotFound => LinkPathState::Vacant,
         // `read_link` on an existing non-symlink fails with `EINVAL`, and any
@@ -76,10 +130,27 @@ fn refusal_message(link_path: &Path, reason: &str) -> String {
 /// this fork did not create: a machine may have both Sawe and another editor
 /// installed, and deleting whatever happens to sit at the target path would
 /// destroy the other product's CLI.
+///
+/// A link that points into *a* Sawe installation is ours to re-point even when
+/// it is not this exact build's — that is the whole reason the app can be
+/// moved out of Downloads, upgraded at a new path, or joined by a second
+/// release channel without `Install CLI` bailing out and leaving a dangling
+/// link behind. The looser test is still an exact structural one
+/// ([`is_a_sawe_cli_path`]); anything it does not recognise is refused by name
+/// and left untouched.
 async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<PathBuf> {
+    let mut replacing_stale = false;
     match inspect_link_path(cli_path, link_path).await {
         LinkPathState::AlreadyOurs => return Ok(link_path.into()),
         LinkPathState::Foreign(reason) => anyhow::bail!(refusal_message(link_path, &reason)),
+        LinkPathState::StaleOurs(_) => {
+            // Unlinking is confined to this branch, where the entry has been
+            // read and proven to be a Sawe bundle's own `cli`. A failure here
+            // is not fatal: the escalated path below removes it with the
+            // privileges this process lacks.
+            smol::fs::remove_file(link_path).await.log_err();
+            replacing_stale = true;
+        }
         LinkPathState::Vacant => {}
     }
 
@@ -93,19 +164,30 @@ async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<PathBuf> {
     }
 
     // The symlink could not be created, so use osascript with admin privileges
-    // to create it. `ln -s`, never `ln -sf`: we established above that nothing
-    // is at `link_path`, and the non-forcing form refuses to clobber an entry
-    // that appeared in the meantime rather than deleting it.
+    // to create it. `ln -s`, never `ln -sf`: the forcing form would clobber
+    // whatever is at `link_path` without ever having looked at it, and the
+    // whole point of this function is that nothing is removed unexamined. The
+    // `rm -f` below is not that: it runs only after `inspect_link_path` read
+    // the entry and proved it to be a Sawe bundle's own `cli`, and it is still
+    // paired with the non-forcing `ln -s`, so if it loses a race and something
+    // new appears in the gap the link is refused rather than the newcomer
+    // destroyed.
     let bin_dir_path = link_path.parent().context(NO_PARENT_ERROR)?;
+    let remove_stale = if replacing_stale {
+        format!("rm -f \'{}\' && ", link_path.to_string_lossy())
+    } else {
+        String::new()
+    };
     let status = smol::process::Command::new("/usr/bin/osascript")
         .args([
             "-e",
             &format!(
                 "do shell script \" \
                     mkdir -p \'{}\' && \
-                    ln -s \'{}\' \'{}\' \
+                    {}ln -s \'{}\' \'{}\' \
                 \" with administrator privileges",
                 bin_dir_path.to_string_lossy(),
+                remove_stale,
                 cli_path.to_string_lossy(),
                 link_path.to_string_lossy(),
             ),
@@ -279,7 +361,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cli_path = dir.path().join("cli");
         fs::write(&cli_path, b"cli").expect("write cli");
-        let other_cli_path = dir.path().join("other-editor-cli");
+        // Shaped exactly like ours except for the bundle name — the case the
+        // structural check exists to keep on the refusing side.
+        let other_cli_path = dir.path().join("Zed.app/Contents/MacOS/cli");
+        fs::create_dir_all(other_cli_path.parent().expect("parent")).expect("other bundle");
         fs::write(&other_cli_path, b"other").expect("write other cli");
         let link_path = dir.path().join("sawe");
         std::os::unix::fs::symlink(&other_cli_path, &link_path).expect("symlink");
@@ -293,6 +378,86 @@ mod tests {
             other_cli_path
         );
         assert!(other_cli_path.exists());
+    }
+
+    /// A Sawe bundle's own `cli` at any of the four channel names, dangling or
+    /// not, is ours. Everything else — another product's bundle, a `cli` that
+    /// is not in `Contents/MacOS`, a bare `sawe` on `$PATH`, a relative target
+    /// — is not, because a wrong "ours" verdict here unlinks somebody else's
+    /// binary.
+    #[test]
+    fn only_a_cli_inside_a_sawe_bundle_is_recognised_as_ours() {
+        let ours = [
+            "/Applications/Sawe.app/Contents/MacOS/cli",
+            "/Applications/SaweDev.app/Contents/MacOS/cli",
+            "/Applications/SawePreview.app/Contents/MacOS/cli",
+            "/Applications/SaweNightly.app/Contents/MacOS/cli",
+            "/Users/someone/Downloads/Sawe.app/Contents/MacOS/cli",
+        ];
+        for target in ours {
+            assert!(
+                is_a_sawe_cli_path(Path::new(target)),
+                "{target} is a Sawe bundle's own CLI"
+            );
+        }
+
+        let not_ours = [
+            // Another product's bundle, in the same directory.
+            "/Applications/Zed.app/Contents/MacOS/cli",
+            // A name that merely starts the same way.
+            "/Applications/SaweEditorPro.app/Contents/MacOS/cli",
+            // Right bundle, wrong executable.
+            "/Applications/Sawe.app/Contents/MacOS/sawe",
+            // Right name, no bundle around it — this is the substring match
+            // the refusal must not degenerate into.
+            "/usr/local/bin/cli",
+            "/opt/sawe/cli",
+            "/home/someone/sawe-tools/Contents/MacOS/cli",
+            // A relative target is not one we ever wrote.
+            "Sawe.app/Contents/MacOS/cli",
+            "",
+        ];
+        for target in not_ours {
+            assert!(
+                !is_a_sawe_cli_path(Path::new(target)),
+                "{target} must not be treated as a Sawe installation"
+            );
+        }
+    }
+
+    /// The defect: after the bundle is moved (Downloads to /Applications),
+    /// upgraded at a new path, or joined by a second channel, the existing
+    /// symlink no longer spells this build's `cli_path`. It used to be
+    /// classified `Foreign` and the install bailed with "Sawe only replaces a
+    /// symlink it created itself" — which is false, and leaves the user with a
+    /// dangling `sawe` command and no way to repair it from the menu.
+    #[test]
+    fn repoints_a_link_left_behind_by_another_sawe_installation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli_path = dir.path().join("Applications/Sawe.app/Contents/MacOS/cli");
+        fs::create_dir_all(cli_path.parent().expect("parent")).expect("bundle");
+        fs::write(&cli_path, b"cli").expect("write cli");
+
+        // The old location the app was dragged out of. Deliberately never
+        // created on disk: the link is dangling, which is exactly the state
+        // that made `Install CLI` refuse to repair itself.
+        let stale_target = dir
+            .path()
+            .join("Downloads/SawePreview.app/Contents/MacOS/cli");
+        let link_path = dir.path().join("sawe");
+        std::os::unix::fs::symlink(&stale_target, &link_path).expect("symlink");
+
+        assert_eq!(
+            smol::block_on(inspect_link_path(&cli_path, &link_path)),
+            LinkPathState::StaleOurs(stale_target),
+            "a link into any Sawe installation is one this fork created"
+        );
+
+        let installed = smol::block_on(install_symlink(&cli_path, &link_path))
+            .expect("a link we created is ours to re-point");
+
+        assert_eq!(installed, link_path);
+        assert_eq!(fs::read_link(&link_path).expect("read_link"), cli_path);
     }
 
     #[test]

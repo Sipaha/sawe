@@ -215,9 +215,46 @@ struct HandoffArgs {
     /// went into `paths`, rendered as typed. The file *is* opened; only the
     /// position is lost, so this is a separate loss from `unforwarded`.
     dropped_positions: Vec<String>,
-    /// `sawe-cli://<server>` handshake urls. Not the user's arguments at all —
-    /// see [`handoff_loss_report`].
+    /// Options that change *how* the carried paths are opened and that the
+    /// hand-off has no way to apply — `--dev-container`, `--wsl`. A separate
+    /// bucket from `unforwarded` because these are not arguments that failed
+    /// to open: the paths did open, plainly.
+    unapplied_options: Vec<String>,
+    /// `--solution <name-or-id>`, carried through the hand-off by
+    /// `solutions.list` + `solutions.open` (`editor_mcp::handoff`). Present
+    /// only when the canonical path would have honoured it — see
+    /// [`split_handoff_args`].
+    solution: Option<String>,
+    /// `sawe-cli://<server>` handshake urls. Not the user's arguments at all,
+    /// and their presence forbids the hand-off outright — see
+    /// [`may_hand_off`].
     cli_handshakes: Vec<String>,
+}
+
+/// The command-line switches that are neither paths nor `--diff` and that the
+/// hand-off has to account for one way or another.
+///
+/// `wsl` is a Windows-only field on [`Args`]; it is unconditional here so that
+/// [`split_handoff_args`] and its tests are the same code on every platform.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct HandoffExtras {
+    solution: Option<String>,
+    dev_container: bool,
+    wsl: Option<String>,
+}
+
+impl HandoffExtras {
+    fn from_args(args: &Args) -> Self {
+        #[cfg(target_os = "windows")]
+        let wsl = args.wsl.clone();
+        #[cfg(not(target_os = "windows"))]
+        let wsl = None;
+        Self {
+            solution: args.solution.clone(),
+            dev_container: args.dev_container,
+            wsl,
+        }
+    }
 }
 
 /// Split the command line into what `editor.handle_cli_args` can carry and
@@ -242,7 +279,11 @@ struct HandoffArgs {
 /// desktop entry: `Exec=` there is `bin/sawe`, which is `crates/cli`, and the
 /// CLI passes the editor only `sawe-cli://<server>` in argv and sends the user's
 /// URLs over that IPC channel instead.
-fn split_handoff_args(paths_or_urls: &[String], diff_paths: &[String]) -> HandoffArgs {
+fn split_handoff_args(
+    paths_or_urls: &[String],
+    diff_paths: &[String],
+    extras: &HandoffExtras,
+) -> HandoffArgs {
     let mut handoff = HandoffArgs::default();
     for arg in paths_or_urls {
         if arg.starts_with("sawe-cli://") {
@@ -257,13 +298,72 @@ fn split_handoff_args(paths_or_urls: &[String], diff_paths: &[String]) -> Handof
     }
     // `--diff` takes its two paths as one argument pair; clap enforces the
     // pairing, but `chunks` is used rather than indexing so a hypothetical odd
-    // tail is reported rather than panicked on.
+    // tail is reported rather than panicked on. One entry per *pair* is also
+    // the only count anything may use: sizing a second report off
+    // `args.diff.len()` made the same command line report two different
+    // numbers depending on which exit it took.
     for pair in diff_paths.chunks(2) {
         handoff
             .unforwarded
             .push(format!("--diff {}", pair.join(" ")));
     }
+
+    // Parity with the canonical path decides both of the branches below, and
+    // it is the same rule as `file://`: the same argv must not do different
+    // things depending on whether another editor happened to be running.
+    //
+    // Further down this file, `--solution` is read *only* by the `None` arm of
+    // the `open_rx.try_recv()` match — a command line that also carries paths
+    // or `--diff` produces a `RawOpenRequest` and never reaches it. So it is
+    // carried here on exactly the command lines where a canonical instance
+    // would have honoured it, and ignored (not reported) on the ones where a
+    // canonical instance ignores it too.
+    let has_open_request = !paths_or_urls.is_empty() || !diff_paths.is_empty();
+    if has_open_request {
+        // `--dev-container` and `--wsl` are the mirror image: they are read
+        // only when there *is* a `RawOpenRequest` to decorate, and the
+        // hand-off's one channel opens paths plainly. So they are lost exactly
+        // when they would have done something, and named exactly then.
+        if extras.dev_container {
+            handoff
+                .unapplied_options
+                .push("--dev-container".to_string());
+        }
+        if let Some(wsl) = &extras.wsl {
+            handoff.unapplied_options.push(format!("--wsl {wsl}"));
+        }
+    } else {
+        handoff.solution = extras.solution.clone();
+    }
     handoff
+}
+
+/// Whether this process may hand its command line to a running instance and
+/// exit.
+///
+/// A `sawe-cli://<server>` in argv is an ipc handshake `crates/cli` opened
+/// *before* it booted this process, and the user's real request — paths, urls,
+/// `--wait` — travels over that channel rather than in argv. Handing off and
+/// exiting therefore leaves `crates/cli` blocked in `server.accept()` for ever
+/// with nothing on the far end: the datagram socket the CLI tries first was
+/// absent (that is the only reason it booted us at all), so answering the
+/// handshake is this process's job and cannot be delegated. The handshake
+/// makes this process canonical by force.
+fn may_hand_off(handoff: &HandoffArgs) -> bool {
+    handoff.cli_handshakes.is_empty()
+}
+
+/// Everything on the command line the user asked to have opened, counted once
+/// each — the size of the loss a give-up exit inflicts.
+///
+/// Counted off the split rather than off [`Args`] so there is exactly one
+/// notion of "how many": `--diff` is one pair, not two paths, and a
+/// `sawe-cli://` handshake is not one of the user's arguments at all.
+/// `unapplied_options` are excluded because they open nothing on their own —
+/// they modify the paths, which are already counted — and `dropped_positions`
+/// because each belongs to a path that is counted too.
+fn total_arg_count(handoff: &HandoffArgs) -> usize {
+    handoff.paths.len() + handoff.unforwarded.len() + usize::from(handoff.solution.is_some())
 }
 
 /// Put `path` on the hand-off's carry list, splitting off a `:line:column`
@@ -338,14 +438,19 @@ fn file_url_as_path(arg: &str) -> Option<PathBuf> {
 ///
 /// This branch had no accounting at all: `sawe /tmp/a sawe://settings` opened
 /// `/tmp/a` in the running instance, threw `sawe://settings` away and exited 0
-/// with an empty terminal. That is worse than the give-up exits this session
-/// already fixed, because nothing failed and the user has no reason to look.
+/// with an empty terminal. That is worse than the give-up exits, because
+/// nothing failed and the user has no reason to look.
 ///
-/// Three losses, three lines, because they are three different facts:
+/// Four losses, four lines, because they are four different facts:
 ///
 /// - arguments the hand-off cannot carry at all. Named rather than counted:
 ///   unlike the give-up exits, only a subset is lost, so the user has to know
 ///   which.
+/// - options that would have changed *how* the carried paths were opened —
+///   `--dev-container`, `--wsl`. The paths did open, so calling these "NOT
+///   opened" would have been false; what is true is that they had no effect.
+///   They are listed only on the command lines where a canonical instance
+///   would have applied them (see [`split_handoff_args`]).
 /// - a `:line:column` suffix, dropped from a path that was handed off.
 ///   Carrying it would mean navigating an editor from
 ///   `crates/workspace/src/mcp/handle_cli_args.rs`, and the navigation
@@ -357,52 +462,42 @@ fn file_url_as_path(arg: &str) -> Option<PathBuf> {
 ///   opened at all — measured, the running instance grows a second window of
 ///   `kind: "folder"` rooted at that nonexistent path — so "opened at the
 ///   start of the file" would have asserted more than this process knows.
-/// - the `sawe-cli://<server>` ipc handshake, which is not the user's argument
-///   at all: it is the socket `crates/cli` opened before it booted this
-///   process, and the user's real request is on the far end of it. Listing that
-///   url among "arguments NOT opened" told the user two untrue things — that
-///   they had passed it, and that one argument was the extent of the damage.
+/// - `--solution`, when the running instance could not honour it. That one is
+///   the *instance's* sentence, not ours (`editor_mcp::handoff` builds it from
+///   the reply), because the two ways it fails — no Solution by that name, and
+///   `solutions.open` refusing an empty one — are things only the far end
+///   knows. The ordinary case says nothing: `--solution` is carried now, and a
+///   carried argument is not a loss.
 ///
-/// What that last line must NOT say is what happens to the `sawe` command
-/// next, because it differs per mode and this process cannot tell which it is
-/// in. Without `--foreground`, `crates/cli` fork/execs the editor through
-/// `boot_background` — `fork::close_fd` has already closed this process's
-/// stderr, so the line is not shown at all — and then blocks in
-/// `sender.join()` on a receiver still waiting in `server.accept()`, i.e. it
-/// hangs. With `--foreground` it is the opposite on both counts:
-/// `Command::status()` inherits stderr, so this line *is* what the user reads,
-/// and the `join` is never reached, so the command exits normally. A sentence
-/// about waiting would therefore have been false on the one CLI path where it
-/// is read.
-///
-/// What it *does* say about provenance — that the connection was opened by
-/// "the `sawe` command that started this process" — is deliberate, and was
-/// weighed against the third mode, direct invocation of this binary
-/// (`libexec/sawe-bin sawe-cli://…`, a dev build), where there is no `sawe`
-/// command at all. Left as it stands: that mode has no user request to
-/// describe either, because a live `sawe-cli://<server>` only ever comes from
-/// `crates/cli`. In the two modes anyone reaches by *using* the product the
-/// clause is exactly true, and naming the producer is the half of the sentence
-/// that explains why an argument the reader never typed is in their argv. Fed
-/// the url by hand, the whole sentence is hypothetical and its operative claim
-/// — nothing it asked for was opened — still holds. A mode-agnostic phrasing
-/// would buy accuracy in the synthetic case at the cost of precision in the
-/// two real ones.
+/// What is deliberately NOT here any more is a line about the
+/// `sawe-cli://<server>` ipc handshake. It used to be reported as a loss on
+/// this exit; it is now impossible to reach this exit with one, because
+/// [`may_hand_off`] refuses the hand-off outright when argv carries a
+/// handshake. Reporting the loss was never the repair — the `sawe` command on
+/// the far end of that socket does not read this process's stderr in the mode
+/// where it matters (`boot_background` has closed it) and sits in
+/// `server.accept()` until it is answered.
 ///
 /// The exit code stays 0. A non-zero exit from this binary means "the running
 /// editor could not be reached, your work was not done" (FORK.md #114); folding
 /// "I cannot route that" into the same code would make the exit status depend
 /// on whether another editor happened to be running, which is exactly the
-/// coupling the hand-off's parity rule exists to prevent. That holds for the
-/// handshake too: a canonical instance answers it, a handing-off one cannot,
-/// and it is the presence of the other editor that decides which.
-fn handoff_loss_report(handoff: &HandoffArgs) -> Vec<String> {
+/// coupling the hand-off's parity rule exists to prevent.
+fn handoff_loss_report(handoff: &HandoffArgs, solution_note: Option<&str>) -> Vec<String> {
     let mut lines = Vec::new();
     if !handoff.unforwarded.is_empty() {
         lines.push(format!(
             "sawe: the running instance opens paths only — {} argument(s) were NOT opened: {}",
             handoff.unforwarded.len(),
             handoff.unforwarded.join(", ")
+        ));
+    }
+    if !handoff.unapplied_options.is_empty() {
+        lines.push(format!(
+            "sawe: the running instance opens paths as they are — {} option(s) had no effect \
+             there: {}",
+            handoff.unapplied_options.len(),
+            handoff.unapplied_options.join(", ")
         ));
     }
     if !handoff.dropped_positions.is_empty() {
@@ -413,14 +508,33 @@ fn handoff_loss_report(handoff: &HandoffArgs) -> Vec<String> {
             handoff.dropped_positions.join(", ")
         ));
     }
-    if !handoff.cli_handshakes.is_empty() {
-        lines.push(
-            "sawe: the `sawe` command that started this process opened a connection the running \
-             instance cannot answer — nothing it asked for was opened."
-                .to_string(),
-        );
-    }
+    lines.extend(solution_note.map(str::to_string));
     lines
+}
+
+/// What became of the user's arguments by the time a give-up exit runs.
+///
+/// The give-up exits used to assume there was only one answer — "nobody
+/// carried them anywhere" — and printed "N argument(s) … were NOT opened"
+/// unconditionally. Two of the three states below make that sentence false,
+/// and both were shipping it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ArgumentFate {
+    /// Nothing carried them anywhere: this exit is the loss.
+    #[default]
+    Dropped,
+    /// The hand-off request reached the running instance and no usable reply
+    /// came back (`editor_mcp::HandoffOutcome::DeliveredButUnconfirmed`). The
+    /// paths may well be open already — `handoff::READ_TIMEOUT` is 30s and an
+    /// ordinary cold-project open can exceed it — so calling this a loss is
+    /// what sent users off to run the command again and collect a second
+    /// window.
+    DeliveredUnconfirmed,
+    /// Another mechanism already delivered them. On Windows
+    /// `handle_single_instance` writes the whole command line down the named
+    /// pipe to the first instance *before* returning that we lost the gate, so
+    /// the files do open and the exit that follows must not claim otherwise.
+    AlreadyForwarded,
 }
 
 /// The stderr lines that go with an exit that opened nothing.
@@ -434,27 +548,63 @@ fn handoff_loss_report(handoff: &HandoffArgs) -> Vec<String> {
 ///   at all — and the single-instance check below it can still send us home
 ///   without opening anything, which is the same silent drop with no error
 ///   value to carry;
-/// - the count is over **every** command-line argument, not only the ones
-///   [`split_handoff_args`] would have carried. A canonical instance turns
-///   each element of `paths_or_urls` into a URL and feeds it to the open
-///   listener (`parse_url_arg` + `open_listener.open`, further down this
-///   file), and reads `--diff` pairs there too, so those arguments are lost by
-///   these exits exactly as a path is. Sizing this line off the hand-off's
-///   path list instead made `sawe sawe://…` report nothing at all about what
-///   it had just thrown away;
+/// - it does not claim a loss another path already prevented. See
+///   [`ArgumentFate`]: on Windows the arguments have already gone down the
+///   named pipe, and a hand-off whose reply timed out may have opened
+///   everything. Neither is a drop, and reporting them as one is how a user
+///   ends up with two windows;
+/// - the count comes from [`total_arg_count`], so a `--diff` pair counts once
+///   here and once in the hand-off's own report rather than once as a pair and
+///   once as two paths;
 /// - with no arguments there is nothing to warn about, so a second `sawe` with
 ///   no arguments stays as quiet as it has always been.
-fn dropped_args_report(handoff_failure: Option<&str>, arg_count: usize) -> Vec<String> {
+fn dropped_args_report(
+    handoff: &HandoffArgs,
+    handoff_failure: Option<&str>,
+    fate: ArgumentFate,
+) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(reason) = handoff_failure {
-        lines.push(format!(
-            "sawe: could not hand off to the running instance: {reason}"
-        ));
+        lines.push(match fate {
+            ArgumentFate::DeliveredUnconfirmed => format!(
+                "sawe: the running instance was given the command line but did not confirm it: \
+                 {reason}"
+            ),
+            _ => format!("sawe: could not hand off to the running instance: {reason}"),
+        });
     }
+    let arg_count = total_arg_count(handoff);
     if arg_count > 0 {
-        lines.push(format!(
-            "sawe: {arg_count} argument(s) from the command line were NOT opened."
-        ));
+        match fate {
+            ArgumentFate::Dropped => lines.push(format!(
+                "sawe: {arg_count} argument(s) from the command line were NOT opened."
+            )),
+            ArgumentFate::DeliveredUnconfirmed => lines.push(format!(
+                "sawe: {arg_count} argument(s) may already be open in the running instance — \
+                 check it before running the command again."
+            )),
+            // Already opened by the first instance; saying anything here would
+            // only be wrong.
+            ArgumentFate::AlreadyForwarded => {}
+        }
+    }
+    if !handoff.cli_handshakes.is_empty() && fate != ArgumentFate::AlreadyForwarded {
+        // Not one of the user's arguments — it is the socket `crates/cli`
+        // opened before it booted this process — so it is neither named nor
+        // counted above. It still has to be said, because the request the user
+        // actually typed is on the far end of it and nothing answered.
+        //
+        // What this must NOT say is what happens to that `sawe` command next:
+        // without `--foreground` it blocks in `server.accept()` and this line
+        // is not even shown (`fork::close_fd` closed stderr); with
+        // `--foreground` the line *is* what the user reads and the command
+        // exits normally. A sentence about waiting would be false on the one
+        // mode where it is read.
+        lines.push(
+            "sawe: the `sawe` command that started this process opened a connection nothing \
+             answered — nothing it asked for was opened."
+                .to_string(),
+        );
     }
     lines
 }
@@ -468,14 +618,37 @@ fn dropped_args_report(handoff_failure: Option<&str>, arg_count: usize) -> Vec<S
 /// failed outright, in which case it holds the lock for the rest of its life
 /// (`editor_mcp::lifecycle::InstanceLock`) and no amount of waiting helps. So
 /// this names both and gives advice that is right for either.
-fn unreachable_instance_report(holder: &str, arg_count: usize) -> Vec<String> {
+///
+/// The fate is always `Dropped` here: this exit is reached without ever having
+/// connected, so nothing was delivered to anything.
+fn unreachable_instance_report(holder: &str, handoff: &HandoffArgs) -> Vec<String> {
     let mut lines = vec![format!(
         "sawe: the running instance ({holder}) is not accepting hand-offs — it is \
          either still starting or its MCP server failed to start."
     )];
-    lines.extend(dropped_args_report(None, arg_count));
+    lines.extend(dropped_args_report(handoff, None, ArgumentFate::Dropped));
     lines.push("sawe: retry shortly; if it persists, restart sawe.".to_string());
     lines
+}
+
+/// What the platform's single-instance gate decided, and what it did with this
+/// process's command line on the way.
+///
+/// `forwarded` exists because on Windows losing the gate is not the same as
+/// losing the arguments: `handle_single_instance` writes them down the named
+/// pipe to the first instance before it reports the loss, so the files open.
+/// The give-up exit printed "N argument(s) … were NOT opened" regardless, and
+/// a user who believes it opens the files a second time by hand.
+struct SingleInstanceVerdict {
+    lost: bool,
+    forwarded: bool,
+}
+
+impl SingleInstanceVerdict {
+    const CARRY_ON: Self = Self {
+        lost: false,
+        forwarded: false,
+    };
 }
 
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
@@ -706,11 +879,11 @@ fn main() {
     // its MCP server is reachable, hand off our CLI paths to it and exit.
     // Otherwise we continue and become the canonical instance (later we'll
     // bind the MCP server in `editor_mcp::start_server`).
-    let handoff_args = split_handoff_args(&args.paths_or_urls, &args.diff);
-    // Sized off every argument, not off what the hand-off carries: the exits
-    // below open nothing at all, so a `sawe://…` argument and a `--diff` pair
-    // are dropped just like a path.
-    let dropped_arg_count = args.paths_or_urls.len() + args.diff.len();
+    let handoff_args = split_handoff_args(
+        &args.paths_or_urls,
+        &args.diff,
+        &HandoffExtras::from_args(&args),
+    );
     // Why the reason is carried to the exit site instead of being reported
     // here: a hand-off failure is only *user-visible harm* if we then give up
     // without opening anything. When it fails and we go on to become the
@@ -719,49 +892,74 @@ fn main() {
     // ordinary case noisy for nothing. So the reason rides along and is
     // printed only by the branch that returns without doing the work.
     let mut handoff_failure: Option<String> = None;
-    match editor_mcp::try_handoff_to_existing_instance(handoff_args.paths.clone()) {
-        Ok(editor_mcp::HandoffOutcome::HandedOff { focused_window_id }) => {
-            log::info!(
-                "sawe: handed off to existing instance (window: {:?})",
-                focused_window_id
-            );
-            // The one exit that opened something and can still have lost
-            // something. Silent for the ordinary path-only hand-off.
-            for line in handoff_loss_report(&handoff_args) {
-                eprintln!("{line}");
+    let mut argument_fate = ArgumentFate::Dropped;
+    if !may_hand_off(&handoff_args) {
+        // `crates/cli` is blocked in `server.accept()` on the far end of the
+        // handshake in our argv and only this process can answer it, so there
+        // is no hand-off to attempt — see `may_hand_off`.
+        log::info!("sawe: argv carries a cli handshake; becoming canonical instead of handing off");
+    } else {
+        match editor_mcp::try_handoff_to_existing_instance(
+            handoff_args.paths.clone(),
+            handoff_args.solution.clone(),
+        ) {
+            Ok(editor_mcp::HandoffOutcome::HandedOff {
+                focused_window_id,
+                solution_note,
+            }) => {
+                log::info!(
+                    "sawe: handed off to existing instance (window: {:?})",
+                    focused_window_id
+                );
+                // The one exit that opened something and can still have lost
+                // something. Silent for the ordinary path-only hand-off.
+                for line in handoff_loss_report(&handoff_args, solution_note.as_deref()) {
+                    eprintln!("{line}");
+                }
+                return;
             }
-            return;
-        }
-        Ok(editor_mcp::HandoffOutcome::LockBusyButUnreachable { lockholder_pid }) => {
-            // `{:?}` on the Option printed the literal `Some(12345)` at the
-            // user, on the one line this branch has to explain itself with.
-            let holder = lockholder_pid
-                .map(|pid| format!("PID {pid}"))
-                .unwrap_or_else(|| "an unrecorded PID".to_string());
-            // This used to claim the other instance "is starting" and drop the
-            // arguments without a word. Since `editor_mcp::start_server` now
-            // keeps the lock across a failed bind, a *permanently* MCP-less
-            // editor also lands here — "please wait" would be wrong advice for
-            // half the cases, and the silent drop was wrong for all of them.
-            for line in unreachable_instance_report(&holder, dropped_arg_count) {
-                eprintln!("{line}");
+            Ok(editor_mcp::HandoffOutcome::LockBusyButUnreachable { lockholder_pid }) => {
+                // `{:?}` on the Option printed the literal `Some(12345)` at the
+                // user, on the one line this branch has to explain itself with.
+                let holder = lockholder_pid
+                    .map(|pid| format!("PID {pid}"))
+                    .unwrap_or_else(|| "an unrecorded PID".to_string());
+                // This used to claim the other instance "is starting" and drop
+                // the arguments without a word. Since `editor_mcp::start_server`
+                // now keeps the lock across a failed bind, a *permanently*
+                // MCP-less editor also lands here — "please wait" would be wrong
+                // advice for half the cases, and the silent drop was wrong for
+                // all of them.
+                for line in unreachable_instance_report(&holder, &handoff_args) {
+                    eprintln!("{line}");
+                }
+                process::exit(1);
             }
-            process::exit(1);
-        }
-        Ok(editor_mcp::HandoffOutcome::BecameCanonical) => {
-            // Continue normal startup; we'll bind the MCP server later. Note
-            // that "we may take the lock" is not "we will open the paths":
-            // the upstream single-instance check below owns a *different*
-            // socket (`data_dir()/zed-<channel>.sock`, bound at startup) than
-            // the one this probe read (`state/mcp.lock`, taken much later, in
-            // `editor_mcp::start_server`), so a live instance that is still
-            // initialising leaves the lock free while owning that socket. We
-            // can therefore reach the exit site below with no failure to
-            // report and still drop everything the user asked for.
-        }
-        Err(err) => {
-            log::warn!("sawe: handoff probe failed: {err}; continuing as canonical");
-            handoff_failure = Some(err.to_string());
+            Ok(editor_mcp::HandoffOutcome::BecameCanonical) => {
+                // Continue normal startup; we'll bind the MCP server later. Note
+                // that "we may take the lock" is not "we will open the paths":
+                // the upstream single-instance check below owns a *different*
+                // socket (`data_dir()/zed-<channel>.sock`, bound at startup) than
+                // the one this probe read (`state/mcp.lock`, taken much later, in
+                // `editor_mcp::start_server`), so a live instance that is still
+                // initialising leaves the lock free while owning that socket. We
+                // can therefore reach the exit site below with no failure to
+                // report and still drop everything the user asked for.
+            }
+            Ok(editor_mcp::HandoffOutcome::DeliveredButUnconfirmed { reason }) => {
+                // The request is on the wire and the running instance may have
+                // done every bit of the work; we simply never saw it say so.
+                // Continue as canonical (a Dev-channel or ZED_STATELESS run
+                // still opens the paths for real), but never let the exit below
+                // call this a loss.
+                log::warn!("sawe: handoff delivered but unconfirmed: {reason}");
+                handoff_failure = Some(reason);
+                argument_fate = ArgumentFate::DeliveredUnconfirmed;
+            }
+            Err(err) => {
+                log::warn!("sawe: handoff probe failed: {err}; continuing as canonical");
+                handoff_failure = Some(err.to_string());
+            }
         }
     }
 
@@ -784,28 +982,53 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
+    let single_instance = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
     {
-        false
+        SingleInstanceVerdict::CARRY_ON
     } else {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
-            crate::zed::listen_for_cli_connections(open_listener.clone()).is_err()
+            SingleInstanceVerdict {
+                lost: crate::zed::listen_for_cli_connections(open_listener.clone()).is_err(),
+                forwarded: false,
+            }
         }
 
         #[cfg(target_os = "windows")]
         {
-            !crate::zed::windows_only_instance::handle_single_instance(open_listener.clone(), &args)
+            use crate::zed::windows_only_instance::SingleInstanceOutcome;
+            // The Windows gate does not merely answer "did we lose?" — when it
+            // loses it *forwards the whole command line down the named pipe*
+            // first, so the files really do open in the first instance. The
+            // exit below used to print "N argument(s) … were NOT opened"
+            // anyway.
+            match crate::zed::windows_only_instance::handle_single_instance(
+                open_listener.clone(),
+                &args,
+            ) {
+                SingleInstanceOutcome::FirstInstance => SingleInstanceVerdict::CARRY_ON,
+                SingleInstanceOutcome::ForwardedToFirstInstance => SingleInstanceVerdict {
+                    lost: true,
+                    forwarded: true,
+                },
+                SingleInstanceOutcome::NotForwarded => SingleInstanceVerdict {
+                    lost: true,
+                    forwarded: false,
+                },
+            }
         }
 
         #[cfg(target_os = "macos")]
         {
             use zed::mac_only_instance::*;
-            ensure_only_instance() != IsOnlyInstance::Yes
+            SingleInstanceVerdict {
+                lost: ensure_only_instance() != IsOnlyInstance::Yes,
+                forwarded: false,
+            }
         }
     };
-    if failed_single_instance_check {
+    if single_instance.lost {
         println!("sawe is already running");
         // This is the exit that used to lose the user's file in silence:
         // another instance owns the single-instance socket, so we return
@@ -814,7 +1037,10 @@ fn main() {
         // invisible for as long as it did. Everything else goes to stderr so
         // the existing stdout line stays byte-identical for anything parsing
         // it.
-        for line in dropped_args_report(handoff_failure.as_deref(), dropped_arg_count) {
+        if single_instance.forwarded {
+            argument_fate = ArgumentFate::AlreadyForwarded;
+        }
+        for line in dropped_args_report(&handoff_args, handoff_failure.as_deref(), argument_fate) {
             eprintln!("{line}");
         }
         return;
@@ -2750,10 +2976,31 @@ fn check_for_conpty_dll() {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandoffArgs, dropped_args_report, handoff_loss_report, split_handoff_args,
-        unreachable_instance_report,
+        ArgumentFate, HandoffArgs, HandoffExtras, dropped_args_report, handoff_loss_report,
+        may_hand_off, split_handoff_args, total_arg_count, unreachable_instance_report,
     };
     use std::path::PathBuf;
+
+    /// `split_handoff_args` for the common case: paths only, no switches.
+    fn split_paths(paths_or_urls: &[&str]) -> HandoffArgs {
+        split_with(paths_or_urls, &[], &HandoffExtras::default())
+    }
+
+    fn split_with(
+        paths_or_urls: &[&str],
+        diff_paths: &[&str],
+        extras: &HandoffExtras,
+    ) -> HandoffArgs {
+        let owned = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        split_handoff_args(&owned(paths_or_urls), &owned(diff_paths), extras)
+    }
+
+    fn solution_extras(name: &str) -> HandoffExtras {
+        HandoffExtras {
+            solution: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn dropped_args_are_reported_without_a_failure_to_blame() {
@@ -2762,7 +3009,11 @@ mod tests {
         // print — but the arguments are dropped all the same and saying so is
         // the whole point.
         assert_eq!(
-            dropped_args_report(None, 2),
+            dropped_args_report(
+                &split_paths(&["/tmp/a.txt", "/tmp/b.txt"]),
+                None,
+                ArgumentFate::Dropped
+            ),
             vec!["sawe: 2 argument(s) from the command line were NOT opened."]
         );
     }
@@ -2771,8 +3022,9 @@ mod tests {
     fn a_failure_is_reported_once_alongside_the_dropped_args() {
         assert_eq!(
             dropped_args_report(
+                &split_paths(&["/tmp/a.txt"]),
                 Some("existing instance returned an error: Tool not found"),
-                1
+                ArgumentFate::Dropped
             ),
             vec![
                 "sawe: could not hand off to the running instance: existing instance returned an error: Tool not found",
@@ -2785,10 +3037,16 @@ mod tests {
     fn the_quiet_cases_stay_quiet() {
         // A second `sawe` with no arguments has lost nothing, so it says
         // nothing beyond the one stdout line the caller prints.
-        assert!(dropped_args_report(None, 0).is_empty());
+        assert!(
+            dropped_args_report(&HandoffArgs::default(), None, ArgumentFate::Dropped).is_empty()
+        );
         // A failure with no arguments still explains itself, but claims no loss.
         assert_eq!(
-            dropped_args_report(Some("connection refused"), 0),
+            dropped_args_report(
+                &HandoffArgs::default(),
+                Some("connection refused"),
+                ArgumentFate::Dropped
+            ),
             vec!["sawe: could not hand off to the running instance: connection refused"]
         );
     }
@@ -2799,12 +3057,7 @@ mod tests {
     /// the hand-off's paths made `sawe sawe://…` report nothing at all.
     #[test]
     fn a_url_argument_is_not_handed_off_but_is_still_reported_as_dropped() {
-        let args = vec![
-            "/tmp/a.txt".to_string(),
-            "sawe://file/tmp/b.txt".to_string(),
-        ];
-
-        let split = split_handoff_args(&args, &[]);
+        let split = split_paths(&["/tmp/a.txt", "sawe://file/tmp/b.txt"]);
         assert_eq!(
             split.paths,
             vec![PathBuf::from("/tmp/a.txt")],
@@ -2812,10 +3065,57 @@ mod tests {
         );
 
         assert_eq!(
-            dropped_args_report(None, args.len()),
+            dropped_args_report(&split, None, ArgumentFate::Dropped),
             vec!["sawe: 2 argument(s) from the command line were NOT opened."],
             "the report is sized off every argument, not off the hand-off's paths"
         );
+    }
+
+    /// Defect 3a: on Windows the give-up exit is reached *after*
+    /// `handle_single_instance` has written the whole command line down the
+    /// named pipe, so the first instance opens the files. Printing "were NOT
+    /// opened" there is simply false, and a user who believes it opens them
+    /// again by hand.
+    #[test]
+    fn arguments_another_path_already_forwarded_are_not_reported_as_dropped() {
+        let split = split_paths(&["/tmp/a.txt", "/tmp/b.txt"]);
+        assert!(
+            dropped_args_report(&split, None, ArgumentFate::AlreadyForwarded).is_empty(),
+            "the first instance was given these; there is no loss to report"
+        );
+        assert_eq!(
+            total_arg_count(&split),
+            2,
+            "the arguments are still there — it is the verdict about them that changed"
+        );
+    }
+
+    /// Defect 3b: the request went out and the reply did not come back. That
+    /// is not the same as never delivering it — `handoff::READ_TIMEOUT` is 30s
+    /// and an ordinary cold-project open can exceed it — so the exit must not
+    /// call the paths dropped and send the user off to make a second window.
+    #[test]
+    fn a_delivered_but_unconfirmed_handoff_is_not_reported_as_a_loss() {
+        let lines = dropped_args_report(
+            &split_paths(&["/tmp/a.txt"]),
+            Some("existing instance did not reply within 30s (it may be wedged)"),
+            ArgumentFate::DeliveredUnconfirmed,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "sawe: the running instance was given the command line but did not confirm it: \
+                 existing instance did not reply within 30s (it may be wedged)",
+                "sawe: 1 argument(s) may already be open in the running instance — check it \
+                 before running the command again.",
+            ]
+        );
+        for line in &lines {
+            assert!(
+                !line.contains("NOT opened"),
+                "a delivered request must not be reported as a loss: {line}"
+            );
+        }
     }
 
     /// A `file://` URL is a path spelled differently, and the running instance
@@ -2825,13 +3125,7 @@ mod tests {
     /// desktop entry runs `crates/cli` instead, which never puts it in argv.
     #[test]
     fn a_file_url_is_carried_as_the_path_it_denotes() {
-        let split = split_handoff_args(
-            &[
-                "file:///tmp/c.txt".to_string(),
-                "file:///tmp/a%20b.txt".to_string(),
-            ],
-            &[],
-        );
+        let split = split_paths(&["file:///tmp/c.txt", "file:///tmp/a%20b.txt"]);
         assert_eq!(
             split,
             HandoffArgs {
@@ -2841,7 +3135,7 @@ mod tests {
             "a file:// URL must be percent-decoded and carried, as OpenRequest::parse does"
         );
         assert!(
-            handoff_loss_report(&split).is_empty(),
+            handoff_loss_report(&split, None).is_empty(),
             "nothing was lost, so nothing is said"
         );
     }
@@ -2852,18 +3146,18 @@ mod tests {
     /// the user is told it was not opened instead of being left to notice.
     #[test]
     fn an_undecodable_file_url_is_reported_rather_than_dropped() {
-        let arg = "file:///tmp/%FF.txt".to_string();
-        let split = split_handoff_args(&[arg.clone()], &[]);
+        let arg = "file:///tmp/%FF.txt";
+        let split = split_paths(&[arg]);
         assert_eq!(
             split,
             HandoffArgs {
-                unforwarded: vec![arg],
+                unforwarded: vec![arg.to_string()],
                 ..Default::default()
             },
             "an escape that is not valid UTF-8 must not be silently swallowed"
         );
         assert_eq!(
-            handoff_loss_report(&split),
+            handoff_loss_report(&split, None),
             vec![
                 "sawe: the running instance opens paths only — 1 argument(s) were NOT opened: \
                  file:///tmp/%FF.txt"
@@ -2875,9 +3169,10 @@ mod tests {
     /// and used to exit 0 having thrown the rest away without a word.
     #[test]
     fn a_successful_handoff_names_what_it_could_not_carry() {
-        let split = split_handoff_args(
-            &["/tmp/a.txt".to_string(), "sawe://settings".to_string()],
-            &["/tmp/old.rs".to_string(), "/tmp/new.rs".to_string()],
+        let split = split_with(
+            &["/tmp/a.txt", "sawe://settings"],
+            &["/tmp/old.rs", "/tmp/new.rs"],
+            &HandoffExtras::default(),
         );
         assert_eq!(
             split.paths,
@@ -2885,7 +3180,7 @@ mod tests {
             "the plain path is still handed off"
         );
         assert_eq!(
-            handoff_loss_report(&split),
+            handoff_loss_report(&split, None),
             vec![
                 "sawe: the running instance opens paths only — 2 argument(s) were NOT opened: \
                  sawe://settings, --diff /tmp/old.rs /tmp/new.rs"
@@ -2894,38 +3189,136 @@ mod tests {
         );
     }
 
-    /// `--diff` is read only by this process's own startup, so a hand-off
-    /// abandons it — and the give-up exits drop it too, which the count they
-    /// print must include. Verified rather than assumed: it is a separate clap
-    /// field from `paths_or_urls` and neither path handles it.
+    /// Defect 4: `--diff` used to be one entry per PAIR in the hand-off's
+    /// report and `args.diff.len()` — two, one per path — in the give-up
+    /// exit's, so the same command line reported a different number depending
+    /// on which exit it took. Both counts now come from the same split.
     #[test]
-    fn diff_pairs_are_abandoned_by_the_handoff_and_counted_by_the_giving_up_exits() {
-        let diff = vec!["/tmp/old.rs".to_string(), "/tmp/new.rs".to_string()];
-        let split = split_handoff_args(&[], &diff);
+    fn a_diff_pair_counts_once_in_both_reports() {
+        let split = split_with(
+            &[],
+            &["/tmp/old.rs", "/tmp/new.rs"],
+            &HandoffExtras::default(),
+        );
         assert!(
             split.paths.is_empty(),
             "a diff pair is not a path the hand-off can open"
         );
         assert_eq!(split.unforwarded, vec!["--diff /tmp/old.rs /tmp/new.rs"]);
         assert_eq!(
-            dropped_args_report(None, diff.len()),
-            vec!["sawe: 2 argument(s) from the command line were NOT opened."],
-            "`sawe --diff a b` at a give-up exit used to report nothing at all"
+            total_arg_count(&split),
+            1,
+            "one pair is one thing asked for"
         );
+        assert_eq!(
+            dropped_args_report(&split, None, ArgumentFate::Dropped),
+            vec!["sawe: 1 argument(s) from the command line were NOT opened."],
+            "`sawe --diff a b` used to report 2 here and 1 in the hand-off report"
+        );
+        assert_eq!(
+            handoff_loss_report(&split, None),
+            vec![
+                "sawe: the running instance opens paths only — 1 argument(s) were NOT opened: \
+                 --diff /tmp/old.rs /tmp/new.rs"
+            ]
+        );
+    }
+
+    /// Defect 1: `--solution` was neither carried nor counted, so
+    /// `sawe --solution probe-test` against a running instance exited 0 in
+    /// total silence having opened nothing. It is carried now — the split puts
+    /// it where `editor_mcp::handoff` picks it up — and a give-up exit counts
+    /// it like any other thing the user asked for.
+    #[test]
+    fn a_solution_is_carried_by_the_handoff_and_counted_by_the_give_up_exits() {
+        let split = split_with(&[], &[], &solution_extras("probe-test"));
+        assert_eq!(split.solution.as_deref(), Some("probe-test"));
+        assert!(
+            handoff_loss_report(&split, None).is_empty(),
+            "a carried argument is not a loss"
+        );
+        assert_eq!(total_arg_count(&split), 1);
+        assert_eq!(
+            dropped_args_report(&split, None, ArgumentFate::Dropped),
+            vec!["sawe: 1 argument(s) from the command line were NOT opened."],
+            "the give-up exit used to say nothing at all about --solution"
+        );
+    }
+
+    /// Parity with the canonical path, which is the rule that decides what the
+    /// split carries at all: `--solution` is read only by the `None` arm of
+    /// the `open_rx.try_recv()` match, so a command line that also carries
+    /// paths never honours it there either. Carrying it here would make the
+    /// same argv do different things depending on whether an editor happened
+    /// to be running.
+    #[test]
+    fn a_solution_alongside_paths_is_ignored_exactly_as_the_canonical_path_ignores_it() {
+        let split = split_with(&["/tmp/a.txt"], &[], &solution_extras("probe-test"));
+        assert_eq!(split.solution, None);
+        assert_eq!(split.paths, vec![PathBuf::from("/tmp/a.txt")]);
+        assert_eq!(
+            total_arg_count(&split),
+            1,
+            "an option the canonical path ignores is not a loss to count"
+        );
+        assert!(handoff_loss_report(&split, None).is_empty());
+    }
+
+    /// When the running instance cannot honour `--solution`, the reason is its
+    /// own sentence and the hand-off's report simply carries it.
+    #[test]
+    fn a_solution_the_instance_could_not_open_is_named() {
+        let split = split_with(&[], &[], &solution_extras("probe-test"));
+        let note = "sawe: --solution probe-test: the running instance has no Solution with that \
+                    name or id — nothing was opened for it.";
+        assert_eq!(handoff_loss_report(&split, Some(note)), vec![note]);
+    }
+
+    /// Defect 1, the other two switches: `--dev-container` and `--wsl` decorate
+    /// a `RawOpenRequest` this hand-off cannot build, and were dropped without
+    /// a word. They get their own line rather than the "NOT opened" one,
+    /// because the paths *were* opened — just plainly.
+    #[test]
+    fn dev_container_and_wsl_are_named_where_they_would_have_mattered() {
+        let extras = HandoffExtras {
+            solution: None,
+            dev_container: true,
+            wsl: Some("me@Ubuntu".to_string()),
+        };
+        let split = split_with(&["/tmp/a.txt"], &[], &extras);
+        assert_eq!(split.paths, vec![PathBuf::from("/tmp/a.txt")]);
+        assert_eq!(
+            handoff_loss_report(&split, None),
+            vec![
+                "sawe: the running instance opens paths as they are — 2 option(s) had no effect \
+                 there: --dev-container, --wsl me@Ubuntu"
+            ]
+        );
+        assert_eq!(
+            total_arg_count(&split),
+            1,
+            "these modify the path that is already counted; they open nothing of their own"
+        );
+
+        // With nothing to decorate they are inert on the canonical path too,
+        // so reporting them would be a warning about nothing.
+        let bare = split_with(&[], &[], &extras);
+        assert!(bare.unapplied_options.is_empty());
+        assert!(handoff_loss_report(&bare, None).is_empty());
     }
 
     /// The ordinary case — one or more plain paths against a healthy instance
     /// — must stay exactly as silent as it has always been.
     #[test]
     fn the_ordinary_handoff_stays_silent() {
-        let split = split_handoff_args(&["/tmp/a.txt".to_string(), "rel/b.txt".to_string()], &[]);
+        let split = split_paths(&["/tmp/a.txt", "rel/b.txt"]);
         assert_eq!(
             split.paths,
             vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("rel/b.txt")],
             "a relative path is carried too; the tool joins it with our cwd"
         );
-        assert!(handoff_loss_report(&split).is_empty());
-        assert!(handoff_loss_report(&HandoffArgs::default()).is_empty());
+        assert!(handoff_loss_report(&split, None).is_empty());
+        assert!(handoff_loss_report(&HandoffArgs::default(), None).is_empty());
     }
 
     /// The help text promises `path:line:row`, and a canonical instance keeps
@@ -2935,13 +3328,10 @@ mod tests {
     /// loud rather than left for the user to notice.
     #[test]
     fn a_position_suffix_is_split_off_the_path_and_reported() {
-        let split = split_handoff_args(
-            &[
-                "/tmp/sawe-taskr-absent.rs:3:2".to_string(),
-                "file:///tmp/sawe-taskr-absent.rs:12".to_string(),
-            ],
-            &[],
-        );
+        let split = split_paths(&[
+            "/tmp/sawe-taskr-absent.rs:3:2",
+            "file:///tmp/sawe-taskr-absent.rs:12",
+        ]);
         assert_eq!(
             split.paths,
             vec![
@@ -2951,7 +3341,7 @@ mod tests {
             "both spellings must hand off the path the argument denotes"
         );
         assert_eq!(
-            handoff_loss_report(&split),
+            handoff_loss_report(&split, None),
             vec![
                 "sawe: the running instance cannot be given a cursor position — the \
                  `:line:column` was dropped from 2 argument(s): \
@@ -2973,7 +3363,7 @@ mod tests {
         std::fs::write(&path, b"probe").expect("temp file");
         let arg = path.to_string_lossy().into_owned();
 
-        let split = split_handoff_args(&[arg], &[]);
+        let split = split_paths(&[arg.as_str()]);
         std::fs::remove_file(&path).expect("cleanup");
 
         assert_eq!(
@@ -2982,17 +3372,20 @@ mod tests {
             "a real file whose name ends in :3:2 must be carried verbatim"
         );
         assert!(
-            handoff_loss_report(&split).is_empty(),
+            handoff_loss_report(&split, None).is_empty(),
             "nothing was lost, so nothing is said"
         );
     }
 
-    /// `sawe-cli://<server>` is the ipc handshake `crates/cli` puts in this
-    /// process's argv, not something a user typed. Listing it among "arguments
-    /// NOT opened" named an internal url at a person and understated the harm.
+    /// Defect 2: `sawe-cli://<server>` is the ipc handshake `crates/cli` opened
+    /// *before* it booted this process, and the user's real request travels
+    /// over it rather than in argv. Handing off and exiting therefore left the
+    /// `sawe` command blocked in `server.accept()` for ever. The handshake now
+    /// forbids the hand-off outright: this process becomes canonical and
+    /// answers it.
     #[test]
-    fn a_cli_handshake_is_not_reported_as_one_of_the_users_arguments() {
-        let split = split_handoff_args(&["sawe-cli:///tmp/socket-name".to_string()], &[]);
+    fn a_cli_handshake_forbids_the_handoff_instead_of_stranding_the_cli() {
+        let split = split_paths(&["sawe-cli:///tmp/socket-name"]);
         assert_eq!(
             split,
             HandoffArgs {
@@ -3001,12 +3394,35 @@ mod tests {
             },
             "the handshake is neither a path to carry nor a user argument to list"
         );
-        let lines = handoff_loss_report(&split);
+        assert!(
+            !may_hand_off(&split),
+            "handing off exits this process, and only this process can answer the handshake"
+        );
+        assert!(
+            may_hand_off(&split_paths(&["/tmp/a.txt"])),
+            "an ordinary command line still hands off"
+        );
+        assert_eq!(
+            total_arg_count(&split),
+            0,
+            "the handshake is not one of the user's arguments"
+        );
+    }
+
+    /// If the hand-off is refused *and* the single-instance gate then sends us
+    /// home, the handshake really is stranded — and unlike the arguments it is
+    /// not counted, so it needs a line of its own. It must not say what the
+    /// `sawe` command does next: without `--foreground` that command cannot
+    /// even read this stderr, and with it the command exits normally.
+    #[test]
+    fn a_stranded_cli_handshake_says_so_without_naming_the_internal_url() {
+        let split = split_paths(&["sawe-cli:///tmp/socket-name"]);
+        let lines = dropped_args_report(&split, None, ArgumentFate::Dropped);
         assert_eq!(
             lines,
             vec![
-                "sawe: the `sawe` command that started this process opened a connection the \
-                 running instance cannot answer — nothing it asked for was opened."
+                "sawe: the `sawe` command that started this process opened a connection nothing \
+                 answered — nothing it asked for was opened."
             ]
         );
         assert!(
@@ -3025,7 +3441,8 @@ mod tests {
     /// distinguish, and must not stay silent about the arguments it drops.
     #[test]
     fn an_unreachable_instance_names_both_causes_and_its_losses() {
-        let lines = unreachable_instance_report("PID 4242", 2);
+        let lines =
+            unreachable_instance_report("PID 4242", &split_paths(&["/tmp/a.txt", "/tmp/b.txt"]));
         assert_eq!(
             lines,
             vec![
@@ -3037,7 +3454,7 @@ mod tests {
 
         // With nothing to open, the loss line disappears but the diagnosis and
         // the advice do not: the user still asked for a window to be raised.
-        let quiet = unreachable_instance_report("an unrecorded PID", 0);
+        let quiet = unreachable_instance_report("an unrecorded PID", &HandoffArgs::default());
         assert_eq!(quiet.len(), 2, "no loss line when nothing was dropped");
         assert!(quiet[0].contains("an unrecorded PID"));
     }
