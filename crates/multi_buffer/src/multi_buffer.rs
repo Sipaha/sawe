@@ -112,6 +112,16 @@ pub struct MultiBuffer {
     /// The writing capability of the multi-buffer.
     capability: Capability,
     buffer_changed_since_sync: Rc<Cell<bool>>,
+    /// The buffers that [`MultiBuffer::set_caret_positions`] last reported a
+    /// caret to.
+    ///
+    /// Clearing carets used to walk *every* excerpted buffer on every
+    /// selection change, so one arrow key in a 2000-buffer project diff cost
+    /// 2000 entity leases. Only the buffers in here can be holding a stale
+    /// caret, so only they need clearing. `RefCell` because the method takes
+    /// `&self` — its caller (`Editor::update_selections`) already holds the
+    /// entity.
+    buffers_with_carets: RefCell<HashSet<BufferId>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1278,6 +1288,7 @@ impl MultiBuffer {
             capability,
             title: None,
             buffer_changed_since_sync: Default::default(),
+            buffers_with_carets: Default::default(),
             history: History::default(),
         }
     }
@@ -1314,6 +1325,7 @@ impl MultiBuffer {
             history: self.history.clone(),
             title: self.title.clone(),
             buffer_changed_since_sync,
+            buffers_with_carets: RefCell::new(self.buffers_with_carets.borrow().clone()),
         }
     }
 
@@ -1799,8 +1811,32 @@ impl MultiBuffer {
             }
         }
 
-        for (buffer_id, buffer_state) in self.buffers.iter() {
-            if !positions_by_buffer.contains_key(buffer_id) {
+        // Only a buffer this method itself put a caret on can be holding a
+        // stale one, so buffers that never had one are not visited at all —
+        // the sweep over every excerpted buffer that used to be here cost one
+        // entity lease per buffer on every single selection change.
+        let stale_buffers = {
+            let mut buffers_with_carets = self.buffers_with_carets.borrow_mut();
+            let mut stale_buffers = Vec::new();
+            buffers_with_carets.retain(|buffer_id| {
+                if positions_by_buffer.contains_key(buffer_id) {
+                    return true;
+                }
+                if self.buffers.contains_key(buffer_id) {
+                    stale_buffers.push(*buffer_id);
+                    false
+                } else {
+                    // Not excerpted right now, so there is nothing to clear
+                    // yet; stay queued so that a buffer coming back into the
+                    // multibuffer does not come back with a stale caret.
+                    true
+                }
+            });
+            buffers_with_carets.extend(positions_by_buffer.keys().copied());
+            stale_buffers
+        };
+        for buffer_id in stale_buffers {
+            if let Some(buffer_state) = self.buffers.get(&buffer_id) {
                 buffer_state
                     .buffer
                     .update(cx, |buffer, _| buffer.set_caret_positions(Vec::new()));

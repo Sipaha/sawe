@@ -15,6 +15,7 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use ui::{ContextMenu, CountBadge, IconButton, Tooltip, prelude::*, right_click_menu};
@@ -275,6 +276,14 @@ pub struct Dock {
     pub(crate) serialized_dock: Option<DockData>,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
+    /// Size writes waiting for the debounce below to fire, keyed by panel.
+    ///
+    /// Accumulating rather than replacing is what keeps the two writers —
+    /// `resize_all_panels` (N panels at once, settings-driven) and
+    /// `resize_active_panel` (one panel, per mouse-move) — from cancelling
+    /// each other: a drag that lands within the debounce window overwrites
+    /// only *its own* panel's entry and leaves the other N-1 queued.
+    pending_panel_size_writes: HashMap<&'static str, PanelSizeState>,
     /// Debounce token for KVP-backed size persistence. While the user is
     /// dragging the resize handle the listener fires per mouse-move (60+/s);
     /// each fire used to schedule its own `cx.background_spawn` write,
@@ -417,6 +426,11 @@ impl Dock {
                     dock.zoom_layer_open = is_zoomed;
                 }
             });
+            // A debounced size write that is still pending is the user's most
+            // recent resize; dropping the timer at window close would bring
+            // the panel back at the size it had *before* that resize.
+            cx.on_release(|dock: &mut Dock, cx| dock.flush_pending_panel_sizes(cx))
+                .detach();
             Self {
                 position,
                 workspace: workspace.downgrade(),
@@ -425,6 +439,7 @@ impl Dock {
                 is_open: false,
                 focus_handle: focus_handle.clone(),
                 focus_follows_mouse: WorkspaceSettings::get_global(cx).focus_follows_mouse,
+                pending_panel_size_writes: HashMap::default(),
                 _persist_panel_size_task: None,
                 _subscriptions: [focus_subscription, zoom_subscription],
                 serialized_dock: None,
@@ -979,36 +994,52 @@ impl Dock {
         {
             let (panel_key, size_state) =
                 resize_panel_entry(self.position, entry, size, flex, window, cx);
-            self.schedule_persist_panel_size(panel_key, size_state, cx);
+            self.schedule_persist_panel_sizes([(panel_key, size_state)], cx);
             cx.notify();
         }
     }
 
-    /// Trailing-edge debounce of the KVP write for the active panel's size.
+    /// Trailing-edge debounce of the KVP writes for panel sizes.
     /// Replaces a per-mouse-move `cx.background_spawn` (which the resize
     /// listener fired at ~60 Hz, swamping the SQLite executor and showing up
     /// as visible drag jitter) with a single write 200 ms after the last
-    /// resize. Dropping the previous task cancels its pending timer, so we
-    /// only ever persist the trailing position the user rests on.
-    fn schedule_persist_panel_size(
+    /// resize.
+    ///
+    /// Re-arming the timer must not throw away what an earlier caller queued:
+    /// the pending writes live in [`Dock::pending_panel_size_writes`] and only
+    /// the *timer* is replaced here, so a settings-driven `resize_all_panels`
+    /// of N panels survives a resize-handle drag that lands inside its
+    /// debounce window.
+    fn schedule_persist_panel_sizes(
         &mut self,
-        panel_key: &'static str,
-        size_state: PanelSizeState,
+        writes: impl IntoIterator<Item = (&'static str, PanelSizeState)>,
         cx: &mut Context<Self>,
     ) {
-        let workspace = self.workspace.clone();
-        self._persist_panel_size_task = Some(cx.spawn(async move |_, cx| {
+        self.pending_panel_size_writes.extend(writes);
+        self._persist_panel_size_task = Some(cx.spawn(async move |dock, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(200))
                 .await;
-            cx.update(|cx| {
-                if let Some(workspace) = workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.persist_panel_size_state(panel_key, size_state, cx);
-                    });
+            dock.update(cx, |dock, cx| dock.flush_pending_panel_sizes(cx))
+                .ok();
+        }));
+    }
+
+    /// Writes every queued panel size immediately. Called by the debounce
+    /// timer, and again when the `Dock` is released so a window closing
+    /// inside the debounce window does not swallow the last resize.
+    fn flush_pending_panel_sizes(&mut self, cx: &mut App) {
+        if self.pending_panel_size_writes.is_empty() {
+            return;
+        }
+        let writes = std::mem::take(&mut self.pending_panel_size_writes);
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                for (panel_key, size_state) in writes {
+                    workspace.persist_panel_size_state(panel_key, size_state, cx);
                 }
             });
-        }));
+        }
     }
 
     pub fn resize_all_panels(
@@ -1046,21 +1077,7 @@ impl Dock {
 
         // Same trailing-edge debounce as `resize_active_panel` — drag fires
         // 60+ events/s, immediate persistence created visible jitter.
-        let workspace = self.workspace.clone();
-        self._persist_panel_size_task = Some(cx.spawn(async move |_, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(200))
-                .await;
-            cx.update(|cx| {
-                if let Some(workspace) = workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        for (panel_key, size_state) in size_states_to_persist {
-                            workspace.persist_panel_size_state(panel_key, size_state, cx);
-                        }
-                    });
-                }
-            });
-        }));
+        self.schedule_persist_panel_sizes(size_states_to_persist, cx);
 
         cx.notify();
     }
@@ -1257,8 +1274,29 @@ impl PanelButtons {
             .read(cx)
             .panel_entries
             .iter()
-            .any(|entry| entry.panel.icon(window, cx).is_some())
+            .any(|entry| panel_button_parts(entry.panel.as_ref(), window, cx).is_some())
     }
+}
+
+/// The icon and tooltip a panel button needs, or `None` when [`PanelButtons`]
+/// would not paint a button for this panel at all.
+///
+/// The one place that answers "does this panel get a button" — the renderer
+/// filters on it and [`PanelButtons::has_visible_buttons`] asks it, so chrome
+/// drawn around the group (the project toolbar's divider) cannot disagree with
+/// what the group paints. A panel with an icon but no tooltip is a bug in that
+/// panel, so it is logged rather than silently skipped.
+fn panel_button_parts(
+    panel: &dyn PanelHandle,
+    window: &Window,
+    cx: &App,
+) -> Option<(ui::IconName, &'static str)> {
+    let icon = panel.icon(window, cx)?;
+    let icon_tooltip = panel
+        .icon_tooltip(window, cx)
+        .ok_or_else(|| anyhow::anyhow!("can't render a panel button without an icon tooltip"))
+        .log_err()?;
+    Some((icon, icon_tooltip))
 }
 
 impl Render for PanelButtons {
@@ -1280,14 +1318,7 @@ impl Render for PanelButtons {
             .iter()
             .enumerate()
             .filter_map(|(i, entry)| {
-                let icon = entry.panel.icon(window, cx)?;
-                let icon_tooltip = entry
-                    .panel
-                    .icon_tooltip(window, cx)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("can't render a panel button without an icon tooltip")
-                    })
-                    .log_err()?;
+                let (icon, icon_tooltip) = panel_button_parts(entry.panel.as_ref(), window, cx)?;
                 let name = entry.panel.persistent_name();
                 let panel = entry.panel.clone();
                 let supports_flexible = panel.supports_flexible_size(cx);
@@ -1593,5 +1624,246 @@ pub mod test {
         fn focus_handle(&self, _cx: &App) -> FocusHandle {
             self.focus_handle.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Workspace;
+    use fs::FakeFs;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::Project;
+
+    fn fixed_size(size: Pixels) -> PanelSizeState {
+        PanelSizeState {
+            size: Some(size),
+            flex: None,
+        }
+    }
+
+    /// `resize_all_panels` (settings-driven, N panels at once) and
+    /// `resize_active_panel` (one panel, per mouse-move) share one debounce
+    /// timer. Re-arming it must not discard what the other one queued, or a
+    /// drag landing inside the 200 ms window silently drops N-1 panel sizes
+    /// and those panels come back at stale sizes next session.
+    #[gpui::test]
+    async fn a_second_size_write_does_not_cancel_the_first(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
+
+        let dock = workspace.read_with(cx, |workspace, _| workspace.left_dock().clone());
+
+        dock.update(cx, |dock, cx| {
+            dock.schedule_persist_panel_sizes(
+                [
+                    ("SizeWriteFirstPanel", fixed_size(px(120.))),
+                    ("SizeWriteSecondPanel", fixed_size(px(120.))),
+                ],
+                cx,
+            );
+            dock.schedule_persist_panel_sizes([("SizeWriteSecondPanel", fixed_size(px(340.)))], cx);
+        });
+
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+
+        let (first, second) = workspace.read_with(cx, |workspace, cx| {
+            (
+                workspace.persisted_panel_size_state("SizeWriteFirstPanel", cx),
+                workspace.persisted_panel_size_state("SizeWriteSecondPanel", cx),
+            )
+        });
+        assert_eq!(
+            first.and_then(|state| state.size),
+            Some(px(120.)),
+            "the panel the second writer said nothing about must still be persisted"
+        );
+        assert_eq!(
+            second.and_then(|state| state.size),
+            Some(px(340.)),
+            "the panel both writers touched keeps the newer size"
+        );
+    }
+
+    /// The debounce is a timer owned by the `Dock`; closing the window drops
+    /// it. Whatever was queued is the user's most recent resize, so it has to
+    /// be written out rather than thrown away.
+    #[gpui::test]
+    async fn a_pending_size_write_is_flushed_when_the_dock_is_released(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update(cx, |workspace, _| workspace.set_random_database_id());
+
+        let dock = workspace.update_in(cx, |_workspace, window, cx| {
+            let modal_layer = cx.new(|_| ModalLayer::new());
+            Dock::new(DockPosition::Left, modal_layer, window, cx)
+        });
+        dock.update(cx, |dock, cx| {
+            dock.schedule_persist_panel_sizes([("ReleaseFlushPanel", fixed_size(px(275.)))], cx);
+        });
+
+        // Deliberately *not* past the debounce window: the timer must not be
+        // what makes this land.
+        drop(dock);
+        // Dropping the last handle only queues the entity for release; the
+        // listener runs on the next app update.
+        cx.update(|_window, _cx| {});
+        cx.run_until_parked();
+
+        let persisted = workspace.read_with(cx, |workspace, cx| {
+            workspace.persisted_panel_size_state("ReleaseFlushPanel", cx)
+        });
+        assert_eq!(
+            persisted.and_then(|state| state.size),
+            Some(px(275.)),
+            "a size write queued when the dock went away must still reach the KVP"
+        );
+    }
+
+    struct ButtonlessPanel {
+        icon: Option<ui::IconName>,
+        icon_tooltip: Option<&'static str>,
+        focus_handle: FocusHandle,
+    }
+
+    gpui::actions!(workspace_dock_test_only, [ToggleButtonlessPanel]);
+
+    impl EventEmitter<PanelEvent> for ButtonlessPanel {}
+
+    impl Focusable for ButtonlessPanel {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for ButtonlessPanel {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus_handle(cx))
+        }
+    }
+
+    impl Panel for ButtonlessPanel {
+        fn persistent_name() -> &'static str {
+            "ButtonlessPanel"
+        }
+
+        fn panel_key() -> &'static str {
+            "ButtonlessPanel"
+        }
+
+        fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+            DockPosition::Left
+        }
+
+        fn position_is_valid(&self, _position: DockPosition) -> bool {
+            true
+        }
+
+        fn set_position(
+            &mut self,
+            _position: DockPosition,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+        }
+
+        fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+            px(240.)
+        }
+
+        fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
+            self.icon
+        }
+
+        fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+            self.icon_tooltip
+        }
+
+        fn toggle_action(&self) -> Box<dyn Action> {
+            ToggleButtonlessPanel.boxed_clone()
+        }
+
+        fn activation_priority(&self) -> u32 {
+            0
+        }
+    }
+
+    struct PanelButtonsHarness(Entity<PanelButtons>);
+
+    impl Render for PanelButtonsHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// `has_visible_buttons` gates chrome drawn *around* the group (the
+    /// project toolbar's divider), so it has to answer the same question
+    /// `PanelButtons::render` answers. A panel with an icon and no tooltip is
+    /// where the two used to disagree: the predicate counted it, the renderer
+    /// dropped it, and the toolbar drew its divider next to nothing.
+    #[gpui::test]
+    async fn has_visible_buttons_agrees_with_what_the_group_paints(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| ButtonlessPanel {
+                icon: Some(ui::IconName::Folder),
+                icon_tooltip: None,
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let dock = workspace.read_with(cx, |workspace, _| workspace.left_dock().clone());
+        let panel_buttons = cx.update(|_window, cx| {
+            let dock = dock.clone();
+            cx.new(|cx| PanelButtons::new(dock, cx))
+        });
+        let window = cx.add_window(|_window, _cx| PanelButtonsHarness(panel_buttons.clone()));
+        let paint_cx = &mut VisualTestContext::from_window(window.into(), cx);
+        paint_cx.run_until_parked();
+
+        let has_buttons = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| panel_buttons.read(cx).has_visible_buttons(window, cx))
+        };
+
+        assert!(
+            paint_cx.debug_bounds("ICON-Folder").is_none(),
+            "the renderer drops a panel button with no icon tooltip"
+        );
+        assert!(
+            !has_buttons(paint_cx),
+            "…so the predicate the toolbar's divider is gated on must not count it"
+        );
+
+        panel.update(paint_cx, |panel, _| {
+            panel.icon_tooltip = Some("Buttonless Panel");
+        });
+        // `PanelButtons` derives its invalidation from the dock, not from the
+        // panel, so nudge the entity it actually observes.
+        dock.update(paint_cx, |_, cx| cx.notify());
+        paint_cx.run_until_parked();
+
+        assert!(
+            paint_cx.debug_bounds("ICON-Folder").is_some(),
+            "with a tooltip the button paints"
+        );
+        assert!(
+            has_buttons(paint_cx),
+            "…and the predicate must count it, or the divider disappears"
+        );
     }
 }

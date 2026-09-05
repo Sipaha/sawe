@@ -6345,3 +6345,70 @@ async fn test_set_caret_positions(cx: &mut TestAppContext) {
         assert_eq!(buffer.text(), "abcd\nefgh");
     });
 }
+
+/// `set_caret_positions` used to clear carets by sweeping EVERY excerpted
+/// buffer, which in a 2000-excerpt project diff cost 2000 entity leases per
+/// arrow key. It now remembers which buffers it handed a caret to and clears
+/// only those — so a buffer it never gave a caret to is left alone, including
+/// when another view over the same `Buffer` is the one holding the caret.
+///
+/// The other half of the contract — a buffer that *loses* its caret is still
+/// cleared — is covered by `test_set_caret_positions` above.
+#[gpui::test]
+async fn test_set_caret_positions_leaves_untouched_buffers_alone(cx: &mut TestAppContext) {
+    let buffer_1 = cx.new(|cx| Buffer::local("abcd  \nefgh  ", cx));
+    let buffer_2 = cx.new(|cx| Buffer::local("ijkl  ", cx));
+    let multibuffer = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            buffer_1.clone(),
+            [Point::new(0, 0)..Point::new(1, 6)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(1),
+            buffer_2.clone(),
+            [Point::new(0, 0)..Point::new(0, 6)],
+            0,
+            cx,
+        );
+        multibuffer
+    });
+
+    // Something other than this multibuffer — a second editor over the same
+    // `Buffer` — is what put this caret there.
+    buffer_2.update(cx, |buffer, _| {
+        buffer.set_caret_positions(vec![buffer.anchor_before(Point::new(0, 4))]);
+    });
+
+    let anchor = multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.snapshot(cx).anchor_before(Point::new(1, 5))
+    });
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_caret_positions(
+            &[Selection {
+                id: 0,
+                start: anchor,
+                end: anchor,
+                reversed: false,
+                goal: language::SelectionGoal::None,
+            }],
+            cx,
+        )
+    });
+
+    let diff = buffer_2
+        .update(cx, |buffer, cx| buffer.remove_trailing_whitespace(cx))
+        .await;
+    buffer_2.update(cx, |buffer, cx| {
+        buffer.apply_diff(diff, cx);
+        assert_eq!(
+            buffer.text(),
+            "ijkl  ",
+            "a selection change that says nothing about this buffer must not \
+             reach into it at all"
+        );
+    });
+}

@@ -121,6 +121,18 @@ pub struct GitBlame {
     regenerate_on_edit_task: Task<Result<()>>,
     _regenerate_subscriptions: Vec<Subscription>,
     options: BlameOptions,
+    /// Bumped whenever the blame entries change, so that
+    /// [`RunPredecessorCache`] can tell a still-valid answer from one taken
+    /// against blame data that has since been re-generated or re-synced.
+    blame_generation: usize,
+    run_predecessor_cache: Option<RunPredecessorCache>,
+    /// Display rows the last [`GitBlame::run_predecessor_above`] actually
+    /// read: zero when the memo answered, and never more than
+    /// [`MAX_RUN_PREDECESSOR_LOOKBACK`] because each widening only reads the
+    /// rows it has not read yet. Both are properties a test cannot see from
+    /// the classification alone.
+    #[cfg(test)]
+    last_predecessor_scan_rows: u32,
 }
 
 /// Where a blamed gutter row sits inside a run of consecutive lines that came
@@ -158,6 +170,17 @@ pub enum BlameRunPredecessor {
         sha: Oid,
         buffer_row: u32,
     },
+    /// The scan above the slice ran out of budget
+    /// ([`MAX_RUN_PREDECESSOR_LOOKBACK`]) without reaching anything that
+    /// settles the question, and everything it did see was a soft-wrap
+    /// continuation or an alignment spacer — neither of which can start a run.
+    ///
+    /// Distinct from [`Self::DisplayStart`] precisely because "I could not
+    /// see far enough" is not "there is nothing up there": reading it as the
+    /// latter relabels a still-continuing run's first visible row as a head,
+    /// redrawing the date and author mid-run and making the two panes of a
+    /// split diff disagree about where the label sits.
+    Unsettled,
 }
 
 /// Classifies each row as opening or continuing a run of lines that share a
@@ -209,7 +232,9 @@ pub fn blame_run_positions(
             sha,
             buffer_row,
         } => Some((buffer_id, sha, buffer_row)),
-        BlameRunPredecessor::DisplayStart | BlameRunPredecessor::Severed => None,
+        BlameRunPredecessor::DisplayStart
+        | BlameRunPredecessor::Severed
+        | BlameRunPredecessor::Unsettled => None,
     };
     // Whether nothing at all has been seen yet. Soft-wrap continuations and
     // alignment spacers do not clear it: a wrap is the same line still, and a
@@ -217,6 +242,12 @@ pub fn blame_run_positions(
     // either count as "something above" would make the two panes disagree
     // about whether their first row opens the display.
     let mut nothing_above = matches!(predecessor, BlameRunPredecessor::DisplayStart);
+    // Same lifetime as `nothing_above` — a wrap or a spacer leaves it standing,
+    // anything else clears it — but the opposite classification: the run above
+    // is unreadable rather than absent, so the first blamed row continues it
+    // instead of opening a new one. Choosing a head here would be inventing a
+    // run boundary out of a scan budget.
+    let mut unsettled_above = matches!(predecessor, BlameRunPredecessor::Unsettled);
 
     let mut positions = Vec::with_capacity(rows.len());
     for (ix, info) in rows.iter().enumerate() {
@@ -238,6 +269,7 @@ pub fn blame_run_positions(
             }
             if !is_wrap_row && !(is_block_row && is_alignment_row) {
                 nothing_above = false;
+                unsettled_above = false;
             }
             positions.push(None);
             continue;
@@ -251,12 +283,14 @@ pub fn blame_run_positions(
             {
                 BlameRunPosition::Continuation
             }
+            _ if unsettled_above => BlameRunPosition::Continuation,
             _ if nothing_above => BlameRunPosition::DocumentHead,
             _ => BlameRunPosition::Head,
         };
 
         previous = info.buffer_row.map(|row| (*buffer_id, entry.sha, row));
         nothing_above = false;
+        unsettled_above = false;
         positions.push(Some(position));
     }
 
@@ -267,6 +301,7 @@ pub fn blame_run_positions(
             sha,
             buffer_row,
         },
+        (false, None) if unsettled_above => BlameRunPredecessor::Unsettled,
         (false, None) => BlameRunPredecessor::Severed,
     };
     (positions, trailing)
@@ -306,10 +341,53 @@ fn alignment_rows_in_range(
 /// question, so it costs one row in the ordinary case; it only keeps widening
 /// while every row above is a soft-wrap continuation or an alignment spacer,
 /// neither of which settles anything. A stretch of those longer than this is
-/// pathological, and giving up reads as [`BlameRunPredecessor::DisplayStart`]
-/// — a labelled head with no hairline, which is what the gutter drew for its
-/// top row before it could see above itself at all.
+/// pathological, and giving up reads as [`BlameRunPredecessor::Unsettled`] —
+/// which keeps the run going rather than inventing a boundary where the scan
+/// merely ran out of budget.
+///
+/// This is a budget on rows *scanned in total*, not on how far above the
+/// viewport the last window starts: each widening only reads the rows it has
+/// not read yet (see [`GitBlame::scan_run_predecessor_above`]).
 const MAX_RUN_PREDECESSOR_LOOKBACK: u32 = 1024;
+
+/// Everything about a [`DisplaySnapshot`] that can change the answer
+/// [`GitBlame::run_predecessor_above`] gives for a fixed start row, cheap
+/// enough to recompute every frame.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct DisplayFingerprint {
+    display_map_id: gpui::EntityId,
+    max_display_row: u32,
+    max_display_column: u32,
+    edit_count: usize,
+    non_text_state_update_count: usize,
+    trailing_excerpt_update_count: usize,
+}
+
+impl DisplayFingerprint {
+    fn of(snapshot: &DisplaySnapshot) -> Self {
+        let max_point = snapshot.max_point();
+        let buffer = snapshot.buffer_snapshot();
+        Self {
+            display_map_id: snapshot.display_map_id,
+            max_display_row: max_point.row().0,
+            max_display_column: max_point.column(),
+            edit_count: buffer.edit_count(),
+            non_text_state_update_count: buffer.non_text_state_update_count(),
+            trailing_excerpt_update_count: buffer.trailing_excerpt_update_count(),
+        }
+    }
+}
+
+/// Memo for [`GitBlame::run_predecessor_above`]. The gutter asks the same
+/// question on every frame it is shown, and in the pathological case (a huge
+/// alignment spacer, or a line wrapping into hundreds of display rows) that
+/// question costs a scan of up to [`MAX_RUN_PREDECESSOR_LOOKBACK`] rows.
+struct RunPredecessorCache {
+    start_row: DisplayRow,
+    display: DisplayFingerprint,
+    blame_generation: usize,
+    predecessor: BlameRunPredecessor,
+}
 
 impl GitBlame {
     /// [`blame_run_positions`] for the rows a renderer is about to lay out,
@@ -346,35 +424,83 @@ impl GitBlame {
         start_row: DisplayRow,
         cx: &mut App,
     ) -> BlameRunPredecessor {
-        let mut lookback = 1;
-        loop {
-            let scan_start = DisplayRow(start_row.0.saturating_sub(lookback));
-            let count = start_row.0.saturating_sub(scan_start.0) as usize;
-            if count == 0 {
-                return BlameRunPredecessor::DisplayStart;
+        let display = DisplayFingerprint::of(snapshot);
+        if let Some(cache) = self.run_predecessor_cache.as_ref()
+            && cache.start_row == start_row
+            && cache.display == display
+            && cache.blame_generation == self.blame_generation
+        {
+            #[cfg(test)]
+            {
+                self.last_predecessor_scan_rows = 0;
             }
-            let scanned = snapshot
-                .row_infos(scan_start)
-                .take(count)
+            return cache.predecessor;
+        }
+
+        let predecessor = self.scan_run_predecessor_above(snapshot, start_row, cx);
+        self.run_predecessor_cache = Some(RunPredecessorCache {
+            start_row,
+            display,
+            blame_generation: self.blame_generation,
+            predecessor,
+        });
+        predecessor
+    }
+
+    /// Walks upward from `start_row` in widening segments until one of them
+    /// settles what the first visible row is looking at.
+    ///
+    /// Each segment covers only the rows not already scanned. That is sound
+    /// because a segment that comes back [`BlameRunPredecessor::DisplayStart`]
+    /// held nothing but wraps and spacers, and those pass whatever is above
+    /// them through unchanged — so the answer for `start_row` is exactly what
+    /// the newest segment settles. Restarting the whole window on every
+    /// doubling (which is what this used to do) re-read the same rows up to
+    /// eleven times, on every frame the gutter was shown.
+    fn scan_run_predecessor_above(
+        &mut self,
+        snapshot: &DisplaySnapshot,
+        start_row: DisplayRow,
+        cx: &mut App,
+    ) -> BlameRunPredecessor {
+        let mut scanned = 0u32;
+        let mut segment_len = 1u32;
+        loop {
+            let segment_end = start_row.0.saturating_sub(scanned);
+            let budget = MAX_RUN_PREDECESSOR_LOOKBACK.saturating_sub(scanned);
+            let count = segment_len.min(budget).min(segment_end);
+            if count == 0 {
+                return if segment_end == 0 {
+                    BlameRunPredecessor::DisplayStart
+                } else {
+                    BlameRunPredecessor::Unsettled
+                };
+            }
+            let segment_start = DisplayRow(segment_end - count);
+            scanned += count;
+            #[cfg(test)]
+            {
+                self.last_predecessor_scan_rows = scanned;
+            }
+            let rows = snapshot
+                .row_infos(segment_start)
+                .take(count as usize)
                 .collect::<Vec<_>>();
-            let scanned_blame = self.blame_for_rows(&scanned, cx).collect::<Vec<_>>();
-            let alignment_rows = alignment_rows_in_range(snapshot, scan_start, scanned.len());
-            // Seeded as if the scanned window started the display: coming back
+            let blamed_rows = self.blame_for_rows(&rows, cx).collect::<Vec<_>>();
+            let alignment_rows = alignment_rows_in_range(snapshot, segment_start, rows.len());
+            // Seeded as if the scanned segment started the display: coming back
             // out the other end still saying so is precisely "these rows
             // settled nothing", which is the signal to widen.
             let (_, predecessor) = blame_run_positions(
-                &scanned,
-                &scanned_blame,
+                &rows,
+                &blamed_rows,
                 &alignment_rows,
                 BlameRunPredecessor::DisplayStart,
             );
-            if predecessor != BlameRunPredecessor::DisplayStart
-                || scan_start.0 == 0
-                || lookback >= MAX_RUN_PREDECESSOR_LOOKBACK
-            {
+            if predecessor != BlameRunPredecessor::DisplayStart {
                 return predecessor;
             }
-            lookback = lookback.saturating_mul(2);
+            segment_len = segment_len.saturating_mul(2);
         }
     }
 }
@@ -609,6 +735,10 @@ impl GitBlame {
                 git_store_subscription,
             ],
             options: BlameOptions::default(),
+            blame_generation: 0,
+            run_predecessor_cache: None,
+            #[cfg(test)]
+            last_predecessor_scan_rows: 0,
         };
         this.generate(cx);
         this
@@ -781,6 +911,7 @@ impl GitBlame {
             return;
         };
         let edits = blame_buffer.buffer_edits.consume();
+        let had_edits = !edits.is_empty();
         let new_snapshot = buffer.read(cx).snapshot();
 
         let mut row_edits = edits
@@ -883,6 +1014,9 @@ impl GitBlame {
 
         blame_buffer.buffer_snapshot = new_snapshot;
         blame_buffer.entries = new_entries;
+        if had_edits {
+            self.blame_generation = self.blame_generation.wrapping_add(1);
+        }
     }
 
     #[cfg(test)]
@@ -1034,6 +1168,7 @@ impl GitBlame {
 
             this.update(cx, |this, cx| {
                 this.buffers.clear();
+                this.blame_generation = this.blame_generation.wrapping_add(1);
                 for (id, snapshot, buffer_edits, entries, commit_details) in all_results {
                     let Some(entries) = entries else {
                         continue;
@@ -2413,5 +2548,171 @@ mod tests {
             BlameRunPredecessor::DisplayStart,
             "spacers and wraps settle nothing, so the scan must widen past them"
         );
+    }
+
+    /// A scan that ran out of budget knows one thing for certain: everything
+    /// it saw was a wrap or a spacer, so nothing up there *started* a run.
+    /// Reading that as `DisplayStart` drew the date and author again in the
+    /// middle of a run — and only in the pane that had the huge spacer, so the
+    /// two panes of a split diff put the label on different rows.
+    #[test]
+    fn blame_run_positions_continue_a_run_the_scan_could_not_reach() {
+        let buffer = test_buffer_id(1);
+        pretty_assertions::assert_eq!(
+            run_positions(
+                &plain(&[
+                    (text_row(buffer, 900), Some((buffer, "1a1a1a"))),
+                    (text_row(buffer, 901), Some((buffer, "1a1a1a"))),
+                ]),
+                BlameRunPredecessor::Unsettled,
+            )
+            .0,
+            vec![
+                Some(BlameRunPosition::Continuation),
+                Some(BlameRunPosition::Continuation),
+            ],
+            "the run above is unreadable, not absent, so its first visible row \
+             must not be relabelled as a head"
+        );
+    }
+
+    /// `Unsettled` only survives the same rows `DisplayStart` survives — a
+    /// wrap or a spacer. Anything that genuinely breaks a run still breaks it,
+    /// so the fallback cannot glue two commits together.
+    #[test]
+    fn blame_run_positions_stop_continuing_an_unreachable_run_at_a_block_row() {
+        let buffer = test_buffer_id(1);
+        pretty_assertions::assert_eq!(
+            run_positions(
+                &plain(&[
+                    (block_row(), None),
+                    (text_row(buffer, 900), Some((buffer, "1a1a1a"))),
+                ]),
+                BlameRunPredecessor::Unsettled,
+            )
+            .0,
+            vec![None, Some(BlameRunPosition::Head)],
+            "a block row severs whatever the scan could not see"
+        );
+        pretty_assertions::assert_eq!(
+            run_positions(
+                &[(soft_wrapped_row(900), None, false)],
+                BlameRunPredecessor::Unsettled,
+            )
+            .1,
+            BlameRunPredecessor::Unsettled,
+            "a slice of nothing but wraps hands the same unreadable state down"
+        );
+    }
+
+    /// The two halves of the lookback cap, on a real display snapshot: a line
+    /// wrapping into more display rows than the scan is allowed to read.
+    ///
+    /// 1. The scan must not invent a run boundary — the row below the wrap
+    ///    continues the run rather than opening one, which is also what the
+    ///    companion pane of a split diff says about the same line.
+    /// 2. It must not cost more than its budget, and the *same* question asked
+    ///    again on the same frame must cost nothing: this runs from
+    ///    `EditorElement::layout_blame_entries` on every frame the gutter is
+    ///    shown, and it used to restart the whole widening window each time.
+    #[gpui::test]
+    async fn test_run_positions_at_the_lookback_cap(cx: &mut gpui::TestAppContext) {
+        use crate::display_map::{DisplayMap, DisplayRow, FoldPlaceholder};
+        use gpui::{font, px};
+        use project::project_settings::DiagnosticSeverity;
+
+        init_test(cx);
+
+        // Long enough that the wrapped rows above the third line outnumber
+        // `MAX_RUN_PREDECESSOR_LOOKBACK`, which is the only way to reach the
+        // cap without a companion pane and a giant alignment spacer.
+        let long_line = "wrapped ".repeat(1400);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/my-repo"),
+            json!({
+                ".git": {},
+                "file.txt": format!("first\n{long_line}\nthird\nfourth\n"),
+            }),
+        )
+        .await;
+        // One commit over every line: anything but `Continuation` below the
+        // wrap is the classification losing the run, not the fixture.
+        fs.set_blame_for_repo(
+            Path::new(path!("/my-repo/.git")),
+            vec![(
+                repo_path("file.txt"),
+                Blame {
+                    entries: vec![blame_entry("1a1a1a", 0..4)],
+                    ..Default::default()
+                },
+            )],
+        );
+
+        let project = Project::test(fs, [path!("/my-repo").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/my-repo/file.txt"), cx)
+            })
+            .await
+            .expect("the fixture file opens");
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+        let display_map = cx.new(|cx| {
+            DisplayMap::new(
+                multi_buffer.clone(),
+                font("Helvetica"),
+                px(14.),
+                Some(px(60.)),
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        cx.executor().run_until_parked();
+        let snapshot = display_map.update(cx, |map, cx| map.snapshot(cx));
+
+        let blame =
+            cx.new(|cx| GitBlame::new(multi_buffer, project, HashMap::default(), false, true, cx));
+        cx.executor().run_until_parked();
+
+        let start_row = snapshot
+            .row_infos(DisplayRow(0))
+            .position(|info| info.buffer_row == Some(2))
+            .expect("the third line is on screen somewhere") as u32;
+        assert!(
+            start_row > MAX_RUN_PREDECESSOR_LOOKBACK,
+            "the wrapped line must occupy more display rows than the scan is \
+             allowed to read, or the cap is never reached: {start_row}"
+        );
+
+        let start_row = DisplayRow(start_row);
+        let rows = snapshot.row_infos(start_row).take(2).collect::<Vec<_>>();
+        blame.update(cx, |blame, cx| {
+            let blamed_rows = blame.blame_for_rows(&rows, cx).collect::<Vec<_>>();
+            pretty_assertions::assert_eq!(
+                blame.run_positions_in_viewport(&snapshot, start_row, &rows, &blamed_rows, cx),
+                vec![
+                    Some(BlameRunPosition::Continuation),
+                    Some(BlameRunPosition::Continuation),
+                ],
+                "the scan gave up without reaching the run's head, which is not \
+                 a reason to draw a new one"
+            );
+            assert_eq!(
+                blame.last_predecessor_scan_rows, MAX_RUN_PREDECESSOR_LOOKBACK,
+                "each widening must read only the rows it has not read yet — \
+                 restarting the window every doubling scanned about twice this"
+            );
+
+            blame.run_positions_in_viewport(&snapshot, start_row, &rows, &blamed_rows, cx);
+            assert_eq!(
+                blame.last_predecessor_scan_rows, 0,
+                "the gutter asks this on every frame, so the same question \
+                 against the same snapshot must be answered from the memo"
+            );
+        });
     }
 }

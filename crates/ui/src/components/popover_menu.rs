@@ -381,24 +381,54 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
                         anchored =
                             anchored.position(child_bounds.corner(self.resolved_attach()) + offset);
                     }
+                    let menu_div = div().occlude().child(menu.clone());
                     // Dismiss the menu when the user mouses down anywhere
-                    // outside its bounds. PopoverMenu's only other built-in
-                    // dismiss path is "click on the trigger toggle", so
-                    // without this every popover stays stuck open until the
-                    // user explicitly hits Escape or clicks the trigger
-                    // again. Wired here on the menu's outer div (rather
-                    // than per-popover) so every PopoverMenu in the app
+                    // outside it. PopoverMenu's only other built-in dismiss
+                    // path is "click on the trigger toggle", so without this
+                    // every popover stays stuck open until the user explicitly
+                    // hits Escape or clicks the trigger again. Wired here
+                    // (rather than per-popover) so every PopoverMenu in the app
                     // gets the same behaviour for free.
+                    //
+                    // "Outside" is decided by hit test, not by the wrapper's
+                    // bounds: a `ContextMenu` submenu is painted
+                    // `absolute().left_full()` and so lies *outside* the
+                    // wrapper it descends from (`context_menu.rs`,
+                    // `render_submenu_container`). An `on_mouse_down_out` on
+                    // the wrapper read a mouse-down on a submenu item as a
+                    // click outside and dismissed the whole popover before the
+                    // click could complete. This backdrop instead covers the
+                    // window and does *not* occlude, so it fires only when the
+                    // press was not swallowed by an occluding hitbox painted
+                    // above it — which the menu, and every submenu and popover
+                    // nested in it, all are. Anything genuinely outside still
+                    // gets its own click: a non-occluding hitbox blocks
+                    // nothing, and the listener runs in the capture phase
+                    // without stopping propagation, exactly as before.
                     let dismiss_menu = menu.clone();
-                    let menu_div = div()
-                        .occlude()
-                        .on_mouse_down_out(move |_, _, cx| {
-                            dismiss_menu.update(cx, |_, cx| cx.emit(DismissEvent));
-                        })
-                        .child(menu.clone());
-                    let mut element = deferred(anchored.child(menu_div))
-                        .with_priority(1)
-                        .into_any();
+                    let viewport = window.viewport_size();
+                    let backdrop = gpui::anchored().position(point(px(0.), px(0.))).child(
+                        div()
+                            .w(viewport.width)
+                            .h(viewport.height)
+                            .capture_any_mouse_down(move |_, _, cx| {
+                                dismiss_menu.update(cx, |_, cx| cx.emit(DismissEvent));
+                            }),
+                    );
+                    // One deferred draw, backdrop first: hit testing walks the
+                    // hitboxes of a frame in reverse insertion order and stops
+                    // at the first occluding one, so the backdrop has to be
+                    // inserted *before* the menu's. Putting both in the same
+                    // deferred subtree is what guarantees that, independently
+                    // of what any other deferred draw in the app does.
+                    let mut element = deferred(
+                        div()
+                            .absolute()
+                            .child(backdrop)
+                            .child(anchored.child(menu_div)),
+                    )
+                    .with_priority(1)
+                    .into_any();
 
                     menu_layout_id = Some(element.request_layout(window, cx));
                     element
@@ -519,5 +549,202 @@ impl<M: ManagedView> IntoElement for PopoverMenu<M> {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Button, ContextMenu};
+    use gpui::{Font, Modifiers, MouseButton, Render, TestAppContext, font};
+    use std::cell::Cell;
+
+    /// The `ui` crate does not depend on `theme_settings`, which is what
+    /// registers the real provider, so a rendering test has to supply one.
+    struct TestThemeSettings {
+        ui_font: Font,
+        buffer_font: Font,
+    }
+
+    impl theme::ThemeSettingsProvider for TestThemeSettings {
+        fn ui_font<'a>(&'a self, _cx: &'a App) -> &'a Font {
+            &self.ui_font
+        }
+
+        fn buffer_font<'a>(&'a self, _cx: &'a App) -> &'a Font {
+            &self.buffer_font
+        }
+
+        fn ui_font_size(&self, _cx: &App) -> Pixels {
+            px(14.)
+        }
+
+        fn buffer_font_size(&self, _cx: &App) -> Pixels {
+            px(14.)
+        }
+
+        fn ui_density(&self, _cx: &App) -> theme::UiDensity {
+            theme::UiDensity::Default
+        }
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+            theme::set_theme_settings_provider(
+                Box::new(TestThemeSettings {
+                    ui_font: font("Helvetica"),
+                    buffer_font: font("Helvetica"),
+                }),
+                cx,
+            );
+        });
+    }
+
+    struct SubmenuHarness {
+        handle: PopoverMenuHandle<ContextMenu>,
+        menu: Rc<RefCell<Option<Entity<ContextMenu>>>>,
+        child_invoked: Rc<Cell<bool>>,
+    }
+
+    impl Render for SubmenuHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let menu_slot = self.menu.clone();
+            let child_invoked = self.child_invoked.clone();
+            div().size_full().child(
+                PopoverMenu::new("popover-submenu-test")
+                    .with_handle(self.handle.clone())
+                    .trigger(Button::new("popover-submenu-trigger", "Open"))
+                    .menu(move |window, cx| {
+                        let child_invoked = child_invoked.clone();
+                        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+                            menu.entry("Sibling", None, |_, _| {}).submenu(
+                                "Parent",
+                                move |submenu, _, _| {
+                                    let child_invoked = child_invoked.clone();
+                                    submenu
+                                        .entry("Child", None, move |_, _| child_invoked.set(true))
+                                },
+                            )
+                        });
+                        *menu_slot.borrow_mut() = Some(menu.clone());
+                        Some(menu)
+                    }),
+            )
+        }
+    }
+
+    /// A `ContextMenu` submenu is painted `absolute().left_full()`, i.e.
+    /// *outside* the bounds of the wrapper `PopoverMenu` puts around its menu.
+    /// The wrapper's click-outside-to-dismiss must therefore not be a bounds
+    /// test: reading a press on a submenu item as "outside" tore the whole
+    /// popover down before the click could complete, which is what the title
+    /// bar's "Panel Layout" submenu, edit prediction's "Experiment" submenu
+    /// and the AI session strip's submenu all did.
+    #[gpui::test]
+    async fn a_press_inside_a_submenu_does_not_dismiss_the_popover(cx: &mut TestAppContext) {
+        init_test(cx);
+        let handle = PopoverMenuHandle::<ContextMenu>::default();
+        let menu_slot: Rc<RefCell<Option<Entity<ContextMenu>>>> = Rc::default();
+        let child_invoked = Rc::new(Cell::new(false));
+
+        let cx = {
+            let handle = handle.clone();
+            let menu_slot = menu_slot.clone();
+            let child_invoked = child_invoked.clone();
+            let (_harness, cx) = cx.add_window_view(move |_window, _cx| SubmenuHarness {
+                handle,
+                menu: menu_slot,
+                child_invoked,
+            });
+            cx
+        };
+        cx.run_until_parked();
+
+        cx.update(|window, app| handle.show(window, app));
+        cx.run_until_parked();
+        assert!(handle.is_deployed(), "the popover must open at all");
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Sibling").is_some(),
+            "the popover's menu must be painted"
+        );
+
+        let menu = menu_slot
+            .borrow()
+            .clone()
+            .expect("the menu builder must have run");
+        cx.update(|window, app| {
+            menu.update(app, |menu, cx| {
+                menu.select_last(window, cx);
+                menu.select_submenu_child(&menu::SelectChild, window, cx);
+            });
+        });
+        // The submenu positions itself off bounds two canvases record, so it
+        // cannot paint on the frame that opened it: the first frame measures
+        // the menu and the trigger row, the second one places the submenu.
+        for _ in 0..3 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+
+        let child_bounds = cx
+            .debug_bounds("MENU_ITEM-Child")
+            .expect("the submenu must be open and painted");
+        let child_center = child_bounds.center();
+
+        cx.simulate_mouse_down(child_center, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            handle.is_deployed(),
+            "a press on a submenu item is a press inside the popover, however \
+             far outside the menu wrapper's bounds the submenu is painted"
+        );
+
+        cx.simulate_mouse_up(child_center, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            child_invoked.get(),
+            "…and the click it belongs to must reach the submenu entry"
+        );
+    }
+
+    /// The other half of the same contract: the backdrop still exists to close
+    /// a popover the user clicked away from.
+    #[gpui::test]
+    async fn a_press_outside_the_menu_still_dismisses_the_popover(cx: &mut TestAppContext) {
+        init_test(cx);
+        let handle = PopoverMenuHandle::<ContextMenu>::default();
+        let menu_slot: Rc<RefCell<Option<Entity<ContextMenu>>>> = Rc::default();
+        let child_invoked = Rc::new(Cell::new(false));
+
+        let cx = {
+            let handle = handle.clone();
+            let (_harness, cx) = cx.add_window_view(move |_window, _cx| SubmenuHarness {
+                handle,
+                menu: menu_slot,
+                child_invoked,
+            });
+            cx
+        };
+        cx.run_until_parked();
+
+        cx.update(|window, app| handle.show(window, app));
+        cx.run_until_parked();
+        assert!(handle.is_deployed());
+
+        let menu_bounds = cx
+            .debug_bounds("MENU_ITEM-Sibling")
+            .expect("the menu must be painted");
+        let far_away = point(
+            menu_bounds.right() + px(400.),
+            menu_bounds.bottom() + px(400.),
+        );
+
+        cx.simulate_mouse_down(far_away, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            !handle.is_deployed(),
+            "clicking away from the popover must still close it"
+        );
     }
 }

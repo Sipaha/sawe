@@ -47,6 +47,19 @@ pub const STATUS_BAR_HEIGHT: Pixels = px(33.);
 /// and must reset it the way `ContextMenu` does.
 const STATUS_BAR_UI_SCALE: f32 = 1.1;
 
+/// How much more eagerly the left group yields width than the right one.
+///
+/// Both groups are shrinkable — the right group has to be, or its outermost
+/// item slides off the window instead of its inboard items clipping (see
+/// [`StatusBar::render_right_tools`]) — and flexbox distributes a deficit
+/// across every shrinkable item in proportion to `shrink × base size`. A
+/// weight this much larger makes the left group absorb essentially the whole
+/// deficit until it is frozen at `min-width: 0`, at which point the remainder
+/// falls to the right group. That is the previous ordering (left clips first),
+/// kept without the `flex_shrink_0` that made the right group unable to clip
+/// at all.
+const LEFT_TOOLS_SHRINK_WEIGHT: f32 = 1000.;
+
 /// Describes how a status-bar item can be hidden by the user.
 ///
 /// Every [`StatusItemView`] must either provide this (so that the user gets a
@@ -196,18 +209,16 @@ impl Render for StatusBar {
                     .border_color(cx.theme().colors().status_bar_background),
             })
             .child(
-                WithRemSize::new(
-                    theme::theme_settings(cx).ui_font_size(cx) * STATUS_BAR_UI_SCALE,
-                )
-                .size_full()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(DynamicSpacing::Base08.rems(cx))
-                .p(DynamicSpacing::Base04.rems(cx))
-                .child(self.render_left_tools(&sidebar, cx))
-                .child(self.render_right_tools(&sidebar, cx)),
+                WithRemSize::new(theme::theme_settings(cx).ui_font_size(cx) * STATUS_BAR_UI_SCALE)
+                    .size_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(DynamicSpacing::Base08.rems(cx))
+                    .p(DynamicSpacing::Base04.rems(cx))
+                    .child(self.render_left_tools(&sidebar, cx))
+                    .child(self.render_right_tools(&sidebar, cx)),
             )
     }
 }
@@ -220,31 +231,70 @@ impl StatusBar {
     ) -> impl IntoElement {
         // SPK fork: sidebar is disabled (see `zed::zed::initialize_workspace`),
         // so the status-bar toggle that normally re-opens it is hidden.
-        h_flex().gap_1().min_w_0().overflow_x_hidden().children(
-            self.left_items.iter().enumerate().map(|(index, item)| {
+        h_flex()
+            .gap_1()
+            .min_w_0()
+            .overflow_x_hidden()
+            // Weighted against the right group's `1`, so the left group is
+            // still what gives up width first and only collapses to nothing
+            // before the right group starts clipping anything of its own.
+            .flex_shrink(LEFT_TOOLS_SHRINK_WEIGHT)
+            .debug_selector(|| "STATUS-BAR-LEFT".into())
+            .children(self.left_items.iter().enumerate().map(|(index, item)| {
                 render_hideable_item("status-bar-left", index, item.as_ref(), cx)
-            }),
-        )
+            }))
     }
 
+    /// The right group paints `right_items` in **reverse** registration order,
+    /// so `right_items[0]` is the item flush against the window's right edge.
+    /// That outermost item is the one this bar must not clip — the fork mounts
+    /// the band's utility buttons there because they are the only mouse path
+    /// to the git graph (`zed::zed::initialize_workspace`) — so it is painted
+    /// as a `flex_none` sibling of everything inboard of it, which is the part
+    /// allowed to shrink and clip.
+    ///
+    /// Before this split the whole group was `flex_shrink_0`: once the left
+    /// group had collapsed to zero the group simply overflowed the window and
+    /// the outermost item — the one deliberately made unclippable — was the
+    /// first thing off the right edge.
     fn render_right_tools(
         &self,
         _sidebar: &SidebarStatus,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let (anchor_item, inboard_items) = match self.right_items.split_first() {
+            Some((anchor, rest)) => (Some(anchor), rest),
+            None => (None, &[] as &[Box<dyn StatusItemViewHandle>]),
+        };
+
         h_flex()
-            .flex_shrink_0()
+            .min_w_0()
+            .flex_shrink_1()
             .gap_1()
-            .overflow_x_hidden()
-            .children(
-                self.right_items
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .map(|(index, item)| {
-                        render_hideable_item("status-bar-right", index, item.as_ref(), cx)
-                    }),
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .overflow_x_hidden()
+                    .gap_1()
+                    .debug_selector(|| "STATUS-BAR-RIGHT-INBOARD".into())
+                    .children(inboard_items.iter().enumerate().rev().map(|(index, item)| {
+                        // `+ 1`: `index` is into `inboard_items`, but the
+                        // per-item menu id must stay keyed on the item's
+                        // position in `right_items`.
+                        render_hideable_item("status-bar-right", index + 1, item.as_ref(), cx)
+                    })),
             )
+            .children(anchor_item.map(|item| {
+                h_flex()
+                    .flex_none()
+                    .debug_selector(|| "STATUS-BAR-RIGHT-ANCHOR".into())
+                    .child(render_hideable_item(
+                        "status-bar-right",
+                        0,
+                        item.as_ref(),
+                        cx,
+                    ))
+            }))
     }
 
     #[allow(dead_code)]
@@ -513,7 +563,7 @@ mod tests {
     use super::*;
     use crate::Workspace;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, size};
     use project::Project;
     use serde_json::json;
     use util::path;
@@ -542,6 +592,105 @@ mod tests {
         fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
             None
         }
+    }
+
+    /// A status item that is simply too wide, so that the right group has to
+    /// overflow and something has to give.
+    struct WideProbeItem {
+        selector: &'static str,
+        width: Pixels,
+    }
+
+    impl Render for WideProbeItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let selector = self.selector;
+            div()
+                .flex_none()
+                .w(self.width)
+                .h(px(10.))
+                .debug_selector(move || selector.into())
+        }
+    }
+
+    impl StatusItemView for WideProbeItem {
+        fn set_active_pane_item(
+            &mut self,
+            _active_pane_item: Option<&dyn ItemHandle>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) {
+        }
+
+        fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+            None
+        }
+    }
+
+    /// `right_items` paints in reverse registration order, so the item
+    /// registered first is the one flush against the window's right edge —
+    /// which is where this fork mounts the band's utility buttons precisely
+    /// because they must never be clipped (they are the only mouse path to the
+    /// git graph). The whole group used to be `flex_shrink_0`, so once the left
+    /// group had collapsed the group overflowed the window and that outermost
+    /// item was the first thing to leave the viewport.
+    #[gpui::test]
+    async fn the_outermost_right_status_item_survives_a_narrow_window(cx: &mut TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "file.rs": "fn main() {}\n" }))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.status_bar().update(cx, |status_bar, cx| {
+                let anchor = cx.new(|_| WideProbeItem {
+                    selector: "RIGHT-ANCHOR-PROBE",
+                    width: px(300.),
+                });
+                let inboard = cx.new(|_| WideProbeItem {
+                    selector: "RIGHT-INBOARD-PROBE",
+                    width: px(900.),
+                });
+                status_bar.add_right_item(anchor, window, cx);
+                status_bar.add_right_item(inboard, window, cx);
+            });
+        });
+        cx.simulate_resize(size(px(500.), px(400.)));
+        cx.run_until_parked();
+
+        let bar = cx
+            .debug_bounds("STATUS-BAR")
+            .expect("the status bar must paint");
+        let anchor = cx
+            .debug_bounds("RIGHT-ANCHOR-PROBE")
+            .expect("the outermost right item must paint");
+        let inboard = cx
+            .debug_bounds("RIGHT-INBOARD-PROBE")
+            .expect("the inboard right items must still paint (clipped, not dropped)");
+
+        assert!(
+            anchor.right() <= bar.right(),
+            "the item registered first is the one that must not leave the \
+             viewport: it ends at {:?} but the bar ends at {:?}",
+            anchor.right(),
+            bar.right()
+        );
+        assert_eq!(
+            anchor.size.width,
+            px(300.),
+            "…and it must not be squeezed either — it is `flex_none`"
+        );
+        assert!(
+            inboard.right() > bar.right(),
+            "the items inboard of it are the ones that overflow and clip \
+             ({:?} vs {:?}) — if nothing overflowed, this test is not \
+             exercising a narrow window at all",
+            inboard.right(),
+            bar.right()
+        );
     }
 
     /// Both halves of the ~10% change, read off the tree that was actually
