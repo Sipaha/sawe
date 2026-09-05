@@ -178,6 +178,13 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/gpui_linux/src/linux/platform.rs` | **First local change (decision #117).** `KEYRING_LABEL` is `sawe-github-account`, not `zed-github-account`. The Secret Service keyring is an OS-wide namespace, so this was the one rebrand leftover that actually collided with a real Zed install rather than merely reading wrong. | rebrand |
 | `script/uninstall.sh` | Repointed at `paths::base_dir()` (`~/.spk/sawe`), which is the only directory the binary creates; it previously removed `~/.config/sawe`, `~/.local/share/sawe` and `~/Library/Application Support/Sawe`, none of which exist, so neither its per-channel cleanup nor its "keep your preferences?" prompt did anything. Never removes the root recursively — `ss/` under it is the Solutions root and holds the user's project checkouts. | rebrand |
 | `.github/workflows/*.yml` (21 generated files) | **Decision #118.** One line under the `cargo xtask workflows` rebuild instruction saying not to follow it: regenerating deletes `retag_release.yml`, strips 25 `if: false # sawe: not applicable` guards and restores 5 upstream triggers this fork narrowed to `workflow_dispatch:`. | build |
+| `crates/ui/src/components/popover_menu.rs` | **First local change (decision #150).** Every `PopoverMenu` dismisses on a press outside itself, through a full-viewport **non-occluding** backdrop painted before the menu inside the same deferred subtree — not a bounds test on the menu's wrapper, which a `ContextMenu` submenu (painted `absolute().left_full()`, outside those bounds) fails. | `ui` |
+| `crates/terminal_view/src/terminal_view.rs` | **First local change (decision #151).** `assistant_enabled` is a field pushed down by `ConsolePanel`, not read back from a `TerminalPanel` this fork never docks. `terminal_view` cannot depend on `console_panel` — the edge runs the other way. | `console_panel` |
+| `crates/multi_buffer/src/multi_buffer_tests.rs` | **First local change.** Covers `set_caret_positions` clearing only the buffers that actually lost a caret (decision #83's bookkeeping, made O(carets) instead of O(excerpted buffers)). | `editor` |
+| `crates/copilot/src/copilot.rs` | **First local change.** The LSP shutdown exchange is driven to completion instead of dropping its future (`91fea6d1ae`). | upstream-fix |
+| `crates/remote/src/transport.rs`, `crates/remote/src/transport/live_remote_support.rs` | **First local change.** A `#[cfg(test)]` support module for the live-remote tests. | `remote` |
+| `crates/dap/src/debugger_settings.rs` | **First local change.** `debugger.dock` / `debugger.button` are documented INERT here — the debugger is a Solution-band occupant with no `Panel` impl (decision #97). | `debugger_ui` |
+| `crates/util/src/shell.rs` | **First local change.** The WSL example path spells this fork's own remote-server directory and binary (decision #119). | rebrand |
 
 Locked rebrand identifiers (display name, bundle ids, URL scheme, config dirs, etc.) — see `.rules` § "Locked rebrand identifiers". Changing any requires explicit approval — they're cross-referenced in spec docs.
 
@@ -2047,6 +2054,20 @@ How to apply:
 - **The report names its arguments where the give-up exits only count them.** A give-up exit loses everything, so a count is enough; here only a subset is lost and the user has to be told which. `--diff` is in the same boat as a URL and is accounted for in both places — named in the hand-off's unforwarded list, and included in `dropped_arg_count` (`paths_or_urls.len() + diff.len()`), which used to size itself off `paths_or_urls` alone and so said nothing at all about a dropped `--diff` pair.
 - **`zed-cli://<server>` is not one of the user's arguments and must never be listed as one.** It is the ipc handshake `crates/cli` puts in this process's argv before booting it, and the user's real request is on the far end of it. Naming that url in "N argument(s) were NOT opened" told the reader two untrue things — that they had typed it, and that one argument was the extent of the loss. It gets its own line saying nothing the `sawe` command asked for was opened — and nothing more, because **what happens to that command next differs per CLI mode and this process cannot see which it is in**. Without `--foreground`, `App::launch` -> `boot_background` fork/execs the editor after `fork::close_fd` has closed its stderr, so the line is not shown at all, and the CLI then blocks in `sender.join()` (`cli/src/main.rs:794`) on a receiver still sitting in `server.accept()` — it hangs. With `--foreground` it is the opposite on both counts: `run_foreground` uses `Command::status()`, which inherits stderr, so this line *is* what the user reads, and the `join` is never reached, so the command exits normally. The `join` is unconditional on `--wait`; `!args.foreground` is the real condition. A sentence about waiting therefore reads false on the one CLI path where it is read at all. Answering the handshake for real (connect back, send `CliResponse::Stderr` + `Exit`, or relay the `CliRequest::Open` through the MCP hand-off) is the unbuilt repair. Exit still stays 0 by the rule above: a canonical instance answers the handshake and a handing-off one cannot, so a non-zero exit here would be decided by whether another editor happened to be running — and it would be unobservable anyway, since `boot_background` detaches and `run_foreground`'s `ExitStatus` is discarded at its call site. The clause naming *the `sawe` command that started this process* as the connection's opener is deliberate and stays: the third mode — direct invocation of the editor binary — has no `sawe` command, but it also has no user request to describe, because a live `zed-cli://<server>` only ever comes from `crates/cli`. Weighed and left alone; the reasoning is in `handoff_loss_report`'s doc comment so it does not get reopened.
 - **A `:line:column` suffix is split off by the *sender*, not carried.** `handle_cli_args` hands its strings straight to `workspace::open_paths`, so the suffix used to travel as part of the filename: `sawe probe.rs:3:2` against a running instance opened a window rooted at the nonexistent `…/probe.rs:3:2` (measured — `windows.list` reported `kind: "folder"` and that literal string) and never opened the file, while a canonical instance opened `…/probe.rs` at line 3. `split_off_position` applies `derive_paths_with_position`'s own rule — strip only when the literal string is not already a real file, and skip that check on Windows where `name:stream` is an NTFS alternate data stream — so the right file opens and the lost position is reported — reported as *dropped*, not as "opened at the start of the file", because when the stripped path does not exist no file is opened at all: the running instance grows a second window of `kind: "folder"` rooted at that nonexistent path instead (measured the same way — `windows.list` after handing off `…/absent.rs:9:1` reports `root_paths: ["…/absent.rs"]`, title `absent.rs`). The position itself stays lost on purpose: the navigation is `recent_projects::navigate_to_positions`, which downcasts the opened item to an `Editor` and therefore sits above `workspace` in the crate graph, so carrying it means moving the tool's registration, not adding a field.
+
+**Amended 2026-09-05.** The hand-off now also carries `--solution`, by making the two calls an
+operator would make (`solutions.list` to resolve the name, then `solutions.open`) — `crates/workspace`,
+where `editor.handle_cli_args` lives, sits below `crates/solutions` and can never reach a
+`SolutionStore` itself. It is carried **only when `paths_or_urls` and `--diff` are both empty**,
+because further down `main.rs` the canonical path reads `--solution` only in the `None` arm of the
+open-request match: carrying it more widely would make one argv do different things depending on
+whether an editor happened to be running, which is what this decision's `file://` argument forbids.
+`--dev-container` / `--wsl` decorate a request this hand-off cannot build, so they are *named* in an
+"had no effect there" line rather than dropped. Separately, `ArgumentFate` now distinguishes three
+outcomes, because two of them were being reported as losses that had not happened: a command line
+Windows already forwarded down the named pipe, and a request that was delivered but whose reply
+timed out (an ordinary cold-project open can exceed the 30 s read timeout — the old message sent the
+user to open a second window).
 ### 115. `Install CLI` claims one name in a shared directory, and refuses to touch anything else in it
 
 What: the maintainer's rule is that a user may have both Zed and Sawe installed and the two must not intersect in any way. `/usr/local/bin` is the one directory where this fork writes into a namespace it shares with every other program on the machine, and upstream's installer treated that directory as its own.
@@ -2059,6 +2080,16 @@ How to apply:
 - **The refusal is deliberately stricter than "does it look like a Sawe path?"**, and it costs something: if the app moves (bundle relocated, a different channel installed over it), the existing symlink points at the old `cli` and is no longer provably ours, so `Install CLI` refuses to repair itself and instead tells the user exactly what is there to remove. That is the price of the only test that cannot be wrong in the destructive direction — every looser rule is a heuristic, and a wrong heuristic here deletes somebody else's binary with admin rights.
 - **`register_zed_scheme` is deleted, not repointed at `sawe`.** It registered `ZED_URL_SCHEME = "zed"` from two places: a `cli: register zed scheme` palette action, and the last line of `Install CLI`, unconditionally. Both are gone. It was *not* turned into a `register_sawe_scheme`, because nothing would call it and no platform needs it: `sawe://` is already declared at install time on all three targets (`osx_url_schemes = ["sawe"]` on all four channels, `x-scheme-handler/sawe` in `sawe.desktop.in`, `HKCU\Software\Classes\sawe` in `sawe.iss`), and `register_url_scheme` is implemented **only on macOS** — `gpui_linux` and `gpui_windows` both return `Err("register_url_scheme unimplemented")`. The imperative call adds exactly one thing on top of the declarative registration, `NSWorkspace.setDefaultApplication`, which only matters when two *installed* apps claim the same scheme; once `zed://` is disowned that can only be two Sawe channels fighting over `sawe://`, a case this fork has never needed. If it ever does, the function was twelve lines and this entry says where it went.
 - **A correction to the recon that produced this work:** the claim that the `Install CLI` *menu item* routinely showed Linux users an "Error registering zed:// scheme" was wrong twice over. The call site was `register_zed_scheme(cx).await.log_err()` — the error went to the log, never to a dialog — so the menu item could not produce that message on **any** platform; and on Linux/FreeBSD `install_cli_binary` early-returns behind `cfg!(any(target_os = "linux", target_os = "freebsd"))` with an informational prompt, so it never reached `install_script` or the scheme registration at all. The palette action was the only route to the dialog, on every platform. What the menu item actually did was worse than the reported symptom and silent: on macOS it reached the unconditional `remove_file` under administrator privileges *and* `setDefaultApplication`, reporting neither. Do not cite the Linux dialog as the motivation.
+
+**Amended 2026-09-05.** "A symlink it created itself" is now judged by the **exact bundle
+structure** — an absolute path whose last four components are
+`{Sawe|SaweDev|SawePreview|SaweNightly}.app / Contents / MacOS / cli` — and such a link is
+re-pointed rather than refused. Byte-equality with the running app's own `cli_path` was too strict:
+moving the bundle out of `~/Downloads`, upgrading into a new path, or installing a second channel
+left a dangling link that `Install CLI` then refused to replace, with a message claiming Sawe had
+not created it. Anything else is still `Foreign`, untouched, with the same refusal message; the rule
+reads the *stored* target (the dangling case is the point), rejects relative targets, and unlinking
+is confined to that one branch.
 
 ### 116. `sawe://` is the scheme this fork parses, and `zed://` gets no arm and no producer
 
@@ -2119,6 +2150,16 @@ How to apply:
   self-consistent ACP resource-link namespace that is persisted in thread history and
   never reaches `cx.open_url`, and which therefore still awaits a migration or a
   tolerant reader rather than a rename in place.
+
+**Amended 2026-09-05.** `rescan_branches` clears the cached log and emits `HeadChanged` **only when
+the branch list (or its error) actually changed**. `Repository::fetch` runs it on every success, and
+unconditional invalidation meant a fetch that brought nothing still blanked and re-ran `git log` for
+every open graph (~150 ms on a 79k-commit repo), dropped the graph's selection, and re-scheduled the
+git panel, the branch diff, an ACP checkpoint diff and the sidebar — multiplied by member count for
+`solution.git.batch_fetch`. The branch list is the complete test: `branch` is derived from it, and
+each `Branch` carries its upstream's ahead/behind and most recent commit, so any ref move is a list
+change. A caller that wanted an unconditional cache drop for some reason other than a ref change no
+longer gets one.
 
 ### 117. A name the guarded crate does not spell is a name it cannot guard
 
@@ -3135,6 +3176,16 @@ How to apply:
   this bullet used to list, a hairline flickering at `ix == 0` and the label sticking to the
   top of the viewport, were both the viewport-local computation and are gone with it.)
 
+**Amended 2026-09-05.** `BlameRunPredecessor` gained an `Unsettled` variant. When the scan above the
+viewport exhausts its lookback budget it used to answer `DisplayStart`, which classifies the first
+visible row as a `DocumentHead` — inventing a run boundary, drawing the date/author again mid-run and
+making the two panes of a split diff disagree, reachable with an alignment spacer or a soft-wrapped
+line longer than the budget. `Unsettled` has the same lifetime as "nothing above" (a wrap or spacer
+preserves it, anything else clears it) and the opposite classification: `Continuation`. The scan
+itself is now incremental (each doubling reads only rows it has not read, and the budget counts total
+rows read) and memoised on the display fingerprint plus a blame generation, so a stationary gutter
+costs nothing per frame instead of re-reading up to ~2047 rows in every one.
+
 ### 141. The band's terminal half auto-starts a shell on a state edge, because it has no `Panel` to give it an activity edge
 
 What: opening the Solution band's terminal half while it holds no terminal now starts one, the
@@ -3627,3 +3678,137 @@ Adjacent but distinct: #147 (a project switch holds the previous graph rather th
 placeholder) is about not showing a *transient* state during a switch. Same family — the window
 should be still unless the user asked for motion — but that one is about time, and this one is
 about position.
+
+### 150. Every popover dismisses through a non-occluding backdrop, not a bounds test
+
+What: `PopoverMenu` dismisses on a press outside itself by painting a **full-viewport,
+non-occluding** div with `capture_any_mouse_down` *before* the menu, inside the **same deferred
+subtree**. The previous fork-local version put `on_mouse_down_out` on the menu's wrapper `div`,
+which is a bounds test against that one element.
+
+Why the bounds test is wrong, and not just for `ContextMenu`: a `ContextMenu` submenu is painted
+`absolute().left_full()` and anchored, i.e. deliberately **outside** the wrapper's bounds, so
+pressing a submenu item read as "outside the popover" and emitted `DismissEvent` before the click
+could complete — the whole popover vanished and the item never ran. `ContextMenu`'s own
+`on_mouse_down_out` already knows to exempt this (`padded_submenu_bounds`), but exporting that
+exemption would have fixed `ContextMenu` alone; any other popover content that renders outside its
+wrapper has the same defect.
+
+How the backdrop is correct: GPUI's `hit_test` walks hitboxes in reverse insertion order and stops
+at the first `BlockMouse`. The menu — and every submenu and nested popover, all inserted later and
+all occluding — swallows presses that land on it, so the backdrop never sees them; a press anywhere
+else reaches the backdrop. It does not occlude and its listener is capture-phase without
+`stop_propagation`, so clicking outside still both dismisses **and** activates whatever was clicked,
+which is what the wrapper handler did.
+
+How to apply: do not "fix" a dismissal bug by widening a bounds check to include the currently known
+overlay. Ask whether the press was swallowed by anything belonging to the popover, which is what hit
+ordering already answers. The `CLAUDE.md` caveat that `windows.click_at` on a submenu item merely
+dismisses the menu described **this bug** and is now obsolete.
+
+### 151. `workspace::OpenTerminal` and `NewTerminal` belong to the ConsolePanel, and the upstream handlers fall through
+
+What: `console_panel::init` registers both actions and opens the terminal in the Solution band's
+utility half; `TerminalPanel::open_terminal` / `TerminalPanel::new_terminal` keep their
+registrations but call `cx.propagate()` in the arm where no `TerminalPanel` is docked.
+
+Why registering in `console_panel` is not enough on its own — this is the part that bites: both
+handlers hang off the same `Workspace` dispatch node, GPUI's bubble phase clears `propagate_event`
+before each listener and stops at the first one that does not re-propagate, and `terminal_view::init`
+runs **before** `console_panel::init` (`crates/zed/src/main.rs`). So the upstream handler won for
+every dispatch and swallowed the action after its `workspace.panel::<Self>(cx)` lookup returned
+`None` (#22 deleted the only code that ever added that panel). Every "Open in Terminal" in the
+product — project panel, tab context menu, `editor::OpenInTerminal`, the multibuffer header, the
+outline panel — was a silent no-op, and `ctrl-~` reached only the centre-pane branch.
+
+Why fall-through rather than deleting the upstream registration: deletion works only while the init
+order stays as it is, and it makes the private `new_terminal` dead code. Propagating keeps the
+upstream path correct if a `TerminalPanel` is ever docked again.
+
+How to apply: when an action stops working after a panel is un-docked, look for a second handler on
+the same dispatch node before assuming the registration is missing. A handler that early-returns
+because its panel is absent must `cx.propagate()`, or it is a black hole for that action.
+
+### 152. A message's streamed-text state is keyed by the stream that produced it
+
+What: `claude_native`'s pump tracks "did this message stream its text, and what has it streamed so
+far" in a map keyed on `parent_tool_use_id` (`None` = the main agent, `Some(toolu_…)` = a Task
+subagent), not in one set of variables per connection.
+
+Why: the flags exist so a final `assistant` block can be completed from the streamed prefix when the
+stream was truncated (`final_text_suffix`). With one shared slot, a `message_start` from **any**
+stream reset it — so a background `Agent` teammate emitting events between the main agent's
+`text_delta`s and its final message left the buffer empty, the suffix logic returned the whole text,
+and the user's transcript showed the reply **twice**. The map is cleared at each terminating
+`result`, so subagent entries cannot accumulate.
+
+How to apply: any per-message accumulator in the pump has to ask which stream the event belongs to.
+The interleaving is not exotic — it is what Agent Teams does by design.
+
+### 153. The session view's entry-text cache cannot key on `mod_seq`
+
+What: `SolutionSessionView` caches each entry's rendered text spans across frames, keyed on
+`Arc::ptr_eq` **or** (equal non-zero `mod_seq` **and** both sides `AssistantMessage`).
+
+Why not the obvious `(index, mod_seq)`: `mod_seq` is not bumped on every mutation. The store's
+stranded-tool-call sweep (`normalize_stranded_tool_status`) rewrites a `ToolCall`'s status through
+`Arc::make_mut` and re-demuxes **without** a bump, producing a new `Arc` with the same `mod_seq` and
+different content — a `mod_seq`-keyed cache pins a cancelled tool call's card at "running" for the
+rest of the session, which is the stuck-spinner bug relocated into the view. Pointer identity alone
+is sound but nearly useless, because `rebuild_streams` re-forks every coalesced assistant head on
+every delta; hence the one narrow exception for assistant coalescing, which is the only path that
+re-forks an entry.
+
+Why the cache exists at all: `Render` previously rebuilt the text of **every** entry of the selected
+stream on every frame (a `String` per span, then a `SharedString` copy, then a full-content compare)
+and called `set_search_highlights` — an unconditional `cx.notify()` — on every cached `Markdown`
+entity, while ~10 rows were painted. On a 1500-entry transcript that was megabytes of copying and
+1500 notifies per streaming delta.
+
+How to apply: before keying any cache on `mod_seq`, check that the write path bumps it. Treat
+`mod_seq` as "the persistence watermark", not "the content version".
+
+### 154. Restoring a conflict is `git checkout --merge`, verified by `ls-files -u`
+
+Amends #132. What: the Conflicts row's reverse gesture (**Mark Unresolved**, and un-ticking the
+checkbox on a path that `had_conflict_on_last_merge_head_change`) runs `RestoreConflictOp` — a
+destructive `AtomicGitOp` that shells `git checkout --merge -- <paths>` and then **verifies with
+`git ls-files -u -z -- <paths>`**, erroring if the path did not come back unmerged.
+
+Why: the row said "Mark Unresolved" but dispatched `ToggleStaged`, whose unstage arm is
+`git reset -- <path>`. That does not restore the unmerged stages; it puts **HEAD's** version in the
+index, drops the path out of `git ls-files -u`, and `git <op> --continue` then commits HEAD's
+content — silently losing the incoming side of the merge. Verified against git 2.43.
+
+Why the verification is load-bearing: `git checkout --merge` degrades into a plain checkout and
+exits **0** when the index carries no resolve-undo record, so success is not evidence. Without the
+check the row would silently stay ticked.
+
+Also: the gesture confirms first, because `checkout --merge` overwrites the resolution text in the
+working tree and that text was never committed. `UnstageAll` still runs a repo-wide `git reset` and
+would flatten unmerged entries the same way — it is not labelled as an unresolve gesture, and is
+left as known remaining work.
+
+### 155. A `Background` commit selection only refreshes the tab it already describes
+
+Amends #100. What: `GitPanel::show_commit_selection` refuses a `CommitSelectionSource::Background`
+push unless the open Commit tab already describes that selection — **same repository entity and same
+sha list**. `UserGesture` still replaces and activates. `Event::CommitTabClosed` carries
+`{ repository, shas }` rather than the shas alone.
+
+Why: the `Background` gate previously suppressed only the *activation*, so execution fell through to
+replacing `CommitTabState`. Every graph in the window re-anchors after its own log settles or after a
+`git fetch` lands in a terminal, so an unrelated Solution member's graph — or a file-history pane
+item — could repoint the tab being read, and a `[a,b,c]` multi-row selection collapsed to the single
+sha the re-anchor knew. The repository is in the close event for the same reason: a Solution can hold
+two clones of one project, where a sha alone names a commit in both, so a tab closing over there
+cleared the selection over here.
+
+Consequences elsewhere, all landed together: the graph parks the *source* with a deferred selection
+(a `UserGesture` for a not-yet-loaded commit used to replay as `Background` and so never opened the
+tab); a filter-driven refetch no longer closes the tab as if the commit had been rewritten; and a
+held (pending) graph takes no selection gestures at all, so it cannot push the outgoing project's
+commit into the incoming project's panel.
+
+How to apply: `Background` means "the same thing I was already showing moved"; it is never an open,
+never an activation, and never a repoint.
