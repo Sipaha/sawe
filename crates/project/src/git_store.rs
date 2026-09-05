@@ -4991,15 +4991,30 @@ async fn rescan_branches(
         this.snapshot.branch = branch;
         this.snapshot.branch_list = branch_list;
         this.snapshot.branch_list_error = branch_list_error;
-        // Unconditional, unlike the `scan_id > 2` guard `handle_subscribe_self`
-        // puts on the generic `HeadChanged` arm: that guard is there to survive
-        // the initial-load scan storm, and a rescan only ever runs after an
-        // explicit push. Leaving it to the guard means a push early in a
-        // session (`scan_id` still 2) keeps serving the cached log, so the
-        // graph goes on drawing `origin/…` on the pre-push commit.
-        this.initial_graph_data.clear();
-        cx.emit(RepositoryEvent::HeadChanged);
+        // Invalidate only when the refs this rescan describes actually moved.
+        // A rescan no longer runs only after an explicit push: `fetch` runs one
+        // too, and a fetch that brings nothing new is the common case. Every
+        // `HeadChanged` consumer does real work — git_graph drops `graph_data`
+        // and the selection and re-runs `git log` (~150 ms on a 79k-commit
+        // repo), the git panel schedules a status update, branch_diff
+        // recomputes, acp_thread re-diffs a checkpoint, the sidebar rebuilds —
+        // multiplied by member count for `solution.git.batch_fetch`.
+        //
+        // Comparing the branch list is the complete test for "the refs moved":
+        // `branch` is derived from `branch_list` (the head is the entry with
+        // `is_head`), and each `Branch` carries its upstream's ahead/behind
+        // counts and most-recent commit, so a moved HEAD or a changed
+        // `refs/remotes/**` relationship is necessarily a list change.
+        //
+        // When they DID move the invalidation is unconditional, unlike the
+        // `scan_id > 2` guard `handle_subscribe_self` puts on the generic
+        // `HeadChanged` arm: that guard exists to survive the initial-load scan
+        // storm, but leaving a rescan to it means a push early in a session
+        // (`scan_id` still 2) keeps serving the cached log, so the graph goes on
+        // drawing `origin/…` on the pre-push commit.
         if branch_list_changed || branch_list_error_changed {
+            this.initial_graph_data.clear();
+            cx.emit(RepositoryEvent::HeadChanged);
             cx.emit(RepositoryEvent::BranchListChanged);
         }
         this.snapshot.clone()
@@ -10085,7 +10100,8 @@ mod tests {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(Path::new("/project"), json!({ ".git": {} })).await;
+        fs.insert_tree(Path::new("/project"), json!({ ".git": {} }))
+            .await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
         let repository = cx
             .read(|cx| project.read(cx).active_repository(cx))
@@ -10127,6 +10143,126 @@ mod tests {
             published_refs(cx).contains(&"refs/remotes/origin/fetched".to_string()),
             "fetch must republish the branch list, or the UI keeps its pre-fetch view"
         );
+    }
+
+    /// A fetch that brings nothing new must not invalidate anything. Every
+    /// `HeadChanged` consumer does real work (git_graph re-runs `git log`, the
+    /// panel schedules a status update, branch_diff recomputes), and a fetch
+    /// with no new refs is the common case — especially under
+    /// `solution.git.batch_fetch`, which multiplies it by member count.
+    #[gpui::test]
+    async fn test_fetch_only_invalidates_when_the_refs_moved(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), json!({ ".git": {} }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .expect("fake project should expose a repository");
+        cx.run_until_parked();
+
+        let events = Arc::new(Mutex::new(Vec::<RepositoryEvent>::new()));
+        let _subscription = cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&repository, move |_, event: &RepositoryEvent, _| {
+                events.lock().push(event.clone());
+            })
+        });
+
+        let fetch_once = |cx: &mut TestAppContext| {
+            let askpass = AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
+            repository.update(cx, |repository, cx| {
+                repository.fetch(FetchOptions::All, askpass, cx)
+            })
+        };
+
+        fetch_once(cx)
+            .await
+            .expect("fetch was canceled")
+            .expect("fetch failed");
+        cx.run_until_parked();
+        assert_eq!(
+            events.lock().drain(..).collect::<Vec<_>>(),
+            Vec::new(),
+            "a fetch that moved no refs must not invalidate the graph cache"
+        );
+
+        // Now the fetch actually brings a ref, exactly as `git fetch` would
+        // write it into `refs/remotes/**` without an fs-watcher event.
+        fs.with_git_state(Path::new("/project/.git"), false, |state| {
+            state.branches.insert("origin/fetched".to_string());
+        })
+        .expect("fake repository should exist");
+        fetch_once(cx)
+            .await
+            .expect("fetch was canceled")
+            .expect("fetch failed");
+        cx.run_until_parked();
+        assert_eq!(
+            events.lock().drain(..).collect::<Vec<_>>(),
+            vec![
+                RepositoryEvent::HeadChanged,
+                RepositoryEvent::BranchListChanged,
+            ],
+            "a fetch that moved refs must still invalidate, even at a low scan_id"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_failing_tag_scan_does_not_blank_the_branch_list(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), json!({ ".git": {} }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .expect("fake project should expose a repository");
+        cx.run_until_parked();
+
+        // `compute_snapshot` asks for the tags beside the branch list, the head
+        // commit and the worktrees, and `git for-each-ref refs/tags` is a hard
+        // error rather than an empty answer. Joining the four so that any one
+        // failure defaulted all four published a snapshot with no current
+        // branch, an empty branch picker and no ref chips.
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.branches.insert("main".to_string());
+            state.branches.insert("origin/main".to_string());
+            state.current_branch_name = Some("main".to_string());
+            state.simulated_tag_names_error = Some("fatal: bad object refs/tags/v1".to_string());
+        })
+        .expect("fake repository should exist");
+        cx.run_until_parked();
+
+        repository.read_with(cx, |repository, _| {
+            assert_eq!(
+                repository
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.ref_name.to_string()),
+                Some("refs/heads/main".to_string()),
+                "a failing tag scan must not blank the current branch"
+            );
+            assert_eq!(
+                repository
+                    .branch_list
+                    .iter()
+                    .map(|branch| branch.ref_name.to_string())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "refs/heads/main".to_string(),
+                    "refs/remotes/origin/main".to_string(),
+                ],
+                "a failing tag scan must not blank the branch list"
+            );
+            assert!(
+                repository.tag_list.is_empty(),
+                "only the field whose query failed degrades"
+            );
+        });
     }
 
     #[gpui::test]
@@ -10645,24 +10781,28 @@ async fn compute_snapshot(
             }
         }
     };
+    // Each of the four degrades ON ITS OWN. They are independent facts about
+    // the repo, and a joint `try_join4` made them a single point of failure:
+    // one erroring sub-query (`tag_names` hard-errors on a non-zero exit, an
+    // old git has no `worktree list`, a packed/broken ref fails the branch
+    // scan, a watcher rescan can race an index rewrite) collapsed ALL of them
+    // to defaults, and that empty result was still published as a changed
+    // snapshot — no current branch in the panel, empty branch picker, ref chips
+    // gone. Still one background spawn, still all four in parallel.
     let (branches, head_commit, all_worktrees, tag_names) = cx
         .background_spawn({
             let backend = backend.clone();
             async move {
-                futures::future::try_join4(
-                    backend.branches(),
-                    head_commit_future,
-                    backend.worktrees(),
-                    backend.tag_names(),
+                futures::future::join4(
+                    async { backend.branches().await.log_err().unwrap_or_default() },
+                    async move { head_commit_future.await.log_err().flatten() },
+                    async { backend.worktrees().await.log_err().unwrap_or_default() },
+                    async { backend.tag_names().await.log_err().unwrap_or_default() },
                 )
                 .await
             }
         })
-        .await
-        .unwrap_or_else(|err| {
-            log::error!("failed to compute git snapshot: {err:?}");
-            (BranchesScanResult::default(), None, Vec::new(), Vec::new())
-        });
+        .await;
     log::debug!("fetched branches, head commit, worktrees, tags");
 
     let BranchesScanResult {

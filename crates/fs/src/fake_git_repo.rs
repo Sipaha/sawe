@@ -84,6 +84,12 @@ pub struct FakeGitRepositoryState {
     pub simulated_index_write_error_message: Option<String>,
     pub simulated_create_worktree_error: Option<String>,
     pub simulated_graph_error: Option<String>,
+    /// When set, [`GitRepository::tag_names`] fails with this message.
+    /// `git for-each-ref refs/tags` is a hard error in the real backend, and
+    /// `compute_snapshot` asks for it beside the branch list, the head commit
+    /// and the worktrees — so this is what a test needs to prove that one
+    /// failing sub-query degrades only its own field.
+    pub simulated_tag_names_error: Option<String>,
     pub branches_requiring_force_delete: HashSet<String>,
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
@@ -136,6 +142,7 @@ impl FakeGitRepositoryState {
             simulated_index_write_error_message: Default::default(),
             simulated_create_worktree_error: Default::default(),
             simulated_graph_error: None,
+            simulated_tag_names_error: None,
             branches_requiring_force_delete: Default::default(),
             pushes: Default::default(),
             simulated_push_error: Default::default(),
@@ -1188,6 +1195,24 @@ impl GitRepository for FakeGitRepository {
                 stdout: String::new(),
                 stderr: String::new(),
             })
+        })
+    }
+
+    fn tag_names(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        self.with_state_async(false, move |state| {
+            if let Some(message) = &state.simulated_tag_names_error {
+                anyhow::bail!("{message}");
+            }
+            let mut names: Vec<SharedString> = state
+                .tags_pointing_at
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            names.sort();
+            Ok(names)
         })
     }
 
