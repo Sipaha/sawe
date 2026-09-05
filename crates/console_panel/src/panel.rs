@@ -8,7 +8,6 @@ use gpui::{
     Render, Subscription, Task, WeakEntity, Window, anchored, deferred,
 };
 use solution_agent::solution_band::SolutionBand;
-use solution_agent::store::SolutionAgentStore;
 use solutions::{MemberId, SolutionId, SolutionStore};
 use std::path::PathBuf;
 use task::{RevealStrategy, RevealTarget, Shell, SpawnInTerminal, TaskId};
@@ -166,6 +165,28 @@ pub fn workspace_has_project(workspace: &Workspace, cx: &App) -> bool {
         .visible_worktrees(cx)
         .next()
         .is_some()
+}
+
+/// Whether this workspace is the one its window currently presents.
+///
+/// A `MultiWorkspace` window holds several `Workspace`s — the active one plus
+/// the retained ones — and only the active one is rendered
+/// (`solutions_ui::solution_tab_strip` builds its tabs from exactly this
+/// distinction, and notes that a retained workspace and the active one can map
+/// to the SAME Solution). Band state is keyed per Solution, so a background
+/// workspace's `ConsolePanel` sees the same "the terminal half just opened"
+/// transition as the visible one; acting on it would start a real PTY the user
+/// can neither see nor close. A workspace with no `MultiWorkspace` (a plain
+/// test window) owns its window unconditionally.
+fn workspace_is_presented(workspace: &Entity<Workspace>, cx: &App) -> bool {
+    let Some(multi_workspace) = workspace
+        .read(cx)
+        .multi_workspace()
+        .and_then(|multi_workspace| multi_workspace.upgrade())
+    else {
+        return true;
+    };
+    multi_workspace.read(cx).workspace() == workspace
 }
 
 /// Folder of the solution's *active* project — the one selected in the
@@ -464,7 +485,7 @@ impl ConsolePanel {
                         // which sidesteps the `read(cx).method(cx)` borrow
                         // conflict on the outer `cx`.
                         provider.update(cx, |provider, cx| {
-                            provider.new_tab(cwd_path.clone(), window, cx)
+                            provider.new_tab(cwd_path.clone(), false, window, cx)
                         })
                     });
                     match task {
@@ -515,8 +536,7 @@ impl ConsolePanel {
 
             if let Some(tab) = spawned {
                 let new_index = panel.update(cx, |panel, cx| {
-                    panel.tabs.push(tab);
-                    let new_index = panel.tabs.len() - 1;
+                    let new_index = panel.push_terminal_tab(tab, cx);
                     cx.notify();
                     new_index
                 });
@@ -920,16 +940,46 @@ impl ConsolePanel {
         cx.notify();
     }
 
+    /// The single place a terminal tab enters `self.tabs`, so a newborn view
+    /// inherits the panel's `assistant_enabled` flag. `TerminalView` cannot
+    /// read that flag back off its owner (`console_panel` depends on
+    /// `terminal_view`, so the typed lookup would be a dependency cycle), so
+    /// it is pushed — and a creation path that skipped this funnel would show
+    /// a context menu with no "Inline Assist" in it, which is exactly the
+    /// defect this replaced. Returns the new tab's index.
+    fn push_terminal_tab(&mut self, tab: ConsoleTab, cx: &mut Context<Self>) -> usize {
+        let ConsoleTab::Terminal { view, .. } = &tab;
+        view.update(cx, |view, cx| {
+            view.set_assistant_enabled(self.assistant_enabled, cx);
+        });
+        self.tabs.push(tab);
+        self.tabs.len() - 1
+    }
+
     pub fn add_terminal_tab(
         &mut self,
         cwd: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let origin_cwd = cwd.clone();
+        self.add_terminal_tab_inner(cwd, false, window, cx);
+    }
+
+    /// `local` mirrors `workspace::{NewTerminal,OpenTerminal}::local`: force a
+    /// terminal on this machine even when the project is remote. It ignores
+    /// `cwd` for the same reason upstream's `add_local_terminal_shell` does —
+    /// the remote path would not exist locally.
+    fn add_terminal_tab_inner(
+        &mut self,
+        cwd: Option<PathBuf>,
+        local: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let origin_cwd = if local { None } else { cwd.clone() };
         let task = self
             .terminal_provider
-            .update(cx, |provider, cx| provider.new_tab(cwd, window, cx));
+            .update(cx, |provider, cx| provider.new_tab(cwd, local, window, cx));
         // Counted for the same reason `add_terminal_task` counts it: between
         // this call and the spawned view landing, `self.tabs` is still empty,
         // and `autostart_terminal_if_empty` reads exactly that pair to decide
@@ -941,19 +991,34 @@ impl ConsolePanel {
             let view = task.await;
             this.update(cx, |this, cx| {
                 this.pending_terminals_to_add = this.pending_terminals_to_add.saturating_sub(1);
-                if let Ok(view) = &view {
-                    this.tabs.push(ConsoleTab::Terminal {
-                        view: view.clone(),
-                        origin_cwd,
-                    });
-                    this.active_index = Some(this.tabs.len() - 1);
-                    cx.notify();
-                    this.persist(cx);
+                match view {
+                    Ok(view) => {
+                        let ix =
+                            this.push_terminal_tab(ConsoleTab::Terminal { view, origin_cwd }, cx);
+                        this.active_index = Some(ix);
+                        cx.notify();
+                        this.persist(cx);
+                    }
+                    // A shell that will not start (a bad `terminal.shell`
+                    // setting, a cwd that no longer exists) used to be a log
+                    // line and nothing else: the half stayed empty, the user
+                    // was told nothing, and the band's auto-start quietly
+                    // retried on every edge. Say it out loud, in the
+                    // workspace's own error notification, and keep the log
+                    // line for the session log.
+                    Err(error) => {
+                        log::error!("console panel: failed to open a terminal: {error:#}");
+                        if let Some(workspace) = this.workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.show_error(error, cx);
+                            });
+                        }
+                    }
                 }
-            })?;
-            view.map(|_| ())
+            })
+            .ok();
         })
-        .detach_and_log_err(cx);
+        .detach();
     }
 
     /// The `SolutionBand` installed in this panel's window, if any. `None` in
@@ -970,29 +1035,22 @@ impl ConsolePanel {
     /// Whether the Solution band is currently handing its utility half to
     /// THIS panel: the half is visible and its content kind is `Terminal`.
     ///
-    /// Read from wherever the band actually keeps that state, which depends
-    /// on the window. A Solution window's band writes through to
-    /// `SolutionAgentStore` (that is what makes the geometry persist per
-    /// Solution); a plain-folder window has no Solution to key a store row
-    /// on, so `SolutionBand` keeps the identical `BandState` in its own
-    /// `local_state` field. Asking the band directly in that case is not a
-    /// second source of truth — it is the only one that window has, and
-    /// `ctrl-\`` there deserves the same non-empty terminal half.
+    /// Asked of the band this panel's own window owns, and only of it.
+    /// `SolutionBand::band_state` already answers "the owning Solution's
+    /// persisted row, or this window's local fallback when it has no
+    /// Solution", so re-deriving that here — resolving the Solution a second
+    /// way (`active_solution_id_for_workspace`, walking the *workspace's*
+    /// worktrees) and reading `SolutionAgentStore::band_state` directly — was
+    /// a duplicate with a different resolution of the same question. Two
+    /// resolutions that disagree do not produce a warning; they produce an
+    /// edge that never fires, silently and forever, in whichever window they
+    /// disagree in. `None` (no band installed — a headless or test workspace)
+    /// means nothing shows this panel.
     fn band_shows_this_panel(&self, cx: &App) -> bool {
-        let state = match self.active_solution_id(cx) {
-            Some(solution_id) => {
-                let Some(store) = SolutionAgentStore::try_global(cx) else {
-                    return false;
-                };
-                store.read(cx).band_state(solution_id)
-            }
-            None => {
-                let Some(band) = self.solution_band(cx) else {
-                    return false;
-                };
-                band.read(cx).band_state(cx)
-            }
+        let Some(band) = self.solution_band(cx) else {
+            return false;
         };
+        let state = band.read(cx).band_state(cx);
         state.utility_visible && state.utility_kind == UtilityKind::Terminal
     }
 
@@ -1004,13 +1062,26 @@ impl ConsolePanel {
     /// `ConsolePanel` deliberately implements no `Panel` — it is a Solution
     /// band occupant, not a dock panel — so nothing ever calls `set_active`
     /// and the behaviour was silently dropped in the port. The band's
-    /// equivalent flag is `SolutionAgentStore::band_state`, and its
-    /// equivalent edge source is `BandStateChanged`, which covers all three
-    /// ways the half opens: `ctrl-\``, the status-bar Terminal button, and
-    /// the hydration that restores a window whose band was already open.
+    /// equivalent flag is `SolutionBand::band_state`, and the edge source is
+    /// the band's own `cx.notify()`, which covers all the ways the half
+    /// opens: `ctrl-\``, the status-bar Terminal button, and the hydration
+    /// that restores a window whose band was already open.
     ///
-    /// Two sources are armed, not one, because `BandStateChanged` describes
-    /// only Solution windows — see the comment on the observation below.
+    /// **One source, deliberately.** This used to also subscribe to
+    /// `SolutionAgentStore`'s `BandStateChanged` and answer the "does the
+    /// band show me" question from the store row directly, which made the
+    /// panel react to a state change resolved a different way than the band
+    /// resolves it — and made every Solution window's panel react to a store
+    /// row that is shared between them. The band re-notifies whenever it sees
+    /// `BandStateChanged` (`SolutionBand::new`), so the store event carries
+    /// no edge the band's notify does not, and a Solution-less window's
+    /// `local_state` change is a band notify and nothing else. Observing the
+    /// band therefore covers both window kinds with a single resolution.
+    ///
+    /// Observing rather than checking in `render` keeps the "never
+    /// level-triggered" property that stops the panel resurrecting the
+    /// terminal a user just closed — a notify with `shows == showed` does
+    /// nothing.
     ///
     /// Called from [`Self::load`] rather than from `new` because the
     /// subscription needs a `Window` (constructing a `TerminalView` does) and
@@ -1018,67 +1089,32 @@ impl ConsolePanel {
     /// `new`'s signature stays untouched for this crate's — and
     /// `run_config_ui`'s — test constructors.
     pub fn observe_band_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(store) = SolutionAgentStore::try_global(cx) else {
-            // Not fatal — a window with no agent store has no band state to
-            // watch — but it silently costs this panel its auto-start for the
-            // window's whole life, so it must not be invisible. In the app the
-            // store is installed before any panel loads; reaching this in a
-            // real session means the install order regressed.
-            log::warn!(
-                "console panel: no SolutionAgentStore global; the band's \
-                 terminal auto-start is disabled for this window"
-            );
-            return;
-        };
         // Deferred, not read inline: `band_shows_this_panel` resolves the
-        // active Solution by reading the `Workspace` through this panel's weak
-        // handle, and every caller that can arm this — `load`'s
+        // band by reading the `Workspace` through this panel's weak handle,
+        // and every caller that can arm this — `load`'s
         // `workspace.update_in`, a test's `WindowHandle::update` — may hold
         // that same entity leased. A read under a lease aborts the process
         // (`entity_map.rs:164`), so take the snapshot once the lease is gone.
         cx.defer_in(window, |this, window, cx| {
+            let Some(band) = this.solution_band(cx) else {
+                // Not fatal — a window with no band has no terminal half to
+                // fill — but it silently costs this panel its auto-start for
+                // the window's whole life, so it must not be invisible. In
+                // the app the band is installed at `initialize_workspace`,
+                // before `initialize_panels` runs at all; reaching this in a
+                // real session means the install order regressed.
+                log::warn!(
+                    "console panel: no SolutionBand installed; the band's \
+                     terminal auto-start is disabled for this window"
+                );
+                return;
+            };
             this.band_showed_this_panel = this.band_shows_this_panel(cx);
-            // Second edge source, for the window `BandStateChanged` cannot
-            // describe. A plain-folder window has no Solution, so
-            // `SolutionBand::set_utility_visible` takes its `None` arm: it
-            // writes `local_state` and calls `cx.notify()`, and the store —
-            // and therefore the event above — never hears about it. That
-            // notify is the honest edge source for such a window, because the
-            // band entity IS that window's band state. Observing it runs the
-            // very same check, so no second code path decides anything.
-            //
-            // Both sources are live in a Solution window (the band re-notifies
-            // when it sees `BandStateChanged`), and that is harmless:
-            // `on_band_state_changed` is edge-guarded by
-            // `band_showed_this_panel`, so whichever arrives first takes the
-            // false → true edge and the other sees none. Observing rather than
-            // checking in `render` keeps the "never level-triggered" property
-            // that stops the panel resurrecting the terminal a user just
-            // closed — a notify with `shows == showed` does nothing.
-            //
-            // Resolved here rather than at the top of this method because
-            // finding the band means reading the `Workspace`, and every caller
-            // that can arm this holds that entity leased.
-            if let Some(band) = this.solution_band(cx) {
-                let subscription = cx.observe_in(&band, window, |this, _band, window, cx| {
-                    this.on_band_state_changed(window, cx);
-                });
-                this._subscriptions.push(subscription);
-            }
-        });
-        let subscription = cx.subscribe_in(&store, window, |this, _store, event, window, cx| {
-            // Not filtered on the event's `solution_id`: the state is
-            // re-derived for THIS panel's Solution either way, so another
-            // Solution's band change reproduces the same answer and yields no
-            // edge.
-            if matches!(
-                event,
-                solution_agent::store::SolutionAgentStoreEvent::BandStateChanged { .. }
-            ) {
+            let subscription = cx.observe_in(&band, window, |this, _band, window, cx| {
                 this.on_band_state_changed(window, cx);
-            }
+            });
+            this._subscriptions.push(subscription);
         });
-        self._subscriptions.push(subscription);
     }
 
     fn on_band_state_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1107,13 +1143,26 @@ impl ConsolePanel {
     ///   tabs starts a shell nobody asked for and nobody can see. Caught by
     ///   `debugger_ui`'s suite, which spawned real PTYs and lost its
     ///   determinism.
-    /// * `tabs.is_empty() && pending_terminals_to_add == 0` is upstream's
+    /// * emptiness `&& pending_terminals_to_add == 0` is upstream's
     ///   `TerminalPanel::has_no_terminals`; the counter is what makes two
-    ///   edges arriving inside one spawn's round trip idempotent.
+    ///   edges arriving inside one spawn's round trip idempotent. Emptiness is
+    ///   asked of the tabs this panel actually RENDERS, not of `self.tabs`:
+    ///   the strip and the content are both filtered by the active member
+    ///   (`tab_scope_flags` / `effective_active_index`), so a global
+    ///   `tabs.is_empty()` answered "not empty" for a half that paints
+    ///   nothing — switch the project tab strip to a member with no terminal
+    ///   of its own and the auto-start declined to fill the empty half it was
+    ///   looking at.
     /// * `workspace_has_project` is this fork's addition: an empty Solution
     ///   has nowhere to `cd` into, which is exactly why the "+" menu greys
     ///   "New Terminal" out there. Auto-start must not do what the menu
     ///   forbids.
+    /// * `workspace_is_presented` is the other half of "the user can actually
+    ///   see it": a band's state is the Solution's, and a window can hold
+    ///   several workspaces (`MultiWorkspace`) of which exactly one is on
+    ///   screen. Without this, opening the terminal half spawned a real PTY
+    ///   in every retained background workspace that maps to the same
+    ///   Solution too.
     /// * `restore_in_flight` — see the field.
     ///
     /// Focus is deliberately untouched: this only appends a tab. When the
@@ -1122,7 +1171,10 @@ impl ConsolePanel {
     /// when it was opened by the status-bar button focus stays wherever the
     /// user left it.
     fn autostart_terminal_if_empty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.restore_in_flight || !self.tabs.is_empty() || self.pending_terminals_to_add > 0 {
+        if self.restore_in_flight || self.pending_terminals_to_add > 0 {
+            return;
+        }
+        if self.tab_scope_flags(cx).iter().any(|in_scope| *in_scope) {
             return;
         }
         if !self.band_shows_this_panel(cx) {
@@ -1131,6 +1183,9 @@ impl ConsolePanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
+        if !workspace_is_presented(&workspace, cx) {
+            return;
+        }
         if !workspace_has_project(workspace.read(cx), cx) {
             return;
         }
@@ -1179,14 +1234,66 @@ impl ConsolePanel {
             return;
         }
 
+        let working_directory = terminal_view::default_working_directory(workspace, cx);
+        Self::open_terminal_in_utility_half(workspace, working_directory, action.local, window, cx);
+    }
+
+    /// Handler for `workspace::OpenTerminal` — "Open in Terminal" on a project
+    /// panel folder, on an editor tab, on a multibuffer header, and
+    /// `editor::OpenInTerminal`.
+    ///
+    /// Its only other handler is `TerminalPanel::open_terminal`, which looks
+    /// the action's terminal up in a dock this fork never fills, so every one
+    /// of those menu entries was a silent no-op until this one existed. Both
+    /// handlers hang off the same `Workspace` dispatch node and the bubble
+    /// phase stops at the first that does not propagate; `terminal_view::init`
+    /// runs first (`crates/zed/src/main.rs`), so this handler is reachable
+    /// only because that one now calls `cx.propagate()` when the dock lookup
+    /// fails.
+    ///
+    /// No `workspace_has_project` gate, unlike `NewTerminal`: that gate exists
+    /// because a terminal needs somewhere to `cd`, and this action names the
+    /// directory itself.
+    pub fn handle_open_terminal(
+        workspace: &mut Workspace,
+        action: &workspace::OpenTerminal,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::open_terminal_in_utility_half(
+            workspace,
+            Some(action.working_directory.clone()),
+            action.local,
+            window,
+            cx,
+        );
+    }
+
+    /// Open a terminal tab at `working_directory` in the Solution band's
+    /// utility half, and put it in front of the user: reveal the half (it may
+    /// be hidden, or showing the debugger / the graph) and focus the panel, so
+    /// `render` hands focus down to the tab once it lands. This is upstream's
+    /// `RevealStrategy::Always`, which is what both `workspace::NewTerminal`
+    /// and `workspace::OpenTerminal` asked their dock panel for.
+    ///
+    /// Must be called with `&mut Workspace` in hand (both callers are
+    /// `workspace.register_action` handlers): it reads the workspace straight
+    /// off that reference and never re-acquires the entity's lease.
+    fn open_terminal_in_utility_half(
+        workspace: &Workspace,
+        working_directory: Option<PathBuf>,
+        local: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let Some(console_panel) = console_panel_for_workspace(workspace) else {
             return;
         };
-
-        let working_directory = terminal_view::default_working_directory(workspace, cx);
+        reveal_utility_section(workspace, UtilityKind::Terminal, cx);
         console_panel.update(cx, |panel, cx| {
-            panel.add_terminal_tab(working_directory, window, cx);
+            panel.add_terminal_tab_inner(working_directory, local, window, cx);
         });
+        console_panel.focus_handle(cx).focus(window, cx);
     }
 
     /// Spawn a task into a fresh terminal tab. Used both as the public entry
@@ -1255,11 +1362,14 @@ impl ConsolePanel {
                         view
                     })?;
                     this.update(cx, |this, cx| {
-                        this.tabs.push(ConsoleTab::Terminal {
-                            view: terminal_view,
-                            origin_cwd,
-                        });
-                        this.active_index = Some(this.tabs.len() - 1);
+                        let ix = this.push_terminal_tab(
+                            ConsoleTab::Terminal {
+                                view: terminal_view,
+                                origin_cwd,
+                            },
+                            cx,
+                        );
+                        this.active_index = Some(ix);
                         cx.notify();
                         this.persist(cx);
                     })?;
@@ -1499,11 +1609,22 @@ impl ConsolePanel {
         self.tabs.len()
     }
 
+    /// Set by `agent_ui::inline_assistant`'s settings observer. The flag is
+    /// consumed by the terminal's own context menu ("Inline Assist", "Add to
+    /// Agent Thread"), which used to read it back off
+    /// `workspace.panel::<TerminalPanel>()` — always `None` in this fork — so
+    /// it is pushed onto every terminal this panel owns instead. New tabs
+    /// pick it up in [`Self::push_terminal_tab`].
     pub fn set_assistant_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.assistant_enabled != enabled {
-            self.assistant_enabled = enabled;
-            cx.notify();
+        if self.assistant_enabled == enabled {
+            return;
         }
+        self.assistant_enabled = enabled;
+        for tab in &self.tabs {
+            let ConsoleTab::Terminal { view, .. } = tab;
+            view.update(cx, |view, cx| view.set_assistant_enabled(enabled, cx));
+        }
+        cx.notify();
     }
 
     fn show_tab_context_menu(
@@ -2072,6 +2193,28 @@ mod tests {
         Entity<ConsolePanel>,
         SolutionId,
     ) {
+        let (solution_id, project) =
+            bootstrap_solution_and_project(cx, worktree_under_solution).await;
+
+        let window_handle = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
+        let panel = window_handle
+            .update(cx, |workspace, window, cx| {
+                install_band_and_panel(workspace, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        (window_handle, panel, solution_id)
+    }
+
+    /// The half of [`bootstrap_band_and_panel`] that has nothing to do with
+    /// the window: a Solution, its `SolutionStore` + `SolutionAgentStore`
+    /// globals, and a `Project` whose worktree either does or does not live
+    /// under the Solution root.
+    async fn bootstrap_solution_and_project(
+        cx: &mut TestAppContext,
+        worktree_under_solution: bool,
+    ) -> (SolutionId, Entity<project::Project>) {
         init_test(cx);
 
         let (solution_id, solution_root) = cx.update(|cx| {
@@ -2118,31 +2261,70 @@ mod tests {
             });
         });
 
-        let window_handle = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
-        let panel = window_handle
-            .update(cx, |workspace, window, cx| {
-                let panel = cx.new(|cx| ConsolePanel::new(workspace.weak_handle(), cx));
-                // `ConsolePanel::load` arms this in production; without it the
-                // band's terminal half would never auto-start a shell here and
-                // the tests below would pass against a panel that is not the
-                // one the app ships.
-                panel.update(cx, |panel, cx| panel.observe_band_state(window, cx));
-                let band = cx.new(|cx| {
-                    SolutionBand::new(workspace.weak_handle(), workspace.project().clone(), cx)
-                });
-                workspace.set_solution_band_item(band.into(), window, cx);
-                workspace.set_solution_band_utility_item(
-                    UtilityKind::Terminal,
-                    panel.clone().into(),
-                    window,
-                    cx,
-                );
-                panel
+        (solution_id, project)
+    }
+
+    /// Fill both Solution-band slots on `workspace` the way `zed.rs` does at
+    /// startup — the `SolutionBand` in `solution_band_item`, a `ConsolePanel`
+    /// under `UtilityKind::Terminal` in `solution_band_utility_item` — and
+    /// return the panel.
+    fn install_band_and_panel(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<ConsolePanel> {
+        let panel = cx.new(|cx| ConsolePanel::new(workspace.weak_handle(), cx));
+        // `ConsolePanel::load` arms this in production; without it the band's
+        // terminal half would never auto-start a shell here and the tests
+        // below would pass against a panel that is not the one the app ships.
+        panel.update(cx, |panel, cx| panel.observe_band_state(window, cx));
+        let band = cx
+            .new(|cx| SolutionBand::new(workspace.weak_handle(), workspace.project().clone(), cx));
+        workspace.set_solution_band_item(band.into(), window, cx);
+        workspace.set_solution_band_utility_item(
+            UtilityKind::Terminal,
+            panel.clone().into(),
+            window,
+            cx,
+        );
+        panel
+    }
+
+    /// Like [`bootstrap_band_and_panel`], but the window's root view is a
+    /// `MultiWorkspace` — which is what the app runs, and the only way an
+    /// action dispatch reaches a `workspace.register_action` handler at all:
+    /// the listeners are attached by `Workspace::actions`, and its ONLY caller
+    /// is `MultiWorkspace::render` (`multi_workspace.rs`). A window whose root
+    /// view is a bare `Workspace` renders no workspace action listeners, so a
+    /// dispatch test against one silently exercises nothing.
+    async fn bootstrap_dispatchable_band_and_panel(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<workspace::MultiWorkspace>,
+        Entity<ConsolePanel>,
+        Entity<SolutionBand>,
+        SolutionId,
+    ) {
+        let (solution_id, project) = bootstrap_solution_and_project(cx, true).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let (panel, band) = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    let panel = install_band_and_panel(workspace, window, cx);
+                    let band = workspace
+                        .solution_band_item()
+                        .and_then(|item| item.downcast::<SolutionBand>().ok())
+                        .expect("install_band_and_panel just set it");
+                    (panel, band)
+                })
             })
             .unwrap();
         cx.run_until_parked();
 
-        (window_handle, panel, solution_id)
+        (window_handle, panel, band, solution_id)
     }
 
     fn band_of(
@@ -2166,6 +2348,33 @@ mod tests {
     /// `create_for_test_minimal` builds a MEMBERLESS Solution, which is why
     /// the band tests that don't call this never auto-start a terminal: they
     /// model a Solution with nowhere to `cd` into.
+    /// Give the bootstrapped Solution two member projects, each in its own
+    /// folder under the Solution root, and return `(id, path)` for both. The
+    /// paths are what scopes a terminal tab to a member (`tab_scope` places a
+    /// tab by its creation-time cwd), which is what makes the panel render one
+    /// member's terminals and hide the other's.
+    fn two_members(
+        cx: &mut TestAppContext,
+        solution_id: SolutionId,
+    ) -> ((MemberId, PathBuf), (MemberId, PathBuf)) {
+        cx.update(|cx| {
+            SolutionStore::global(cx).update(cx, |store, _| {
+                let root = store
+                    .find_solution(solution_id)
+                    .expect("bootstrapped solution")
+                    .root
+                    .clone();
+                let first_path = root.join("first");
+                let second_path = root.join("second");
+                let first =
+                    store.test_add_member_with_path(solution_id, "first", first_path.clone());
+                let second =
+                    store.test_add_member_with_path(solution_id, "second", second_path.clone());
+                ((first, first_path), (second, second_path))
+            })
+        })
+    }
+
     fn give_the_solution_a_member(cx: &mut TestAppContext, solution_id: SolutionId) {
         cx.update(|cx| {
             SolutionStore::global(cx).update(cx, |store, _| {
@@ -3405,5 +3614,312 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    /// The whole "Open in Terminal" feature — the project panel's folder
+    /// context menu, the tab context menu, the multibuffer header,
+    /// `editor::OpenInTerminal`, the outline panel — dispatches
+    /// `workspace::OpenTerminal` and nothing else. Its only handler used to be
+    /// `TerminalPanel::open_terminal`, which returns the moment
+    /// `workspace.panel::<TerminalPanel>()` is `None` — and it always is in
+    /// this fork, which never adds that panel to a dock. So every one of those
+    /// entries was a silent no-op.
+    ///
+    /// Dispatched for real through the rendered workspace rather than by
+    /// calling the handler, because the defect is not in a handler: it is that
+    /// BOTH handlers sit on the same `Workspace` dispatch node, the bubble
+    /// phase stops at the first one that does not propagate, and
+    /// `terminal_view::init` (which `init_test` runs first, exactly as
+    /// `crates/zed/src/main.rs` does) registers before `console_panel::init`.
+    /// A test that called `ConsolePanel::handle_open_terminal` directly would
+    /// pass with the feature still dead.
+    #[gpui::test]
+    async fn the_open_terminal_action_opens_a_terminal_in_the_band(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, band, solution_id) =
+            bootstrap_dispatchable_band_and_panel(cx).await;
+        give_the_solution_a_member(cx, solution_id);
+        let working_directory = cx.update(|cx| {
+            SolutionStore::global(cx)
+                .read(cx)
+                .find_solution(solution_id)
+                .expect("bootstrapped solution")
+                .root
+                .clone()
+        });
+
+        assert!(
+            !band.read_with(cx, |band, cx| band.utility_visible(cx)),
+            "precondition: the band's terminal half starts hidden, so the \
+             action has to reveal it or the user sees nothing happen"
+        );
+
+        let cx = &mut gpui::VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+        cx.dispatch_action(workspace::OpenTerminal {
+            working_directory: working_directory.clone(),
+            local: false,
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tabs.len(),
+                1,
+                "`workspace::OpenTerminal` must open a terminal tab"
+            );
+            let ConsoleTab::Terminal { origin_cwd, .. } = &panel.tabs[0];
+            assert_eq!(
+                origin_cwd.as_deref(),
+                Some(working_directory.as_path()),
+                "and it must run in the directory the action named"
+            );
+            assert_eq!(panel.active_index, Some(0));
+        });
+        let state = band.read_with(cx, |band, cx| band.band_state(cx));
+        assert!(
+            state.utility_visible && state.utility_kind == UtilityKind::Terminal,
+            "the terminal half must be revealed — a tab in a hidden half is \
+             the same silent no-op from the user's side"
+        );
+        cx.update(|window, cx| {
+            assert!(
+                panel.focus_handle(cx).contains_focused(window, cx),
+                "and the new terminal must take focus: the user asked for a \
+                 terminal here, not for one somewhere behind the editor"
+            );
+        });
+    }
+
+    /// `workspace::NewTerminal` (`ctrl-~`) reaches this panel through the same
+    /// fall-through, and was dead in the same way for the same reason.
+    #[gpui::test]
+    async fn the_new_terminal_action_reaches_the_console_panel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, _band, solution_id) =
+            bootstrap_dispatchable_band_and_panel(cx).await;
+        give_the_solution_a_member(cx, solution_id);
+
+        let cx = &mut gpui::VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+        cx.dispatch_action(workspace::NewTerminal { local: false });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.tabs.len(),
+                1,
+                "`workspace::NewTerminal` must open a terminal tab in the band"
+            );
+        });
+    }
+
+    /// The panel renders ONE member's terminals (`tab_scope_flags` /
+    /// `effective_active_index`), so "does this panel have a terminal" and
+    /// "does the half the user is looking at have a terminal" are different
+    /// questions — and the auto-start has to answer the second one. Asking
+    /// `self.tabs.is_empty()` meant that after switching the project tab strip
+    /// to a member with no terminal of its own, the half painted empty and the
+    /// auto-start declined to fill it because a *different* member's tab
+    /// existed.
+    #[gpui::test]
+    async fn a_member_with_no_terminal_of_its_own_still_gets_one(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel, solution_id) = bootstrap_band_and_panel(cx, true).await;
+        let (first, second) = two_members(cx, solution_id);
+        let band = band_of(&window_handle, cx);
+
+        // A terminal that belongs to the first member only.
+        cx.update(|cx| {
+            SolutionStore::global(cx).update(cx, |store, cx| {
+                store.set_active_member(solution_id, first.0, cx);
+            });
+        });
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.add_terminal_tab(Some(first.1.clone()), window, cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            SolutionStore::global(cx).update(cx, |store, cx| {
+                store.set_active_member(solution_id, second.0, cx);
+            });
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                !panel.tabs.is_empty(),
+                "precondition: the panel does hold a terminal…"
+            );
+            assert!(
+                !panel.tab_scope_flags(cx).iter().any(|in_scope| *in_scope),
+                "…but none of it belongs to the member now selected, so the \
+                 half paints empty"
+            );
+        });
+
+        band.update(cx, |band, cx| {
+            band.activate_utility_kind(UtilityKind::Terminal, cx)
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.tabs.len(),
+                2,
+                "showing an empty-looking half must start a shell for the \
+                 member the user is actually looking at"
+            );
+            let flags = panel.tab_scope_flags(cx);
+            assert_eq!(
+                flags.iter().filter(|in_scope| **in_scope).count(),
+                1,
+                "and exactly one tab is in scope for that member"
+            );
+        });
+    }
+
+    /// A shell that cannot start (a bad `terminal.shell`, a cwd that went
+    /// away) used to leave the half empty with nothing but a log line, and the
+    /// band's auto-start retried it on every edge. The user is told.
+    #[gpui::test]
+    async fn a_shell_that_cannot_start_tells_the_user(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel) = bootstrap_panel(cx).await;
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.terminal.get_or_insert_default().shell =
+                        Some(settings_content::Shell::Program(
+                            "/nonexistent-console-panel-shell-for-the-toast-test".to_string(),
+                        ));
+                });
+            });
+        });
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.tabs.is_empty(),
+                "precondition: the shell must actually have failed to spawn"
+            );
+            assert_eq!(
+                panel.pending_terminals_to_add, 0,
+                "and the in-flight counter must not leak on the failure path"
+            );
+        });
+        window_handle
+            .read_with(cx, |workspace, _| {
+                assert_eq!(
+                    workspace.notification_ids().len(),
+                    1,
+                    "a shell that will not start must say so; an empty half \
+                     with no explanation is the bug"
+                );
+            })
+            .unwrap();
+    }
+
+    /// The band's state is the *Solution's*, and a `MultiWorkspace` window
+    /// holds several workspaces that can map to the same Solution — of which
+    /// exactly one is on screen. Opening the terminal half must not start a
+    /// real PTY in the ones the user cannot see.
+    #[gpui::test]
+    async fn a_background_workspace_is_not_presented(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        fs.insert_tree("/other", serde_json::json!({})).await;
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let other_project = Project::test(fs, ["/other".as_ref()], cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let (background, presented) = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                // The first workspace becomes the retained one the moment a
+                // second is activated in the same window.
+                let background = multi_workspace.workspace().clone();
+                let presented =
+                    multi_workspace.test_add_workspace(other_project.clone(), window, cx);
+                (background, presented)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                workspace_is_presented(&presented, cx),
+                "the workspace the window is showing is presented"
+            );
+            assert!(
+                !workspace_is_presented(&background, cx),
+                "a retained one is not — its ConsolePanel must sit out the \
+                 band edge its Solution's visible workspace just took"
+            );
+        });
+    }
+
+    /// The terminal's context menu offers "Inline Assist" / "Add to Agent
+    /// Thread" only when the flag says so, and it reads that flag off itself
+    /// (`terminal_view` cannot look at `ConsolePanel` — that is the crate
+    /// cycle), so the panel has to push it down: onto the tabs it already has
+    /// when `agent_ui::inline_assistant` flips it, and onto every tab created
+    /// afterwards.
+    #[gpui::test]
+    async fn the_assistant_flag_reaches_every_terminal_the_panel_owns(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (window_handle, panel) = bootstrap_panel(cx).await;
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            let ConsoleTab::Terminal { view, .. } = &panel.tabs[0];
+            assert!(
+                !view.read(cx).assistant_enabled(),
+                "precondition: the flag starts off"
+            );
+        });
+
+        // What `agent_ui::inline_assistant`'s settings observer does.
+        panel.update(cx, |panel, cx| panel.set_assistant_enabled(true, cx));
+        panel.read_with(cx, |panel, cx| {
+            let ConsoleTab::Terminal { view, .. } = &panel.tabs[0];
+            assert!(
+                view.read(cx).assistant_enabled(),
+                "flipping the panel's flag must reach the terminal already open \
+                 in it, or its context menu keeps hiding Inline Assist"
+            );
+        });
+
+        window_handle
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| panel.add_terminal_tab(None, window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            let ConsoleTab::Terminal { view, .. } = &panel.tabs[1];
+            assert!(
+                view.read(cx).assistant_enabled(),
+                "and a terminal created afterwards must inherit it"
+            );
+        });
     }
 }

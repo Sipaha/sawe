@@ -45,6 +45,7 @@ pub fn init(cx: &mut gpui::App) {
         workspace.register_action(handle_show_session);
         workspace.register_action(handle_toggle_dialog);
         workspace.register_action(ConsolePanel::handle_new_terminal);
+        workspace.register_action(ConsolePanel::handle_open_terminal);
     })
     .detach();
 }

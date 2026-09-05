@@ -18,10 +18,14 @@ impl TerminalProvider {
         Self { workspace }
     }
 
-    /// Spawn a new terminal view at `cwd` (or the active worktree root if `None`).
+    /// Spawn a new terminal view at `cwd` (or the active worktree root if
+    /// `None`). `local` forces a terminal on this machine even for a remote
+    /// project — `workspace::{NewTerminal,OpenTerminal}::local` — and ignores
+    /// `cwd`, which names a path on the remote side.
     pub fn new_tab(
         &self,
         cwd: Option<PathBuf>,
+        local: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<TerminalView>>> {
@@ -41,7 +45,11 @@ impl TerminalProvider {
             };
             let terminal = project
                 .update(cx, |project: &mut Project, cx| {
-                    project.create_terminal_shell(resolved_cwd, cx)
+                    if local {
+                        project.create_local_terminal(cx)
+                    } else {
+                        project.create_terminal_shell(resolved_cwd, cx)
+                    }
                 })
                 .await?;
             let terminal_view = workspace.update_in(cx, |ws, window, cx| {
@@ -96,7 +104,9 @@ mod tests {
             .unwrap();
 
         let task: Task<Result<Entity<TerminalView>>> = window_handle
-            .update(cx, |_, window, cx| provider.new_tab(None, window, cx))
+            .update(cx, |_, window, cx| {
+                provider.new_tab(None, false, window, cx)
+            })
             .unwrap();
 
         let result = task.await;

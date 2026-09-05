@@ -152,6 +152,22 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
+    /// Whether this terminal's context menu may offer the agent entries
+    /// ("Inline Assist", "Add to Agent Thread").
+    ///
+    /// Pushed down by whoever owns the terminal rather than read back out of
+    /// an owner: upstream read it off `workspace.panel::<TerminalPanel>()`,
+    /// but this fork hosts terminals in `console_panel::ConsolePanel` (the
+    /// Solution band's utility half, FORK.md #22/#91), which never lands in a
+    /// dock — so that lookup returned `None` and the entries were
+    /// unreachable from the mouse even with the shipped `agent.enabled: true`.
+    /// `ConsolePanel` cannot be read from here either: `console_panel`
+    /// depends on `terminal_view`, so the typed lookup would be a dependency
+    /// cycle. The value therefore travels the other way, from
+    /// `ConsolePanel::set_assistant_enabled` (fed by
+    /// `agent_ui::inline_assistant`'s settings observer) onto each terminal
+    /// it owns.
+    assistant_enabled: bool,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -298,6 +314,7 @@ impl TerminalView {
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
+            assistant_enabled: false,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -488,6 +505,18 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Whether the context menu offers the agent entries — see the field.
+    pub fn assistant_enabled(&self) -> bool {
+        self.assistant_enabled
+    }
+
+    pub fn set_assistant_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.assistant_enabled != enabled {
+            self.assistant_enabled = enabled;
+            cx.notify();
+        }
+    }
+
     pub fn clear_bell(&mut self, cx: &mut Context<TerminalView>) {
         self.has_bell = false;
         cx.emit(Event::Wakeup);
@@ -500,11 +529,7 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let assistant_enabled = self
-            .workspace
-            .upgrade()
-            .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
-            .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
+        let assistant_enabled = self.assistant_enabled;
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .action("New Terminal", Box::new(NewTerminal::default()))

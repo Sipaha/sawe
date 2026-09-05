@@ -524,6 +524,19 @@ impl TerminalPanel {
         cx: &mut Context<Workspace>,
     ) {
         let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
+            // Fork: `TerminalPanel` is never added to a dock (FORK.md #22/#91
+            // — the band's utility half hosts `console_panel::ConsolePanel`
+            // instead), so this lookup always fails here. Both handlers hang
+            // off the same `Workspace` dispatch node and the bubble phase
+            // stops at the FIRST one that does not propagate, and
+            // `terminal_view::init` runs before `console_panel::init`
+            // (`crates/zed/src/main.rs`) — so without this the console
+            // panel's handler is never reached and `workspace::OpenTerminal`
+            // is a silent no-op for every one of its dispatchers ("Open in
+            // Terminal" in the project panel, the tab context menu, the
+            // multibuffer header, `editor::OpenInTerminal`, the outline
+            // panel).
+            cx.propagate();
             return;
         };
 
@@ -675,6 +688,11 @@ impl TerminalPanel {
         }
 
         let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
+            // Same fall-through as `open_terminal` above: with no docked
+            // `TerminalPanel`, `workspace::NewTerminal` (`ctrl-~`) must reach
+            // `ConsolePanel::handle_new_terminal`, which is registered later
+            // on the same dispatch node.
+            cx.propagate();
             return;
         };
 

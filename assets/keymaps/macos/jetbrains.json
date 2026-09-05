@@ -147,7 +147,7 @@
   {
     "context": "Workspace || Editor",
     "bindings": {
-      "alt-f12": "terminal_panel::Toggle",
+      "alt-f12": "console_panel::ToggleFocus",
       "cmd-shift-k": "git::Push",
     },
   },
@@ -176,7 +176,7 @@
     "context": "Terminal",
     "bindings": {
       "cmd-t": "workspace::NewTerminal",
-      "alt-f12": "workspace::CloseActiveDock",
+      "alt-f12": "console_panel::ToggleFocus",
       "cmd-up": "terminal::ScrollLineUp",
       "cmd-down": "terminal::ScrollLineDown",
       "shift-pageup": "terminal::ScrollPageUp",

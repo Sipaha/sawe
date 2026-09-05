@@ -95,7 +95,7 @@ If you chose the JetBrains keymap during onboarding, most of your shortcuts shou
 | Rename Symbol          | {#kb:jetbrains editor::Rename}                  |
 | Reformat Code          | {#kb:jetbrains editor::Format}                  |
 | Toggle Project Panel   | {#kb:jetbrains project_panel::ToggleFocus}      |
-| Toggle Terminal        | {#kb:jetbrains terminal_panel::Toggle}          |
+| Toggle Terminal        | {#kb:jetbrains console_panel::ToggleFocus}      |
 | Duplicate Line         | {#kb:jetbrains editor::DuplicateSelection}      |
 | Delete Line            | {#kb:jetbrains editor::DeleteLine}              |
 | Move Line Up           | {#kb:jetbrains editor::MoveLineUp}              |
@@ -206,7 +206,7 @@ What this means in practice:
 ```
 
 - Use {#kb:jetbrains task::Spawn} to run tasks quickly
-- Lean on your terminal ({#kb:jetbrains terminal_panel::Toggle}) for anything tasks don't cover
+- Lean on your terminal ({#kb:jetbrains console_panel::ToggleFocus}) for anything tasks don't cover
 
 ### No Framework Integration
 
@@ -231,7 +231,7 @@ WebStorm organizes auxiliary views into numbered tool windows. Zed uses a simila
 | -------------------- | -------------- | ------------------------------------------ |
 | Project              | Project Panel  | {#kb:jetbrains project_panel::ToggleFocus} |
 | Git                  | Git Panel      | {#kb:jetbrains git_panel::ToggleFocus}     |
-| Terminal             | Terminal Panel | {#kb:jetbrains terminal_panel::Toggle}     |
+| Terminal             | Terminal Panel | {#kb:jetbrains console_panel::ToggleFocus} |
 | Structure            | Outline Panel  | {#kb:jetbrains outline_panel::ToggleFocus} |
 | Problems             | Diagnostics    | {#kb:jetbrains diagnostics::Deploy}        |
 | Debug                | Debug Panel    | {#kb:jetbrains debug_panel::ToggleFocus}   |
