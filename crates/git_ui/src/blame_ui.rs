@@ -24,6 +24,7 @@ use settings::Settings as _;
 use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{CopyButton, Divider, prelude::*, tooltip_container};
+use util::ResultExt as _;
 use workspace::Workspace;
 
 /// Ceiling on the author column, in monospace columns. Only 7 of the 1931
@@ -34,15 +35,18 @@ const GIT_BLAME_MAX_AUTHOR_COLUMNS: usize = 20;
 /// Columns the fixed-width date takes, e.g. `21 Mar 2019`.
 const GIT_BLAME_DATE_COLUMNS: usize = "21 Mar 2019".len();
 
-/// Columns for the gap inside the row and the margin after it. Both are
-/// pixel-sized (8px each) and a column is wider than that at every font size
-/// the editor uses, so rounding up to whole columns keeps the reservation an
-/// upper bound.
-const GIT_BLAME_SPACING_COLUMNS: usize = 2;
+/// The rem fraction of one gap in the row: `gap_2` between the date and the
+/// author name, `mr_2` after the row, and the second `gap_2` an avatar
+/// introduces are all the same `0.5rem`.
+const GIT_BLAME_GAP_REMS: f32 = 0.5;
 
-/// Columns the avatar and the second gap it introduces take when
-/// `git.blame.show_avatar` is on.
-const GIT_BLAME_AVATAR_COLUMNS: usize = 3;
+/// How many gaps the row spends without an avatar: the one inside it and the
+/// margin after it.
+const GIT_BLAME_GAPS: f32 = 2.;
+
+/// The border `CommitAvatar` draws around itself, one pixel on each side. The
+/// avatar image itself is `rems(1.)`.
+const GIT_BLAME_AVATAR_BORDER: Pixels = px(2.);
 
 pub struct GitBlameRenderer;
 
@@ -52,12 +56,12 @@ impl BlameRenderer for GitBlameRenderer {
     }
 
     fn gutter_fixed_columns(&self, cx: &App) -> usize {
-        let avatar_columns = if ProjectSettings::get_global(cx).git.blame.show_avatar {
-            GIT_BLAME_AVATAR_COLUMNS
-        } else {
-            0
-        };
-        GIT_BLAME_DATE_COLUMNS + GIT_BLAME_SPACING_COLUMNS + avatar_columns
+        let rem_size = ThemeSettings::get_global(cx).ui_font_size(cx);
+        let mut fixed_pixels = rem_size * GIT_BLAME_GAP_REMS * GIT_BLAME_GAPS;
+        if ProjectSettings::get_global(cx).git.blame.show_avatar {
+            fixed_pixels += rem_size * GIT_BLAME_GAP_REMS + rem_size + GIT_BLAME_AVATAR_BORDER;
+        }
+        GIT_BLAME_DATE_COLUMNS + columns_covering(fixed_pixels, cx)
     }
 
     fn render_blame_entry(
@@ -114,6 +118,10 @@ impl BlameRenderer for GitBlameRenderer {
             return Some(render_muted_blame_entry(style, ix, cx));
         }
 
+        // Once per row, not once per debug id: the four selectors below all
+        // ask the same editor the same question.
+        let pane_suffix = blame_pane_suffix(&editor, cx);
+
         // Consecutive lines from one commit used to repeat the same date and
         // author on every row, so a file written in a few large commits read
         // as a wall of identical text. Only the row that opens a run names its
@@ -164,14 +172,17 @@ impl BlameRenderer for GitBlameRenderer {
                             .to_string(),
                     )
                 });
-                Some(
-                    CommitAvatar::new(
-                        &blame_entry.sha.to_string().into(),
-                        author_email,
-                        details.as_ref().and_then(|it| it.remote.as_ref()),
-                    )
-                    .render(window, cx),
-                )
+                let remote = details.as_ref().and_then(|it| it.remote.as_ref());
+                // `CommitAvatar` uses the sha as the cache key of the image it
+                // fetches, and it fetches nothing without both an author email
+                // and a remote to ask. Formatting the `Oid` into a
+                // forty-character `String` and then an `Arc<str>` for a person
+                // icon is one allocation per visible row per frame, so it is
+                // only worth doing when something will actually read it.
+                let sha = (author_email.is_some() && remote.is_some())
+                    .then(|| SharedString::from(blame_entry.sha.to_string()))
+                    .unwrap_or_default();
+                Some(CommitAvatar::new(&sha, author_email, remote).render(window, cx))
             } else {
                 None
             };
@@ -182,9 +193,7 @@ impl BlameRenderer for GitBlameRenderer {
                     // Named apart from the row container, and per row, because
                     // the two now differ: a continuation row paints the
                     // container and not this. See `blame_pane_suffix`.
-                    .debug_selector(|| {
-                        format!("GIT-BLAME-META{}-{ix}", blame_pane_suffix(&editor, cx))
-                    })
+                    .debug_selector(|| format!("GIT-BLAME-META{pane_suffix}-{ix}"))
                     .child(date)
                     .children(avatar)
                     // Coloured per commit (or per author / per age, under
@@ -220,9 +229,7 @@ impl BlameRenderer for GitBlameRenderer {
                 .w_full()
                 .h_px()
                 .bg(cx.theme().colors().border_variant)
-                .debug_selector(|| {
-                    format!("GIT-BLAME-SEPARATOR{}-{ix}", blame_pane_suffix(&editor, cx))
-                })
+                .debug_selector(|| format!("GIT-BLAME-SEPARATOR{pane_suffix}-{ix}"))
         });
 
         Some(
@@ -242,7 +249,7 @@ impl BlameRenderer for GitBlameRenderer {
                 // turns blame on for both. Encoding the side beats measuring
                 // against the divider — no geometry to recompute when the split
                 // layout changes, and both sides can be asserted by name.
-                .debug_selector(|| format!("GIT-BLAME-ENTRY{}", blame_pane_suffix(&editor, cx)))
+                .debug_selector(|| format!("GIT-BLAME-ENTRY{pane_suffix}"))
                 .child(
                     h_flex()
                         .id(("blame", ix))
@@ -264,9 +271,7 @@ impl BlameRenderer for GitBlameRenderer {
                             row.h(style.line_height_in_pixels(window.rem_size()))
                         })
                         .text_color(cx.theme().status().hint)
-                        .debug_selector(|| {
-                            format!("GIT-BLAME-ROW{}-{ix}", blame_pane_suffix(&editor, cx))
-                        })
+                        .debug_selector(|| format!("GIT-BLAME-ROW{pane_suffix}-{ix}"))
                         .children(metadata)
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
                         .cursor_pointer()
@@ -294,7 +299,6 @@ impl BlameRenderer for GitBlameRenderer {
                         .on_click({
                             // S-ANN — left-click navigates to the commit in
                             // the Git Graph view (opens it if not present).
-                            let blame_entry = blame_entry.clone();
                             move |_, window, cx| {
                                 let sha = blame_entry.sha.to_string();
                                 window.dispatch_action(Box::new(OpenAtCommit { sha }), cx);
@@ -665,6 +669,36 @@ fn deploy_blame_entry_context_menu(
     });
 }
 
+/// How many of the editor's monospace columns it takes to cover `pixels`.
+///
+/// `EditorSnapshot::gutter_dimensions` reserves `columns * ch_advance` for the
+/// blame column, so every pixel-sized part of the row — the gaps, the margin,
+/// the avatar — has to be converted at the *actual* character width or the
+/// reservation stops being an upper bound. It used to be a constant 2 columns
+/// for 16px of gaps, i.e. an assumption that a column is never narrower than
+/// 8px. It is 7.2px at `buffer_font_size: 12`, and wider gaps at
+/// `ui_font_size: 20` overflow it from the other side; either way the row ran
+/// past its column and `overflow_x_hidden` clipped the widest author's last
+/// glyph.
+fn columns_covering(pixels: Pixels, cx: &App) -> usize {
+    let character_width = blame_character_width(cx).unwrap_or_else(|| {
+        // Nothing measurable to divide by; the old fixed assumption is still
+        // the best guess available.
+        px(8.)
+    });
+    (pixels / character_width).ceil() as usize
+}
+
+/// The advance width of one column of the gutter the blame is drawn in, which
+/// is laid out in the buffer font at the buffer font size.
+fn blame_character_width(cx: &App) -> Option<Pixels> {
+    let theme_settings = ThemeSettings::get_global(cx);
+    let font_id = cx.text_system().resolve_font(&theme_settings.buffer_font);
+    cx.text_system()
+        .ch_advance(font_id, theme_settings.buffer_font_size(cx))
+        .log_err()
+}
+
 /// The pane half of a blame gutter selector: `-LEFT` / `-RIGHT` in a split
 /// diff, empty in a single editor.
 ///
@@ -672,8 +706,11 @@ fn deploy_blame_entry_context_menu(
 /// name overwrites a single map entry and a lookup can only ever prove that
 /// *some* row painted. The pane and, for the per-row names, the viewport row
 /// index are therefore part of the name — that is what lets a test say this
-/// row drew metadata and that one did not. Only called from the `debug_selector`
-/// closures, which are compiled to nothing outside tests.
+/// row drew metadata and that one did not.
+///
+/// Read once per row and handed to all four `debug_selector` closures rather
+/// than called from inside each of them: the answer is the same for every
+/// selector on a row, and the closures are the only readers.
 fn blame_pane_suffix(editor: &Entity<Editor>, cx: &App) -> &'static str {
     match editor.read(cx).split_side() {
         Some(SplitSide::Left) => "-LEFT",
@@ -752,6 +789,92 @@ fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{TestAppContext, UpdateGlobal as _};
+    use settings::{FontSize, SettingsStore};
+
+    /// The reservation `EditorSnapshot::gutter_dimensions` makes for the blame
+    /// column, in pixels: the author budget and the fixed cost, both priced at
+    /// the gutter's own character width.
+    fn reserved_pixels(cx: &App) -> Pixels {
+        let renderer = GitBlameRenderer;
+        let columns = renderer.max_author_columns() + renderer.gutter_fixed_columns(cx);
+        blame_character_width(cx).expect("the test text system measures a character") * columns
+    }
+
+    /// What `render_blame_entry_with_options` lays out for the widest row it
+    /// can produce, priced from the element tree rather than from the
+    /// reservation: the eleven-column date, the row's `gap_2`, the avatar and
+    /// the second `gap_2` it introduces, the widest author name the renderer
+    /// will draw, and the `mr_2` on the container — which the reservation has
+    /// to cover too, since the editor reserves `columns * ch_advance` and the
+    /// margin is drawn inside that.
+    fn drawn_pixels(cx: &App) -> Pixels {
+        let character_width =
+            blame_character_width(cx).expect("the test text system measures a character");
+        let rem_size = ThemeSettings::get_global(cx).ui_font_size(cx);
+        let gap = rem_size * 0.5;
+        let avatar = if ProjectSettings::get_global(cx).git.blame.show_avatar {
+            gap + rem_size + px(2.)
+        } else {
+            px(0.)
+        };
+        character_width * GIT_BLAME_DATE_COLUMNS
+            + gap
+            + avatar
+            + character_width * GIT_BLAME_MAX_AUTHOR_COLUMNS
+            + gap
+    }
+
+    /// The gutter reserves `columns * ch_advance` and nothing clips the blame
+    /// element into it, so an under-estimate does not truncate — it paints
+    /// over the line numbers, with `overflow_x_hidden` on the row as the only
+    /// backstop, which costs the widest author its last glyph.
+    ///
+    /// The reservation used to spend a flat two columns on the row's 16px of
+    /// gaps and three on the avatar, which is an assumption that a monospace
+    /// column is at least 8px wide. It is 7.2px at `buffer_font_size: 12`, and
+    /// `ui_font_size: 20` widens the gaps without widening the column at all.
+    #[gpui::test]
+    fn the_gutter_reservation_is_an_upper_bound_at_every_font_size(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            ProjectSettings::register(cx);
+        });
+
+        // Both extremes of each axis, and the two the review named: a small
+        // buffer font narrows the column, a large UI font widens the gaps.
+        for buffer_font_size in [6., 12., 14., 16., 20., 40.] {
+            for ui_font_size in [6., 12., 16., 20., 40.] {
+                for show_avatar in [false, true] {
+                    cx.update(|cx| {
+                        SettingsStore::update_global(cx, |store, cx| {
+                            store.update_user_settings(cx, |settings| {
+                                settings.theme.buffer_font_size = Some(FontSize(buffer_font_size));
+                                settings.theme.ui_font_size = Some(FontSize(ui_font_size));
+                                settings
+                                    .git
+                                    .get_or_insert_default()
+                                    .blame
+                                    .get_or_insert_default()
+                                    .show_avatar = Some(show_avatar);
+                            })
+                        });
+
+                        let reserved = reserved_pixels(cx);
+                        let drawn = drawn_pixels(cx);
+                        assert!(
+                            reserved >= drawn,
+                            "buffer font {buffer_font_size}, ui font {ui_font_size}, \
+                             avatar {show_avatar}: reserved {reserved:?} for a row that \
+                             draws {drawn:?}"
+                        );
+                    });
+                }
+            }
+        }
+    }
 
     /// The gutter reserves exactly `GIT_BLAME_DATE_COLUMNS` for the date, so a
     /// date that formats wider than that would push the author name over the

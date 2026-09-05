@@ -192,7 +192,7 @@ impl StashesView {
         let prior = std::mem::take(&mut self.entries);
         cx.spawn_in(window, async move |this, cx| {
             let mut stats: HashMap<usize, git::stash::StashStat> = HashMap::new();
-            for (entry, task) in cached.iter().zip(stat_tasks.into_iter()) {
+            for (entry, task) in cached.iter().zip(stat_tasks) {
                 if let Ok(Ok(stat)) = task.await {
                     stats.insert(entry.index, stat);
                 }

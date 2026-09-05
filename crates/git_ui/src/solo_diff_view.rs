@@ -21,7 +21,7 @@ use gpui::{
     Focusable, IntoElement, Render, Task, WeakEntity, Window,
 };
 use language::{Buffer, Capability, HighlightedText};
-use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
+use multi_buffer::{MultiBuffer, MultiBufferSnapshot, PathKey};
 use project::{
     Project,
     git_store::{Repository, RepositoryId},
@@ -30,6 +30,7 @@ use settings::{DiffViewStyle, Settings, update_settings_file};
 use std::{
     any::{Any, TypeId},
     cell::Cell,
+    ops::Range,
     sync::Arc,
 };
 use ui::{
@@ -125,6 +126,62 @@ enum GestureOutcome {
     Load,
 }
 
+/// The most recent diff-load gesture per workspace, so an older load that is
+/// still in flight cannot land on top of a newer one.
+///
+/// Arrow-stepping down a commit's file list starts one `load_commit_diff`
+/// subprocess per step, and they do not finish in the order they were
+/// started: without this the tab settles on whichever load happened to
+/// return last rather than on the file the user last selected.
+///
+/// Keyed by the workspace rather than by the pane because that is the scope
+/// both halves of the open path actually work in — `resolve_gesture` and
+/// `add_to_pane` are handed the workspace and go through *its* active pane,
+/// which may not be the pane that was active when the gesture started.
+#[derive(Default)]
+struct SharedDiffLoads {
+    next_request: u64,
+    /// One entry per workspace that has loaded a diff, minus the ones whose
+    /// workspace has since been dropped. Pruned on every `begin`, so this
+    /// stays as short as the number of open windows rather than growing for
+    /// the life of the process.
+    current: Vec<(WeakEntity<Workspace>, u64)>,
+}
+
+impl gpui::Global for SharedDiffLoads {}
+
+/// A claim on a workspace's shared diff slot, taken when a load starts and
+/// checked again when it finishes.
+struct DiffLoadRequest {
+    workspace: WeakEntity<Workspace>,
+    request: u64,
+}
+
+impl DiffLoadRequest {
+    fn begin(workspace: &Entity<Workspace>, cx: &mut App) -> Self {
+        let workspace = workspace.downgrade();
+        let loads = cx.default_global::<SharedDiffLoads>();
+        loads.next_request += 1;
+        let request = loads.next_request;
+        loads
+            .current
+            .retain(|(entry, _)| entry.is_upgradable() && entry != &workspace);
+        loads.current.push((workspace.clone(), request));
+        Self { workspace, request }
+    }
+
+    /// Whether this is still the load the user is waiting for. A `false` here
+    /// means a later gesture claimed the slot while this one was loading, and
+    /// the result has to be dropped rather than shown.
+    fn is_current(&self, cx: &App) -> bool {
+        cx.try_global::<SharedDiffLoads>().is_some_and(|loads| {
+            loads.current.iter().any(|(workspace, request)| {
+                workspace == &self.workspace && *request == self.request
+            })
+        })
+    }
+}
+
 /// What a [`SoloDiffView`] is showing, and therefore what it can do.
 ///
 /// Every difference between the two modes is derived from this value, so the
@@ -175,20 +232,18 @@ impl DiffSource {
 
     /// Whether two views show the same thing, and so should be one tab.
     ///
-    /// A working-tree diff is identified by its repository — the same relative
-    /// path can exist in a second repository in the window — and a commit diff
-    /// by its sha, so the same file at two revisions gets two tabs.
+    /// Both arms are keyed by the repository — the same relative path can
+    /// exist in a second repository in the window — and a commit diff by its
+    /// sha as well, so the same file at two revisions gets two tabs.
     ///
-    /// The asymmetry is deliberate, not an omission: the commit arm ignores
-    /// the repository because `(sha, path)` already identifies the *content*.
-    /// A sha is content-addressed, so two repositories that both contain it
-    /// contain the same blob at that path. The one visible consequence is in a
-    /// Solution whose members are two clones of one repository: a Commit-tab
-    /// click in member B reuses member A's open tab. The diff shown is
-    /// identical, which is why this is a dedupe win rather than a bug — but if
-    /// the tab ever grows a working-tree-relative affordance (reveal in the
-    /// project panel, "open the file at HEAD"), the repository has to join the
-    /// key at that point.
+    /// The commit arm used to leave the repository out, on the grounds that a
+    /// sha is content-addressed and two clones holding it hold the same blob.
+    /// The *text* is indeed the same; everything hanging off the tab is not.
+    /// In a Solution whose members are two clones of one repository, a
+    /// Commit-tab click in member B activated member A's tab, whose permalink
+    /// is built from A's remote, whose `repository_id()` makes the git panel
+    /// mark a row in A, and whose blame runs `git blame` in A. That is a
+    /// wrong-repository tab, not a dedupe win.
     fn matches(&self, other: &Self, cx: &App) -> bool {
         match (self, other) {
             (
@@ -205,13 +260,21 @@ impl DiffSource {
                     && repo_path == other_repo_path
             }
             (
-                Self::Commit { sha, repo_path, .. },
                 Self::Commit {
+                    repository,
+                    sha,
+                    repo_path,
+                },
+                Self::Commit {
+                    repository: other_repository,
                     sha: other_sha,
                     repo_path: other_repo_path,
-                    ..
                 },
-            ) => sha == other_sha && repo_path == other_repo_path,
+            ) => {
+                repository.read(cx).id == other_repository.read(cx).id
+                    && sha == other_sha
+                    && repo_path == other_repo_path
+            }
             _ => false,
         }
     }
@@ -371,6 +434,96 @@ impl LoadedDiff {
     }
 }
 
+/// The buffers a [`LoadedDiff`] resolved to, kept on the view so a split
+/// pane's clone can build a *second* multibuffer over the same buffers.
+///
+/// The clone must not share the original's multibuffer.
+/// `SplittableEditor::split` and `unsplit` reconfigure the one they are given
+/// — `set_show_deleted_hunks`, `set_use_extended_diff_range` — so with a
+/// shared one, dragging either pane below `minimum_split_diff_width` reshaped
+/// the *other* pane's rows behind its back, and unsplitting the clone reached
+/// `editor::display_map`'s "patches_for_… is only allowed to return an empty
+/// vec if the multibuffer is empty" debug assertion (TODO C6). The buffers
+/// and the `BufferDiff` are still shared, which is what keeps the two views
+/// showing the same text and the same hunks; only the presentation of them is
+/// per-editor, which is what it was always supposed to be.
+#[derive(Clone)]
+enum DiffContents {
+    WorkingTree {
+        buffer: Entity<Buffer>,
+        diff: Entity<BufferDiff>,
+    },
+    Commit {
+        buffer: Entity<Buffer>,
+        diff: Entity<BufferDiff>,
+        path_key: PathKey,
+        excerpt_ranges: Vec<Range<language::Point>>,
+    },
+}
+
+impl DiffContents {
+    fn new(loaded: &LoadedDiff) -> Self {
+        match loaded {
+            LoadedDiff::WorkingTree { buffer, diff } => Self::WorkingTree {
+                buffer: buffer.clone(),
+                diff: diff.clone(),
+            },
+            LoadedDiff::Commit(blob) => Self::Commit {
+                buffer: blob.buffer.clone(),
+                diff: blob.diff.clone(),
+                path_key: blob.path_key.clone(),
+                excerpt_ranges: blob.excerpt_ranges.clone(),
+            },
+        }
+    }
+
+    /// A multibuffer of this source's shape over these buffers. One per
+    /// `SplittableEditor` — see this type's doc comment for why it is never
+    /// shared between two of them.
+    fn build_multibuffer(&self, cx: &mut Context<MultiBuffer>) -> MultiBuffer {
+        let mut multibuffer = match self {
+            // A live project buffer brings its own capability, which is what
+            // makes this side editable.
+            Self::WorkingTree { buffer, diff } => {
+                let mut multibuffer = MultiBuffer::singleton(buffer.clone(), cx);
+                multibuffer.add_diff(diff.clone(), cx);
+                multibuffer
+            }
+            // Read-only-ness lives here, not on the buffer: the historic blob
+            // itself is built `ReadWrite`. The file's name is already in the
+            // tab, so a path header would be redundant chrome.
+            Self::Commit { .. } => MultiBuffer::without_headers(Capability::ReadOnly),
+        };
+        multibuffer.set_all_diff_hunks_expanded(cx);
+        multibuffer
+    }
+
+    /// Excerpts the commit source's blob; a working-tree singleton already
+    /// spans its whole buffer.
+    ///
+    /// Has to run before `configure_editor_for_source`: `sync_blame_sources`
+    /// drops entries whose base buffer is not excerpted (FORK.md #59).
+    fn install_excerpts(&self, editor: &mut SplittableEditor, cx: &mut Context<SplittableEditor>) {
+        let Self::Commit {
+            buffer,
+            diff,
+            path_key,
+            excerpt_ranges,
+        } = self
+        else {
+            return;
+        };
+        editor.update_excerpts_for_path(
+            path_key.clone(),
+            buffer.clone(),
+            excerpt_ranges.clone(),
+            multibuffer_context_lines(cx),
+            diff.clone(),
+            cx,
+        );
+    }
+}
+
 /// What the commit-file loader worked out that the view still needs once the
 /// `CommitFile` itself is gone.
 #[derive(Clone)]
@@ -391,6 +544,8 @@ pub struct SoloDiffView {
     source: DiffSource,
     repository_id: RepositoryId,
     buffer: Entity<Buffer>,
+    /// What a split pane's clone rebuilds its own multibuffer from.
+    contents: DiffContents,
     multibuffer: Entity<MultiBuffer>,
     editor: Entity<SplittableEditor>,
     /// Held rather than read back off the workspace: `clone_on_split` runs
@@ -445,6 +600,7 @@ impl SoloDiffView {
         };
 
         let project = workspace_entity.read(cx).project().clone();
+        let request = DiffLoadRequest::begin(&workspace_entity, cx);
         window.spawn(cx, async move |cx| {
             let buffer = project
                 .update(cx, |project, cx| {
@@ -458,6 +614,9 @@ impl SoloDiffView {
                 .await?;
 
             workspace_entity.update_in(cx, |workspace, window, cx| {
+                if !Self::may_still_open(&request, workspace, mode, cx) {
+                    return None;
+                }
                 let workspace_handle = cx.entity();
                 let view = cx.new(|cx| {
                     Self::new(
@@ -525,6 +684,7 @@ impl SoloDiffView {
         let commit_diff = repository.update(cx, |repository, _| {
             repository.load_commit_diff(sha.to_string())
         });
+        let request = DiffLoadRequest::begin(&workspace_entity, cx);
 
         window.spawn(cx, async move |cx| {
             let commit_diff = commit_diff
@@ -551,6 +711,9 @@ impl SoloDiffView {
             .await?;
 
             workspace_entity.update_in(cx, |workspace, window, cx| {
+                if !Self::may_still_open(&request, workspace, mode, cx) {
+                    return None;
+                }
                 let workspace_handle = cx.entity();
                 let view = cx.new(|cx| {
                     Self::new(
@@ -576,8 +739,7 @@ impl SoloDiffView {
     /// type into the same slot, so "is the shared diff open?" is the whole
     /// question either of them has to ask, and a Changes click retargeting a
     /// commit's diff (or the reverse) is the point rather than an accident.
-    fn preview_holds_a_diff(workspace: &Entity<Workspace>, cx: &App) -> bool {
-        let workspace = workspace.read(cx);
+    fn preview_holds_a_diff(workspace: &Workspace, cx: &App) -> bool {
         let Some(preview_id) = workspace.active_pane().read(cx).preview_item_id() else {
             return false;
         };
@@ -608,7 +770,7 @@ impl SoloDiffView {
         // at all — and it is the difference between arrow-stepping down the
         // list and arrow-stepping down the list while a pane jumps to a pinned
         // diff and never jumps back.
-        if mode == DiffOpen::Retarget && !Self::preview_holds_a_diff(workspace, cx) {
+        if mode == DiffOpen::Retarget && !Self::preview_holds_a_diff(workspace.read(cx), cx) {
             return GestureOutcome::Declined;
         }
 
@@ -631,6 +793,32 @@ impl SoloDiffView {
         }
 
         GestureOutcome::Load
+    }
+
+    /// Whether the gesture that started a load may still act on its result.
+    ///
+    /// Two things can have happened while the load ran, and both of them make
+    /// adding the view wrong rather than merely late:
+    ///
+    /// - A newer gesture claimed the shared slot. Arrow-stepping is fast
+    ///   enough to have several loads in flight, and they finish out of
+    ///   order, so without this the tab settles on the wrong file.
+    /// - The precondition the gesture was allowed under stopped holding. A
+    ///   `Retarget` is only ever permitted because the shared diff tab is
+    ///   open; if the user closed it (or an edit promoted it out of the
+    ///   preview slot) mid-load, `replace_preview_item_id` finds nothing to
+    ///   replace and `add_item` would resurrect a tab the user just closed —
+    ///   or, with the slot merely unpreviewed, open a *second* diff tab and
+    ///   break the one-shared-tab invariant. A `Summon` has no such
+    ///   precondition: opening when nothing is open is what it means.
+    fn may_still_open(
+        request: &DiffLoadRequest,
+        workspace: &Workspace,
+        mode: DiffOpen,
+        cx: &App,
+    ) -> bool {
+        request.is_current(cx)
+            && (mode != DiffOpen::Retarget || Self::preview_holds_a_diff(workspace, cx))
     }
 
     /// Put a freshly-built view into the active pane.
@@ -694,23 +882,8 @@ impl SoloDiffView {
             DiffSource::WorkingTree { .. } => None,
             DiffSource::Commit { repository, .. } => parse_repository_remote(repository, cx),
         };
-        let multibuffer = cx.new(|cx| {
-            let mut multibuffer = match &loaded {
-                LoadedDiff::WorkingTree { buffer, diff } => {
-                    // A live project buffer brings its own capability, which is
-                    // what makes this side editable.
-                    let mut multibuffer = MultiBuffer::singleton(buffer.clone(), cx);
-                    multibuffer.add_diff(diff.clone(), cx);
-                    multibuffer
-                }
-                // Read-only-ness lives here, not on the buffer: the historic
-                // blob itself is built `ReadWrite`. The file's name is already
-                // in the tab, so a path header would be redundant chrome.
-                LoadedDiff::Commit(_) => MultiBuffer::without_headers(Capability::ReadOnly),
-            };
-            multibuffer.set_all_diff_hunks_expanded(cx);
-            multibuffer
-        });
+        let contents = DiffContents::new(&loaded);
+        let multibuffer = cx.new(|cx| contents.build_multibuffer(cx));
         let editor = cx.new(|cx| {
             let mut editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
@@ -721,20 +894,7 @@ impl SoloDiffView {
                 cx,
             );
 
-            // The excerpts have to exist before the source's configuration is
-            // applied: `sync_blame_sources` drops entries whose base
-            // buffer is not excerpted. A clone skips this step — the excerpts
-            // belong to the multibuffer, which it shares.
-            if let LoadedDiff::Commit(blob) = &loaded {
-                editor.update_excerpts_for_path(
-                    blob.path_key.clone(),
-                    blob.buffer.clone(),
-                    blob.excerpt_ranges.clone(),
-                    multibuffer_context_lines(cx),
-                    blob.diff.clone(),
-                    cx,
-                );
-            }
+            contents.install_excerpts(&mut editor, cx);
             configure_editor_for_source(&mut editor, &source, commit_file.as_ref(), cx);
 
             editor.rhs_editor().update(cx, |editor, cx| {
@@ -759,6 +919,7 @@ impl SoloDiffView {
             source,
             repository_id,
             buffer,
+            contents,
             multibuffer,
             editor,
             project,
@@ -1070,11 +1231,10 @@ impl Item for SoloDiffView {
         };
         let project = self.project.clone();
         let diff_view_style = self.editor.read(cx).diff_view_style();
-        // The same multibuffer, not a second one built from the same buffers:
-        // the excerpts, the expanded-hunk state and the diff all live on it,
-        // and a clone that rebuilt them would drift from the original the
-        // moment either side changed.
-        let multibuffer = self.multibuffer.clone();
+        // A second multibuffer over the same buffers, never the original's:
+        // see [`DiffContents`] for the two things `SplittableEditor` writes
+        // onto whichever multibuffer it is handed, and what sharing one did.
+        let contents = self.contents.clone();
         let source = self.source.clone();
         let commit_file = self.commit_file.clone();
         let repository_id = self.repository_id;
@@ -1082,9 +1242,15 @@ impl Item for SoloDiffView {
         let remote = self.remote.clone();
 
         Task::ready(Some(cx.new(|cx| {
+            let multibuffer = cx.new({
+                let contents = contents.clone();
+                move |cx| contents.build_multibuffer(cx)
+            });
             let editor = cx.new({
                 let source = source.clone();
                 let commit_file = commit_file.clone();
+                let contents = contents.clone();
+                let multibuffer = multibuffer.clone();
                 // Reborrow `window` so the `move` closure consumes the
                 // reborrow (which ends when `cx.new` returns) rather than the
                 // caller's `&mut Window`.
@@ -1098,6 +1264,7 @@ impl Item for SoloDiffView {
                         window,
                         cx,
                     );
+                    contents.install_excerpts(&mut editor, cx);
                     configure_editor_for_source(&mut editor, &source, commit_file.as_ref(), cx);
                     editor
                 }
@@ -1106,7 +1273,8 @@ impl Item for SoloDiffView {
                 source,
                 repository_id,
                 buffer,
-                multibuffer: self.multibuffer.clone(),
+                contents,
+                multibuffer,
                 editor,
                 project: self.project.clone(),
                 workspace: self.workspace.clone(),
@@ -1601,6 +1769,95 @@ mod tests {
         cx: &mut VisualTestContext,
     ) -> Result<Option<Entity<SoloDiffView>>> {
         open_commit_with(context, sha, path, DiffOpen::Summon { focus: false }, cx).await
+    }
+
+    /// A retarget gesture whose load is left in flight, so a test can act on
+    /// the workspace before the result lands. Deliberately not awaited and
+    /// not pumped: `window.spawn` schedules the body, it does not run it.
+    fn start_commit_load(
+        context: &DiffTestContext,
+        path: &str,
+        cx: &mut VisualTestContext,
+    ) -> Task<Result<Option<Entity<SoloDiffView>>>> {
+        cx.update(|window, cx| {
+            SoloDiffView::open_commit_file(
+                SHA.into(),
+                context.repository.clone(),
+                repo_path(path),
+                context.workspace.downgrade(),
+                DiffOpen::Retarget,
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// A workspace over two clones of one repository — the Solution shape in
+    /// which one sha exists in two working directories. Returns the mirror
+    /// alongside the fork, which is `context.repository`.
+    async fn two_clone_test_context(
+        cx: &mut TestAppContext,
+    ) -> (DiffTestContext, Entity<Repository>, VisualTestContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        for root in [path!("/fork"), path!("/mirror")] {
+            fs.insert_tree(
+                root,
+                serde_json::json!({
+                    ".git": {},
+                    "src": { "lib.rs": "one\n" },
+                }),
+            )
+            .await;
+        }
+
+        let project = Project::test(
+            fs.clone(),
+            [Path::new(path!("/fork")), Path::new(path!("/mirror"))],
+            cx,
+        )
+        .await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("the test window holds a workspace");
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+
+        let mut repositories = workspace.read_with(&mut cx, |workspace, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .repositories(cx)
+                .values()
+                .map(|repository| {
+                    (
+                        repository
+                            .read(cx)
+                            .work_directory_abs_path
+                            .to_string_lossy()
+                            .into_owned(),
+                        repository.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        repositories.sort_by(|(left, _), (right, _)| left.cmp(right));
+        assert_eq!(repositories.len(), 2, "both clones are open");
+        let fork = repositories.remove(0).1;
+        let mirror = repositories.remove(0).1;
+
+        (
+            DiffTestContext {
+                workspace,
+                repository: fork,
+                fs,
+            },
+            mirror,
+            cx,
+        )
     }
 
     async fn open_working_tree(
@@ -3054,7 +3311,7 @@ mod tests {
         let project = context
             .workspace
             .read_with(&cx, |workspace, _| workspace.project().clone());
-        let workspace = context.workspace.clone();
+        let workspace = context.workspace;
 
         let search_bar =
             cx.update(|window, cx| cx.new(|cx| BufferSearchBar::new(None, window, cx)));
@@ -3146,7 +3403,7 @@ mod tests {
         let project = context
             .workspace
             .read_with(&cx, |workspace, _| workspace.project().clone());
-        let workspace = context.workspace.clone();
+        let workspace = context.workspace;
 
         // Headerless and empty — a compare-range `CommitView` at `add_item`.
         let editor = cx.update(|window, cx| {
@@ -3213,11 +3470,9 @@ mod tests {
     /// for the default.
     ///
     /// One source per test, deliberately: a *second* split in the same
-    /// workspace narrows the panes enough to unsplit one of the diffs, and
-    /// unsplitting a clone that shares its multibuffer trips a debug assertion
-    /// in `editor::display_map`. That is not this task's bug — an untouched
-    /// `CommitView`, split twice, hits the same assertion — but there is no
-    /// reason for these tests to walk into it.
+    /// workspace narrows the panes enough to unsplit one of the diffs, which
+    /// is a separate claim with a test of its own
+    /// (`test_a_split_clone_gets_a_multibuffer_of_its_own`).
     async fn assert_splits_into_a_working_clone(
         context: &DiffTestContext,
         view: &Entity<SoloDiffView>,
@@ -3248,13 +3503,13 @@ mod tests {
             })
             .expect("the new pane holds the cloned diff");
 
-        let (source_matches, same_multibuffer, distinct_editor, controls, blame, hunks) = cx
-            .update(|_window, cx| {
+        let (source_matches, own_multibuffer, distinct_editor, controls, blame, hunks) =
+            cx.update(|_window, cx| {
                 let original = view.read(cx);
                 let clone = clone.read(cx);
                 (
                     clone.source().matches(original.source(), cx),
-                    clone.multibuffer == original.multibuffer,
+                    clone.multibuffer != original.multibuffer && clone.buffer == original.buffer,
                     clone.editor != original.editor,
                     clone.editor.read(cx).diff_hunk_controls_disabled()
                         == original.editor.read(cx).diff_hunk_controls_disabled(),
@@ -3264,7 +3519,10 @@ mod tests {
                 )
             });
         assert!(source_matches, "the clone shows what the original showed");
-        assert!(same_multibuffer, "over the very same multibuffer");
+        assert!(
+            own_multibuffer,
+            "over a multibuffer of its own, built from the very same buffers"
+        );
         assert!(distinct_editor, "through an editor of its own");
         assert!(controls, "with the source's hunk-control rule re-applied");
         assert!(blame, "and the source's blame base re-applied");
@@ -3424,5 +3682,345 @@ mod tests {
                 "and actually collapse the second pane"
             );
         });
+    }
+    /// Holding an arrow key down the Commit tab's file list starts one
+    /// `load_commit_diff` subprocess per step, and they do not finish in the
+    /// order they were started. Without a request id the tab settles on
+    /// whichever load happened to return last rather than on the file the
+    /// user last selected.
+    #[gpui::test]
+    async fn test_a_superseded_load_never_reaches_the_shared_tab(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![
+                commit_file("src/a.rs", Some("a\n"), Some("A\n")),
+                commit_file("src/b.rs", Some("b\n"), Some("B\n")),
+                commit_file("src/c.rs", Some("c\n"), Some("C\n")),
+            ],
+        );
+
+        open_commit(&context, SHA, "src/a.rs", &mut cx)
+            .await
+            .expect("the commit's first file opens")
+            .expect("the gesture opened a view");
+
+        // Two retargets before either finishes: both pass `resolve_gesture`,
+        // because the shared diff really is open when each of them is made.
+        let stale = start_commit_load(&context, "src/b.rs", &mut cx);
+        let latest = start_commit_load(&context, "src/c.rs", &mut cx);
+
+        let stale = stale
+            .await
+            .expect("the superseded load still runs to a result");
+        let latest = latest
+            .await
+            .expect("the last load runs to a result")
+            .expect("and it is the one that opens a view");
+        cx.run_until_parked();
+
+        assert!(
+            stale.is_none(),
+            "a load the user has already stepped past must not open anything"
+        );
+
+        let (views, previewed) = context.workspace.read_with(&cx, |workspace, cx| {
+            let previewed = workspace
+                .active_pane()
+                .read(cx)
+                .preview_item()
+                .and_then(|item| item.downcast::<SoloDiffView>())
+                .map(|view| view.read(cx).repo_path().clone());
+            (
+                workspace.items_of_type::<SoloDiffView>(cx).count(),
+                previewed,
+            )
+        });
+        assert_eq!(views, 1, "still one shared diff tab, not one per gesture");
+        assert_eq!(
+            previewed.as_ref(),
+            Some(&repo_path("src/c.rs")),
+            "and it shows the file the last gesture selected"
+        );
+        assert_eq!(
+            latest.read_with(&cx, |view, _| view.repo_path().clone()),
+            repo_path("src/c.rs")
+        );
+    }
+
+    /// A `Retarget` is allowed only because the shared diff tab is open. If
+    /// the user closes it while the load runs, the precondition is gone by
+    /// the time the result arrives: `replace_preview_item_id` then finds
+    /// nothing to replace and `add_item` resurrects the tab that was just
+    /// closed.
+    #[gpui::test]
+    async fn test_a_retarget_declines_when_its_tab_is_closed_mid_load(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![
+                commit_file("src/a.rs", Some("a\n"), Some("A\n")),
+                commit_file("src/b.rs", Some("b\n"), Some("B\n")),
+            ],
+        );
+
+        let view = open_commit(&context, SHA, "src/a.rs", &mut cx)
+            .await
+            .expect("the commit's first file opens")
+            .expect("the gesture opened a view");
+
+        let load = start_commit_load(&context, "src/b.rs", &mut cx);
+        let pane = context
+            .workspace
+            .read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.remove_item(view.entity_id(), false, false, window, cx);
+        });
+
+        let opened = load.await.expect("the load itself still runs to a result");
+        cx.run_until_parked();
+
+        assert!(
+            opened.is_none(),
+            "closing the shared diff cancels the retarget that was aiming at it"
+        );
+        assert_eq!(
+            context.workspace.read_with(&cx, |workspace, cx| workspace
+                .items_of_type::<SoloDiffView>(cx)
+                .count()),
+            0,
+            "and no tab the user closed comes back"
+        );
+    }
+
+    /// The other way the precondition can evaporate: the shared diff is still
+    /// open but is no longer the pane's preview item, so replacing the
+    /// preview slot would leave it alone and add a *second* diff tab beside
+    /// it — the single-shared-tab invariant broken from the other side.
+    #[gpui::test]
+    async fn test_a_retarget_declines_when_its_tab_is_unpreviewed_mid_load(
+        cx: &mut TestAppContext,
+    ) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![
+                commit_file("src/a.rs", Some("a\n"), Some("A\n")),
+                commit_file("src/b.rs", Some("b\n"), Some("B\n")),
+            ],
+        );
+
+        let view = open_commit(&context, SHA, "src/a.rs", &mut cx)
+            .await
+            .expect("the commit's first file opens")
+            .expect("the gesture opened a view");
+
+        let load = start_commit_load(&context, "src/b.rs", &mut cx);
+        let pane = context
+            .workspace
+            .read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        pane.update(&mut cx, |pane, _| {
+            pane.unpreview_item_if_preview(view.entity_id());
+        });
+
+        let opened = load.await.expect("the load itself still runs to a result");
+        cx.run_until_parked();
+
+        assert!(
+            opened.is_none(),
+            "a pinned diff is not a shared slot to retarget"
+        );
+        assert_eq!(
+            context.workspace.read_with(&cx, |workspace, cx| workspace
+                .items_of_type::<SoloDiffView>(cx)
+                .count()),
+            1,
+            "and no second diff tab appears beside it"
+        );
+    }
+
+    /// A sha identifies the same *content* in two clones of one repository,
+    /// but not the same tab: the permalink is built from one clone's remote,
+    /// `repository_id` marks a row in one clone's git panel, and blame runs
+    /// in one clone's working directory.
+    #[gpui::test]
+    async fn test_a_commit_diff_is_keyed_by_repository_too(cx: &mut TestAppContext) {
+        let (context, mirror, mut cx) = two_clone_test_context(cx).await;
+        for dot_git in [path!("/fork/.git"), path!("/mirror/.git")] {
+            context.fs.set_commit_diff(
+                dot_git.as_ref(),
+                SHA,
+                CommitDiff {
+                    files: vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
+                },
+            );
+        }
+
+        let fork_view = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the fork's copy of the commit opens")
+            .expect("the gesture opened a view");
+        let mirror_view = cx
+            .update(|window, cx| {
+                SoloDiffView::open_commit_file(
+                    SHA.into(),
+                    mirror.clone(),
+                    repo_path("src/lib.rs"),
+                    context.workspace.downgrade(),
+                    DiffOpen::Summon { focus: false },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("the mirror's copy of the same commit opens")
+            .expect("the gesture opened a view");
+        cx.run_until_parked();
+
+        assert_ne!(
+            fork_view.entity_id(),
+            mirror_view.entity_id(),
+            "a click in the mirror must not activate the fork's tab"
+        );
+        assert_eq!(
+            mirror_view.read_with(&cx, |view, _| view.repository_id()),
+            mirror.read_with(&cx, |repository, _| repository.id),
+            "the tab reports the repository the user clicked in"
+        );
+        cx.update(|_window, cx| {
+            let fork_source = fork_view.read(cx).source().clone();
+            assert!(
+                !fork_source.matches(mirror_view.read(cx).source(), cx),
+                "the same (sha, path) in two clones is two sources"
+            );
+        });
+    }
+
+    /// `SplittableEditor::split` and `unsplit` write `show_deleted_hunks` and
+    /// `use_extended_diff_range` onto whichever multibuffer they are handed.
+    /// A clone that shared the original's therefore reshaped the original's
+    /// rows whenever it crossed `minimum_split_diff_width` in either
+    /// direction — and unsplitting reached `display_map`'s "patches_for_… is
+    /// only allowed to return an empty vec if the multibuffer is empty"
+    /// assertion (TODO C6).
+    #[gpui::test]
+    async fn test_a_split_clone_gets_a_multibuffer_of_its_own(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file(
+                "src/lib.rs",
+                Some("one\ntwo\nthree\nfour\n"),
+                Some("one\nTWO\nthree\n"),
+            )],
+        );
+
+        let view = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+
+        let pane = context
+            .workspace
+            .read_with(&cx, |workspace, _| workspace.active_pane().clone());
+        let new_pane = context
+            .workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.activate_item(&view, true, false, window, cx);
+                workspace.split_and_clone(pane, SplitDirection::Right, window, cx)
+            })
+            .await
+            .expect("a splittable item produces a second pane");
+        cx.run_until_parked();
+        let clone = new_pane
+            .read_with(&cx, |pane, _| {
+                pane.active_item()
+                    .and_then(|item| item.downcast::<SoloDiffView>())
+            })
+            .expect("the new pane holds the cloned diff");
+
+        let rows_before = cx.update(|_window, cx| {
+            assert_ne!(
+                clone.read(cx).multibuffer,
+                view.read(cx).multibuffer,
+                "the clone must not be handed the original's multibuffer"
+            );
+            assert_eq!(
+                clone.read(cx).buffer,
+                view.read(cx).buffer,
+                "but it must be over the very same buffer"
+            );
+            view.read(cx).multibuffer.read(cx).snapshot(cx).max_point()
+        });
+
+        // Narrowing the clone's pane past `minimum_split_diff_width` unsplits
+        // it; `toggle_split` is the same call by the other route.
+        clone.update_in(&mut cx, |view, window, cx| {
+            view.editor.update(cx, |editor, cx| {
+                editor.toggle_split(&ToggleSplitDiff, window, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            assert!(
+                !clone.read(cx).editor.read(cx).is_split(),
+                "the clone really did unsplit"
+            );
+            assert!(
+                view.read(cx).editor.read(cx).is_split(),
+                "and the original is untouched by it"
+            );
+            assert_eq!(
+                view.read(cx).multibuffer.read(cx).snapshot(cx).max_point(),
+                rows_before,
+                "including the rows it shows: unsplitting the clone must not \
+                 put the original's deleted hunks back"
+            );
+        });
+    }
+
+    /// The avatar row is the one place the renderer formats the entry's
+    /// `Oid`, and it now skips that formatting when nothing will read it —
+    /// no author email or no remote means `CommitAvatar` fetches nothing.
+    /// The row still has to paint its metadata.
+    #[gpui::test]
+    async fn test_the_blame_row_still_paints_with_avatars_on(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .blame
+                        .get_or_insert_default()
+                        .show_avatar = Some(true);
+                })
+            });
+        });
+        set_blame_at_revisions(&context, "a.rs", ["HEAD".to_string()], 3);
+
+        let view = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+        let lhs = view
+            .read_with(&cx, |view, cx| view.editor.read(cx).lhs_editor().cloned())
+            .expect("a working-tree diff opens split");
+        lhs.update_in(&mut cx, |editor, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+            editor.toggle_git_blame(&::git::Blame, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("GIT-BLAME-META-LEFT-0").is_some(),
+            "the first row still draws its date, avatar and author"
+        );
     }
 }

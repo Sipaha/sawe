@@ -228,6 +228,15 @@ impl CommitView {
     ///
     /// `file_filter` narrows which of the commit's files the diff shows while
     /// keeping the whole-commit chrome; it is not a single-file mode.
+    ///
+    /// It filters the *loaded* diff, and there is no cheaper place to do it
+    /// from here: `Repository::load_commit_diff` streams every changed path's
+    /// two blobs through one `cat-file --batch`, so a filtered open of a
+    /// 500-file merge still reads ~1000 blobs to keep one. Making it cheap
+    /// means giving `GitRepository::load_commit` a pathspec, which is a
+    /// change in `git` and `project`, not here. No caller passes `Some`
+    /// today, so nothing pays for it yet — but a caller that does should
+    /// expect the whole commit's I/O.
     pub fn open(
         commit_sha: String,
         repo: WeakEntity<Repository>,
@@ -282,8 +291,18 @@ impl CommitView {
                         pane.update(cx, |pane, cx| {
                             let existing = pane.items().enumerate().find_map(|(ix, item)| {
                                 let view = item.downcast::<CommitView>()?;
-                                let matches = view.read(cx).commit.sha == commit_sha;
-                                matches.then(|| (ix, view.item_id()))
+                                let view = view.read(cx);
+                                // `compare_range` is half of the identity, not
+                                // a detail: a `base..head` comparison hangs
+                                // itself off the *head* commit's details, so
+                                // matching on the sha alone made opening
+                                // commit B close the user's open `A..B` tab
+                                // and replace it with B on its own.
+                                // `open_range` has always filtered on the
+                                // range for the mirror-image reason.
+                                let matches =
+                                    view.commit.sha == commit_sha && view.compare_range.is_none();
+                                matches.then(|| (ix, item.item_id()))
                             });
 
                             if let Some((ix, existing_id)) = existing {
@@ -1526,4 +1545,183 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
         .get(stash_index)
         .map(|entry| entry.oid.to_string() == sha)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git::repository::{CommitFile, repo_path};
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::FakeFs;
+    use settings::SettingsStore;
+    use std::path::Path;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    const BASE_SHA: &str = "1111111111111111111111111111111111111111";
+    const HEAD_SHA: &str = "2222222222222222222222222222222222222222";
+
+    fn init_test(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+            let store = solutions::SolutionStore::for_test(std::path::PathBuf::new(), cx);
+            solutions::install_global_for_test(store, cx);
+        });
+    }
+
+    struct CommitTestContext {
+        workspace: Entity<Workspace>,
+        repository: Entity<Repository>,
+    }
+
+    async fn commit_test_context(
+        cx: &mut TestAppContext,
+    ) -> (CommitTestContext, VisualTestContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            serde_json::json!({
+                ".git": {},
+                "a.rs": "one\ntwo\nthree\n",
+            }),
+        )
+        .await;
+        fs.set_commit_diff(
+            path!("/project/.git").as_ref(),
+            HEAD_SHA,
+            CommitDiff {
+                files: vec![CommitFile {
+                    path: repo_path("a.rs"),
+                    old_text: Some("one\n".to_string()),
+                    new_text: Some("two\n".to_string()),
+                    is_binary: false,
+                }],
+            },
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("the test window holds a workspace");
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.run_until_parked();
+
+        let repository = workspace
+            .update_in(&mut cx, |workspace, _window, cx| {
+                workspace.project().read(cx).active_repository(cx)
+            })
+            .expect("the fake project exposes its repository");
+
+        (
+            CommitTestContext {
+                workspace,
+                repository,
+            },
+            cx,
+        )
+    }
+
+    fn commit_details(sha: &str) -> CommitDetails {
+        CommitDetails {
+            sha: sha.to_string().into(),
+            message: "a commit".into(),
+            commit_timestamp: 1_700_000_000,
+            author_email: "tester@example.com".into(),
+            author_name: "Tester".into(),
+        }
+    }
+
+    /// IDEA's "Compare Versions" hangs its view off the *head* commit's
+    /// details, so a `base..head` tab and a whole-commit tab for `head` share
+    /// a sha. `open`'s dedupe used to match on that sha alone and
+    /// `remove_item` the comparison — opening commit B closed the user's open
+    /// `A..B`. `open_range` has always also filtered on the range; this is the
+    /// same predicate from the other side.
+    #[gpui::test]
+    async fn test_opening_a_commit_leaves_a_compare_versions_tab_alone(cx: &mut TestAppContext) {
+        let (context, mut cx) = commit_test_context(cx).await;
+
+        let range = (
+            SharedString::from(BASE_SHA.to_string()),
+            SharedString::from(HEAD_SHA.to_string()),
+        );
+        let compare_view = context
+            .workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                let project = workspace.project().clone();
+                let workspace_entity = cx.entity();
+                let workspace_handle = cx.weak_entity();
+                let view = cx.new(|cx| {
+                    CommitView::new(
+                        commit_details(HEAD_SHA),
+                        CommitDiff { files: Vec::new() },
+                        context.repository.clone(),
+                        project,
+                        workspace_entity,
+                        workspace_handle,
+                        None,
+                        Some(range.clone()),
+                        window,
+                        cx,
+                    )
+                });
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
+                });
+                view
+            });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            CommitView::open(
+                HEAD_SHA.to_string(),
+                context.repository.downgrade(),
+                context.workspace.downgrade(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let ranges = context.workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<CommitView>())
+                .map(|view| view.read(cx).compare_range.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            ranges.len(),
+            2,
+            "the comparison and the whole-commit view are two tabs, not one"
+        );
+        assert!(
+            ranges.contains(&Some(range)),
+            "and the comparison is still one of them"
+        );
+        assert!(
+            ranges.contains(&None),
+            "beside the whole-commit view that was just opened"
+        );
+        assert!(
+            compare_view
+                .read_with(&cx, |view, _| view.compare_range.is_some())
+                .then_some(true)
+                .is_some(),
+            "the comparison view is the one that survived"
+        );
+    }
 }

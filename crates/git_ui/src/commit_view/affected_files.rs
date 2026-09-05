@@ -308,7 +308,7 @@ fn render_tree_row(
             let name = file
                 .path
                 .components()
-                .last()
+                .next_back()
                 .map(|component| component.to_string())
                 .unwrap_or_else(|| file.path.as_unix_str().to_string());
             let status = match file.status() {

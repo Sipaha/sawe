@@ -425,6 +425,20 @@ pub(super) fn plan_branch_submenu(
     }
     if remote_ref.is_none() {
         checkout_group.push(match &upstream_ref {
+            // A `[gone]` upstream is a tracking ref git has pruned, so
+            // `git pull <remote> <branch>` answers `couldn't find remote ref`.
+            // Only the delete row survives a gone upstream, and it says so
+            // itself — see `plan_delete_row`.
+            Some(upstream) if upstream.gone => SubmenuRow::unavailable(
+                BranchAction::Update,
+                "Checkout and Update",
+                format!(
+                    "“{}” is gone from this clone — git still lists it as the configured \
+                     upstream, but the tracking ref itself has been pruned, so there is \
+                     nothing to update from. Fetch first.",
+                    upstream.full
+                ),
+            ),
             Some(upstream) => match upstream.split.clone() {
                 Some((remote, remote_branch)) => SubmenuRow::enabled(
                     BranchAction::CheckoutAndUpdate {
@@ -558,6 +572,36 @@ pub(super) fn plan_branch_submenu(
             rows.push(SubmenuRow::Separator);
         }
         rows.extend(group);
+    }
+    // Every row above acts on the ref it names, and a `[gone]` tracking ref is
+    // not in this clone any more: `Checkout`, `New Branch from`, `New
+    // Worktree`, the diff and the rebase/merge pair would each hand git a
+    // pathspec it cannot resolve. Disabling them here rather than at each
+    // construction site keeps the submenu's shape identical to a live ref's —
+    // IDEA shows the rows and greys them — and cannot miss a row added later.
+    // Rows that already carry their own reason keep it; `Delete` is the one
+    // that stays meaningful, and `plan_delete_row` writes its own.
+    if let BranchRef::Remote(remote) = branch
+        && remote.gone
+    {
+        let reason = SharedString::from(format!(
+            "“{}” is gone from this clone — git still lists it as the configured upstream, \
+             but the tracking ref itself has been pruned. Fetch to find out whether it is \
+             still on the remote.",
+            remote.full
+        ));
+        for row in &mut rows {
+            if let SubmenuRow::Row {
+                action,
+                unavailable,
+                ..
+            } = row
+                && unavailable.is_none()
+                && !matches!(action, BranchAction::Delete)
+            {
+                *unavailable = Some(reason.clone());
+            }
+        }
     }
     rows
 }
@@ -1075,6 +1119,70 @@ mod tests {
                 },
                 "Delete",
             ))
+        );
+    }
+
+    /// A pruned tracking ref is not in this clone, so every row that would
+    /// hand git that ref as a pathspec — `Checkout`, `New Branch from`,
+    /// `New Worktree…`, the diff, the rebase/merge pair — is greyed with a
+    /// reason instead of failing at the git call. `Delete` is the exception:
+    /// it stays the one meaningful action and carries its own wording.
+    #[test]
+    fn test_a_gone_upstream_greys_every_row_that_needs_the_ref() {
+        let remotes = strings(&["origin"]);
+        let rows = plan_branch_submenu(
+            &BranchRef::Local("feature".into()),
+            Some(&"master222".into()),
+            &[local_info_with_gone_upstream("feature", "origin/feature")],
+            &remotes,
+            None,
+        );
+        for row in tracked_branch_submenu(&rows, &remotes) {
+            let SubmenuRow::Row {
+                action,
+                label,
+                unavailable,
+            } = row
+            else {
+                continue;
+            };
+            assert!(
+                unavailable.is_some(),
+                "“{label}” acts on a ref this clone no longer has ({action:?})"
+            );
+        }
+    }
+
+    /// The local branch's own group asks the same question from the other
+    /// side: `Checkout and Update` is `git pull <remote> <branch>`, which
+    /// answers `couldn't find remote ref` once the upstream is pruned.
+    #[test]
+    fn test_a_gone_upstream_withholds_checkout_and_update() {
+        let rows = plan_branch_submenu(
+            &BranchRef::Local("feature".into()),
+            Some(&"master222".into()),
+            &[local_info_with_gone_upstream("feature", "origin/feature")],
+            &strings(&["origin"]),
+            None,
+        );
+        let update = rows
+            .iter()
+            .find_map(|row| match row {
+                SubmenuRow::Row {
+                    label,
+                    unavailable,
+                    action,
+                } if label.as_ref() == "Checkout and Update" => Some((action, unavailable)),
+                _ => None,
+            })
+            .expect("the row is shown for a tracking local branch");
+        assert!(
+            update.1.is_some(),
+            "a [gone] upstream has nothing to pull from"
+        );
+        assert!(
+            !matches!(update.0, BranchAction::CheckoutAndUpdate { .. }),
+            "and must not carry the action that would run the pull"
         );
     }
 
