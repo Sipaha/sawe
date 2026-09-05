@@ -76,6 +76,27 @@ while IFS= read -r line; do
 
       emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}},"uuid":"u1","session_id":"mock-session"}'
 
+      if [ -n "${MOCK_CLAUDE_INTERLEAVED_SUBAGENT:-}" ]; then
+        # The duplicate-reply repro: the main agent streams its whole reply,
+        # an async Agent (teammate) then opens a message of its own on the
+        # same pipe, and only after that does the main agent's final
+        # `assistant` message arrive. The teammate's `message_start` must not
+        # be able to clear the main message's streamed prefix — otherwise the
+        # final block is re-emitted and the reply renders twice.
+        emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"role":"assistant"}},"uuid":"u-ms-main","session_id":"mock-session"}'
+        emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"MAIN_REPLY_TEXT"}},"uuid":"u-main-d","session_id":"mock-session"}'
+        emit '{"type":"stream_event","parent_tool_use_id":"toolu_sub","event":{"type":"message_start","message":{"role":"assistant"}},"uuid":"u-ms-sub","session_id":"mock-session"}'
+        emit '{"type":"stream_event","parent_tool_use_id":"toolu_sub","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"SUB_REPLY_TEXT"}},"uuid":"u-sub-d","session_id":"mock-session"}'
+        emit '{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"MAIN_REPLY_TEXT"}]},"uuid":"u-main-a","session_id":"mock-session"}'
+      fi
+
+      if [ -n "${MOCK_CLAUDE_TRUNCATED_STREAM:-}" ]; then
+        emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"role":"assistant"}},"uuid":"u-ms-main","session_id":"mock-session"}'
+        emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"MAIN_REPLY"}},"uuid":"u-main-d","session_id":"mock-session"}'
+        emit '{"type":"stream_event","parent_tool_use_id":"toolu_sub","event":{"type":"message_start","message":{"role":"assistant"}},"uuid":"u-ms-sub","session_id":"mock-session"}'
+        emit '{"type":"assistant","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"text","text":"MAIN_REPLY_AND_ITS_TAIL"}]},"uuid":"u-main-a","session_id":"mock-session"}'
+      fi
+
       if [ -n "${MOCK_CLAUDE_SUBAGENT:-}" ]; then
         # Emit a fake subagent assistant message that carries a tool_use, so
         # the integration test can assert the pump stamps

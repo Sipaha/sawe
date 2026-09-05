@@ -34,7 +34,7 @@ use crate::command::{ClaudeCommandSpec, SessionArg, mcp_config_json};
 use crate::process::ClaudeProcess;
 use crate::protocol::{
     ControlRequestEnvelope, ControlRequestKind, ControlRequestOut, HookConfig, InputMessage,
-    ModelInfo, OutputMessage,
+    ModelInfo, OutputMessage, StreamEvent,
 };
 use crate::translate::{
     DEFAULT_CONTEXT_WINDOW, TurnEnd, apply_stream_usage, apply_usage, assistant_usage_update,
@@ -110,6 +110,133 @@ fn final_text_block_suffix<'a>(
         Some(&final_text[streamed_text.len()..])
     } else {
         None
+    }
+}
+
+/// Streamed-text state for ONE assistant message identity.
+#[derive(Default, Debug)]
+struct StreamedMessage {
+    /// A `text_delta` arrived for the message currently open on this stream,
+    /// so its text is already rendered.
+    text_streamed: bool,
+    /// A `thinking_delta` arrived for the message currently open on this
+    /// stream.
+    thinking_streamed: bool,
+    /// The text streamed so far for this stream's current message — the
+    /// prefix the user can already see. Cleared by `message_start`, NOT by the
+    /// final `assistant` message (the `Stop` hook that follows reads it).
+    text: String,
+}
+
+static EMPTY_STREAMED_MESSAGE: StreamedMessage = StreamedMessage {
+    text_streamed: false,
+    thinking_streamed: false,
+    text: String::new(),
+};
+
+/// Delta characters observed on one `stream_event`, for the turn diagnostics.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct StreamedDeltaChars {
+    text: usize,
+    thinking: usize,
+}
+
+/// Streamed-text tracking keyed by message identity: `parent_tool_use_id` —
+/// `None` for the main agent's stream, `Some(tool_use_id)` for a Task
+/// subagent's.
+///
+/// Keying is the whole point. `claude` interleaves these streams on one pipe,
+/// so a single global "did text stream for the current message" flag is wrong:
+/// a background Agent's `message_start` landing between the main agent's
+/// `text_delta`s and its final `assistant` message cleared the main message's
+/// streamed prefix, `final_text_block_suffix` then saw "nothing streamed" and
+/// re-emitted the complete reply as a second `AgentMessageChunk` — the reply
+/// rendered twice. Per-stream state keeps each message's suffix recovery
+/// answerable only from its own deltas.
+#[derive(Default, Debug)]
+struct StreamedMessages(HashMap<Option<String>, StreamedMessage>);
+
+impl StreamedMessages {
+    /// Apply one `stream_event` — the `message_start` boundary and the
+    /// text/thinking deltas — to the stream it belongs to, leaving every other
+    /// stream untouched. Returns the delta characters for the turn stats.
+    fn observe_stream_event(&mut self, ev: &StreamEvent) -> StreamedDeltaChars {
+        let mut chars = StreamedDeltaChars::default();
+        match ev.event.get("type").and_then(|t| t.as_str()) {
+            // A fresh assistant message opened on THIS stream: forget what its
+            // previous message streamed.
+            Some("message_start") => {
+                self.0.remove(&ev.parent_tool_use_id);
+            }
+            Some("content_block_delta") => {
+                let Some(delta) = ev.event.get("delta") else {
+                    return chars;
+                };
+                match delta.get("type").and_then(|t| t.as_str()) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                            chars.text = text.chars().count();
+                            let state = self.0.entry(ev.parent_tool_use_id.clone()).or_default();
+                            state.text_streamed = true;
+                            state.text.push_str(text);
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta.get("thinking").and_then(|v| v.as_str()) {
+                            chars.thinking = text.chars().count();
+                            self.0
+                                .entry(ev.parent_tool_use_id.clone())
+                                .or_default()
+                                .thinking_streamed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        chars
+    }
+
+    fn message(&self, parent_tool_use_id: &Option<String>) -> &StreamedMessage {
+        self.0
+            .get(parent_tool_use_id)
+            .unwrap_or(&EMPTY_STREAMED_MESSAGE)
+    }
+
+    /// The text streamed for the MAIN agent's current message. A teammate's
+    /// output must never be matched against the main agent's `Stop` hook, so
+    /// this deliberately ignores every subagent stream.
+    fn main_text(&self) -> &str {
+        &self.message(&None).text
+    }
+
+    /// What to append for a final `assistant` text block on this stream, given
+    /// only what THIS stream streamed. See [`final_text_block_suffix`].
+    fn final_text_suffix<'a>(
+        &self,
+        parent_tool_use_id: &Option<String>,
+        final_text: &'a str,
+    ) -> Option<&'a str> {
+        let state = self.message(parent_tool_use_id);
+        final_text_block_suffix(state.text_streamed, &state.text, final_text)
+    }
+
+    /// A final `assistant` message closed this stream's current message: its
+    /// streamed-* flags no longer describe the next one. The accumulated text
+    /// is intentionally KEPT — the `Stop` hook fires after this and reads it
+    /// (`looks_like_text_tool_call`); `message_start` is what clears it.
+    fn finish_message(&mut self, parent_tool_use_id: &Option<String>) {
+        if let Some(state) = self.0.get_mut(parent_tool_use_id) {
+            state.text_streamed = false;
+            state.thinking_streamed = false;
+        }
+    }
+
+    /// Drop every stream's state at a turn's terminating `result`, so subagent
+    /// entries can't accumulate across turns.
+    fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -1277,24 +1404,24 @@ async fn run_update_pump(
     // don't), or "agent finished without saying anything despite tools"
     // (tool_calls_emitted>0, text_chars=0).
     let mut turn_stats = TurnStats::default();
-    // Per-assistant-message flags: true once a `stream_event(*_delta)` for
-    // text/thinking has arrived for the message currently being built; reset
-    // on every `stream_event(message_start)` and on every
+    // Per-assistant-message streamed state, keyed by stream identity
+    // (`parent_tool_use_id`: `None` = main agent, `Some` = a Task subagent).
+    // A flag flips true once a `stream_event(*_delta)` for text/thinking has
+    // arrived for the message currently being built on that stream; it resets
+    // on that stream's `stream_event(message_start)` and on its
     // `OutputMessage::Assistant` (the boundary between sub-calls within a
     // multi-step turn). Used to distinguish "normal turn (text/thinking
     // already streamed → assistant block would double-render)" from "no
     // stream events → assistant block carries the only copy". Without this,
     // local slash commands like `/context` produce a `result.result` with
     // 9k chars of markdown but zero rendered UI bubbles, and extended-
-    // thinking-only turns lose their `thinking` blocks the same way.
-    let mut text_streamed_for_current_message: bool = false;
-    let mut thinking_streamed_for_current_message: bool = false;
-    // Accumulates the current assistant message's streamed TEXT (not
-    // thinking), cleared on each `message_start`. Read at the Stop hook to
-    // self-heal a degraded turn where the model wrote a tool call as text —
+    // thinking-only turns lose their `thinking` blocks the same way. It is
+    // keyed rather than global because the streams interleave — see
+    // `StreamedMessages`. The accumulated text is also read at the Stop hook
+    // to self-heal a degraded turn where the model wrote a tool call as text —
     // see `looks_like_text_tool_call` / `MAX_DEGENERATE_NUDGES`. The counter
     // bounds the retries and resets at each turn's `result`.
-    let mut current_message_text = String::new();
+    let mut streamed_messages = StreamedMessages::default();
     let mut degenerate_tool_call_nudges: u8 = 0;
     loop {
         let message = select_biased! {
@@ -1459,6 +1586,7 @@ async fn run_update_pump(
                 );
             }
             turn_stats = TurnStats::default();
+            streamed_messages.clear();
             degenerate_tool_call_nudges = 0;
             if let Some(sender) = shared.prompt_tx.borrow_mut().take() {
                 log::debug!(
@@ -1570,15 +1698,15 @@ async fn run_update_pump(
                     // text looks like a text-form tool call, inject a bounded
                     // one-line nudge (build_hook_response adds decision:block)
                     // so the agent retries as a real tool call in the SAME
-                    // turn. Main agent only — `current_message_text` holds the
-                    // main stream, not a teammate's (whose hook carries an
+                    // turn. Main agent only — `main_text()` holds the main
+                    // stream, not a teammate's (whose hook carries an
                     // `agent_id`), so it must not be matched against a
                     // teammate's Stop.
                     if is_end_of_turn
                         && pending.is_none()
                         && agent_id.is_none()
                         && degenerate_tool_call_nudges < MAX_DEGENERATE_NUDGES
-                        && looks_like_text_tool_call(&current_message_text)
+                        && looks_like_text_tool_call(streamed_messages.main_text())
                     {
                         degenerate_tool_call_nudges += 1;
                         log::warn!(
@@ -1616,40 +1744,15 @@ async fn run_update_pump(
             continue;
         }
 
-        // Diagnostic: count text/thinking chars per turn from stream
-        // deltas. This is what actually gets rendered to the user; the
-        // turn_end log line compares it against `result.result` so a
-        // mismatch flags translation drops.
-        if let OutputMessage::StreamEvent(ev) = &message
-            && ev.event.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
-            && let Some(delta) = ev.event.get("delta")
-        {
-            match delta.get("type").and_then(|t| t.as_str()) {
-                Some("text_delta") => {
-                    if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-                        turn_stats.text_chars_streamed += t.chars().count();
-                        text_streamed_for_current_message = true;
-                        current_message_text.push_str(t);
-                    }
-                }
-                Some("thinking_delta") => {
-                    if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
-                        turn_stats.thinking_chars_streamed += t.chars().count();
-                        thinking_streamed_for_current_message = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        // `message_start` opens a fresh assistant message — reset the
-        // streamed-* flags so we can detect the next message's local-vs-
-        // streamed nature independently.
-        if let OutputMessage::StreamEvent(ev) = &message
-            && ev.event.get("type").and_then(|t| t.as_str()) == Some("message_start")
-        {
-            text_streamed_for_current_message = false;
-            thinking_streamed_for_current_message = false;
-            current_message_text.clear();
+        // Track the per-stream streamed text (`message_start` opens a fresh
+        // assistant message on that stream; the deltas accumulate onto it),
+        // and count text/thinking chars per turn. The counts are what actually
+        // gets rendered to the user; the turn_end log line compares them
+        // against `result.result` so a mismatch flags translation drops.
+        if let OutputMessage::StreamEvent(ev) = &message {
+            let chars = streamed_messages.observe_stream_event(ev);
+            turn_stats.text_chars_streamed += chars.text;
+            turn_stats.thinking_chars_streamed += chars.thinking;
         }
 
         // Mid-turn usage: `message_start` snapshots `event.message.usage`
@@ -1755,6 +1858,8 @@ async fn run_update_pump(
                 turn_stats.assistant_messages_received += 1;
             }
             let parent_id = m.parent_tool_use_id.clone();
+            let thinking_streamed_for_this_message =
+                streamed_messages.message(&parent_id).thinking_streamed;
             let blocks = m
                 .message
                 .get("content")
@@ -1788,14 +1893,13 @@ async fn run_update_pump(
                         //  - streaming already delivered the whole text → emit
                         //    nothing (a genuine duplicate).
                         // Appends, so we must never re-emit already-streamed bytes.
+                        // Answered from THIS message's own stream only, so an
+                        // interleaved subagent can't make the main reply look
+                        // un-streamed and get it emitted a second time.
                         if let Some(text) = block.get("text").and_then(|v| v.as_str())
                             && !text.is_empty()
                         {
-                            let suffix = final_text_block_suffix(
-                                text_streamed_for_current_message,
-                                &current_message_text,
-                                text,
-                            );
+                            let suffix = streamed_messages.final_text_suffix(&parent_id, text);
                             if let Some(suffix) = suffix.filter(|s| !s.is_empty()) {
                                 let chunk = acp::ContentChunk::new(acp::ContentBlock::Text(
                                     acp::TextContent::new(suffix.to_string()),
@@ -1813,7 +1917,7 @@ async fn run_update_pump(
                             }
                         }
                     }
-                    "thinking" if !thinking_streamed_for_current_message => {
+                    "thinking" if !thinking_streamed_for_this_message => {
                         if let Some(text) = block.get("thinking").and_then(|v| v.as_str())
                             && !text.is_empty()
                         {
@@ -1887,9 +1991,8 @@ async fn run_update_pump(
                     _ => {}
                 }
             }
-            // Reset flags for next message (or sub-call).
-            text_streamed_for_current_message = false;
-            thinking_streamed_for_current_message = false;
+            // Reset flags for the next message (or sub-call) ON THIS STREAM.
+            streamed_messages.finish_message(&parent_id);
             // Per-message recovery counts feed the assistant_blocks debug
             // line so a "smoking gun" report can tell apart a normal
             // streaming turn from a local-command / image / redacted
@@ -2305,6 +2408,122 @@ mod tests {
         assert_eq!(final_text_block_suffix(true, "Tel", "Телефон"), None);
         // Streamed text longer than final (shouldn't happen) → None.
         assert_eq!(final_text_block_suffix(true, "Телефон", "Тел"), None);
+    }
+
+    /// Feed the pump's stream-event tracking the way `run_update_pump` does:
+    /// every `StreamEvent` message, in arrival order.
+    fn observe(tracker: &mut StreamedMessages, line: &str) -> StreamedDeltaChars {
+        match OutputMessage::parse(line).expect("valid stream json") {
+            OutputMessage::StreamEvent(ev) => tracker.observe_stream_event(&ev),
+            other => panic!("expected a stream_event, got {other:?}"),
+        }
+    }
+
+    fn text_delta(parent_tool_use_id: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"stream_event","parent_tool_use_id":{parent_tool_use_id},"event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}},"uuid":"u","session_id":"s"}}"#
+        )
+    }
+
+    fn message_start(parent_tool_use_id: &str) -> String {
+        format!(
+            r#"{{"type":"stream_event","parent_tool_use_id":{parent_tool_use_id},"event":{{"type":"message_start","message":{{"role":"assistant"}}}},"uuid":"u","session_id":"s"}}"#
+        )
+    }
+
+    #[test]
+    fn interleaved_subagent_does_not_duplicate_the_main_reply() {
+        // Main agent streams its whole reply, then an async Agent (teammate)
+        // opens a message of its own and streams into it, and only THEN does
+        // the main agent's final `assistant` message arrive. With one global
+        // flag the teammate's `message_start` cleared the main message's
+        // streamed prefix and the whole reply was appended a second time.
+        let mut tracker = StreamedMessages::default();
+        observe(&mut tracker, &message_start("null"));
+        observe(&mut tracker, &text_delta("null", "Готово, "));
+        observe(&mut tracker, &text_delta("null", "проверь."));
+        observe(&mut tracker, &message_start("\"toolu_sub\""));
+        observe(&mut tracker, &text_delta("\"toolu_sub\"", "searching…"));
+
+        // Main message: everything was streamed → nothing more to append.
+        assert_eq!(tracker.final_text_suffix(&None, "Готово, проверь."), None);
+        // The subagent's own message still gets its own (independent) answer.
+        assert_eq!(
+            tracker.final_text_suffix(&Some("toolu_sub".into()), "searching…"),
+            None
+        );
+        // And the teammate's text never leaks into the main stream's view.
+        assert_eq!(tracker.main_text(), "Готово, проверь.");
+    }
+
+    #[test]
+    fn truncated_main_stream_still_recovers_its_suffix() {
+        // The stream is cut short mid-reply (the "reply stays 'Тел'" bug):
+        // the final block must contribute exactly the missing suffix — and
+        // still does with an interleaved subagent in the middle.
+        let mut tracker = StreamedMessages::default();
+        observe(&mut tracker, &message_start("null"));
+        observe(&mut tracker, &text_delta("null", "Тел"));
+        observe(&mut tracker, &message_start("\"toolu_sub\""));
+        observe(&mut tracker, &text_delta("\"toolu_sub\"", "unrelated"));
+
+        assert_eq!(
+            tracker.final_text_suffix(&None, "Телефон подключён"),
+            Some("ефон подключён")
+        );
+    }
+
+    #[test]
+    fn non_streaming_message_is_emitted_whole_and_boundaries_reset_per_stream() {
+        let mut tracker = StreamedMessages::default();
+        // Nothing streamed at all (local slash-command path) → whole block.
+        assert_eq!(
+            tracker.final_text_suffix(&None, "/context output"),
+            Some("/context output")
+        );
+
+        observe(&mut tracker, &message_start("null"));
+        observe(&mut tracker, &text_delta("null", "first"));
+        // The final `assistant` for the main message closes it: the NEXT
+        // message on the same stream must not inherit "already streamed"…
+        tracker.finish_message(&None);
+        assert_eq!(
+            tracker.final_text_suffix(&None, "second, unstreamed"),
+            Some("second, unstreamed")
+        );
+        // …but the accumulated text survives for the Stop hook's
+        // degenerate-tool-call check, which reads the main stream only.
+        assert_eq!(tracker.main_text(), "first");
+        observe(&mut tracker, &message_start("null"));
+        assert_eq!(tracker.main_text(), "");
+    }
+
+    #[test]
+    fn stream_event_delta_chars_are_counted_for_turn_stats() {
+        let mut tracker = StreamedMessages::default();
+        assert_eq!(
+            observe(&mut tracker, &text_delta("null", "Тел")),
+            StreamedDeltaChars {
+                text: 3,
+                thinking: 0
+            }
+        );
+        let thinking = r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}},"uuid":"u","session_id":"s"}"#;
+        assert_eq!(
+            observe(&mut tracker, thinking),
+            StreamedDeltaChars {
+                text: 0,
+                thinking: 3
+            }
+        );
+        assert!(tracker.message(&None).thinking_streamed);
+        // A subagent's thinking must not suppress the main message's
+        // `thinking` block recovery.
+        let mut tracker = StreamedMessages::default();
+        let sub_thinking = r#"{"type":"stream_event","parent_tool_use_id":"toolu_sub","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}},"uuid":"u","session_id":"s"}"#;
+        observe(&mut tracker, sub_thinking);
+        assert!(!tracker.message(&None).thinking_streamed);
+        assert!(tracker.message(&Some("toolu_sub".into())).thinking_streamed);
     }
 
     #[test]

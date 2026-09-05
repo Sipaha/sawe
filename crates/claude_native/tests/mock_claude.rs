@@ -878,6 +878,84 @@ async fn subagent_tool_use_carries_parent_meta_through_pump(cx: &mut TestAppCont
     );
 }
 
+/// Run one prompt against the mock with `scenario` set and return the thread's
+/// rendered markdown.
+async fn markdown_for_scenario(scenario: &str, cx: &mut TestAppContext) -> String {
+    let project = init_test(cx).await;
+    let connection =
+        connect_mock(&project, vec![(scenario.to_string(), "1".to_string())], cx).await;
+
+    let task = cx.update(|cx| {
+        Rc::clone(&connection).new_session(
+            project.clone(),
+            PathList::new(&[std::env::temp_dir().as_path()]),
+            cx,
+        )
+    });
+    let thread = await_thread(task, cx).await;
+    let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+    let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new(
+        "hello".to_string(),
+    ))];
+    let request = acp::PromptRequest::new(session_id, prompt);
+    let prompt_task =
+        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let response = {
+        let timeout = cx.background_executor.timer(Duration::from_secs(10)).fuse();
+        let prompt_task = prompt_task.fuse();
+        futures::pin_mut!(timeout, prompt_task);
+        futures::select! {
+            response = prompt_task => response.expect("prompt resolved Ok"),
+            _ = timeout => panic!("prompt did not resolve on result message"),
+        }
+    };
+    assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+    // Streamed text is revealed through `AcpThread`'s smoothing buffer, so the
+    // tail of a turn only reaches the rendered markdown once it is flushed —
+    // which is exactly what the real end-of-turn path does.
+    thread.update(cx, |thread, cx| thread.flush_end_of_turn_tail(cx));
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, cx| thread.to_markdown(cx))
+}
+
+#[gpui::test]
+async fn interleaved_subagent_does_not_duplicate_the_main_reply(cx: &mut TestAppContext) {
+    // An async Agent's `message_start` lands between the main agent's
+    // `text_delta`s and its final `assistant` message. With one global
+    // streamed-text flag that reset cleared the main message's streamed
+    // prefix, the final text block looked un-streamed, and the whole reply was
+    // appended a second time.
+    let markdown = markdown_for_scenario("MOCK_CLAUDE_INTERLEAVED_SUBAGENT", cx).await;
+    assert_eq!(
+        markdown.matches("MAIN_REPLY_TEXT").count(),
+        1,
+        "main reply must be rendered exactly once: {markdown}"
+    );
+    assert_eq!(
+        markdown.matches("SUB_REPLY_TEXT").count(),
+        1,
+        "subagent text must be rendered exactly once: {markdown}"
+    );
+}
+
+#[gpui::test]
+async fn truncated_main_stream_recovers_its_missing_suffix(cx: &mut TestAppContext) {
+    // The other half of the same code path: when the stream really was cut
+    // short, the final `assistant` block must still complete the reply — and
+    // must contribute only the MISSING SUFFIX, not the whole text again.
+    let markdown = markdown_for_scenario("MOCK_CLAUDE_TRUNCATED_STREAM", cx).await;
+    assert!(
+        markdown.contains("MAIN_REPLY_AND_ITS_TAIL"),
+        "truncated stream must be completed from the final assistant block: {markdown}"
+    );
+    assert_eq!(
+        markdown.matches("MAIN_REPLY").count(),
+        1,
+        "the streamed prefix must not be re-emitted: {markdown}"
+    );
+}
+
 #[gpui::test]
 async fn close_session_kills_process_and_removes_session(cx: &mut TestAppContext) {
     let project = init_test(cx).await;
