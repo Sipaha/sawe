@@ -4,11 +4,11 @@ use acp_thread::{AgentThreadEntry, ToolCallContent};
 use agent_client_protocol::schema as acp;
 use chrono::TimeZone as _;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, DragMoveEvent, Empty, Entity, EntityId, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, FollowMode, InteractiveElement as _, IntoElement,
-    ListSizingBehavior, ListState, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement as _, Styled, Subscription, Task, WeakEntity, Window,
-    div, list, px,
+    AnyElement, App, Bounds, ClipboardItem, Context, DragMoveEvent, Empty, Entity, EntityId,
+    EventEmitter, ExternalPaths, FocusHandle, Focusable, FollowMode, InteractiveElement as _,
+    IntoElement, ListSizingBehavior, ListState, MouseButton, MouseDownEvent, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement as _, Styled, Subscription, Task, WeakEntity,
+    Window, canvas, div, list, px,
 };
 use markdown::{Markdown, MarkdownFont, MarkdownStyle};
 use ui::prelude::*;
@@ -80,6 +80,67 @@ impl Render for DraggedComposeHandle {
 struct CachedMarkdown {
     entity: Entity<Markdown>,
     source: SharedString,
+}
+
+/// One transcript entry's rendered span texts, cached across frames.
+///
+/// Rebuilding these is what made `Render` O(transcript): `entry_text_spans`
+/// allocates a `String` per span of EVERY entry of the selected stream, and
+/// the render then copied each one again into a `SharedString`. Only ~10 rows
+/// are ever painted, so on a long session that was megabytes of copying per
+/// frame while streaming.
+///
+/// A line is fresh when EITHER key matches:
+///
+/// * the same `Arc` — the entry object is literally the one the text was built
+///   from. Sound on its own: the only in-place mutation is `Arc::make_mut`,
+///   which needs unique ownership, and this cache holds a reference.
+/// * the same non-zero `mod_seq`, AND the entry is an `AssistantMessage` on
+///   both sides. This branch carries the streaming case: `rebuild_streams`
+///   re-forks every coalesced assistant head on every delta (`make_mut` on a
+///   still-shared entry), so pointer identity alone would rebuild every
+///   multi-fragment message in the transcript on every token.
+///
+///   It is deliberately NOT generalised to other kinds. `mod_seq` is only a
+///   sound content key where every mutation bumps it, and one production path
+///   breaks that: `SolutionAgentStore`'s stranded-tool-call terminalisation
+///   (`normalize_stranded_tool_status`) rewrites a `ToolCall`'s status through
+///   `Arc::make_mut` — a fork, since the mirror still holds the entry — and
+///   then re-demuxes, WITHOUT a bump. A `mod_seq` hit there would pin a
+///   cancelled tool call's card at "running" for the rest of the session.
+///   Assistant coalescing is the only thing that re-forks an entry
+///   (`Stream::merge_into_tail` bails unless BOTH sides are assistant
+///   messages, and it raises the merged head's `mod_seq` to the incoming max),
+///   so every other kind keeps stable `Arc` identity across a rebuild and hits
+///   on the pointer anyway. `0` is excluded because it is the unstamped
+///   sentinel (converter default / hand-built test entries) and would collide
+///   across entries.
+struct CachedEntryTexts {
+    /// Held (not just compared as a raw pointer) so the address cannot be
+    /// recycled by a different entry while this cache line describes it.
+    entry: std::sync::Arc<crate::session_entry::SessionEntry>,
+    mod_seq: u64,
+    spans: Vec<SharedString>,
+    /// Set when this line is (re)built, cleared only once the render pass has
+    /// pushed the new source into the matching `Markdown` entities. Sticky on
+    /// purpose: a refresh triggered outside render (`recompute_matches`) must
+    /// not swallow the signal the render pass needs to re-feed
+    /// `ensure_markdown`.
+    markdown_stale: bool,
+}
+
+impl CachedEntryTexts {
+    fn build(entry: &std::sync::Arc<crate::session_entry::SessionEntry>) -> Self {
+        Self {
+            entry: entry.clone(),
+            mod_seq: entry.mod_seq,
+            spans: entry_text_spans(entry)
+                .into_iter()
+                .map(SharedString::from)
+                .collect(),
+            markdown_stale: true,
+        }
+    }
 }
 
 /// Default compose-row height in logical pixels. Matches the previous
@@ -201,11 +262,38 @@ pub struct SolutionSessionView {
     /// Inverted Y: dragging UP grows the compose row.
     resize_start_y: Pixels,
     resize_start_height: Pixels,
+    /// Height the compose block was last actually PAINTED at, handle included.
+    /// `compose_height` is only a *preferred* height: the block is the
+    /// designated absorber once the transcript is down to
+    /// [`MIN_TRANSCRIPT_HEIGHT`], so in a short band it paints smaller than the
+    /// user ever dragged it to. Starting a drag from the preferred height then
+    /// gives the handle a dead zone the size of the difference (drag down and
+    /// nothing moves until the model falls back through the painted value) and
+    /// phantom growth the other way (drag up, nothing moves, and the growth
+    /// materialises later as a jump when the band is enlarged). Recorded during
+    /// paint and read at mouse-down; a frame-stale value is exactly what the
+    /// gesture wants, so this deliberately raises no notify.
+    pub(super) painted_compose_height: Option<Pixels>,
     /// `Markdown` entities reused across renders. Key is `(entry_idx,
     /// span_idx)` — same coords find_matches uses. Entries grow as the
     /// thread streams; we update an existing entity's source rather than
     /// recreating it so partial-parsed content keeps rendering smoothly.
     markdown_cache: HashMap<(usize, usize), CachedMarkdown>,
+    /// Per-entry span texts for the selected stream, indexed 1:1 with
+    /// `main_stream_entries_for_render`. Refreshed (not rebuilt) at the top of
+    /// every `Render` and by `recompute_matches`; see [`CachedEntryTexts`].
+    entry_texts: Vec<CachedEntryTexts>,
+    /// Count of cache lines actually rebuilt so far, for tests that pin the
+    /// "a second render of an unchanged transcript does no work" contract.
+    #[cfg(test)]
+    pub(crate) entry_text_rebuilds: usize,
+    /// Set by the thread/session event paths instead of recomputing find
+    /// matches inline: `observe_in` (session notify) and `on_thread_event`
+    /// (`EntryUpdated`) BOTH fire for a single streaming delta, so recomputing
+    /// eagerly re-scanned the whole transcript twice per token. Consumed by
+    /// `ensure_find_matches` at the top of render and before any match
+    /// navigation, so the matches a caller reads are never stale.
+    find_dirty: bool,
     /// Virtualized conversation list. Only entries that are currently in
     /// the viewport (plus a small overdraw band) get laid out and
     /// rendered, so scaling to thousands of messages stops costing
@@ -469,20 +557,14 @@ impl SolutionSessionView {
         match event {
             NewEntry => {
                 self.recompute_rewind_table(cx);
-                if self.find.is_some() {
-                    self.recompute_matches(cx);
-                }
+                self.invalidate_find_matches();
             }
             EntryUpdated(_idx) => {
-                if self.find.is_some() {
-                    self.recompute_matches(cx);
-                }
+                self.invalidate_find_matches();
             }
             EntriesRemoved(_range) => {
                 self.recompute_rewind_table(cx);
-                if self.find.is_some() {
-                    self.recompute_matches(cx);
-                }
+                self.invalidate_find_matches();
             }
             ToolAuthorizationRequested(_) | ToolAuthorizationReceived(_) => {
                 // No explicit remeasure: the authorization buttons change the
@@ -1130,23 +1212,91 @@ impl SolutionSessionView {
         self.main_stream_entries_for_render = self.selected_parent_stream_entries(cx);
     }
 
-    /// Walks the selected stream's entries and returns the same per-entry
-    /// per-span text shape `entry_text_spans` produces — but as cloned
-    /// `String`s so the caller can release the session/thread borrow on
-    /// `cx` before doing any mutating work (like ensuring the markdown
-    /// cache). Empty if the stream has no entries yet. The source is the
-    /// owned frame-local `main_stream_entries_for_render` vec on `self`, so
-    /// no `cx` / session borrow is taken here.
-    fn collect_entry_texts(&self) -> Vec<Vec<String>> {
-        // Every parent-stream view (Main/Task/Shell): the selected stream's
-        // demux'd entries, populated this frame by
-        // `build_main_stream_entries_for_render`. Indexes 1:1 with the render
-        // path and the `markdown_for_render` cache (keyed by per-stream entry
-        // index).
-        self.main_stream_entries_for_render
-            .iter()
-            .map(|entry| entry_text_spans(entry))
-            .collect()
+    /// Reconcile `self.entry_texts` with `entries` so it holds the same
+    /// per-entry per-span text shape `entry_text_spans` produces, indexed 1:1.
+    /// Entries that are still fresh (see [`CachedEntryTexts`]) keep their
+    /// already-built `SharedString`s — an O(1) check per entry, no allocation;
+    /// only genuinely-changed entries pay the string build. Returns how many
+    /// lines were rebuilt.
+    ///
+    /// Takes the slice explicitly rather than reading
+    /// `main_stream_entries_for_render` so `recompute_matches` — which must see
+    /// the just-mutated stream, possibly before the next render refreshes that
+    /// frame-local field — can share the same cache.
+    /// Whether `cached` still describes `entry`. See [`CachedEntryTexts`] for
+    /// why the `mod_seq` shortcut is restricted to assistant messages.
+    fn entry_text_still_fresh(
+        cached: &CachedEntryTexts,
+        entry: &std::sync::Arc<crate::session_entry::SessionEntry>,
+    ) -> bool {
+        use crate::session_entry::SessionEntryKind::AssistantMessage;
+        if std::sync::Arc::ptr_eq(&cached.entry, entry) {
+            return true;
+        }
+        cached.mod_seq == entry.mod_seq
+            && cached.mod_seq != 0
+            && matches!(entry.kind, AssistantMessage { .. })
+            && matches!(cached.entry.kind, AssistantMessage { .. })
+    }
+
+    fn refresh_entry_texts(
+        entries: &[std::sync::Arc<crate::session_entry::SessionEntry>],
+        cache: &mut Vec<CachedEntryTexts>,
+    ) -> usize {
+        cache.truncate(entries.len());
+        let mut rebuilt = 0;
+        for (idx, entry) in entries.iter().enumerate() {
+            match cache.get_mut(idx) {
+                // Unchanged: keep the built strings AND whatever `markdown_stale`
+                // state the line already carries (see the field's note).
+                Some(cached) if Self::entry_text_still_fresh(cached, entry) => {
+                    // Same content, possibly a re-forked coalesced head: adopt
+                    // the current handle so the cache doesn't pin the old one.
+                    if !std::sync::Arc::ptr_eq(&cached.entry, entry) {
+                        cached.entry = entry.clone();
+                    }
+                }
+                Some(cached) => {
+                    *cached = CachedEntryTexts::build(entry);
+                    rebuilt += 1;
+                }
+                None => {
+                    cache.push(CachedEntryTexts::build(entry));
+                    rebuilt += 1;
+                }
+            }
+        }
+        rebuilt
+    }
+
+    /// `refresh_entry_texts` against the frame-local
+    /// `main_stream_entries_for_render` (populated by
+    /// `build_main_stream_entries_for_render`).
+    fn refresh_entry_texts_for_render(&mut self) {
+        let _rebuilt =
+            Self::refresh_entry_texts(&self.main_stream_entries_for_render, &mut self.entry_texts);
+        #[cfg(test)]
+        {
+            self.entry_text_rebuilds += _rebuilt;
+        }
+    }
+
+    /// `refresh_entry_texts` against the selected stream read straight off the
+    /// session — the shape `recompute_matches` needs.
+    pub(crate) fn refresh_entry_texts_from_session(&mut self, cx: &App) {
+        let entries = self.selected_parent_stream_entries(cx);
+        let _rebuilt = Self::refresh_entry_texts(&entries, &mut self.entry_texts);
+        #[cfg(test)]
+        {
+            self.entry_text_rebuilds += _rebuilt;
+        }
+    }
+
+    /// The cached span texts for entry `idx`, or an empty slice.
+    pub(crate) fn entry_spans(&self, idx: usize) -> &[SharedString] {
+        self.entry_texts
+            .get(idx)
+            .map_or(&[][..], |cached| cached.spans.as_slice())
     }
 
     /// Walks every tool-call terminal currently in the conversation and
@@ -1206,7 +1356,16 @@ impl SolutionSessionView {
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseDownEvent, _, cx| {
                     this.resize_start_y = e.position.y;
-                    this.resize_start_height = this.compose_height;
+                    // From what the user can SEE, not from the preferred
+                    // height — see `painted_compose_height`. Clamped up to the
+                    // floor so a block squeezed below it cannot start the drag
+                    // under its own minimum.
+                    this.resize_start_height = this
+                        .painted_compose_height
+                        .map(|painted| {
+                            (painted - px(COMPOSE_HANDLE_HEIGHT)).max(px(MIN_COMPOSE_HEIGHT))
+                        })
+                        .unwrap_or(this.compose_height);
                     log::debug!(
                         "compose drag down: start_y={:?} start_h={:?}",
                         this.resize_start_y,
@@ -1220,6 +1379,22 @@ impl SolutionSessionView {
                 cx.new(|_| handle.clone())
             })
     }
+
+    /// Records what the compose block was painted at, for
+    /// [`Self::painted_compose_height`]. Absolutely positioned and inset to
+    /// zero, so it reports its parent's box without taking part in the layout
+    /// it is measuring. Raises no notify: nothing renders from the value, and a
+    /// notify from inside a draw would be discarded anyway.
+    fn compose_block_measure(cx: &mut Context<Self>) -> impl IntoElement {
+        canvas(
+            cx.processor(|this: &mut Self, bounds: Bounds<Pixels>, _window, _cx| {
+                this.painted_compose_height = Some(bounds.size.height);
+            }),
+            |_bounds, _state, _window, _cx| {},
+        )
+        .absolute()
+        .inset_0()
+    }
 }
 
 impl Render for SolutionSessionView {
@@ -1229,6 +1404,9 @@ impl Render for SolutionSessionView {
         // could open as a workspace pane tab. Both are gone now: the chat
         // panel hosts views inside its own tab strip + status row, so this
         // view is just the conversation + compose box.
+        // Consume any pending find invalidation before anything reads the
+        // match list (the find bar's "i of N" counter is the first reader).
+        self.ensure_find_matches(cx);
         // Compute the find bar first because `render_find_bar` needs `&mut cx`,
         // while the `session.read(cx)` borrow held for the conversation body
         // section is immutable. Borrow checker rejects nesting them.
@@ -1299,39 +1477,67 @@ impl Render for SolutionSessionView {
         if self.has_in_progress_tool_call(cx) {
             self.ensure_tool_tick(cx);
         }
-        let texts_per_entry = self.collect_entry_texts();
+        self.refresh_entry_texts_for_render();
+        // Taken, not cloned: the matches Vec is only read below and is put
+        // back before this frame ends, so a long find result set doesn't cost
+        // a full Vec copy per frame.
         let (find_matches_owned, find_selected_for_md) = self
             .find
-            .as_ref()
-            .map(|f| (f.matches.clone(), f.selected))
+            .as_mut()
+            .map(|f| (std::mem::take(&mut f.matches), f.selected))
             .unwrap_or_default();
         // Refresh the per-entry Markdown entities + highlight ranges
         // into `self.markdown_for_render` so the virtualized list's
         // processor closure can hand them to `render_entry` per visible
-        // item. The map is rebuilt every Render (cheap O(N) HashMap
-        // ops since `ensure_markdown` short-circuits when source is
-        // unchanged) — only the *paint* / *layout* cost is virtualized.
+        // item. The map is rebuilt every Render, but the two expensive
+        // parts are skipped for unchanged entries: `ensure_markdown` (and
+        // its full source comparison) only runs for entries whose text was
+        // actually rebuilt this frame, and `set_search_highlights` — whose
+        // setter notifies unconditionally, so calling it on all N cached
+        // entities was N notifies per frame — only when the ranges or the
+        // active index actually differ from what the entity already holds.
         self.markdown_for_render.clear();
-        for (entry_idx, spans) in texts_per_entry.iter().enumerate() {
-            for (span_idx, text) in spans.iter().enumerate() {
+        let entry_count = self.entry_texts.len();
+        for entry_idx in 0..entry_count {
+            let markdown_stale = self.entry_texts[entry_idx].markdown_stale;
+            for span_idx in 0..self.entry_texts[entry_idx].spans.len() {
                 let key = (entry_idx, span_idx);
-                let entity = self.ensure_markdown(key, SharedString::from(text.clone()), cx);
+                let cached_entity = (!markdown_stale)
+                    .then(|| self.markdown_cache.get(&key).map(|c| c.entity.clone()))
+                    .flatten();
+                let entity = match cached_entity {
+                    Some(entity) => entity,
+                    None => {
+                        let source = self.entry_texts[entry_idx].spans[span_idx].clone();
+                        self.ensure_markdown(key, source, cx)
+                    }
+                };
                 let (span_ranges, active_in_span) = matches_for_span(
                     &find_matches_owned,
                     find_selected_for_md,
                     entry_idx,
                     span_idx,
                 );
-                entity.update(cx, |md, cx| {
-                    md.set_search_highlights(span_ranges, active_in_span, cx);
-                });
+                let highlights_differ = {
+                    let md = entity.read(cx);
+                    md.search_highlights() != span_ranges.as_slice()
+                        || md.active_search_highlight() != active_in_span
+                };
+                if highlights_differ {
+                    entity.update(cx, |md, cx| {
+                        md.set_search_highlights(span_ranges, active_in_span, cx);
+                    });
+                }
                 self.markdown_for_render.insert(key, entity);
             }
+            self.entry_texts[entry_idx].markdown_stale = false;
+        }
+        if let Some(find) = self.find.as_mut() {
+            find.matches = find_matches_owned;
         }
         // Drop cache entries for entries that no longer exist (e.g. after
         // a session reset). Without this the HashMap grows unbounded as
         // sessions are switched in the same view.
-        let entry_count = texts_per_entry.len();
         self.markdown_cache.retain(|(idx, _), _| *idx < entry_count);
 
         // Refresh the cached `Markdown` widget for the queued ghost
@@ -1877,6 +2083,8 @@ impl Render for SolutionSessionView {
                     .h(self.compose_height + px(COMPOSE_HANDLE_HEIGHT))
                     .min_h(px(MIN_COMPOSE_HEIGHT + COMPOSE_HANDLE_HEIGHT))
                     .flex_shrink(COMPOSE_YIELD_PRIORITY)
+                    .relative()
+                    .child(Self::compose_block_measure(cx))
                     .debug_selector(|| "solution-session-compose".into())
                     .child(self.render_compose_resize_handle(cx))
                     .child(
@@ -1924,6 +2132,8 @@ impl Render for SolutionSessionView {
                     .h(self.compose_height + px(COMPOSE_HANDLE_HEIGHT))
                     .min_h(px(MIN_COMPOSE_HEIGHT + COMPOSE_HANDLE_HEIGHT))
                     .flex_shrink(COMPOSE_YIELD_PRIORITY)
+                    .relative()
+                    .child(Self::compose_block_measure(cx))
                     .debug_selector(|| "solution-session-compose".into())
                     .child(self.render_compose_resize_handle(cx));
                 let compose_inner = div()

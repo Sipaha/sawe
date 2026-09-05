@@ -10,7 +10,7 @@ use ui::{IconButton, IconName, Label, Tooltip};
 
 use super::{FindState, SolutionSessionView};
 use crate::actions::{FindClose, FindInSession, FindNextMatch, FindPreviousMatch};
-use crate::conversation_render::{FindMatch, entry_text_spans, find_all};
+use crate::conversation_render::{FindMatch, find_all};
 
 impl SolutionSessionView {
     pub(super) fn open_find(
@@ -73,6 +73,9 @@ impl SolutionSessionView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A streaming delta may have invalidated the match list since the last
+        // render; navigate over the CURRENT matches, not the pre-delta ones.
+        self.ensure_find_matches(cx);
         {
             let Some(find) = self.find.as_mut() else {
                 return;
@@ -115,6 +118,7 @@ impl SolutionSessionView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_find_matches(cx);
         {
             let Some(find) = self.find.as_mut() else {
                 return;
@@ -134,33 +138,56 @@ impl SolutionSessionView {
         cx.notify();
     }
 
+    /// Mark the find matches as needing a recompute. Cheap and idempotent —
+    /// see [`SolutionSessionView::ensure_find_matches`] for why the recompute
+    /// itself is deferred.
+    pub(crate) fn invalidate_find_matches(&mut self) {
+        if self.find.is_some() {
+            self.find_dirty = true;
+        }
+    }
+
+    /// Recompute the find matches iff something invalidated them since the
+    /// last recompute. Every reader of `find.matches` (render, the find bar's
+    /// counter, next/previous navigation) goes through here first, so
+    /// deferring the work cannot serve a stale match list.
+    pub(crate) fn ensure_find_matches(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.find_dirty) {
+            return;
+        }
+        if self.find.is_some() {
+            self.recompute_matches(cx);
+        }
+    }
+
     pub(crate) fn recompute_matches(&mut self, cx: &mut Context<Self>) {
-        let Some(find) = self.find.as_mut() else {
+        self.find_dirty = false;
+        let Some(find) = self.find.as_ref() else {
             return;
         };
         let query = find.editor.read(cx).text(cx);
         if query.is_empty() {
-            find.matches.clear();
-            find.selected = None;
+            if let Some(find) = self.find.as_mut() {
+                find.matches.clear();
+                find.selected = None;
+            }
             return;
         }
         let query_lower = query.to_lowercase();
+        // Search the SELECTED stream's entries so `entry_idx` is the
+        // per-stream index (matching `markdown_for_render`'s keys and the list
+        // dispatch). Sourced from `session.streams` (via
+        // `selected_parent_stream_entries`), not the render-frame field, so a
+        // recompute fired from an event reflects the just-mutated stream.
+        // Drill-in views don't support find over the parent thread → no
+        // matches. The span texts come from the shared per-entry cache the
+        // render path fills, so an unchanged transcript costs no string
+        // rebuilding here either.
+        self.refresh_entry_texts_from_session(cx);
         let mut matches = Vec::new();
-        let session = self.session.read(cx);
-        // Iterate the selected parent-thread stream's entries so `entry_idx` is
-        // the per-stream index (matching `markdown_for_render`'s keys and the
-        // list dispatch). Read from `session.streams` directly, not the
-        // render-frame field, so a `recompute_matches` fired from
-        // `on_thread_event` reflects the just-mutated stream. Drill-in views
-        // don't support find over the parent thread → no matches.
-        let stream_entries: &[std::sync::Arc<crate::session_entry::SessionEntry>] = session
-            .streams
-            .get(&self.selected_stream)
-            .map(|s| s.entries.as_slice())
-            .unwrap_or_default();
-        for (entry_idx, entry) in stream_entries.iter().enumerate() {
-            for (span_idx, text) in entry_text_spans(entry).into_iter().enumerate() {
-                find_all(&text, &query_lower, |range| {
+        for entry_idx in 0..self.entry_texts.len() {
+            for (span_idx, text) in self.entry_spans(entry_idx).iter().enumerate() {
+                find_all(text, &query_lower, |range| {
                     matches.push(FindMatch {
                         entry_idx,
                         span_idx,
@@ -169,8 +196,10 @@ impl SolutionSessionView {
                 });
             }
         }
-        find.selected = if matches.is_empty() { None } else { Some(0) };
-        find.matches = matches;
+        if let Some(find) = self.find.as_mut() {
+            find.selected = if matches.is_empty() { None } else { Some(0) };
+            find.matches = matches;
+        }
     }
 
     pub(super) fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

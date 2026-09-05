@@ -679,52 +679,70 @@ fn build_get_session_result(
         // `count=50` with no bounds). Indices are STREAM-LOCAL
         // (the enumerate position within the selected stream).
         //
-        // We walk every entry (not just the kept ones) so
-        // `image_cursor` stays in lock-step with what a
-        // non-paginated call would have produced — that
-        // keeps `EntryImage.index` stable across paginated
-        // calls, which is the contract that lets the client
-        // rely on `spk-image://N` URLs in markdown. The cursor is
-        // PER-STREAM now (image index space is scoped to the
-        // selected stream), matching `spk-image://N` inside this
-        // stream's served markdown.
-        let after = input.after_index;
-        let before = input.before_index;
+        // The `image_cursor` is advanced over EVERY entry before
+        // the window (cheaply — `count_images_in_entry` allocates
+        // nothing) so it stays in lock-step with what a
+        // non-paginated call would have produced; that keeps
+        // `EntryImage.index` stable across paginated calls, which
+        // is the contract that lets the client rely on
+        // `spk-image://N` URLs in markdown. The cursor is
+        // PER-STREAM (image index space is scoped to the selected
+        // stream), matching `spk-image://N` inside this stream's
+        // served markdown.
         let stream_entries: &[std::sync::Arc<crate::session_entry::SessionEntry>] =
             selected_stream.map_or(&[][..], |s| s.entries.as_slice());
-        let mut image_cursor = 0usize;
-        let mut kept: Vec<EntrySummary> = Vec::new();
-        for (index, entry) in stream_entries.iter().enumerate() {
-            let in_range = after.map_or(true, |a| index > a) && before.map_or(true, |b| index < b);
-            if in_range {
-                kept.push(summarize_entry(
-                    entry,
-                    index,
-                    input.include_full_content,
-                    input.include_images,
-                    &mut image_cursor,
-                    &live_auth_options,
-                ));
-            } else {
-                image_cursor += count_images_in_entry(&entry.kind);
-            }
-        }
         // `total_count` = the selected stream's pre-window entry count.
         let stream_total = stream_entries.len();
+        // The `[start, end)` index window the bounds select. `after_index` /
+        // `before_index` are exclusive, so `start` is `after + 1` and `end` is
+        // `before`.
+        let start = input
+            .after_index
+            .map_or(0, |a| a.saturating_add(1))
+            .min(stream_total);
+        let end = input.before_index.unwrap_or(stream_total).min(stream_total);
+        let end = end.max(start);
+        // `count` takes the LAST n of the bounded window. When no
+        // user-anchored filter is in play that is a pure index computation, so
+        // narrow the window BEFORE summarising — otherwise a `count=50` on a
+        // long transcript rendered every entry's markdown (and inlined every
+        // image) only to drop all but the last 50.
+        let start = match (input.count, input.user_anchored_lead) {
+            (Some(n), None) => start.max(end.saturating_sub(n)),
+            _ => start,
+        };
+        let mut image_cursor = 0usize;
+        // Entries before the window only advance the cursor — the same
+        // accounting `summarize_entry` does internally, without building a
+        // summary.
+        for entry in stream_entries.iter().take(start) {
+            image_cursor += count_images_in_entry(&entry.kind);
+        }
+        let mut kept: Vec<EntrySummary> = Vec::with_capacity(end - start);
+        for (index, entry) in stream_entries.iter().enumerate().take(end).skip(start) {
+            kept.push(summarize_entry(
+                entry,
+                index,
+                input.include_full_content,
+                input.include_images,
+                &mut image_cursor,
+                &live_auth_options,
+            ));
+        }
         // Judge-frugal slice (user messages + lead context + the
         // resting turn), applied before `count` so a tail window
         // still tails the anchored slice.
         if let Some(lead) = input.user_anchored_lead {
             apply_user_anchored_filter(&mut kept, lead, input.user_anchored_since_ms);
-        }
-        if let Some(n) = input.count {
-            if kept.len() > n {
-                // Take the last n. `EntrySummary.index`
-                // preserves the stream-local position so the
-                // client can still tell where it sits in
-                // the stream timeline.
-                let drop_count = kept.len() - n;
-                kept.drain(..drop_count);
+            if let Some(n) = input.count {
+                if kept.len() > n {
+                    // Take the last n. `EntrySummary.index`
+                    // preserves the stream-local position so the
+                    // client can still tell where it sits in
+                    // the stream timeline.
+                    let drop_count = kept.len() - n;
+                    kept.drain(..drop_count);
+                }
             }
         }
         (kept, stream_total)
@@ -1164,52 +1182,34 @@ fn build_get_session_changes_result(
     // fragment mod_seq is otherwise frozen.
     let stream_entries: &[std::sync::Arc<crate::session_entry::SessionEntry>] =
         selected_stream.map_or(&[][..], |s| s.entries.as_slice());
-    let mut image_cursor = 0usize;
-    // Collect each changed entry WITH its `mod_seq` so the page can be
-    // taken in `mod_seq` order (the cursor axis), independent of index
-    // order — an old entry re-edited has a high `mod_seq` but a low
-    // index. The image index baked into each `EntrySummary` is computed
-    // during this index-order walk, so reordering the Vec afterwards is
-    // safe.
-    let mut changed: Vec<(u64, EntrySummary)> = Vec::new();
     let total_count = stream_entries.len();
-    for (index, entry) in stream_entries.iter().enumerate() {
-        if entry.mod_seq > input.since_seq {
-            let summary = summarize_entry(
-                entry,
-                index,
-                true,
-                input.include_images,
-                &mut image_cursor,
-                &live_auth_options,
-            );
-            changed.push((entry.mod_seq, summary));
-        } else {
-            // Skipped (unchanged): still advance the cursor so later
-            // changed entries get per-stream image indices identical to
-            // get_session's. `summarize_entry` itself advances the
-            // cursor; the skip branch must mirror that.
-            image_cursor += count_images_in_entry(&entry.kind);
-        }
-    }
 
-    // Paginate by `mod_seq` (ascending) so a client that fell far behind
-    // catches up in bounded pages instead of one unbounded "big bang"
-    // response. The cursor advances only to the last entry of the page;
-    // `has_more` tells the client to keep polling from there. Sections
-    // stay gated on the request's `since_seq` (eligible from page 1) and
-    // are idempotent full-replacements, so re-sending them across a
-    // multi-page catch-up is harmless.
-    changed.sort_by_key(|(seq, _)| *seq);
-    let has_more = changed.len() > CHANGED_ENTRIES_PAGE;
-    let (changed_entries, page_current_seq): (Vec<EntrySummary>, u64) = if has_more {
-        let page_last_seq = changed[CHANGED_ENTRIES_PAGE - 1].0;
-        let entries = changed
-            .into_iter()
-            .take(CHANGED_ENTRIES_PAGE)
-            .map(|(_, e)| e)
-            .collect();
-        (entries, page_last_seq)
+    // Pass 1 — pick the page from `(mod_seq, index)` keys ALONE, before any
+    // summary is built. Paginate by `mod_seq` (ascending) so a client that fell
+    // far behind catches up in bounded pages instead of one unbounded "big
+    // bang" response; the sort is stable, so equal `mod_seq`s keep index order.
+    // The cursor advances only to the last entry of the page; `has_more` tells
+    // the client to keep polling from there. Sections stay gated on the
+    // request's `since_seq` (eligible from page 1) and are idempotent
+    // full-replacements, so re-sending them across a multi-page catch-up is
+    // harmless.
+    //
+    // Selecting before summarising is what keeps a from-zero catch-up linear:
+    // summarising every entry behind the cursor and then truncating to
+    // `CHANGED_ENTRIES_PAGE` re-rendered markdown (and re-inlined base64
+    // images) for the whole backlog on EVERY poll — O(behind) per page and
+    // O(behind²/PAGE) over the catch-up.
+    let mut changed_keys: Vec<(u64, usize)> = stream_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.mod_seq > input.since_seq)
+        .map(|(index, entry)| (entry.mod_seq, index))
+        .collect();
+    changed_keys.sort_by_key(|(seq, _)| *seq);
+    let has_more = changed_keys.len() > CHANGED_ENTRIES_PAGE;
+    changed_keys.truncate(CHANGED_ENTRIES_PAGE);
+    let page_current_seq = if has_more {
+        changed_keys[CHANGED_ENTRIES_PAGE - 1].0
     } else {
         // Caught up entry-wise: hand out the SELECTED STREAM's `seq`
         // (its max entry mod_seq, 0 for an empty/missing stream) so the
@@ -1217,9 +1217,51 @@ fn build_get_session_changes_result(
         // from here returns nothing. NOT `session.change_seq` — that is a
         // session-global clock and would over-advance a lagging stream's
         // cursor past its own unseen entries.
-        let entries = changed.into_iter().map(|(_, e)| e).collect();
-        (entries, stream_seq)
+        stream_seq
     };
+
+    // Pass 2 — summarise ONLY the page, walking the stream oldest-first with
+    // ONE `image_cursor` so the per-stream `EntryImage.index` / `spk-image://N`
+    // indices stay identical to what `get_session` returns for the same
+    // `stream_id`; a delta-applied transcript must render byte-for-byte like a
+    // full load. Out-of-page entries only advance the cursor
+    // (`count_images_in_entry`, which allocates nothing and is 0 for every
+    // non-user entry) — the same accounting `summarize_entry` performs
+    // internally — and the walk stops as soon as the last page entry is
+    // summarised. `index` is STREAM-LOCAL (the enumerate position within the
+    // selected stream), matching `get_session`.
+    let mut wanted: Vec<usize> = changed_keys.iter().map(|(_, index)| *index).collect();
+    wanted.sort_unstable();
+    let mut summaries: std::collections::HashMap<usize, EntrySummary> =
+        std::collections::HashMap::with_capacity(wanted.len());
+    let mut image_cursor = 0usize;
+    let mut wanted_iter = wanted.into_iter().peekable();
+    for (index, entry) in stream_entries.iter().enumerate() {
+        if wanted_iter.peek() == Some(&index) {
+            wanted_iter.next();
+            summaries.insert(
+                index,
+                summarize_entry(
+                    entry,
+                    index,
+                    true,
+                    input.include_images,
+                    &mut image_cursor,
+                    &live_auth_options,
+                ),
+            );
+            if wanted_iter.peek().is_none() {
+                break;
+            }
+        } else {
+            image_cursor += count_images_in_entry(&entry.kind);
+        }
+    }
+    // Back into `mod_seq` order — the order the page was chosen in.
+    let changed_entries: Vec<EntrySummary> = changed_keys
+        .iter()
+        .filter_map(|(_, index)| summaries.remove(index))
+        .collect();
 
     // Wall-clock anchors for the state DTO — same scheme as
     // `session_summary` (monotonic Instant rebased onto unix-millis).
@@ -1594,28 +1636,30 @@ impl McpServerTool for ReadSessionHistoryTool {
         //    the reasons recorded on that path — so `readable_in_memory_session`
         //    is the ONLY thing that keeps its live branch answering an
         //    unreadable transcript the way they do.
+        //
+        //    The window is selected BEFORE any markdown is rendered: this branch
+        //    runs inside `cx.update`, i.e. on the foreground thread, so rendering
+        //    the whole transcript to serve a page of it froze the UI for the
+        //    length of the session rather than the length of the page.
         let live = cx.update(|cx| {
             readable_in_memory_session(session_id, cx).map(|entity| {
                 entity.map(|entity| {
                     let s = entity.read(cx);
                     let title = s.title.to_string();
-                    let entries = s
+                    let total = s.entries.len();
+                    let slice = s
                         .entries
                         .iter()
+                        .skip(offset)
+                        .take(limit)
                         .map(|entry| session_entry_to_markdown(&entry.kind))
                         .collect::<Vec<String>>();
-                    (title, entries)
+                    (title, total, slice)
                 })
             })
         });
         if let Some(live) = live {
-            let (title, entries) = live?;
-            let total = entries.len();
-            let slice = entries
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect::<Vec<_>>();
+            let (title, total, slice) = live?;
             let returned = slice.len();
             return Ok(ToolResponse {
                 content: vec![ToolResponseContent::Text {
@@ -1701,15 +1745,14 @@ impl McpServerTool for ReadSessionHistoryTool {
 
         if head.entry_count > 0 {
             // Row-native path: reconstruct markdown from the stored entries.
-            let entries_all = crate::store::entries_from_rows(db.load_entries(session_id).await?)
-                .into_iter()
-                .map(|entry| session_entry_to_markdown(&entry.kind))
-                .collect::<Vec<_>>();
+            let entries_all = crate::store::entries_from_rows(db.load_entries(session_id).await?);
             let total = entries_all.len();
+            // Page first, render second — same reason as the live branch above.
             let slice = entries_all
                 .into_iter()
                 .skip(offset)
                 .take(limit)
+                .map(|entry| session_entry_to_markdown(&entry.kind))
                 .collect::<Vec<_>>();
             let returned = slice.len();
             return Ok(ToolResponse {

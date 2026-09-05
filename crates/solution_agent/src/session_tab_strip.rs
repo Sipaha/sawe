@@ -1073,9 +1073,7 @@ mod tests {
     /// the `+` button's height rather than collapsing to its content now that
     /// the cross is gone.
     #[gpui::test]
-    async fn a_painted_tab_has_no_close_cross_and_the_button_row_height(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_painted_tab_has_no_close_cross_and_the_button_row_height(cx: &mut TestAppContext) {
         let (solution_id, _tmp, project) =
             crate::store::tests::setup_solution_and_project(cx).await;
         cx.update(|cx| {
@@ -1112,8 +1110,7 @@ mod tests {
         // metric the neighbouring `+` / overflow buttons use.
         assert_eq!(active.size.height, px(22.));
         assert_eq!(
-            inactive.size.height,
-            active.size.height,
+            inactive.size.height, active.size.height,
             "selection must not change the row's height"
         );
     }

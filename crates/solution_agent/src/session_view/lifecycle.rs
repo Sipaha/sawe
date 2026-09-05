@@ -56,11 +56,14 @@ impl SolutionSessionView {
             // Thread mutated (new chunk streamed in, tool call appended, etc.).
             // Match indices stored in `find` reference (entry_idx, span_idx,
             // byte range) so a streaming append before/inside an existing
-            // match can shift everything; recompute defensively while find is
-            // open. Cheap for typical chats (<1000 entries × short query).
-            if this.find.is_some() {
-                this.recompute_matches(cx);
-            }
+            // match can shift everything; invalidate defensively while find is
+            // open. Only FLAGGED here, never recomputed inline: this observer
+            // and `on_thread_event`'s `EntryUpdated` both fire for one
+            // streaming delta, and each recompute re-scans the whole
+            // transcript. `ensure_find_matches` consumes the flag at the top of
+            // the next render and before any match navigation, so a reader
+            // never sees stale matches.
+            this.invalidate_find_matches();
             // Rebuild the per-entry rewind lookup table here (cheap O(N))
             // so the conversation render can read it as O(1) per entry.
             // Without this, the render itself did the per-entry scan,
@@ -226,7 +229,12 @@ impl SolutionSessionView {
             compose_height: px(DEFAULT_COMPOSE_HEIGHT),
             resize_start_y: px(0.0),
             resize_start_height: px(DEFAULT_COMPOSE_HEIGHT),
+            painted_compose_height: None,
             markdown_cache: HashMap::new(),
+            entry_texts: Vec::new(),
+            #[cfg(test)]
+            entry_text_rebuilds: 0,
+            find_dirty: false,
             list_state: {
                 // `Bottom` alignment + `FollowMode::Tail`. Bottom anchors a
                 // conversation to the bottom of the viewport — short chats
@@ -329,6 +337,7 @@ impl SolutionSessionView {
         if !cold_to_live {
             self.markdown_cache.clear();
             self.markdown_for_render.clear();
+            self.entry_texts.clear();
             self.rewind_table.clear();
             if let Some(find) = self.find.as_mut() {
                 find.matches.clear();

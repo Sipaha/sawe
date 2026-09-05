@@ -6525,3 +6525,239 @@ async fn get_session_entry_agrees_with_get_session_on_a_closed_coalescing_sessio
         );
     });
 }
+
+// -----------------------------------------------------------------
+// Report §2.5: the read RPCs select their window BEFORE summarising.
+// These pin the OBSERVABLE contract (page shape, ordering, image-index
+// parity) that the index-first rewrite must not disturb.
+// -----------------------------------------------------------------
+
+/// `count` narrows the window before any entry is summarised, so the
+/// `image_cursor` for the served window now comes from a cheap
+/// count-only walk over the entries in front of it. If that walk ever
+/// drifts, the `spk-image://N` indices a paginated call serves stop
+/// matching an unpaginated one and the client renders the wrong image.
+#[gpui::test]
+async fn get_session_count_window_keeps_image_indices_in_lockstep(cx: &mut gpui::TestAppContext) {
+    // Fixture: image-bearing entries at index 0 and index 3.
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+
+    let full = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                include_full_content: true,
+                include_images: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session")
+        .structured_content;
+
+    let windowed = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                include_full_content: true,
+                include_images: true,
+                count: Some(1),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session")
+        .structured_content;
+
+    assert_eq!(
+        windowed.total_count, full.total_count,
+        "total is pre-window"
+    );
+    assert_eq!(windowed.entries.len(), 1, "count=1 serves the last entry");
+    let windowed_entry = &windowed.entries[0];
+    let full_entry = full
+        .entries
+        .iter()
+        .find(|e| e.index == windowed_entry.index)
+        .expect("the same entry must appear in the unpaginated response");
+    assert_eq!(windowed_entry.index, 3);
+    assert_eq!(
+        windowed_entry.markdown, full_entry.markdown,
+        "a windowed entry is byte-identical to the unpaginated one"
+    );
+    let indices = |entry: &EntrySummary| {
+        entry
+            .images
+            .as_ref()
+            .expect("images populated")
+            .iter()
+            .map(|img| img.index)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        indices(windowed_entry),
+        indices(full_entry),
+        "the windowed call must not renumber images"
+    );
+    assert_eq!(
+        indices(windowed_entry),
+        vec![1],
+        "the second image-bearing entry's image is stream image #1"
+    );
+}
+
+/// The delta page is chosen on the `mod_seq` axis, which is NOT index
+/// order: an old entry that gets re-edited carries a high `mod_seq` at a
+/// low index. Selecting the page before summarising must therefore
+/// summarise a set picked by `mod_seq` while still walking indices in
+/// order for the image cursor, and emit the page in `mod_seq` order.
+#[gpui::test]
+async fn get_session_changes_pages_by_mod_seq_across_index_order(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    // 12 user entries. Index 0 carries an image and was RE-EDITED last
+    // (`mod_seq` 100), so it sorts to the END of the delta page even though
+    // it is the oldest entry. Index 1 also carries an image.
+    mutate_session(session_id, cx, |s| {
+        s.entries = (0..12u64)
+            .map(|n| {
+                let mod_seq = if n == 0 { 100 } else { n };
+                let chunks = if n <= 1 {
+                    vec![
+                        fake_user_text_chunk(&format!("u{n}")),
+                        fake_image_chunk("image/png", TINY_PNG_B64),
+                    ]
+                } else {
+                    vec![fake_user_text_chunk(&format!("u{n}"))]
+                };
+                std::sync::Arc::new(SessionEntry {
+                    created_ms: 1_700_000_000_000 + n as i64,
+                    mod_seq,
+                    subagent_id: None,
+                    kind: SessionEntryKind::UserMessage {
+                        id: None,
+                        content_md: format!("u{n}"),
+                        chunks,
+                    },
+                })
+            })
+            .collect();
+        s.change_seq = 100;
+    });
+
+    let page = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 0,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: true,
+        },
+        cx,
+    )
+    .await;
+
+    assert_eq!(page.changed_entries.len(), CHANGED_ENTRIES_PAGE);
+    assert!(page.has_more, "12 changed entries exceed one page");
+    assert_eq!(
+        page.changed_entries
+            .iter()
+            .map(|e| e.index)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "the page is the ten LOWEST mod_seqs, in mod_seq order — index 0's \
+         re-edit (mod_seq 100) sorts past the page"
+    );
+    assert_eq!(
+        page.current_seq, 10,
+        "cursor advances to the last mod_seq on the page"
+    );
+    // Index 1's image sits behind index 0's, which is NOT on this page —
+    // the cheap count-only walk over out-of-page entries is what keeps this 1.
+    let image_indices: Vec<usize> = page.changed_entries[0]
+        .images
+        .as_ref()
+        .expect("images populated")
+        .iter()
+        .map(|img| img.index)
+        .collect();
+    assert_eq!(
+        image_indices,
+        vec![1],
+        "an out-of-page image-bearing entry must still advance the image cursor"
+    );
+
+    // Second poll picks up the re-edited entry 0 and reports caught up.
+    let rest = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: page.current_seq,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: true,
+        },
+        cx,
+    )
+    .await;
+    assert_eq!(
+        rest.changed_entries
+            .iter()
+            .map(|e| e.index)
+            .collect::<Vec<_>>(),
+        vec![11, 0],
+        "the tail of the catch-up, still in mod_seq order (11 then the re-edit)"
+    );
+    assert!(!rest.has_more, "caught up after the second poll");
+    assert_eq!(
+        rest.current_seq, 100,
+        "cursor lands on the stream watermark"
+    );
+}
+
+/// `read_session_history` renders only the requested page. The shape it
+/// must keep: `total_entries` counts the whole transcript, `entries`
+/// carries exactly the `offset`/`limit` slice of it, oldest-first.
+#[gpui::test]
+async fn read_session_history_live_renders_only_the_requested_page(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+
+    let all = ReadSessionHistoryTool
+        .run(
+            ReadSessionHistoryParams {
+                session_id: session_id.to_string(),
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("read_session_history")
+        .structured_content;
+    assert_eq!(all.source, "live");
+    assert_eq!(all.total_entries, 4);
+    assert_eq!(all.returned_entries, 4);
+
+    let page = ReadSessionHistoryTool
+        .run(
+            ReadSessionHistoryParams {
+                session_id: session_id.to_string(),
+                offset: Some(1),
+                limit: Some(2),
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("read_session_history")
+        .structured_content;
+    assert_eq!(
+        page.total_entries, 4,
+        "total still describes the whole transcript"
+    );
+    assert_eq!(page.returned_entries, 2);
+    assert_eq!(
+        page.entries,
+        all.entries[1..3].to_vec(),
+        "the page is byte-identical to the same slice of the full render"
+    );
+}

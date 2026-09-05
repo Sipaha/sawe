@@ -48,6 +48,18 @@ impl ReopenableSession {
     }
 }
 
+/// Workspaces whose closed-session query is still in flight.
+///
+/// The picker cannot open synchronously — its rows come from a DB round trip —
+/// so a second click landing while the first query runs used to reach
+/// `toggle_modal` a second time and TOGGLE the just-opened picker back shut.
+/// A double click on the button therefore opened and immediately closed it.
+/// Keyed by workspace so two windows can each open their own picker.
+#[derive(Default)]
+struct ReopenQueryInFlight(std::collections::HashSet<gpui::EntityId>);
+
+impl gpui::Global for ReopenQueryInFlight {}
+
 /// Open the reopen-a-closed-chat picker over `weak_workspace`.
 ///
 /// Lives here, next to the modal, rather than on whatever surface offers the
@@ -56,7 +68,14 @@ impl ReopenableSession {
 /// on the status-bar session tab strip), and `solution_agent` cannot depend
 /// on `console_panel` to call back into it — that edge already runs the other
 /// way. Closed sessions live only on disk, so the list is queried
-/// asynchronously and the modal is toggled once it resolves.
+/// asynchronously and the modal is opened once it resolves.
+///
+/// Re-entrancy: a call made while this workspace's query is still running, or
+/// while its picker is already up, is a no-op. Both halves are needed — the
+/// flag covers the in-flight window, and the already-open check (made inside
+/// the continuation, where the workspace is legitimately borrowed) covers a
+/// click after the picker has painted. Dismissing it stays the modal's own job
+/// (Esc / click-away), which is why neither path toggles.
 pub fn open_reopen_session_modal(
     weak_workspace: &WeakEntity<Workspace>,
     solution_id: SolutionId,
@@ -66,6 +85,14 @@ pub fn open_reopen_session_modal(
     let Some(workspace) = weak_workspace.upgrade() else {
         return;
     };
+    let workspace_id = workspace.entity_id();
+    if !cx
+        .default_global::<ReopenQueryInFlight>()
+        .0
+        .insert(workspace_id)
+    {
+        return;
+    }
     // The query already returns top-level closed rows ordered
     // most-recently-active first, each carrying the token total +
     // last-activity time the rows display.
@@ -76,13 +103,27 @@ pub fn open_reopen_session_modal(
             let metas = closed.await.log_err().unwrap_or_default();
             let sessions: Vec<ReopenableSession> =
                 metas.iter().map(ReopenableSession::from_metadata).collect();
-            workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.toggle_modal(window, cx, move |window, cx| {
-                        ReopenSessionModal::new(sessions, window, cx)
-                    });
+            let opened = workspace.update_in(cx, |workspace, window, cx| {
+                cx.default_global::<ReopenQueryInFlight>()
+                    .0
+                    .remove(&workspace_id);
+                if workspace.active_modal::<ReopenSessionModal>(cx).is_some() {
+                    return;
+                }
+                workspace.toggle_modal(window, cx, move |window, cx| {
+                    ReopenSessionModal::new(sessions, window, cx)
+                });
+            });
+            if opened.log_err().is_none() {
+                // The workspace went away mid-query; drop the guard anyway so a
+                // dead entity id can't accumulate in the global.
+                cx.update(|_, cx| {
+                    cx.default_global::<ReopenQueryInFlight>()
+                        .0
+                        .remove(&workspace_id);
                 })
                 .log_err();
+            }
         })
         .detach();
 }
@@ -200,5 +241,72 @@ impl Render for ReopenSessionModal {
         }
         container = container.child(list);
         container
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Double-clicking the entry point must leave the picker OPEN.
+    ///
+    /// The rows come from a DB round trip, so the modal is opened from an
+    /// async continuation. With a plain `toggle_modal` there, the second
+    /// click's continuation toggled the picker the first one had just opened
+    /// straight back shut — the button looked like it did nothing.
+    #[gpui::test]
+    async fn a_double_click_leaves_the_picker_open(cx: &mut gpui::TestAppContext) {
+        let (solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = std::sync::Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let weak = cx.update(|cx| {
+            workspace_window
+                .root(cx)
+                .expect("workspace window alive")
+                .downgrade()
+        });
+
+        // Both clicks land before the first query resolves — the second must
+        // be a no-op rather than a toggle.
+        workspace_window
+            .update(cx, |_workspace, window, cx| {
+                open_reopen_session_modal(&weak, solution_id, window, cx);
+                open_reopen_session_modal(&weak, solution_id, window, cx);
+            })
+            .expect("workspace update");
+        cx.run_until_parked();
+
+        workspace_window
+            .update(cx, |workspace, _window, cx| {
+                assert!(
+                    workspace.active_modal::<ReopenSessionModal>(cx).is_some(),
+                    "the picker must still be up after a double click"
+                );
+            })
+            .expect("workspace update");
+
+        // A third click with the picker already up is also a no-op (it must
+        // not close what the user can already see).
+        workspace_window
+            .update(cx, |_workspace, window, cx| {
+                open_reopen_session_modal(&weak, solution_id, window, cx);
+            })
+            .expect("workspace update");
+        cx.run_until_parked();
+        workspace_window
+            .update(cx, |workspace, _window, cx| {
+                assert!(
+                    workspace.active_modal::<ReopenSessionModal>(cx).is_some(),
+                    "a click while the picker is open must not dismiss it"
+                );
+            })
+            .expect("workspace update");
     }
 }

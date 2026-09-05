@@ -818,8 +818,7 @@ async fn the_compose_box_yields_to_the_transcript_as_the_band_shrinks(
 
     // 3. Impossible: a band at `MIN_BAND_HEIGHT` cannot seat a 120px transcript,
     //    a 56px compose box and the status row at once (120 + 59 + 29 > 140).
-    let (crushed_transcript, crushed_compose) =
-        measure_at(vcx, crate::model::MIN_BAND_HEIGHT);
+    let (crushed_transcript, crushed_compose) = measure_at(vcx, crate::model::MIN_BAND_HEIGHT);
     assert_eq!(
         crushed_compose,
         MIN_COMPOSE_HEIGHT + COMPOSE_HANDLE_HEIGHT,
@@ -865,6 +864,26 @@ async fn the_compose_box_yields_to_the_transcript_as_the_band_shrinks(
         f32::from(inner.bottom()),
         f32::from(compose_box.bottom())
     );
+
+    // A drag started in the tight regime must start from what is on screen. The
+    // block is painting ~251px against a `compose_height` of 300, so a handle
+    // that starts from the model has ~49px of dead travel downwards and grows
+    // invisibly upwards — the growth then lands as a jump the next time the
+    // band is enlarged. `painted_compose_height` is what the mouse-down reads.
+    let (_, tight_now) = measure_at(vcx, 400.0);
+    view_window
+        .update(vcx, |view, _window, _cx| {
+            assert_eq!(
+                view.painted_compose_height.map(f32::from),
+                Some(tight_now),
+                "the compose block records the height it was actually painted at"
+            );
+            assert!(
+                tight_now < f32::from(view.compose_height) + COMPOSE_HANDLE_HEIGHT,
+                "…and in this regime that is smaller than the height it prefers"
+            );
+        })
+        .unwrap();
 
     // The view-only shell arm swaps a different element into the same slot. Its
     // geometry must be indistinguishable, or flipping the pill between Main and
@@ -922,4 +941,309 @@ fn shell_stream_for_test(id: &StreamId) -> crate::stream::Stream {
         state: StreamState::Live,
         source: StreamSource::FileTail(std::path::PathBuf::from("/dev/null")),
     }
+}
+
+/// PERF CONTRACT (report §2.2): a second frame over an UNCHANGED transcript
+/// must not rebuild a single per-entry text or `Markdown` entity.
+///
+/// The render path used to call `entry_text_spans` for EVERY entry of the
+/// selected stream on EVERY frame — a fresh `String` per span, copied again
+/// into a `SharedString`, compared in full by `ensure_markdown`, and followed
+/// by an unconditional `set_search_highlights` (whose setter notifies
+/// unconditionally). On a long session that is megabytes of copying and one
+/// notify per cached entity per frame, while the virtualized list paints ~10
+/// rows. Pinned here through the observable seams: the rebuild counter, the
+/// identity of the cached `Markdown` entities, and their sources.
+#[gpui::test]
+async fn a_second_render_of_an_unchanged_transcript_rebuilds_nothing(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    use crate::store::SolutionAgentStore;
+    use gpui::VisualTestContext;
+    use std::sync::Arc;
+
+    fn assistant(text: &str, mod_seq: u64) -> Arc<SessionEntry> {
+        Arc::new(SessionEntry {
+            created_ms: 0,
+            mod_seq,
+            subagent_id: None,
+            kind: SessionEntryKind::AssistantMessage {
+                chunks: vec![AssistantChunk::Message(text.to_string())],
+            },
+        })
+    }
+    fn user(text: &str, mod_seq: u64) -> Arc<SessionEntry> {
+        Arc::new(SessionEntry {
+            created_ms: 0,
+            mod_seq,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: vec![],
+            },
+        })
+    }
+
+    let (solution_id, _tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let workspace_window =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| {
+        workspace_window
+            .root(cx)
+            .expect("workspace window alive")
+            .downgrade()
+    });
+
+    // Three Main entries, none adjacent-assistant, so the stream is 3 entries
+    // of one span each — 1:1 with the `markdown_for_render` keys.
+    let entries = vec![
+        user("hello", 1),
+        assistant("hi there", 2),
+        user("and again", 3),
+    ];
+    let session = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = crate::store::tests::insert_cold_session(
+                session_id,
+                solution_id,
+                agent_id.clone(),
+                Some(120_000),
+                Some(project.clone()),
+                store,
+                cx,
+            );
+            session.update(cx, |s, cx| s.set_entries(entries.clone(), cx));
+            session
+        })
+    });
+
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(
+            session_id,
+            session.clone(),
+            workspace_weak.clone(),
+            window,
+            cx,
+        )
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.run_until_parked();
+
+    let markdown_snapshot = |view: &SolutionSessionView, cx: &gpui::App| {
+        let mut out: Vec<((usize, usize), gpui::EntityId, String)> = view
+            .markdown_for_render
+            .iter()
+            .map(|(key, entity)| {
+                (
+                    *key,
+                    entity.entity_id(),
+                    entity.read(cx).source().to_string(),
+                )
+            })
+            .collect();
+        out.sort_by_key(|(key, _, _)| *key);
+        out
+    };
+
+    let (rebuilds_first, first) = view_window
+        .update(vcx, |view, _window, cx| {
+            (view.entry_text_rebuilds, markdown_snapshot(view, cx))
+        })
+        .unwrap();
+    assert_eq!(
+        rebuilds_first, 3,
+        "the first frame builds one text cache line per entry"
+    );
+    assert_eq!(
+        first
+            .iter()
+            .map(|(_, _, source)| source.as_str())
+            .collect::<Vec<_>>(),
+        ["hello", "hi there", "and again"],
+        "each entry's span text reaches its Markdown entity"
+    );
+
+    // A second frame over the very same transcript.
+    view_window
+        .update(vcx, |_view, _window, cx| cx.notify())
+        .unwrap();
+    vcx.run_until_parked();
+
+    let (rebuilds_second, second) = view_window
+        .update(vcx, |view, _window, cx| {
+            (view.entry_text_rebuilds, markdown_snapshot(view, cx))
+        })
+        .unwrap();
+    assert_eq!(
+        rebuilds_second, rebuilds_first,
+        "an unchanged transcript must not rebuild any per-entry text"
+    );
+    assert_eq!(
+        second, first,
+        "and must reuse the very same Markdown entities, with unchanged sources"
+    );
+
+    // Now mutate ONE entry the way the store does (new Arc, bumped mod_seq)
+    // and leave the other two handles untouched.
+    let mutated = vec![
+        entries[0].clone(),
+        assistant("hi there, friend", 4),
+        entries[2].clone(),
+    ];
+    session.update(vcx, |s, cx| s.set_entries(mutated, cx));
+    vcx.run_until_parked();
+
+    let (rebuilds_third, third) = view_window
+        .update(vcx, |view, _window, cx| {
+            (view.entry_text_rebuilds, markdown_snapshot(view, cx))
+        })
+        .unwrap();
+    assert_eq!(
+        rebuilds_third,
+        rebuilds_second + 1,
+        "only the entry that actually changed is rebuilt"
+    );
+    assert_eq!(
+        third
+            .iter()
+            .map(|(_, _, source)| source.as_str())
+            .collect::<Vec<_>>(),
+        ["hello", "hi there, friend", "and again"],
+        "the changed entry's Markdown entity gets the new source"
+    );
+    assert_eq!(
+        (third[0].1, third[2].1),
+        (first[0].1, first[2].1),
+        "the untouched entries keep their Markdown entities"
+    );
+}
+
+/// REGRESSION: an entry whose content the store rewrote IN PLACE, without
+/// bumping `mod_seq`, must still re-render.
+///
+/// `SolutionAgentStore`'s stranded-tool-call sweep
+/// (`normalize_stranded_tool_status`) flips a non-terminal `ToolCall` to
+/// `Canceled` through `Arc::make_mut` — which FORKS, because the stream mirror
+/// still holds the entry — and then re-demuxes, leaving a NEW `Arc` carrying
+/// the SAME `mod_seq` and different content. A text cache keyed on `mod_seq`
+/// alone reports a hit there and pins the tool card at "running" for the rest
+/// of the session: exactly the stuck-spinner bug, relocated into the view.
+#[gpui::test]
+async fn an_in_place_rewrite_that_keeps_mod_seq_still_re_renders(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind, ToolStatus};
+    use crate::store::SolutionAgentStore;
+    use gpui::VisualTestContext;
+    use std::sync::Arc;
+
+    fn tool_call(status: ToolStatus, mod_seq: u64) -> Arc<SessionEntry> {
+        Arc::new(SessionEntry {
+            created_ms: 0,
+            mod_seq,
+            subagent_id: None,
+            kind: SessionEntryKind::ToolCall {
+                id: "toolu_1".to_string(),
+                label_md: "Bash".to_string(),
+                kind: acp::ToolKind::Execute,
+                status,
+                content_md: Vec::new(),
+                raw_input: None,
+                raw_output: None,
+                tool_name: Some("Bash".to_string()),
+                locations: Vec::new(),
+                status_started_at: None,
+            },
+        })
+    }
+
+    let (solution_id, _tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let workspace_window =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| {
+        workspace_window
+            .root(cx)
+            .expect("workspace window alive")
+            .downgrade()
+    });
+
+    let session = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = crate::store::tests::insert_cold_session(
+                session_id,
+                solution_id,
+                agent_id.clone(),
+                None,
+                Some(project.clone()),
+                store,
+                cx,
+            );
+            session.update(cx, |s, cx| {
+                s.set_entries(vec![tool_call(ToolStatus::InProgress, 7)], cx)
+            });
+            session
+        })
+    });
+
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(
+            session_id,
+            session.clone(),
+            workspace_weak.clone(),
+            window,
+            cx,
+        )
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.run_until_parked();
+
+    let source_of_first_span = |view: &SolutionSessionView, cx: &gpui::App| {
+        view.markdown_for_render
+            .get(&(0, 0))
+            .expect("the tool call's header span must be cached")
+            .read(cx)
+            .source()
+            .to_string()
+    };
+
+    view_window
+        .update(vcx, |view, _window, cx| {
+            assert_eq!(source_of_first_span(view, cx), "Tool: Bash (running)");
+        })
+        .unwrap();
+
+    // Exactly what the store's terminalisation does: fork the entry, rewrite
+    // its status, keep `mod_seq` at 7.
+    session.update(vcx, |s, cx| {
+        s.set_entries(vec![tool_call(ToolStatus::Canceled, 7)], cx)
+    });
+    vcx.run_until_parked();
+
+    view_window
+        .update(vcx, |view, _window, cx| {
+            assert_eq!(
+                source_of_first_span(view, cx),
+                "Tool: Bash (canceled)",
+                "an in-place status rewrite that reuses mod_seq must not be cached away"
+            );
+        })
+        .unwrap();
 }

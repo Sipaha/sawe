@@ -40,6 +40,16 @@ pub type UploadId = u64;
 /// realistic multi-image messages, low enough to prevent runaway state.
 const MAX_CONCURRENT_PER_SESSION: usize = 4;
 
+/// Server-side ceiling on a single upload, mirroring the 5 MB cap the mobile
+/// client already applies before it opens one (`UserMessageBlocks.kt`). The
+/// client-side limit alone is not a limit: `upload_init` used to accept any
+/// `total_size`, so a buggy or hostile client could reserve — and then stream —
+/// an unbounded tmp file, and `resolve_upload_handles_with` would read the
+/// whole thing into memory and base64 it on the foreground. Rejecting at
+/// `init` is what makes both of those bounded (and `write_chunk`'s overrun
+/// check then holds the actual bytes to the declared size).
+pub const MAX_UPLOAD_SIZE: u64 = 5 * 1024 * 1024;
+
 /// 1 hour TTL — uploads that aren't finished within this window get GCed.
 pub const UPLOAD_TTL: Duration = Duration::from_secs(60 * 60);
 
@@ -120,6 +130,11 @@ impl UploadManager {
     ) -> Result<UploadId> {
         if session_id.is_empty() {
             bail!("upload_init: session_id is required");
+        }
+        if total_size > MAX_UPLOAD_SIZE {
+            bail!(
+                "upload_too_large: {total_size} bytes exceeds the {MAX_UPLOAD_SIZE}-byte per-upload limit"
+            );
         }
         let active_for_session = self
             .state
@@ -419,10 +434,15 @@ pub fn is_text_like(mime: &str) -> bool {
 /// has already inlined the bytes into the outgoing prompt; the tmp
 /// file is no longer needed).
 ///
-/// Synchronous file reads are OK here because uploads are capped at
-/// 5 MB on the mobile side and `with_manager` already holds the sync
-/// mutex — the caller (`SendMessageBlocksTool::run`) is on the
-/// AsyncApp executor's task queue, not blocking a hot loop.
+/// Synchronous file reads are OK here because every upload is capped at
+/// [`MAX_UPLOAD_SIZE`] SERVER-side (not merely by the mobile client) and
+/// `with_manager` already holds the sync mutex — the caller
+/// (`SendMessageBlocksTool::run`) is on the AsyncApp executor's task queue,
+/// not blocking a hot loop. Moving the read + base64 to a background thread
+/// would mean holding this `std::sync::Mutex` across an await, which is the
+/// thing the whole-pass lock exists to prevent (a concurrent `upload_abort`
+/// pulling the tmp file out mid-resolution); the cap is what keeps the
+/// foreground cost bounded instead.
 pub fn resolve_upload_handles(blocks: Vec<acp::ContentBlock>) -> Result<Vec<acp::ContentBlock>> {
     let arc = get().ok_or_else(|| anyhow!("upload manager not initialised"))?;
     let mut guard = arc
@@ -612,6 +632,36 @@ mod tests {
         let acks = m.drain_acks();
         assert_eq!(acks.len(), 2);
         assert_eq!(acks[1].received_bytes, 10);
+    }
+
+    #[test]
+    fn init_rejects_an_upload_over_the_server_cap() {
+        let (mut m, _dir) = mgr();
+        // At the cap: accepted (the tmp file is only allocated lazily by
+        // writes, so a declared size costs nothing until bytes arrive).
+        m.init(
+            "s".into(),
+            "image/png".into(),
+            "big.png".into(),
+            MAX_UPLOAD_SIZE,
+            None,
+        )
+        .expect("a declaration exactly at the cap is allowed");
+
+        let err = m
+            .init(
+                "s".into(),
+                "image/png".into(),
+                "huge.png".into(),
+                MAX_UPLOAD_SIZE + 1,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("upload_too_large"),
+            "one byte over the cap must be refused with a machine-readable code, got: {err}"
+        );
     }
 
     #[test]
