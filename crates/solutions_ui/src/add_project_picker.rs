@@ -317,13 +317,13 @@ mod tests {
     /// Builds a popover over an empty registry, then installs `entries`
     /// after the two action rows by hand — the catalog has no non-test
     /// mutator, and the keyboard path only cares about the entry sequence.
-    fn build_picker<'a>(
+    fn build_picker(
         entries: Vec<PickerEntry>,
-        cx: &'a mut TestAppContext,
+        cx: &mut TestAppContext,
     ) -> (
         Entity<Picker<AddProjectDelegate>>,
         TempDir,
-        &'a mut VisualTestContext,
+        &mut VisualTestContext,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         cx.update(|cx| {

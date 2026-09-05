@@ -456,11 +456,7 @@ impl Render for ProjectTabStrip {
             let overflow_entries: Vec<(MemberId, SharedString, bool)> = overflow
                 .iter()
                 .map(|(member_id, name)| {
-                    (
-                        *member_id,
-                        name.clone(),
-                        active_member == Some(*member_id),
-                    )
+                    (*member_id, name.clone(), active_member == Some(*member_id))
                 })
                 .collect();
             let indicator_border = cx.theme().colors().title_bar_background;
@@ -587,7 +583,9 @@ impl Render for ProjectTabStrip {
             .when_some(overflow_popover, |this, popover| {
                 this.child(
                     div()
-                        .debug_selector(move || overflow_more_selector(active_in_overflow).to_string())
+                        .debug_selector(move || {
+                            overflow_more_selector(active_in_overflow).to_string()
+                        })
                         .px_1()
                         .child(popover),
                 )
@@ -792,14 +790,11 @@ mod paint_tests {
 
         let fs = fs::FakeFs::new(cx.executor());
         for path in &member_paths {
-            fs.insert_tree(path, serde_json::json!({ "a.txt": "" })).await;
+            fs.insert_tree(path, serde_json::json!({ "a.txt": "" }))
+                .await;
         }
-        let project = project::Project::test(
-            fs.clone(),
-            member_paths.iter().map(|p| p.as_path()),
-            cx,
-        )
-        .await;
+        let project =
+            project::Project::test(fs.clone(), member_paths.iter().map(|p| p.as_path()), cx).await;
         cx.run_until_parked();
 
         let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
@@ -1176,14 +1171,18 @@ mod paint_tests {
 
     impl Render for RowHost {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .w(px(240.))
-                .h(px(24.))
-                .child(overflow_menu_row(self.member_id, &self.name, self.is_active))
+            div().w(px(240.)).h(px(24.)).child(overflow_menu_row(
+                self.member_id,
+                &self.name,
+                self.is_active,
+            ))
         }
     }
 
-    async fn row_painted_as(is_active: bool, cx: &mut TestAppContext) -> (MemberId, &mut VisualTestContext) {
+    async fn row_painted_as(
+        is_active: bool,
+        cx: &mut TestAppContext,
+    ) -> (MemberId, &mut VisualTestContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -1258,16 +1257,16 @@ mod paint_tests {
         // button held.
         cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::none());
         cx.run_until_parked();
-        cx.simulate_mouse_down(row.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_down(
+            row.center(),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
         cx.run_until_parked();
         for step in 1..=6 {
             let t = step as f32 / 6.0;
             let position = row.center() + (target.1.center() - row.center()) * t;
-            cx.simulate_mouse_move(
-                position,
-                gpui::MouseButton::Left,
-                gpui::Modifiers::none(),
-            );
+            cx.simulate_mouse_move(position, gpui::MouseButton::Left, gpui::Modifiers::none());
             cx.run_until_parked();
         }
         cx.simulate_mouse_up(
@@ -1302,8 +1301,11 @@ mod paint_tests {
         // Dragging is the gesture that DOES rewrite the order — the whole
         // reason clicking must not. Asserted against the store, exactly as the
         // click test asserts the opposite.
-        let mut expected: Vec<MemberId> =
-            order_before.iter().copied().filter(|id| *id != hidden).collect();
+        let mut expected: Vec<MemberId> = order_before
+            .iter()
+            .copied()
+            .filter(|id| *id != hidden)
+            .collect();
         let target_slot = expected
             .iter()
             .position(|id| *id == target.0)
@@ -1342,7 +1344,11 @@ mod paint_tests {
             .expect("some project must have spilled");
         let order_before = stored_order(solution_id, cx);
         let previously_active = cx
-            .update(|_window, cx| SolutionStore::global(cx).read(cx).active_member(solution_id))
+            .update(|_window, cx| {
+                SolutionStore::global(cx)
+                    .read(cx)
+                    .active_member(solution_id)
+            })
             .expect("the strip seeds an active member on its first frame");
         assert!(
             bounds_of(cx, project_tab_selector(hidden)).is_none(),
@@ -1392,7 +1398,9 @@ mod paint_tests {
             "…and must not still claim to be active"
         );
         assert_eq!(
-            cx.update(|_window, cx| SolutionStore::global(cx).read(cx).active_member(solution_id)),
+            cx.update(|_window, cx| SolutionStore::global(cx)
+                .read(cx)
+                .active_member(solution_id)),
             Some(hidden),
             "the picked project must be the active member"
         );

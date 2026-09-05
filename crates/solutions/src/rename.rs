@@ -3,7 +3,7 @@
 //! rename leaves behind), the same-filesystem preflight, and the
 //! `rename(2)` + compat-symlink move itself.
 
-use crate::folder_name::FolderNameError;
+use crate::folder_name::{FolderNameError, same_folder_name};
 use anyhow::{Context as _, Result};
 use std::path::{Path, PathBuf};
 
@@ -12,13 +12,6 @@ use std::path::{Path, PathBuf};
 pub struct TakenFolder {
     pub folder: String,
     pub owner: String,
-}
-
-/// Case-insensitive on purpose: on macOS/Windows `Sawe` and `sawe` are the
-/// same directory, so allowing both would produce a rename that silently
-/// works on Linux and destroys data elsewhere.
-fn same_folder_name(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
 }
 
 pub fn ensure_folder_available(

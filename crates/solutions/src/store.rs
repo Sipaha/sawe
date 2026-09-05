@@ -335,9 +335,9 @@ impl SolutionStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn create_for_test_minimal(&mut self, name: &str, cx: &mut Context<Self>) -> SolutionId {
         let id = SolutionId(self.next_id_without_db());
-        let root = std::env::temp_dir()
-            .join("spke-test-solutions")
-            .join(crate::folder_name::derive(name).unwrap_or_else(|_| format!("solution-{}", id.0)));
+        let root = std::env::temp_dir().join("spke-test-solutions").join(
+            crate::folder_name::derive(name).unwrap_or_else(|_| format!("solution-{}", id.0)),
+        );
         self.config.solutions.push(Solution {
             id,
             name: name.into(),

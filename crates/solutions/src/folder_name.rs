@@ -178,6 +178,25 @@ fn split_camel_case(value: &str) -> String {
     out
 }
 
+/// Do these two folder names name the same directory?
+///
+/// The single equality predicate for folder names — `crate::rename`'s
+/// collision check and `crate::add_member`'s clone-target reservation both
+/// go through it, so a name one of them calls taken can never be called
+/// free by the other. (They used to disagree: the reservation folded ASCII
+/// case only, while the rename folded full Unicode, so two non-ASCII names
+/// differing only in case were "two folders" to the clone target and "one
+/// folder" to the rename — and on a case-insensitive filesystem the second
+/// clone wiped the first member's checkout.)
+///
+/// Case-insensitive on purpose: on macOS/Windows `Sawe` and `sawe` are the
+/// same directory, so allowing both would produce a move that silently works
+/// on Linux and destroys data elsewhere. The fold is full Unicode because
+/// [`derive`] preserves Unicode case.
+pub fn same_folder_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
 /// How far the `-2`, `-3`, … ladder climbs before giving up. Only a caller
 /// that has somehow accumulated a thousand same-named directories can reach
 /// it; the bound exists so a predicate that always answers "taken" cannot
@@ -307,6 +326,20 @@ mod tests {
         assert_eq!(derive(&at_cap).as_deref(), Ok(at_cap.as_str()));
         let over_cap = "a".repeat(MAX_FOLDER_NAME_BYTES + 1);
         assert_eq!(derive(&over_cap).as_deref(), Ok(at_cap.as_str()));
+    }
+
+    /// The predicate every caller shares. The ASCII cases were already right
+    /// under the old `eq_ignore_ascii_case` dedupe in `add_member`; the
+    /// Cyrillic pair is the one it got wrong, and getting it wrong is what
+    /// let a second clone target a live member's directory.
+    #[test]
+    fn same_folder_name_folds_full_unicode_case() {
+        assert!(same_folder_name("Sawe", "sawe"));
+        assert!(same_folder_name("Update-Deps", "update-deps"));
+        assert!(same_folder_name("Проект", "проект"));
+        assert!(same_folder_name("Проект-Один", "проект-Один"));
+        assert!(!same_folder_name("Sawe", "Sawe-2"));
+        assert!(!same_folder_name("Проект", "Проект-2"));
     }
 
     #[test]

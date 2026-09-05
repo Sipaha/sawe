@@ -23,6 +23,7 @@ use solutions::{CatalogId, MemberId, SolutionId, SolutionStore};
 use std::cell::RefCell;
 use ui::{ContextMenu, Indicator, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
+use workspace::MultiWorkspace;
 
 use crate::actions::{EditCatalogProject, RemoveMember, RenameMember};
 use crate::solution_tab::dot_color_for_id;
@@ -417,13 +418,7 @@ impl RenderOnce for PendingProjectTab {
                     .items_center()
                     .border_b_2()
                     .border_color(cx.theme().colors().border_transparent)
-                    .child(
-                        div()
-                            .w(TAB_DOT_SIZE)
-                            .h(TAB_DOT_SIZE)
-                            .rounded_full()
-                            .bg(dot),
-                    )
+                    .child(div().w(TAB_DOT_SIZE).h(TAB_DOT_SIZE).rounded_full().bg(dot))
                     .child(Label::new(self.name).truncate().color(Color::Muted))
                     .child(trailing),
             )
@@ -479,17 +474,58 @@ impl RenderOnce for PendingProjectTab {
                     // forever and is offered again by the add picker, with no
                     // UI anywhere that can delete it.
                     .when(catalog_removable, |menu| {
-                        menu.entry("Remove Project from Catalog", None, move |_window, cx| {
-                            SolutionStore::global(cx).update(cx, |store, cx| {
-                                store.clear_failed_add(solution_id, catalog_id, cx);
-                                store.remove_catalog_project(catalog_id, cx).log_err();
+                        menu.entry("Remove Project from Catalog", None, move |window, cx| {
+                            let result = SolutionStore::global(cx).update(cx, |store, cx| {
+                                remove_failed_add_with_catalog_row(
+                                    store,
+                                    solution_id,
+                                    catalog_id,
+                                    cx,
+                                )
                             });
+                            if let Err(error) = result {
+                                report_menu_error(error, window, cx);
+                            }
                         })
                     })
                 })
             })
             .into_any_element()
     }
+}
+
+/// "Remove Project from Catalog" on a failed add: drop the catalog row
+/// FIRST, and clear the failed row only once that succeeded.
+///
+/// The order is the whole point. `catalog_removable` is computed when the tab
+/// paints, and another Solution can clone the project between that frame and
+/// the click; `remove_catalog_project` then refuses. Clearing the failed add
+/// first took away the only surface that offers retry / edit / dismiss and
+/// left the catalog entry in place — the user saw the row vanish and nothing
+/// else happen, with the refusal visible only in the log.
+fn remove_failed_add_with_catalog_row(
+    store: &mut SolutionStore,
+    solution_id: SolutionId,
+    catalog_id: CatalogId,
+    cx: &mut Context<SolutionStore>,
+) -> anyhow::Result<()> {
+    store.remove_catalog_project(catalog_id, cx)?;
+    store.clear_failed_add(solution_id, catalog_id, cx);
+    Ok(())
+}
+
+/// Surface a context-menu action's refusal where the user can see it. A
+/// menu entry has no entity of its own to render an error into, so it goes
+/// to the hosting workspace's notification stack.
+fn report_menu_error(error: anyhow::Error, window: &mut Window, cx: &mut App) {
+    log::error!("solutions_ui: project tab menu action failed: {error:#}");
+    let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() else {
+        return;
+    };
+    let workspace = multi_workspace.read(cx).workspace().clone();
+    workspace.update(cx, |workspace, cx| {
+        workspace.show_error(format!("{error:#}"), cx)
+    });
 }
 
 /// Move `from` to the very end of the order, preserving the relative
@@ -529,6 +565,115 @@ mod tests {
 
     fn id(n: i64) -> MemberId {
         MemberId(n)
+    }
+
+    /// A catalog project the user typed a wrong URL for, parked as a failed
+    /// add on `solution`. Returns the store, the catalog id, and the path of
+    /// a real bare repo the URL can be corrected to.
+    async fn store_with_a_failed_add(
+        dir: &std::path::Path,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<SolutionStore>,
+        SolutionId,
+        CatalogId,
+        std::path::PathBuf,
+    ) {
+        cx.executor().allow_parking();
+        let bare = solutions::git::test_support::make_bare_with_one_commit(dir).await;
+        let roots = dir.join("solutions");
+        std::fs::create_dir_all(&roots).expect("mkdir solutions");
+
+        let store = cx.update(|cx| SolutionStore::for_test(dir.join("solutions.json"), cx));
+        let bogus = dir.join("does-not-exist.git");
+        let catalog_id = store
+            .update(cx, |store, cx| {
+                store.add_catalog_project("Typo", bogus.to_str().expect("path str"), None, cx)
+            })
+            .expect("add catalog");
+        let solution_id = store
+            .update(cx, |store, cx| store.create_solution("A", roots, cx))
+            .expect("create solution");
+        let task = store.update(cx, |store, cx| {
+            store.add_member(solution_id, catalog_id, dir.join("cache"), cx)
+        });
+        assert!(task.await.is_err(), "the bogus remote must fail to clone");
+        (store, solution_id, catalog_id, bare)
+    }
+
+    /// The happy path: nothing else references the catalog row, so it goes
+    /// and the failed tab goes with it.
+    #[gpui::test]
+    async fn removing_an_unreferenced_catalog_project_clears_the_failed_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, solution_id, catalog_id, _bare) = store_with_a_failed_add(dir.path(), cx).await;
+
+        store
+            .update(cx, |store, cx| {
+                remove_failed_add_with_catalog_row(store, solution_id, catalog_id, cx)
+            })
+            .expect("an unreferenced catalog project is removable");
+
+        store.read_with(cx, |store, _| {
+            assert!(store.catalog().is_empty(), "the catalog row must be gone");
+            assert!(
+                store.pending_adds_for(solution_id).is_empty(),
+                "and the failed tab with it"
+            );
+        });
+    }
+
+    /// `catalog_removable` is decided when the tab paints; another Solution
+    /// can clone the project before the click lands, and then
+    /// `remove_catalog_project` refuses. Clearing the failed add first threw
+    /// away the only surface offering retry / edit / dismiss and left the
+    /// catalog row in place, with the refusal visible only in the log.
+    #[gpui::test]
+    async fn a_refused_catalog_removal_keeps_the_failed_row(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, solution_id, catalog_id, bare) = store_with_a_failed_add(dir.path(), cx).await;
+
+        let other_solution = store
+            .update(cx, |store, cx| {
+                store.create_solution("B", dir.path().join("solutions"), cx)
+            })
+            .expect("second solution");
+        store
+            .update(cx, |store, cx| {
+                store.edit_catalog_project(
+                    catalog_id,
+                    None,
+                    Some("master".into()),
+                    Some(bare.to_string_lossy().into_owned()),
+                    cx,
+                )
+            })
+            .expect("fix the remote url");
+        let task = store.update(cx, |store, cx| {
+            store.add_member(other_solution, catalog_id, dir.path().join("cache"), cx)
+        });
+        task.await.expect("the other solution clones it");
+
+        let result = store.update(cx, |store, cx| {
+            remove_failed_add_with_catalog_row(store, solution_id, catalog_id, cx)
+        });
+        assert!(
+            result.is_err(),
+            "a catalog project another Solution has cloned must not be removed"
+        );
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.pending_adds_for(solution_id).len(),
+                1,
+                "the failed row must survive a refused removal"
+            );
+            assert!(
+                store.catalog().iter().any(|p| p.id == catalog_id),
+                "and the catalog row must still be there"
+            );
+        });
     }
 
     #[test]

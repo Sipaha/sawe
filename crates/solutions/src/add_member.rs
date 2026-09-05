@@ -41,11 +41,53 @@ fn init_empty_git_repo(local_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Delete the checkout an abandoned add cloned, so a cancel does not leave a
+/// full working copy under the solution root for the next add to trip over.
+///
+/// Taken under `fs_lock`, and only after re-checking that nothing has claimed
+/// the folder in the meantime: cancelling releases the reservation
+/// immediately, so a second add may already have reserved this exact
+/// directory and cloned into it — deleting it then would be precisely the
+/// data loss the reservation exists to prevent. Best-effort by design; a
+/// leftover directory is reclaimed by the next add of the same project.
+async fn discard_abandoned_clone(
+    weak: &gpui::WeakEntity<SolutionStore>,
+    cx: &mut AsyncApp,
+    lock: &Arc<smol::lock::Mutex<()>>,
+    solution_id: SolutionId,
+    catalog_id: CatalogId,
+    folder: &str,
+    target: &std::path::Path,
+) {
+    let _guard = lock.lock().await;
+    let claimed = weak
+        .update(cx, |store, _| {
+            store.folder_claimed_by_other(solution_id, catalog_id, folder)
+        })
+        .unwrap_or(true);
+    if claimed || !target.exists() {
+        return;
+    }
+    smol::unblock({
+        let target = target.to_path_buf();
+        move || std::fs::remove_dir_all(&target)
+    })
+    .await
+    .log_err();
+}
+
 /// Internal record for an in-flight `add_member` call. The UI reads a
 /// snapshot via [`SolutionStore::pending_adds_for`] and reacts to
 /// [`SolutionStoreEvent::MemberAddProgress`] / `MemberAddCompleted`.
 pub(crate) struct InFlightAdd {
     pub(crate) catalog_name: String,
+    /// The folder under the solution root this add reserved when it was
+    /// spawned. It is what makes the reservation account for adds that are
+    /// still running: without it two adds whose catalog names derive to the
+    /// same folder ("Update Deps" and "Update-Deps") both computed the same
+    /// `target`, and the second one's "wipe the stale target" step deleted
+    /// the first one's freshly-cloned checkout.
+    pub(crate) folder: String,
     pub(crate) stage: String,
     pub(crate) percent: Option<u8>,
     /// `Some(_)` once the spawned task has completed with an error and is
@@ -147,24 +189,42 @@ impl SolutionStore {
         // same string, different source), by the same rule creation and rename
         // use.
         //
-        // Uniquified against the solution's existing member folders but
+        // Uniquified against the solution's existing member folders AND the
+        // folders every still-running add of this solution reserved, but
         // deliberately NOT against disk: the clone below wipes a stale target
-        // left by a cancelled or failed add, and a disk check would step
-        // around that garbage into `-2` instead of reclaiming it. The
-        // in-memory check is what keeps two *live* members from sharing a
-        // directory — without it the second add's wipe deleted the first
-        // member's checkout.
-        let folder = match crate::folder_name::derive(&cat.name) {
+        // left by a cancelled or failed add *of this same catalog project*,
+        // and a disk check would step around that garbage into `-2` instead
+        // of reclaiming it. The in-memory check is what keeps two *live*
+        // members from sharing a directory — without the in-flight half, two
+        // adds whose names derive to one folder both computed the same target
+        // and the second one's wipe deleted the first member's checkout.
+        //
+        // The reservation is made HERE, in the same synchronous block that
+        // inserts the in-flight entry, rather than under `fs_lock` inside the
+        // spawned task: `add_member` runs on the foreground thread, so
+        // derive-uniquify-insert is already atomic against every other
+        // `add_member` call, while `fs_lock` is only taken once the task is
+        // polled — by which time a second call has long since picked its
+        // folder.
+        let derived = match crate::folder_name::derive(&cat.name) {
             Ok(folder) => folder,
             Err(err) => return cx.background_spawn(async move { Err(anyhow::Error::new(err)) }),
         };
-        let taken: Vec<String> = sol
+        let mut taken: Vec<String> = sol
             .members
             .iter()
             .filter_map(|m| Some(m.local_path.file_name()?.to_string_lossy().into_owned()))
             .collect();
-        let Some(folder) = crate::folder_name::uniquify(&folder, |candidate| {
-            !taken.iter().any(|t| t.eq_ignore_ascii_case(candidate))
+        taken.extend(
+            self.in_flight_adds
+                .iter()
+                .filter(|((in_flight_solution, _), _)| *in_flight_solution == solution_id)
+                .map(|(_, entry)| entry.folder.clone()),
+        );
+        let Some(folder) = crate::folder_name::uniquify(&derived, |candidate| {
+            !taken
+                .iter()
+                .any(|t| crate::folder_name::same_folder_name(t, candidate))
         }) else {
             let cat_name = cat.name;
             return cx.background_spawn(async move {
@@ -181,6 +241,7 @@ impl SolutionStore {
             key,
             InFlightAdd {
                 catalog_name: cat.name,
+                folder: folder.clone(),
                 stage: "queued".into(),
                 percent: Some(0),
                 error: None,
@@ -287,61 +348,33 @@ impl SolutionStore {
 
                 match work_result {
                     Ok(()) => {
-                        weak.update(cx, |store, cx| -> Result<()> {
-                            let position = store
-                                .config
-                                .solutions
-                                .iter()
-                                .find(|s| s.id == solution_id)
-                                .map(|sol| sol.members.len() as i32);
-                            if let Some(position) = position {
-                                // Allocate the member id through the DB so the
-                                // row and the in-memory member agree; `for_test`
-                                // stores with no DB fall back to the shared
-                                // in-memory counter.
-                                let member_id = match store.db.as_ref() {
-                                    Some(db) => {
-                                        MemberId(gpui::block_on(db.insert_solution_member(
-                                            solution_id.0,
-                                            folder.clone(),
-                                            target.to_string_lossy().into_owned(),
-                                            position,
-                                            Some(catalog_id.0),
-                                        ))?)
-                                    }
-                                    None => MemberId(store.next_id_without_db()),
-                                };
-                                let member = SolutionMember {
-                                    id: member_id,
-                                    name: folder.clone(),
-                                    local_path: target.clone(),
-                                    origin_catalog_id: Some(catalog_id),
-                                };
-                                if let Some(sol) = store
-                                    .config
-                                    .solutions
-                                    .iter_mut()
-                                    .find(|s| s.id == solution_id)
-                                {
-                                    sol.members.push(member);
-                                }
-                            }
-                            store.in_flight_adds.remove(&(solution_id, catalog_id));
-                            // First project in the solution → make it the
-                            // active member so panels and new AI sessions
-                            // scope to it instead of the solution root. No-op
-                            // when a member is already active. See the matching
-                            // note in `add_empty_member`.
-                            store.seed_active_member_if_unset(solution_id, cx);
-                            cx.emit(SolutionStoreEvent::MemberAddCompleted {
-                                solution: solution_id,
-                                catalog: catalog_id,
-                                error: None,
-                            });
-                            cx.emit(SolutionStoreEvent::Changed);
-                            cx.notify();
-                            Ok(())
+                        let cancelled = cancel_flag.load(Ordering::SeqCst);
+                        let landed = weak.update(cx, |store, cx| {
+                            store.land_added_member(
+                                solution_id,
+                                catalog_id,
+                                &folder,
+                                &target,
+                                cancelled,
+                                cx,
+                            )
                         })??;
+                        if !landed {
+                            discard_abandoned_clone(
+                                &weak,
+                                cx,
+                                &lock,
+                                solution_id,
+                                catalog_id,
+                                &folder,
+                                &target,
+                            )
+                            .await;
+                            if cancelled {
+                                bail!("cancelled");
+                            }
+                            bail!("add abandoned: no in-flight entry left for {catalog_id}");
+                        }
                         Ok(())
                     }
                     Err(err) => {
@@ -373,6 +406,113 @@ impl SolutionStore {
                 }
             },
         )
+    }
+
+    /// Publish a finished clone as a solution member — unless the add was
+    /// abandoned while the last git steps ran, in which case nothing is
+    /// mutated and `false` is returned so the caller can clean the checkout
+    /// up.
+    ///
+    /// Two ways to be abandoned, both of which used to land a member anyway:
+    /// the user pressed Cancel (`cancel_flag`; `set_remote_url` + `checkout`
+    /// are seconds of work on a large repo, and the UI row disappeared the
+    /// moment they clicked), or the in-flight entry is gone for some other
+    /// reason — `remove_catalog_project_cascade` drops the entries of a
+    /// catalog row that was deleted mid-clone, and a member whose
+    /// `origin_catalog_id` points at nothing is not a member anyone asked
+    /// for. Landing one anyway also armed the *next* add of the same project
+    /// to wipe the checkout it had just published.
+    pub(crate) fn land_added_member(
+        &mut self,
+        solution_id: SolutionId,
+        catalog_id: CatalogId,
+        folder: &str,
+        target: &std::path::Path,
+        cancelled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> Result<bool> {
+        if cancelled || !self.in_flight_adds.contains_key(&(solution_id, catalog_id)) {
+            return Ok(false);
+        }
+        let position = self
+            .config
+            .solutions
+            .iter()
+            .find(|s| s.id == solution_id)
+            .map(|sol| sol.members.len() as i32);
+        if let Some(position) = position {
+            // Allocate the member id through the DB so the row and the
+            // in-memory member agree; `for_test` stores with no DB fall back
+            // to the shared in-memory counter.
+            let member_id = match self.db.as_ref() {
+                Some(db) => MemberId(gpui::block_on(db.insert_solution_member(
+                    solution_id.0,
+                    folder.to_string(),
+                    target.to_string_lossy().into_owned(),
+                    position,
+                    Some(catalog_id.0),
+                ))?),
+                None => MemberId(self.next_id_without_db()),
+            };
+            let member = SolutionMember {
+                id: member_id,
+                name: folder.to_string(),
+                local_path: target.to_path_buf(),
+                origin_catalog_id: Some(catalog_id),
+            };
+            if let Some(sol) = self
+                .config
+                .solutions
+                .iter_mut()
+                .find(|s| s.id == solution_id)
+            {
+                sol.members.push(member);
+            }
+        }
+        self.in_flight_adds.remove(&(solution_id, catalog_id));
+        // First project in the solution → make it the active member so panels
+        // and new AI sessions scope to it instead of the solution root. No-op
+        // when a member is already active. See the matching note in
+        // `add_empty_member`.
+        self.seed_active_member_if_unset(solution_id, cx);
+        cx.emit(SolutionStoreEvent::MemberAddCompleted {
+            solution: solution_id,
+            catalog: catalog_id,
+            error: None,
+        });
+        cx.emit(SolutionStoreEvent::Changed);
+        cx.notify();
+        Ok(true)
+    }
+
+    /// Is `folder` under `solution`'s root spoken for by a landed member, or
+    /// reserved by an in-flight add other than `catalog`'s? Guards the
+    /// cleanup of an abandoned clone: a cancel frees the reservation
+    /// immediately (the UI row has to go at once), so by the time the
+    /// abandoned task gets around to deleting its directory another add may
+    /// legitimately own it.
+    pub(crate) fn folder_claimed_by_other(
+        &self,
+        solution: SolutionId,
+        catalog: CatalogId,
+        folder: &str,
+    ) -> bool {
+        let members = self
+            .config
+            .solutions
+            .iter()
+            .find(|s| s.id == solution)
+            .map(|s| s.members.as_slice())
+            .unwrap_or_default();
+        members.iter().any(|member| {
+            member.local_path.file_name().is_some_and(|name| {
+                crate::folder_name::same_folder_name(&name.to_string_lossy(), folder)
+            })
+        }) || self.in_flight_adds.iter().any(|((sol, cat), entry)| {
+            *sol == solution
+                && *cat != catalog
+                && crate::folder_name::same_folder_name(&entry.folder, folder)
+        })
     }
 
     /// Create a member that has no catalog backing — the user wanted a
@@ -407,7 +547,11 @@ impl SolutionStore {
             .iter()
             .filter_map(|member| {
                 Some(crate::rename::TakenFolder {
-                    folder: member.local_path.file_name()?.to_string_lossy().into_owned(),
+                    folder: member
+                        .local_path
+                        .file_name()?
+                        .to_string_lossy()
+                        .into_owned(),
                     owner: member.name.clone(),
                 })
             })
@@ -481,9 +625,13 @@ impl SolutionStore {
     }
 
     /// Soft-cancel the in-flight add. The UI row is removed immediately and
-    /// the spawned task bails at the next git boundary check. Any half-cloned
-    /// directory under the solution root is left behind and will be wiped on
-    /// the next successful add for the same `(solution, catalog)`.
+    /// the spawned task bails at the next git boundary check — including the
+    /// one *after* the last git step, so a cancel that lands during
+    /// `set_remote_url` / `checkout` no longer publishes a member anyway.
+    /// A task that got far enough to produce a checkout deletes it on its way
+    /// out ([`discard_abandoned_clone`]); a directory left half-written by an
+    /// earlier bail is wiped by the next add for the same
+    /// `(solution, catalog)`.
     pub fn cancel_add_member(
         &mut self,
         solution_id: SolutionId,
@@ -843,6 +991,300 @@ mod tests {
             store.read_with(cx, |s, _| s.pending_adds_for(sol_id).len()),
             0,
             "UI row must disappear synchronously on cancel"
+        );
+    }
+
+    /// `make_bare_with_one_commit` always writes `seed.git` into the
+    /// directory it is handed, so a test that needs two distinct remotes
+    /// (the catalog refuses two rows pointing at the same repository) gives
+    /// each one its own parent.
+    async fn bare_repo(root: &std::path::Path, name: &str) -> PathBuf {
+        let parent = root.join(name);
+        std::fs::create_dir_all(&parent).expect("mkdir bare parent");
+        test_support::make_bare_with_one_commit(&parent).await
+    }
+
+    /// Two adds started before either one runs, whose catalog names derive to
+    /// the SAME folder. The folder reservation used to be taken against
+    /// `sol.members` only — and an in-flight add is not a member — so both
+    /// computed `<root>/Update-Deps`, and the second one's "wipe the stale
+    /// target" step did a `remove_dir_all` on the first member's freshly
+    /// cloned checkout and then pushed a second member on the same path.
+    #[gpui::test]
+    async fn concurrent_adds_deriving_one_folder_get_separate_directories(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempdir().expect("tempdir");
+        let first_bare = bare_repo(dir.path(), "first").await;
+        let second_bare = bare_repo(dir.path(), "second").await;
+        let cache_root = dir.path().join("cache");
+        let cfg_path = dir.path().join("solutions.json");
+        let solutions_root = dir.path().join("solutions");
+        std::fs::create_dir_all(&solutions_root).expect("mkdir solutions");
+
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+        let first_cat = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project(
+                    "Update Deps",
+                    first_bare.to_str().expect("path str"),
+                    Some("master".into()),
+                    cx,
+                )
+            })
+            .expect("first catalog");
+        let second_cat = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project(
+                    "Update-Deps",
+                    second_bare.to_str().expect("path str"),
+                    Some("master".into()),
+                    cx,
+                )
+            })
+            .expect("second catalog");
+        assert_eq!(
+            crate::folder_name::derive("Update Deps").as_deref(),
+            crate::folder_name::derive("Update-Deps").as_deref(),
+            "the premise of this test: both names derive to one folder",
+        );
+        let sol_id = store
+            .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
+            .expect("create solution");
+
+        let first = store.update(cx, |s, cx| {
+            s.add_member(sol_id, first_cat, cache_root.clone(), cx)
+        });
+        let second = store.update(cx, |s, cx| s.add_member(sol_id, second_cat, cache_root, cx));
+        first.await.expect("first add");
+        second.await.expect("second add");
+
+        let members = store.read_with(cx, |s, _| {
+            s.find_solution(sol_id).expect("solution").members.clone()
+        });
+        assert_eq!(members.len(), 2, "both adds must land");
+        assert_ne!(
+            members[0].local_path, members[1].local_path,
+            "two live members must never share a directory",
+        );
+        for member in &members {
+            assert!(
+                member.local_path.join(".git").exists(),
+                "{} must still hold its checkout",
+                member.local_path.display(),
+            );
+        }
+    }
+
+    /// The same race, but the two derived folders differ only in NON-ASCII
+    /// case. The reservation's `eq_ignore_ascii_case` called them two
+    /// folders while `rename`'s Unicode fold called them one, so on a
+    /// case-insensitive filesystem the second clone landed on top of the
+    /// first member's directory. Asserted through the shared predicate
+    /// rather than through path inequality, because on a case-sensitive
+    /// filesystem (this test's) the buggy pair really are two directories —
+    /// the damage only shows up on macOS/Windows.
+    #[gpui::test]
+    async fn concurrent_adds_differing_only_in_unicode_case_get_separate_folders(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let dir = tempdir().expect("tempdir");
+        let first_bare = bare_repo(dir.path(), "first").await;
+        let second_bare = bare_repo(dir.path(), "second").await;
+        let cache_root = dir.path().join("cache");
+        let cfg_path = dir.path().join("solutions.json");
+        let solutions_root = dir.path().join("solutions");
+        std::fs::create_dir_all(&solutions_root).expect("mkdir solutions");
+
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+        let first_cat = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project(
+                    "Проект Один",
+                    first_bare.to_str().expect("path str"),
+                    Some("master".into()),
+                    cx,
+                )
+            })
+            .expect("first catalog");
+        let second_cat = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project(
+                    "проект-Один",
+                    second_bare.to_str().expect("path str"),
+                    Some("master".into()),
+                    cx,
+                )
+            })
+            .expect("second catalog");
+        let sol_id = store
+            .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
+            .expect("create solution");
+
+        let first = store.update(cx, |s, cx| {
+            s.add_member(sol_id, first_cat, cache_root.clone(), cx)
+        });
+        let second = store.update(cx, |s, cx| s.add_member(sol_id, second_cat, cache_root, cx));
+        first.await.expect("first add");
+        second.await.expect("second add");
+
+        let folders: Vec<String> = store.read_with(cx, |s, _| {
+            s.find_solution(sol_id)
+                .expect("solution")
+                .members
+                .iter()
+                .filter_map(|m| Some(m.local_path.file_name()?.to_string_lossy().into_owned()))
+                .collect()
+        });
+        assert_eq!(folders.len(), 2, "both adds must land");
+        assert!(
+            !crate::folder_name::same_folder_name(&folders[0], &folders[1]),
+            "two members must not resolve to one directory on a case-insensitive \
+             filesystem, got {folders:?}",
+        );
+    }
+
+    /// The publish gate. Both refusals used to be missing: the `Ok` arm
+    /// pushed a member no matter what, so a Cancel that arrived during
+    /// `set_remote_url` / `git checkout` produced a `cancelled` completion
+    /// event AND a landed member on a path the next add would wipe.
+    #[gpui::test]
+    async fn an_abandoned_add_does_not_land_a_member(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = tempdir().expect("tempdir");
+        let bare = test_support::make_bare_with_one_commit(dir.path()).await;
+        let cache_root = dir.path().join("cache");
+        let cfg_path = dir.path().join("solutions.json");
+        let solutions_root = dir.path().join("solutions");
+        std::fs::create_dir_all(&solutions_root).expect("mkdir solutions");
+
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+        let cat_id = store
+            .update(cx, |s, cx| {
+                s.add_catalog_project(
+                    "Bare",
+                    bare.to_str().expect("path str"),
+                    Some("master".into()),
+                    cx,
+                )
+            })
+            .expect("add catalog");
+        let sol_id = store
+            .update(cx, |s, cx| {
+                s.create_solution("S", solutions_root.clone(), cx)
+            })
+            .expect("create solution");
+
+        // Hold the task so the in-flight entry stays put while we drive the
+        // gate by hand — racing a real Cancel against a real `git checkout`
+        // on a one-commit repo is not something a test can time.
+        let _task = store.update(cx, |s, cx| s.add_member(sol_id, cat_id, cache_root, cx));
+        let target = store
+            .read_with(cx, |s, _| {
+                s.find_solution(sol_id).map(|sol| sol.root.clone())
+            })
+            .expect("solution")
+            .join("Bare");
+        std::fs::create_dir_all(&target).expect("mkdir target");
+
+        let landed = store
+            .update(cx, |s, cx| {
+                s.land_added_member(sol_id, cat_id, "Bare", &target, true, cx)
+            })
+            .expect("gate");
+        assert!(!landed, "a cancelled add must not publish a member");
+
+        // The other half: nothing was cancelled, but the in-flight entry is
+        // gone — `remove_catalog_project_cascade` drops it when the catalog
+        // row is deleted mid-clone.
+        store.update(cx, |s, cx| s.cancel_add_member(sol_id, cat_id, cx));
+        let landed = store
+            .update(cx, |s, cx| {
+                s.land_added_member(sol_id, cat_id, "Bare", &target, false, cx)
+            })
+            .expect("gate");
+        assert!(
+            !landed,
+            "an add whose in-flight entry vanished must not publish a member"
+        );
+        assert!(
+            store.read_with(cx, |s, _| s
+                .find_solution(sol_id)
+                .expect("solution")
+                .members
+                .is_empty()),
+            "no member may exist for an abandoned add"
+        );
+
+        // …and the checkout it left behind is cleaned up rather than parked
+        // under the solution root for the next add to wipe.
+        let lock = store.read_with(cx, |s, _| Arc::clone(&s.fs_lock));
+        let weak = store.downgrade();
+        let mut async_cx = cx.to_async();
+        discard_abandoned_clone(&weak, &mut async_cx, &lock, sol_id, cat_id, "Bare", &target).await;
+        assert!(
+            !target.exists(),
+            "the abandoned clone must not be left on disk"
+        );
+    }
+
+    /// The guard that keeps the cleanup above from becoming the very data
+    /// loss it is cleaning up after: cancelling frees the reservation at
+    /// once, so another add may legitimately own the directory by the time
+    /// the abandoned task gets to delete it.
+    #[gpui::test]
+    async fn an_abandoned_clone_is_not_deleted_once_someone_else_owns_the_folder(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("solutions.json");
+        let solutions_root = dir.path().join("solutions");
+        std::fs::create_dir_all(&solutions_root).expect("mkdir solutions");
+
+        let store = cx.update(|cx| SolutionStore::for_test(cfg_path, cx));
+        let sol_id = store
+            .update(cx, |s, cx| s.create_solution("S", solutions_root, cx))
+            .expect("create solution");
+        store
+            .update(cx, |s, cx| s.add_empty_member(sol_id, "Frontend", cx))
+            .expect("add empty member");
+        let target = store.read_with(cx, |s, _| {
+            s.find_solution(sol_id).expect("solution").members[0]
+                .local_path
+                .clone()
+        });
+
+        store.read_with(cx, |s, _| {
+            assert!(
+                s.folder_claimed_by_other(sol_id, CatalogId(1), "Frontend"),
+                "a landed member owns its folder"
+            );
+            assert!(
+                s.folder_claimed_by_other(sol_id, CatalogId(1), "frontend"),
+                "ownership is decided by the shared case-insensitive predicate"
+            );
+            assert!(
+                !s.folder_claimed_by_other(sol_id, CatalogId(1), "Backend"),
+                "an unrelated folder is free"
+            );
+        });
+
+        let lock = store.read_with(cx, |s, _| Arc::clone(&s.fs_lock));
+        let weak = store.downgrade();
+        let mut async_cx = cx.to_async();
+        discard_abandoned_clone(
+            &weak,
+            &mut async_cx,
+            &lock,
+            sol_id,
+            CatalogId(1),
+            "Frontend",
+            &target,
+        )
+        .await;
+        assert!(
+            target.is_dir(),
+            "a live member's checkout must survive another add's cleanup"
         );
     }
 

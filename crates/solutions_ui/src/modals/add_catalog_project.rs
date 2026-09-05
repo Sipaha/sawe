@@ -307,12 +307,12 @@ mod tests {
         );
     }
 
-    fn build_modal<'a>(
-        cx: &'a mut TestAppContext,
+    fn build_modal(
+        cx: &mut TestAppContext,
     ) -> (
         gpui::Entity<AddCatalogProjectModal>,
         TempDir,
-        &'a mut VisualTestContext,
+        &mut VisualTestContext,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         cx.update(|cx| {

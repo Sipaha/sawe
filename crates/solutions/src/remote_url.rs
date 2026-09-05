@@ -32,6 +32,13 @@
 //! * **trailing `/` and `.git` are left alone** — both clone fine, and
 //!   `same_remote` already folds them for duplicate detection.
 
+// `git::RemoteUrl` (not `crate::git`, which is this crate's git *driver*) is
+// the workspace's one remote-URL parser: a `FromStr` that normalises scp-like
+// `user@host:path` to `ssh://` and then hands the rest to the `url` crate.
+// Parsing through it is what keeps this module from being a second, quietly
+// disagreeing parser.
+use git::RemoteUrl;
+
 /// Normalise `input`, or explain why it cannot be a git remote.
 ///
 /// The error message is tagged `invalid_remote:` so MCP callers can branch on
@@ -86,7 +93,39 @@ pub fn normalize_remote_url(input: &str) -> anyhow::Result<String> {
 /// Does this input have the shape of a URL (scheme form or scp-like
 /// `user@host:path`), as opposed to a plain filesystem path?
 fn looks_like_url(candidate: &str) -> bool {
-    candidate.contains("://") || is_scp_like(candidate)
+    parse_remote(candidate).is_some()
+}
+
+/// The module's one parse. `None` means "this is a filesystem path" — either
+/// because it has neither a scheme nor an scp-like shape, or because a real
+/// URL parser refused it.
+///
+/// The shape gate stays hand-written on purpose: it is what tells a Windows
+/// drive letter (`C:\src\repo`, which `Url` happily reads as scheme `c`) from
+/// a host, and it is where this fork is deliberately more permissive than
+/// [`RemoteUrl`] — `gitlab.example.com:group/repo` with no user part is a
+/// legitimate remote here. Everything *structural* (scheme, authority, path
+/// segments) then comes from `RemoteUrl` rather than from a second set of
+/// `split_once` calls that called everything before the first slash "the
+/// host" and everything after it "the path" — a query string ended up inside
+/// the path segments, so a `?next=…/-/tree/…` parameter turned a good clone
+/// URL into a rejection whose suggestion was cut off mid-query.
+fn parse_remote(candidate: &str) -> Option<RemoteUrl> {
+    if !candidate.contains("://") && !is_scp_like(candidate) {
+        return None;
+    }
+    // `RemoteUrl` rewrites scp-like input to `ssh://` only when it carries a
+    // `user@` part. Lend the user-less form one so the rewrite happens in the
+    // one place that owns it; nothing downstream reads userinfo off an
+    // scp-like remote.
+    let borrowed;
+    let to_parse = if candidate.contains("://") || candidate.contains('@') {
+        candidate
+    } else {
+        borrowed = format!("git@{candidate}");
+        borrowed.as_str()
+    };
+    to_parse.parse::<RemoteUrl>().ok()
 }
 
 /// `git@gitlab.example.com:group/repo.git` — a host before the first colon and
@@ -107,21 +146,41 @@ fn is_scp_like(candidate: &str) -> bool {
 /// If `candidate` is a forge *browse* URL, return the clone URL it was meant
 /// to be. Recognises the two segments every GitLab / GitHub web link goes
 /// through: GitLab's `/-/` separator and the `tree` / `blob` view segments.
+///
+/// Restricted to `http`/`https` because that is what the rejection claims —
+/// "that is a web page URL". Nobody browses a repository over `ssh://`, and
+/// reconstructing an scp-like remote out of the `ssh://` form `RemoteUrl`
+/// normalises it to would be a lossy round trip for no benefit.
 fn browse_url_suggestion(candidate: &str) -> Option<String> {
-    let (scheme, rest) = candidate.split_once("://")?;
-    let (host, path) = rest.split_once('/')?;
-    let segments: Vec<&str> = path.split('/').collect();
+    let url = parse_remote(candidate)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    // Empty segments are dropped first: a trailing `/` makes `path_segments`
+    // yield a final `""`, which used to read as "something follows the view
+    // segment" and got `https://host/org/tree/` rejected as a browse URL
+    // while the identical `https://host/org/tree` was accepted.
+    let segments: Vec<&str> = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect();
     let marker = segments
         .iter()
         .position(|segment| matches!(*segment, "-" | "tree" | "blob"))?;
-    // A repository can legitimately be named `tree`; a view segment only
-    // counts when something follows it (a ref, or a ref plus a path) and
-    // something precedes it (the project path itself).
-    if marker == 0 || marker + 1 >= segments.len() {
+    // A view segment only counts when something follows it (a ref, or a ref
+    // plus a path) and a whole project path precedes it: a browse URL is
+    // `/<namespace>/<project>/-/tree/<ref>` on GitLab and
+    // `/<org>/<repo>/tree/<ref>` on GitHub, so there are always at least two
+    // segments in front. Requiring them is what keeps a repository or a
+    // subgroup that is genuinely *named* `tree`/`blob` (`/group/tree/repo`)
+    // out of the browse-URL bucket.
+    if marker < 2 || marker + 1 >= segments.len() {
         return None;
     }
     Some(format!(
-        "{scheme}://{host}/{}",
+        "{}://{}/{}",
+        url.scheme(),
+        url.authority(),
         segments[..marker].join("/")
     ))
 }
@@ -203,5 +262,70 @@ mod tests {
     fn a_repository_actually_named_tree_or_blob_is_not_a_browse_url() {
         assert_eq!(ok("https://host/org/tree"), "https://host/org/tree");
         assert_eq!(ok("https://host/org/blob.git"), "https://host/org/blob.git");
+        // A trailing `/` is not "something after the view segment". It used
+        // to be: `path.split('/')` yields a final empty segment, so the same
+        // repository was accepted without the slash and rejected with it.
+        assert_eq!(ok("https://host/org/tree/"), "https://host/org/tree/");
+        assert_eq!(ok("https://host/org/blob/"), "https://host/org/blob/");
+        // A GitLab subgroup or project genuinely named `tree` / `blob`. A
+        // real browse URL always has the full project path in front of the
+        // view segment, so one leading segment is not enough to call this a
+        // web page.
+        assert_eq!(
+            ok("https://host/group/tree/repo"),
+            "https://host/group/tree/repo"
+        );
+        assert_eq!(
+            ok("https://host/group/blob/repo"),
+            "https://host/group/blob/repo"
+        );
+    }
+
+    /// Everything structural now comes out of `git::RemoteUrl`. The old
+    /// hand-rolled split called everything after the first slash "the path",
+    /// so the query string was cut into path segments: a `?next=…` (or any
+    /// other parameter carrying a browse path) made a perfectly good clone
+    /// URL fail the browse check, and the "try this instead" suggestion it
+    /// printed ended mid-query.
+    #[test]
+    fn a_query_string_is_not_part_of_the_path() {
+        assert_eq!(
+            ok("https://host/org/repo?next=/-/tree/main"),
+            "https://host/org/repo?next=/-/tree/main",
+        );
+    }
+
+    /// The authority the suggestion reproduces is the parsed one, so
+    /// userinfo and a non-default port survive it and the browse query does
+    /// not.
+    #[test]
+    fn the_suggested_clone_url_keeps_userinfo_and_port_and_drops_the_query() {
+        let message = err("https://user@host.example:8443/org/repo/-/tree/main?ref_type=heads");
+        assert!(
+            message.contains("https://user@host.example:8443/org/repo"),
+            "the suggestion must reproduce authority and drop the browse query, got: {message}",
+        );
+        assert!(
+            !message.contains("ref_type"),
+            "a browse query string has no place in a clone URL, got: {message}",
+        );
+    }
+
+    /// The fork accepts a user-less scp-like remote, which `RemoteUrl`'s own
+    /// `FromStr` refuses; routing it through one parser must not narrow that.
+    #[test]
+    fn scp_like_remotes_survive_with_and_without_a_user_part() {
+        assert_eq!(
+            ok("gitlab.example.com:group/repo.git"),
+            "gitlab.example.com:group/repo.git"
+        );
+        // Still URL-shaped, so a fragment is still stripped from it.
+        assert_eq!(
+            ok("gitlab.example.com:group/repo.git#"),
+            "gitlab.example.com:group/repo.git"
+        );
+        // …and a Windows drive letter is still a path, not a host, so its
+        // `#` survives.
+        assert_eq!(ok("C:\\src\\odd#name.git"), "C:\\src\\odd#name.git");
     }
 }
