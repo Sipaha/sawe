@@ -18,12 +18,13 @@ use crate::commit_refs;
 use git::repository::{CommitDetails, CommitDiff, CommitFile};
 use git::status::{StatusCode, TrackedStatus};
 use gpui::{
-    AnyElement, ClipboardItem, FontWeight, StyleRefinement, TextRun, TextStyleRefinement,
+    AnyElement, ClipboardItem, EntityId, FontWeight, StyleRefinement, TextRun, TextStyleRefinement,
     UnderlineStyle, canvas, rems,
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::OnceLock;
 use time::{UtcOffset, format_description::BorrowedFormatItem};
@@ -1068,7 +1069,14 @@ pub struct CommitSelection {
 /// Only the first sha is described. A multi-commit selection renders a bare
 /// count with no room for refs, so carrying every row's decorations would be
 /// work for a surface that never paints them.
-#[derive(Clone, Default)]
+///
+/// `PartialEq` is load-bearing rather than derived for convenience: a re-push
+/// of the same sha is only *the same selection* when the decorations match too,
+/// and [`GitPanel::show_commit_selection`] tells a stale refresh from a real
+/// one by comparing them. Refs are not immutable for a sha — creating a tag,
+/// moving or deleting a branch, or a fetch changes them under a commit that is
+/// otherwise exactly the one the tab is showing.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct CommitRefs {
     /// Git's `%D` decorations verbatim and in git's order — `main`,
     /// `origin/main`, `HEAD -> feature/x`, `tag: 2.41.0`.
@@ -1147,9 +1155,22 @@ pub(super) struct CommitTabState {
     /// and "remote repository" — all three render nothing, so the distinction
     /// exists only for tests and for [`GitPanel::retry_failed_commit_loads`].
     pub(super) branches: LoadState<Vec<SharedString>>,
-    /// Tags containing the commit, loaded by the same task as `branches` and
-    /// therefore in lockstep with it. Same three-way collapse: loading, no
-    /// tags and remote repository all render nothing.
+    /// The tags *pointing at* the commit.
+    ///
+    /// Normally `Loaded` from the moment the tab is pointed at a commit and
+    /// without any git process at all: git's `%D` decorations already name
+    /// every tag on the commit, the graph hands them over with the selection,
+    /// and [`commit_refs::tags_pointing_at`] extracts them — the same reason
+    /// [`CommitRefs`] exists at all. A `git tag --points-at` per settled
+    /// selection was a third process re-deriving what the row one line below is
+    /// already painting, once per arrow-key stop.
+    ///
+    /// It is a [`LoadState`] rather than a plain `Vec` only for the one case
+    /// the decorations cannot answer: a selection that carries *no* decorations
+    /// at all — a caller with none to hand — where the query is still the only
+    /// source. `branches` is loaded by that same task, but the two are no
+    /// longer in lockstep and must not be treated as if they were: on the
+    /// common path this is `Loaded` while `branches` is still `Loading`.
     tags: LoadState<Vec<SharedString>>,
     /// Whether the containing-branches line is spelling out every branch.
     /// Lives here, so re-pointing the tab at another commit resets it with the
@@ -1168,21 +1189,61 @@ pub(super) struct CommitTabState {
     pub(super) collapsed_dirs: HashSet<SharedString>,
     scroll_handle: UniformListScrollHandle,
     selected_file: Option<RepoPath>,
+    /// Memo of the collapsed ref row's fit — see [`GitPanel::ref_row_fit`],
+    /// which is called on every panel render and shapes one line of text per
+    /// decoration to answer it.
+    ///
+    /// In a `RefCell` because rendering takes `&self`, and on the state rather
+    /// than the panel because every input but the row width is a property of
+    /// the selected commit: re-pointing the tab drops the memo with the rest of
+    /// what described the old one.
+    ref_row_fit: RefCell<Option<RefRowFit>>,
+    /// How many of those fits were misses — i.e. actually shaped the names.
+    /// The memo has no other observable trace, and a memo that is never
+    /// asserted on is a memo the next refactor deletes.
+    #[cfg(test)]
+    ref_row_fit_computations: std::cell::Cell<usize>,
     _details_task: Option<Task<()>>,
     _diff_task: Option<Task<()>>,
-    /// The one debounced task behind both `branches` and `tags` — see
+    /// The debounced containment task: `branches` always, and `tags` only for
+    /// a selection with no decorations to derive them from — see
     /// [`GitPanel::load_commit_tab_containment`].
     _containment_task: Option<Task<()>>,
+}
+
+/// A remembered [`GitPanel::ref_row_fit`] answer, with every input that
+/// produced it.
+///
+/// The fit costs one `shape_line` per decoration plus one for the toggle label
+/// and a branch-protection lookup per name, and the git panel re-renders on
+/// status polls, hover, scroll and every tree toggle — so a release commit with
+/// thirty decorations was paying thirty glyph shapings a frame for an answer
+/// that changes only when one of these fields does.
+struct RefRowFit {
+    names: Vec<SharedString>,
+    /// `None` is the pre-measurement frame, which is an input like any other:
+    /// it answers "paint every chip" and must not be memoized as if a width had
+    /// been measured.
+    row_width: Option<Pixels>,
+    expanded: bool,
+    /// Decides the check glyph, which widens the chip that carries it.
+    head_branch_name: Option<SharedString>,
+    /// Decides the lock glyph (S-SOL-PRT) the same way.
+    work_dir: PathBuf,
+    /// Every width in the prediction is in rems, so the UI font size is an
+    /// input to all of them.
+    rem_size: Pixels,
+    fit: usize,
 }
 
 impl CommitTabState {
     fn new(selection: CommitSelection) -> Self {
         Self {
+            tags: tag_row_from_decorations(&selection.refs),
             selection,
             details: LoadState::Idle,
             diff: LoadState::Idle,
             branches: LoadState::Idle,
-            tags: LoadState::Idle,
             branches_expanded: false,
             tags_expanded: false,
             refs_expanded: false,
@@ -1190,11 +1251,38 @@ impl CommitTabState {
             collapsed_dirs: HashSet::default(),
             scroll_handle: UniformListScrollHandle::new(),
             selected_file: None,
+            ref_row_fit: RefCell::new(None),
+            #[cfg(test)]
+            ref_row_fit_computations: std::cell::Cell::new(0),
             _details_task: None,
             _diff_task: None,
             _containment_task: None,
         }
     }
+
+    /// How many times [`GitPanel::ref_row_fit`] has had to shape the row's
+    /// names for this selection. The memo is invisible from outside — a fit is
+    /// a fit however it was arrived at — so this is what
+    /// `test_the_ref_row_fit_is_shaped_once_per_change_of_its_inputs` holds
+    /// onto.
+    #[cfg(test)]
+    fn ref_row_fit_computations(&self) -> usize {
+        self.ref_row_fit_computations.get()
+    }
+}
+
+/// The tag row's synchronous answer for a selection: the `tag: ` decorations
+/// it already carries.
+///
+/// `Idle` — i.e. "ask git" — only when the selection carries no decorations at
+/// all. Decorations that carry no tag are a *loaded, empty* tag row rather than
+/// an unanswered one: git lists every tag pointing at a commit among its `%D`
+/// decorations, so a decorated commit with no `tag: ` among them has none.
+fn tag_row_from_decorations(refs: &CommitRefs) -> LoadState<Vec<SharedString>> {
+    if refs.names.is_empty() {
+        return LoadState::Idle;
+    }
+    LoadState::Loaded(commit_refs::tags_pointing_at(&refs.names))
 }
 
 /// The hosting provider of the repository the Commit tab is showing — used for
@@ -1235,8 +1323,9 @@ impl GitPanel {
     /// routes into the tab (its tab-bar row, `git_panel::ActivateCommitTab`) go
     /// through `set_active_tab`, which does focus.
     ///
-    /// A [`CommitSelectionSource::Background`] push refreshes an open tab in
-    /// place and stops there — see that variant for why.
+    /// A [`CommitSelectionSource::Background`] push may only REFRESH the tab it
+    /// already describes — see that variant, and [`Self::commit_tab_describes`]
+    /// for why "describes" is a repository plus a sha list rather than a sha.
     pub fn show_commit_selection(
         &mut self,
         selection: CommitSelection,
@@ -1252,20 +1341,27 @@ impl GitPanel {
             return;
         };
 
-        if source == CommitSelectionSource::Background && !self.commit_tab_is_open() {
+        let already_showing = self.commit_tab_describes(&selection);
+        // A background re-anchor is not a gesture, and there is more than one
+        // graph: another Solution member's, a file-history pane's, and the same
+        // graph's own refetch after a `git fetch` landed in a terminal. Every
+        // one of them re-anchors through this call, so a `Background` push that
+        // is not about the commit on screen must not touch it — it would swap
+        // the body out from under a user who is reading it, and a re-anchor of
+        // a multi-row selection would collapse `[a, b, c]` to `[a]`. Refusing
+        // it here rather than only refusing to ACTIVATE the tab is the whole
+        // difference: the fall-through below replaces `commit_tab` outright.
+        if source == CommitSelectionSource::Background && !already_showing {
             return;
         }
 
-        let already_showing = self.commit_tab.as_ref().is_some_and(|state| {
-            state.selection.repository.entity_id() == selection.repository.entity_id()
-                && state.selection.shas == selection.shas
-        });
         if already_showing {
             // Re-selecting the same row must not restart a load that worked, or
             // throw away the tree's scroll position and collapsed directories.
             // A load that FAILED is the exception: this selection is the only
             // gesture that reaches back here, so refusing it too would make the
             // error permanent until the user picks some other commit.
+            self.adopt_commit_tab_refs(selection.refs, sha, cx);
             self.retry_failed_commit_loads(sha, cx);
             if source == CommitSelectionSource::UserGesture {
                 self.activate_commit_tab_without_focus(cx);
@@ -1288,6 +1384,58 @@ impl GitPanel {
             self.activate_commit_tab_without_focus(cx);
         }
         cx.notify();
+    }
+
+    /// Whether the open Commit tab is already describing exactly this
+    /// selection: the same repository AND the same shas.
+    ///
+    /// The repository half is not ceremony. Two Solution members are routinely
+    /// clones of the same repository, so the same sha exists in both and a
+    /// comparison on shas alone would call a push from one member's graph a
+    /// refresh of the other member's tab.
+    ///
+    /// Deliberately *not* including the refs: they are not immutable for a sha
+    /// (a tag created, a branch moved or deleted, a fetch) and a re-push with
+    /// fresh decorations is a refresh of this very tab, not a different one —
+    /// see [`Self::adopt_commit_tab_refs`], which is what makes the difference
+    /// visible.
+    fn commit_tab_describes(&self, selection: &CommitSelection) -> bool {
+        self.commit_tab.as_ref().is_some_and(|state| {
+            state.selection.repository.entity_id() == selection.repository.entity_id()
+                && state.selection.shas == selection.shas
+        })
+    }
+
+    /// Take the decorations of a re-pushed selection the tab is already
+    /// showing, and re-derive what they feed.
+    ///
+    /// `CommitRefs` are NOT immutable for a sha. Creating a tag, moving or
+    /// deleting a branch, or a fetch changes them, and the graph re-pushes the
+    /// same commit with fresh ones — where discarding them left the tab
+    /// painting stale chips and a stale tag row while the graph row a few
+    /// pixels below already showed the new tag.
+    ///
+    /// Only the decorations and what derives from them are touched: the tree's
+    /// scroll position, its collapsed directories and a diff or details load
+    /// that succeeded all belong to the commit, which has not changed.
+    fn adopt_commit_tab_refs(&mut self, refs: CommitRefs, sha: Oid, cx: &mut Context<Self>) {
+        let Some(state) = self.commit_tab.as_mut() else {
+            return;
+        };
+        if state.selection.refs == refs {
+            return;
+        }
+        state.selection.refs = refs;
+        state.tags = tag_row_from_decorations(&state.selection.refs);
+        // Decorations that answer the tag row for themselves are the common
+        // case; a refresh that leaves the selection with none at all (every ref
+        // on the commit deleted) has to fall back to the query the same way a
+        // fresh selection without decorations does, rather than keep the tags
+        // it derived from the decorations that are gone.
+        if matches!(state.tags, LoadState::Idle) {
+            let repository = state.selection.repository.clone();
+            self.load_commit_tab_containment(sha, &repository, cx);
+        }
     }
 
     /// Activate the Commit tab without taking focus — see
@@ -1339,12 +1487,15 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         let details = repository.update(cx, |repository, _| repository.show(sha.to_string()));
+        let target = (repository.entity_id(), sha);
         let task = cx.spawn(async move |this, cx| {
             let loaded = details.await;
             this.update(cx, |this, cx| {
                 // Drop a load that resolved after the selection moved on,
-                // rather than pairing it with whatever is shown now.
-                if this.commit_tab_sha() != Some(sha) {
+                // rather than pairing it with whatever is shown now. The
+                // repository is half of "moved on" — see
+                // [`Self::commit_tab_target`].
+                if this.commit_tab_target() != Some(target) {
                     return;
                 }
                 let loaded = match loaded {
@@ -1400,10 +1551,11 @@ impl GitPanel {
         let diff = repository.update(cx, |repository, _| {
             repository.load_commit_diff(sha.to_string())
         });
+        let target = (repository.entity_id(), sha);
         let task = cx.spawn(async move |this, cx| {
             let loaded = diff.await;
             this.update(cx, |this, cx| {
-                if this.commit_tab_sha() != Some(sha) {
+                if this.commit_tab_target() != Some(target) {
                     return;
                 }
                 let loaded = match loaded {
@@ -1433,24 +1585,29 @@ impl GitPanel {
         }
     }
 
-    /// Load the branches containing the commit *and* the tags pointing at it
-    /// into the open Commit tab, after [`BRANCHES_CONTAINING_DEBOUNCE`].
+    /// Load the branches containing the commit into the open Commit tab, after
+    /// [`BRANCHES_CONTAINING_DEBOUNCE`] — and the tags pointing at it too, but
+    /// only for a selection that carries no decorations to derive them from.
     ///
-    /// The two halves are deliberately different git queries: `In N branches:`
-    /// means reachability, matching IDEA, while the tag row means the commit's
-    /// own tags. Only the branch half is containment, which is why the shared
-    /// debounce constant keeps its branch-flavoured name.
+    /// **The tag half is the exception now, not the other half of a pair.**
+    /// Git's `%D` already lists every tag pointing at the commit and the graph
+    /// hands those decorations over with the selection, so
+    /// [`tag_row_from_decorations`] answers the tag row synchronously, for free,
+    /// at the moment the tab is pointed at the commit. Spending a
+    /// `git tag --points-at` on every settled selection was one process per
+    /// arrow-key stop to re-derive what the graph row one line below is already
+    /// painting — the very thing [`CommitRefs`] exists to avoid. `branches` has
+    /// no such shortcut: `%D` says nothing about reachability, and `In N
+    /// branches:` is a reachability question.
     ///
-    /// One task for both, not two. The debounce is the reason: the tab is
-    /// driven by graph selection including arrow-key movement, so a second
-    /// independent task would need its own timer and would queue its own job
-    /// on every row the user travels — reintroducing exactly the queue-jamming
-    /// the debounce was added to prevent. Folding them also collapses the
-    /// staleness re-check to a single point: both fields are assigned inside
-    /// one guarded block, so they cannot disagree about which commit they
-    /// describe. The two queries are issued together and awaited with
-    /// `join!` rather than in sequence, so the pair costs one round trip
-    /// through the repository's job queue rather than two.
+    /// So `branches` and `tags` are no longer in lockstep and nothing here
+    /// pretends they are: on the common path `tags` is already `Loaded` while
+    /// this task is still running, and it is left alone.
+    ///
+    /// The debounce is not optional either way: the tab is driven by graph
+    /// selection including arrow-key movement, so without it holding an arrow
+    /// key queues one `git branch --contains` per row onto the repository's job
+    /// queue, ahead of the commit diff the tab actually paints first.
     ///
     /// Unlike the tab's other two loads this one cannot ask the repository up
     /// front — the whole point of the debounce is that the job is not queued
@@ -1463,6 +1620,13 @@ impl GitPanel {
         repository: &Entity<Repository>,
         cx: &mut Context<Self>,
     ) {
+        let target = (repository.entity_id(), sha);
+        // Only the selection that has no decorations at all still costs a
+        // `git tag --points-at`; everything else already knows its tags.
+        let query_tags = self
+            .commit_tab
+            .as_ref()
+            .is_some_and(|state| matches!(state.tags, LoadState::Idle | LoadState::Failed(_)));
         let repository = repository.downgrade();
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -1471,22 +1635,30 @@ impl GitPanel {
             let Ok((branches, tags)) = repository.update(cx, |repository, _| {
                 (
                     repository.branches_containing(sha.to_string()),
-                    repository.tags_pointing_at(sha.to_string()),
+                    query_tags.then(|| repository.tags_pointing_at(sha.to_string())),
                 )
             }) else {
                 return;
             };
-            let (branches, tags) = futures::join!(branches, tags);
+            // Issued together and awaited with `join!` rather than in sequence,
+            // so the pair costs one round trip through the repository's job
+            // queue rather than two.
+            let (branches, tags) = futures::join!(branches, async {
+                match tags {
+                    Some(tags) => Some(tags.await),
+                    None => None,
+                }
+            });
             this.update(cx, |this, cx| {
                 // Same guard as the other two loads: a response that resolved
-                // after the selection moved on describes a commit that is no
-                // longer on screen.
-                if this.commit_tab_sha() != Some(sha) {
+                // after the selection moved on describes a commit — or a
+                // repository — that is no longer on screen.
+                if this.commit_tab_target() != Some(target) {
                     return;
                 }
                 // `what` is a whole noun phrase, not just the ref kind: the
                 // two halves ask different questions and an error that says
-                // "tags containing" would name a query we no longer run.
+                // "tags containing" would name a query we do not run.
                 let loaded = |what: &str, response| match response {
                     Ok(Ok(names)) => LoadState::Loaded(names),
                     Ok(Err(error)) => LoadState::Failed(SharedString::from(format!(
@@ -1499,10 +1671,12 @@ impl GitPanel {
                     ))),
                 };
                 let branches = loaded("branches containing", branches);
-                let tags = loaded("tags on", tags);
+                let tags = tags.map(|tags| loaded("tags on", tags));
                 if let Some(state) = this.commit_tab.as_mut() {
                     state.branches = branches;
-                    state.tags = tags;
+                    if let Some(tags) = tags {
+                        state.tags = tags;
+                    }
                 }
                 cx.notify();
             })
@@ -1510,9 +1684,9 @@ impl GitPanel {
         });
         if let Some(state) = self.commit_tab.as_mut() {
             state.branches = LoadState::Loading;
-            state.tags = LoadState::Loading;
-            state.branches_expanded = false;
-            state.tags_expanded = false;
+            if query_tags {
+                state.tags = LoadState::Loading;
+            }
             state._containment_task = Some(task);
         }
     }
@@ -1521,10 +1695,11 @@ impl GitPanel {
     /// [`Event::CommitTabClosed`] so the git graph can clear the row selection
     /// that opened it.
     ///
-    /// The event carries the shas the tab was describing: the event reaches
-    /// every git graph in the window, and one pinned to another repository (or
-    /// a second graph with its own selection) must not lose its rows because
-    /// somebody else's tab closed.
+    /// The event carries the repository and the shas the tab was describing:
+    /// it reaches every git graph in the window, and one pinned to another
+    /// repository (or a second graph with its own selection) must not lose its
+    /// rows because somebody else's tab closed. Both halves are needed — two
+    /// clones of one project in a Solution answer to the same shas.
     ///
     /// Focus is left alone on the way out for the same reason
     /// [`Self::show_commit_selection`] does not take it: the close can arrive
@@ -1540,7 +1715,10 @@ impl GitPanel {
         if self.active_tab == GitPanelTab::Commit {
             self.active_tab = GitPanelTab::Changes;
         }
-        cx.emit(Event::CommitTabClosed(closed.selection.shas));
+        cx.emit(Event::CommitTabClosed {
+            repository: closed.selection.repository.read(cx).id,
+            shas: closed.selection.shas,
+        });
         cx.notify();
     }
 
@@ -1583,11 +1761,21 @@ impl GitPanel {
             .is_some_and(|state| matches!(state.diff, LoadState::Loaded(_)))
     }
 
-    /// The sha whose details the Commit tab is showing, if it is showing a
-    /// single commit rather than a multi-row selection summary.
-    fn commit_tab_sha(&self) -> Option<Oid> {
-        match self.commit_tab.as_ref()?.selection.shas.as_slice() {
-            [sha] => Some(*sha),
+    /// The commit the Commit tab is showing — the *repository* and the sha —
+    /// if it is showing a single commit rather than a multi-row selection
+    /// summary.
+    ///
+    /// The staleness guard on all three of the tab's background loads compares
+    /// against this rather than against the sha alone. Two Solution members are
+    /// routinely clones of the same repository, so a load started for
+    /// repository A and resolving after the tab has been re-pointed at the same
+    /// sha in repository B passes a sha-only guard: it then overwrites B's
+    /// answer with A's, or — worse, because nothing retries it — hides B's
+    /// `Failed` state behind a `Loaded` that describes a different checkout.
+    fn commit_tab_target(&self) -> Option<(EntityId, Oid)> {
+        let selection = &self.commit_tab.as_ref()?.selection;
+        match selection.shas.as_slice() {
+            [sha] => Some((selection.repository.entity_id(), *sha)),
             _ => None,
         }
     }
@@ -1979,11 +2167,9 @@ impl GitPanel {
                             ),
                     ),
                 },
-                CommitTabSection::Refs => match self.render_commit_refs_row(state, painted_refs, cx)
-                {
-                    Some(row) => body.child(row),
-                    None => body,
-                },
+                CommitTabSection::Refs => {
+                    body.child(self.render_commit_refs_row(state, painted_refs, cx))
+                }
                 CommitTabSection::Tags => {
                     let expanded = state.tags_expanded;
                     let formatted = match &state.tags {
@@ -2136,7 +2322,10 @@ impl GitPanel {
             .branch
             .as_ref()
             .map(|branch| SharedString::from(branch.name().to_string()));
-        (head_branch_name, repository.work_directory_abs_path.to_path_buf())
+        (
+            head_branch_name,
+            repository.work_directory_abs_path.to_path_buf(),
+        )
     }
 
     /// The collapsed row's toggle label. It carries the count where the
@@ -2181,23 +2370,80 @@ impl GitPanel {
     /// chip: the unmeasured answer must not hide a name from [`uncharted_tags`],
     /// the chips truncate rather than overflow, and the measurement lands on the
     /// next frame.
+    ///
+    /// **Memoized on [`CommitTabState`], because this runs on every panel
+    /// render and the panel re-renders on status polls, hover, scroll and every
+    /// tree toggle.** The answer costs one `shape_line` per decoration — plus
+    /// one for the toggle label and a branch-protection lookup per name — and a
+    /// release commit carries ten to thirty of them, so an unmemoized fit was
+    /// shaping thirty lines of text a frame to re-derive a number that changes
+    /// only when [`RefRowFit`]'s fields do.
     fn ref_row_fit(&self, state: &CommitTabState, window: &Window, cx: &App) -> usize {
         let names = &state.selection.refs.names;
         if state.refs_expanded || names.len() <= 1 {
             return names.len();
         }
-        let Some(row_width) = self.commit_refs_row_width else {
-            return names.len();
-        };
+        let row_width = self.commit_refs_row_width;
 
         let (head_branch_name, work_dir) = Self::ref_chip_context(state, cx);
+        let rem_size = window.rem_size();
+        let memo = state.ref_row_fit.borrow();
+        if let Some(memo) = memo.as_ref()
+            && memo.row_width == row_width
+            && memo.expanded == state.refs_expanded
+            && memo.rem_size == rem_size
+            && memo.head_branch_name == head_branch_name
+            && memo.work_dir == work_dir
+            && memo.names == *names
+        {
+            return memo.fit;
+        }
+        drop(memo);
+
+        let fit = Self::compute_ref_row_fit(
+            names,
+            row_width,
+            head_branch_name.as_ref(),
+            &work_dir,
+            window,
+            cx,
+        );
+        #[cfg(test)]
+        state
+            .ref_row_fit_computations
+            .set(state.ref_row_fit_computations.get() + 1);
+        *state.ref_row_fit.borrow_mut() = Some(RefRowFit {
+            names: names.clone(),
+            row_width,
+            expanded: state.refs_expanded,
+            head_branch_name,
+            work_dir,
+            rem_size,
+            fit,
+        });
+        fit
+    }
+
+    /// The fit itself, with no memo and no state: the shaped widths of every
+    /// name against the row's measured width.
+    fn compute_ref_row_fit(
+        names: &[SharedString],
+        row_width: Option<Pixels>,
+        head_branch_name: Option<&SharedString>,
+        work_dir: &Path,
+        window: &Window,
+        cx: &App,
+    ) -> usize {
+        let Some(row_width) = row_width else {
+            return names.len();
+        };
         let widths: Vec<Pixels> = names
             .iter()
             .map(|name| {
                 commit_refs::ref_chip_width(
                     name,
-                    commit_refs::is_head_ref(name.as_ref(), head_branch_name.as_ref()),
-                    Some(work_dir.as_path()),
+                    commit_refs::is_head_ref(name.as_ref(), head_branch_name),
+                    Some(work_dir),
                     window,
                     cx,
                 )
@@ -2220,15 +2466,54 @@ impl GitPanel {
         )
     }
 
+    /// The ref row's outer box, shared by the row that paints chips and by the
+    /// zero-height carrier that only measures.
+    ///
+    /// One builder rather than two, because the measurement is only worth
+    /// anything while the two agree: the canvas reports the width of this box's
+    /// CONTENT, so a carrier whose horizontal padding drifted from the row's
+    /// would hand the fit a budget a few pixels off the row it is budgeting for.
+    fn commit_refs_row_frame() -> Div {
+        h_flex().flex_shrink_0().w_full().px_2()
+    }
+
+    /// The canvas that reports the ref row's width into
+    /// [`GitPanel::commit_refs_row_width`].
+    ///
+    /// Safe to feed back into `render` only because the measured quantity does
+    /// not depend on the decision it drives: the row is `w_full` inside the
+    /// panel, so its width is the panel's regardless of how many chips end up
+    /// inside it. Same reasoning, and same `cx.defer` hop, as
+    /// `project_tab_strip`'s canvas.
+    fn commit_refs_row_measure(cx: &mut Context<Self>) -> impl Styled + IntoElement {
+        canvas(
+            cx.processor(|this: &mut Self, bounds: Bounds<Pixels>, _window, cx| {
+                if this.commit_refs_row_width == Some(bounds.size.width) {
+                    return;
+                }
+                this.commit_refs_row_width = Some(bounds.size.width);
+                // A notify raised during a draw is thrown away by
+                // `Window::invalidate_view`, so this has to hop out of the
+                // frame — and the change check above is what stops it from
+                // re-rendering, re-prepainting and notifying forever.
+                let panel = cx.entity();
+                cx.defer(move |cx| panel.update(cx, |_, cx| cx.notify()));
+            }),
+            |_bounds, _state, _window, _cx| {},
+        )
+    }
+
     /// The refs pointing at the commit, as the chips the graph's own row for it
     /// paints — see [`crate::commit_refs`], which both surfaces build them
     /// with, and [`CommitRefs`] for why the panel is handed them rather than
     /// asking git itself.
     ///
-    /// `None`, and therefore no element at all, when nothing points at the
-    /// commit. That is most commits, and an empty row would still spend its
-    /// padding out of the changed-files tree's budget — the same reason the two
-    /// containment rows below render nothing rather than an empty line.
+    /// Nothing but a zero-height width probe when no ref points at the commit.
+    /// That is most commits, and a row that spent its padding on them would
+    /// take it out of the changed-files tree's budget — the same reason the two
+    /// containment rows below render nothing rather than an empty line. The
+    /// probe stays because the *width* is a property of the panel rather than of
+    /// the commit, and it is what the next decorated commit is fitted against.
     ///
     /// **No `+N`, no threshold, and one height whatever the commit carries.**
     /// The row exists to answer "which branch is this commit on", so it must not
@@ -2270,10 +2555,23 @@ impl GitPanel {
         state: &CommitTabState,
         painted: usize,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> AnyElement {
         let names = &state.selection.refs.names;
         if names.is_empty() {
-            return None;
+            // No chips, but the width still has to be measured. The budget the
+            // fit above spends is only ever re-measured while this row is on
+            // screen, so a panel resized while an UNDECORATED commit was
+            // selected would fit the next decorated one against the width the
+            // panel had before the drag — a frame of chips clipped by
+            // `overflow_hidden`, a wrong `Show N more` count, and
+            // [`uncharted_tags`] subtracting against a prefix that was never
+            // painted. A zero-height carrier for the canvas costs the
+            // changed-files tree nothing (which is why the row itself is absent
+            // rather than empty) and keeps the width honest between commits.
+            return Self::commit_refs_row_frame()
+                .h_0()
+                .child(Self::commit_refs_row_measure(cx).w_full().h_0())
+                .into_any_element();
         }
 
         let (head_branch_name, work_dir) = Self::ref_chip_context(state, cx);
@@ -2282,31 +2580,11 @@ impl GitPanel {
         let painted = painted.min(names.len());
         let hidden = names.len() - painted;
 
-        // Measures the width the row actually has, which is what decides how
-        // many chips are painted above. Safe to feed back into `render` only
-        // because the measured quantity does not depend on the decision it
-        // drives: the row is `w_full` inside the panel, so its width is the
-        // panel's regardless of how many chips end up inside it. Same reasoning,
-        // and same `cx.defer` hop, as `project_tab_strip`'s canvas.
-        let measure = canvas(
-            cx.processor(|this: &mut Self, bounds: Bounds<Pixels>, _window, cx| {
-                if this.commit_refs_row_width == Some(bounds.size.width) {
-                    return;
-                }
-                this.commit_refs_row_width = Some(bounds.size.width);
-                // A notify raised during a draw is thrown away by
-                // `Window::invalidate_view`, so this has to hop out of the
-                // frame — and the change check above is what stops it from
-                // re-rendering, re-prepainting and notifying forever.
-                let panel = cx.entity();
-                cx.defer(move |cx| panel.update(cx, |_, cx| cx.notify()));
-            }),
-            |_bounds, _state, _window, _cx| {},
-        )
-        .size_full()
-        .absolute()
-        .top_0()
-        .left_0();
+        let measure = Self::commit_refs_row_measure(cx)
+            .size_full()
+            .absolute()
+            .top_0()
+            .left_0();
 
         let toggle_label = if expanded {
             Some(SharedString::new_static("Show less"))
@@ -2314,90 +2592,85 @@ impl GitPanel {
             (hidden > 0).then(|| Self::ref_row_toggle_label(hidden))
         };
 
-        Some(
-            h_flex()
-                .id("commit-tab-refs")
-                .debug_selector(|| "COMMIT-TAB-REFS".into())
-                .flex_shrink_0()
-                .w_full()
-                .px_2()
-                .pb_1p5()
-                .child(
-                    h_flex()
-                        .relative()
-                        .w_full()
-                        .gap_1()
-                        .when(expanded, |this| this.items_start())
-                        .child(measure)
-                        .child(
-                            h_flex()
-                                .id("commit-tab-refs-chips")
-                                .debug_selector(|| "COMMIT-TAB-REFS-CHIPS".into())
-                                .min_w_0()
-                                .gap_1()
-                                // The floor a toggle would impose anyway, in
-                                // rems so it tracks the UI font the way the
-                                // button does. Without it the row would be one
-                                // height with a toggle and another without,
-                                // i.e. commit-dependent again.
-                                .min_h(ButtonSize::Default.rems())
-                                .map(|this| {
-                                    if expanded {
-                                        this.flex_wrap()
-                                            .max_h(px(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT))
-                                            .overflow_y_scroll()
-                                    } else {
-                                        this.overflow_hidden()
-                                    }
-                                })
-                                .children(names.iter().take(painted).map(|name| {
-                                    commit_refs::ref_chip(
-                                        name,
-                                        accent_color,
-                                        commit_refs::is_head_ref(
-                                            name.as_ref(),
-                                            head_branch_name.as_ref(),
-                                        ),
-                                        Some(work_dir.as_path()),
-                                        // Per-chip truncation stays on as a
-                                        // backstop and costs nothing while it
-                                        // is not needed: the painted prefix fits
-                                        // by construction, so nothing shrinks.
-                                        // It bites in the two cases the fit
-                                        // cannot promise anything about — the
-                                        // single ref wider than the whole row,
-                                        // and the one pre-measurement frame —
-                                        // where an ellipsis reads better than a
-                                        // name cut off mid-word by the row's
-                                        // `overflow_hidden`.
-                                        true,
-                                    )
-                                })),
-                        )
-                        // Outside the scrolling block, for the reason
-                        // `render_commit_containment_line` gives: `Show less`
-                        // has to stay reachable without scrolling back up to it.
-                        .children(toggle_label.map(|label| {
-                            let selector = ref_row_toggle_selector(label.as_ref());
-                            div()
-                                .flex_shrink_0()
-                                .debug_selector(move || selector.clone())
-                                .child(
-                                    Button::new("commit-tab-refs-toggle", label)
-                                        .style(ButtonStyle::Subtle)
-                                        .label_size(LabelSize::Small)
-                                        .color(Color::Accent)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(state) = this.commit_tab.as_mut() {
-                                                state.refs_expanded = !state.refs_expanded;
-                                                cx.notify();
-                                            }
-                                        })),
+        Self::commit_refs_row_frame()
+            .id("commit-tab-refs")
+            .debug_selector(|| "COMMIT-TAB-REFS".into())
+            .pb_1p5()
+            .child(
+                h_flex()
+                    .relative()
+                    .w_full()
+                    .gap_1()
+                    .when(expanded, |this| this.items_start())
+                    .child(measure)
+                    .child(
+                        h_flex()
+                            .id("commit-tab-refs-chips")
+                            .debug_selector(|| "COMMIT-TAB-REFS-CHIPS".into())
+                            .min_w_0()
+                            .gap_1()
+                            // The floor a toggle would impose anyway, in
+                            // rems so it tracks the UI font the way the
+                            // button does. Without it the row would be one
+                            // height with a toggle and another without,
+                            // i.e. commit-dependent again.
+                            .min_h(ButtonSize::Default.rems())
+                            .map(|this| {
+                                if expanded {
+                                    this.flex_wrap()
+                                        .max_h(px(COMMIT_CONTAINMENT_EXPANDED_MAX_HEIGHT))
+                                        .overflow_y_scroll()
+                                } else {
+                                    this.overflow_hidden()
+                                }
+                            })
+                            .children(names.iter().take(painted).map(|name| {
+                                commit_refs::ref_chip(
+                                    name,
+                                    accent_color,
+                                    commit_refs::is_head_ref(
+                                        name.as_ref(),
+                                        head_branch_name.as_ref(),
+                                    ),
+                                    Some(work_dir.as_path()),
+                                    // Per-chip truncation stays on as a
+                                    // backstop and costs nothing while it
+                                    // is not needed: the painted prefix fits
+                                    // by construction, so nothing shrinks.
+                                    // It bites in the two cases the fit
+                                    // cannot promise anything about — the
+                                    // single ref wider than the whole row,
+                                    // and the one pre-measurement frame —
+                                    // where an ellipsis reads better than a
+                                    // name cut off mid-word by the row's
+                                    // `overflow_hidden`.
+                                    true,
                                 )
-                        })),
-                )
-                .into_any_element(),
-        )
+                            })),
+                    )
+                    // Outside the scrolling block, for the reason
+                    // `render_commit_containment_line` gives: `Show less`
+                    // has to stay reachable without scrolling back up to it.
+                    .children(toggle_label.map(|label| {
+                        let selector = ref_row_toggle_selector(label.as_ref());
+                        div()
+                            .flex_shrink_0()
+                            .debug_selector(move || selector)
+                            .child(
+                                Button::new("commit-tab-refs-toggle", label)
+                                    .style(ButtonStyle::Subtle)
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Accent)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(state) = this.commit_tab.as_mut() {
+                                            state.refs_expanded = !state.refs_expanded;
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                    })),
+            )
+            .into_any_element()
     }
 
     /// IDEA's containment rows, under the identity row: the tag row and the
@@ -3296,8 +3569,7 @@ mod tests {
     /// paint selector encodes it (`ref_row_toggle_selector`), so a wrong count
     /// fails here rather than passing unnoticed.
     fn click_ref_row_toggle(label: &str, cx: &mut VisualTestContext) {
-        let selector: &'static str =
-            Box::leak(ref_row_toggle_selector(label).into_boxed_str());
+        let selector: &'static str = Box::leak(ref_row_toggle_selector(label).into_boxed_str());
         let toggle = cx.debug_bounds(selector).unwrap_or_else(|| {
             panic!("the ref row must be offering `{label}`");
         });
@@ -3460,13 +3732,7 @@ mod tests {
         );
 
         let predicted = cx.update(|window, cx| {
-            commit_refs::ref_chip_width(
-                &SharedString::from("origin/main"),
-                false,
-                None,
-                window,
-                cx,
-            )
+            commit_refs::ref_chip_width(&SharedString::from("origin/main"), false, None, window, cx)
         });
         assert!(
             (remote.size.width - predicted).abs() <= px(1.0),
@@ -3478,7 +3744,9 @@ mod tests {
         );
         assert!(
             painted_chips(&["COMMIT-TAB-REFS-TOGGLE-Show 1 more"], cx).is_empty()
-                && cx.debug_bounds("COMMIT-TAB-REFS-TOGGLE-Show less").is_none(),
+                && cx
+                    .debug_bounds("COMMIT-TAB-REFS-TOGGLE-Show less")
+                    .is_none(),
             "with three short refs on a panel this wide nothing had to fold, so \
              there is no control offering to show what is not missing — the \
              containment rows below hide theirs on the same principle"
@@ -3535,7 +3803,7 @@ mod tests {
             .debug_bounds("COMMIT-TAB-REFS")
             .expect("a decorated commit gets a ref row");
 
-        select_commit_with_refs(&panel, &repository, "1a2b3c4d", many.clone(), cx);
+        select_commit_with_refs(&panel, &repository, "1a2b3c4d", many, cx);
         let nine_refs = cx
             .debug_bounds("COMMIT-TAB-REFS")
             .expect("a decorated commit gets a ref row");
@@ -3639,9 +3907,7 @@ mod tests {
              must still paint some of them — painted {}",
             at_rest.len()
         );
-        let first = cx
-            .debug_bounds(CHIPS[0])
-            .expect("the first ref is painted");
+        let first = cx.debug_bounds(CHIPS[0]).expect("the first ref is painted");
         let last_painted = cx
             .debug_bounds(at_rest[at_rest.len() - 1])
             .expect("the last painted ref is painted");
@@ -3650,9 +3916,8 @@ mod tests {
             "everything painted at rest is on the one line: first={first:?} \
              last={last_painted:?}"
         );
-        let predicted = cx.update(|window, cx| {
-            commit_refs::ref_chip_width(&names[0], false, None, window, cx)
-        });
+        let predicted =
+            cx.update(|window, cx| commit_refs::ref_chip_width(&names[0], false, None, window, cx));
         assert!(
             (first.size.width - predicted).abs() <= px(1.0),
             "and it is painted WHOLE — predicted {predicted:?}, painted {:?}. \
@@ -3673,12 +3938,8 @@ mod tests {
                  the fold hides names behind a control, it never drops them"
             );
         }
-        let expanded_first = cx
-            .debug_bounds(CHIPS[0])
-            .expect("the first ref is painted");
-        let expanded_third = cx
-            .debug_bounds(CHIPS[2])
-            .expect("the third ref is painted");
+        let expanded_first = cx.debug_bounds(CHIPS[0]).expect("the first ref is painted");
+        let expanded_third = cx.debug_bounds(CHIPS[2]).expect("the third ref is painted");
         assert!(
             expanded_third.origin.y > expanded_first.origin.y
                 && expanded_third.origin.x == expanded_first.origin.x,
@@ -3818,6 +4079,594 @@ ships-with-and-then-some-more-of-it";
             "and the tag row stands down rather than repeating it a few pixels \
              lower — which is what `uncharted_tags` is for. The name is on \
              screen in both states; only which row carries it changes"
+        );
+    }
+
+    /// A second repository, in its own project: the shape two Solution members
+    /// that are clones of the same upstream take. Nothing but a distinct
+    /// `Entity<Repository>` is needed — what the tab must not do is treat one
+    /// member's push as being about the other member's tab.
+    async fn another_repository(cx: &mut gpui::TestAppContext) -> Entity<Repository> {
+        let fs = project::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            util::path!("/clone"),
+            serde_json::json!({
+                ".git": {},
+                "a.rs": "a\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [std::path::Path::new(util::path!("/clone"))], cx).await;
+        cx.run_until_parked();
+        project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("the second fake project exposes its repository")
+    }
+
+    /// Force a painted frame.
+    ///
+    /// `run_until_parked` on its own leaves the window between draws when the
+    /// last thing to happen was a repository event — every `debug_bounds`
+    /// lookup then answers `None`, whatever is on screen. A notify puts a
+    /// frame back.
+    fn repaint(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) {
+        panel.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+    }
+
+    /// Push a selection at the tab the way one of the graphs does.
+    fn push_commit_selection(
+        panel: &Entity<GitPanel>,
+        repository: &Entity<Repository>,
+        shas: &[&str],
+        refs: CommitRefs,
+        source: CommitSelectionSource,
+        cx: &mut VisualTestContext,
+    ) {
+        let shas: Vec<Oid> = shas
+            .iter()
+            .map(|sha| sha.parse().expect("valid abbreviated sha"))
+            .collect();
+        cx.update_window_entity(panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas,
+                    refs,
+                },
+                source,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    fn commit_tab_shas_of(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) -> Vec<Oid> {
+        panel.read_with(cx, |panel, _| panel.commit_tab_shas().to_vec())
+    }
+
+    fn oid(sha: &str) -> Oid {
+        sha.parse().expect("valid abbreviated sha")
+    }
+
+    /// Give the git panel's dock a new width and let the frame land, the way
+    /// dragging its edge does.
+    fn resize_git_panel(panel: &Entity<GitPanel>, width: Pixels, cx: &mut VisualTestContext) {
+        let workspace = panel
+            .read_with(cx, |panel, _| panel.workspace.clone())
+            .upgrade()
+            .expect("the test workspace outlives the panel");
+        workspace.update_in(cx, |workspace, window, cx| {
+            let position = panel.read(cx).position(window, cx);
+            workspace.dock_at_position(position).update(cx, |dock, cx| {
+                dock.resize_active_panel(Some(width), None, window, cx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    /// A `Background` push is a re-anchor after a refetch, not a gesture — and
+    /// there is more than one graph pushing them: another Solution member's,
+    /// a file-history pane's, and the selected graph's own refetch after a
+    /// `git fetch` landed in a terminal.
+    ///
+    /// The gate used to suppress only the tab ACTIVATION, and then fall through
+    /// to replacing `commit_tab` outright, so any of those re-anchors swapped
+    /// the commit the user was reading — and a refetch of the same graph
+    /// collapsed a multi-row selection to its first row. A `Background` push may
+    /// only refresh the tab it already describes.
+    #[gpui::test]
+    async fn test_a_background_push_only_refreshes_the_tab_it_describes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, repository, _fs, mut vcx) = commit_tab_panel(cx).await;
+        let other = another_repository(cx).await;
+        let cx = &mut vcx;
+
+        push_commit_selection(
+            &panel,
+            &repository,
+            &["823a3f8a"],
+            CommitRefs::default(),
+            CommitSelectionSource::UserGesture,
+            cx,
+        );
+        assert_eq!(commit_tab_shas_of(&panel, cx), vec![oid("823a3f8a")]);
+
+        push_commit_selection(
+            &panel,
+            &repository,
+            &["1a2b3c4d"],
+            CommitRefs::default(),
+            CommitSelectionSource::Background,
+            cx,
+        );
+        assert_eq!(
+            commit_tab_shas_of(&panel, cx),
+            vec![oid("823a3f8a")],
+            "a background re-anchor describing another commit must not take \
+             the tab over: the user is reading this one"
+        );
+
+        push_commit_selection(
+            &panel,
+            &other,
+            &["823a3f8a"],
+            CommitRefs::default(),
+            CommitSelectionSource::Background,
+            cx,
+        );
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert_eq!(
+                state.selection.repository.entity_id(),
+                repository.entity_id(),
+                "and neither must one from a graph over a different repository \
+                 — two Solution members are routinely clones, so the same sha \
+                 exists in both"
+            );
+        });
+
+        push_commit_selection(
+            &panel,
+            &repository,
+            &["823a3f8a", "1a2b3c4d", "5e6f7a8b"],
+            CommitRefs::default(),
+            CommitSelectionSource::UserGesture,
+            cx,
+        );
+        push_commit_selection(
+            &panel,
+            &repository,
+            &["823a3f8a"],
+            CommitRefs::default(),
+            CommitSelectionSource::Background,
+            cx,
+        );
+        assert_eq!(
+            commit_tab_shas_of(&panel, cx),
+            vec![oid("823a3f8a"), oid("1a2b3c4d"), oid("5e6f7a8b")],
+            "and a refetch that re-anchors on the FIRST row of a multi-row \
+             selection must not collapse the selection to it"
+        );
+
+        push_commit_selection(
+            &panel,
+            &repository,
+            &["1a2b3c4d"],
+            CommitRefs::default(),
+            CommitSelectionSource::UserGesture,
+            cx,
+        );
+        assert_eq!(
+            commit_tab_shas_of(&panel, cx),
+            vec![oid("1a2b3c4d")],
+            "a gesture still replaces whatever the tab was showing — that is \
+             the whole difference between the two sources"
+        );
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.close_commit_tab(window, cx);
+        });
+        cx.run_until_parked();
+        push_commit_selection(
+            &panel,
+            &repository,
+            &["1a2b3c4d"],
+            CommitRefs::default(),
+            CommitSelectionSource::Background,
+            cx,
+        );
+        assert!(
+            !panel.read_with(cx, |panel, _| panel.commit_tab_is_open()),
+            "and with the tab closed a background push still opens nothing"
+        );
+    }
+
+    /// `CommitRefs` are not immutable for a sha: creating a tag, moving or
+    /// deleting a branch, or a fetch changes them, and the graph re-pushes the
+    /// same commit with fresh ones. Comparing repository and shas alone made
+    /// that push a no-op, so the tab kept painting the chips — and the tag row —
+    /// the commit had before, next to a graph row already showing the new tag.
+    ///
+    /// The other half of the assertion is what adopting them must NOT cost: the
+    /// commit has not changed, so its diff, its collapsed directories and its
+    /// scroll position stay exactly where the user left them.
+    #[gpui::test]
+    async fn test_a_refreshed_selection_adopts_its_new_refs(cx: &mut gpui::TestAppContext) {
+        let (panel, repository, fs, mut cx) = commit_tab_painted_panel(cx).await;
+        let cx = &mut cx;
+        let sha = "823a3f8a";
+        fs.set_commit_diff(
+            std::path::Path::new(util::path!("/project/.git")),
+            &oid(sha).to_string(),
+            CommitDiff {
+                files: ["src/a.rs", "src/b.rs"]
+                    .into_iter()
+                    .map(|path| CommitFile {
+                        path: repo_path(path),
+                        old_text: Some(format!("old {path}\n")),
+                        new_text: Some(format!("new {path}\n")),
+                        is_binary: false,
+                    })
+                    .collect(),
+            },
+        );
+
+        select_commit_with_refs(&panel, &repository, sha, vec!["main".into()], cx);
+        repaint(&panel, cx);
+        assert!(
+            cx.debug_bounds("CHIP-main").is_some(),
+            "precondition: the commit's one decoration is on screen"
+        );
+        cx.update_window_entity(&panel, |panel, _window, cx| {
+            panel.toggle_commit_directory(&SharedString::from("src"), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.commit_tab_diff_is_loaded()),
+            "precondition: the commit's diff loaded"
+        );
+
+        // The same commit, re-pushed after a `git tag` — which is what a
+        // refetch hands the panel.
+        push_commit_selection(
+            &panel,
+            &repository,
+            &[sha],
+            CommitRefs {
+                names: vec!["main".into(), "tag: 2.41.0".into()],
+                accent_idx: 0,
+            },
+            CommitSelectionSource::Background,
+            cx,
+        );
+        repaint(&panel, cx);
+
+        assert!(
+            cx.debug_bounds("CHIP-tag: 2.41.0").is_some(),
+            "the new tag reaches the chips — the graph row beside the tab is \
+             already painting it"
+        );
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            let LoadState::Loaded(tags) = &state.tags else {
+                panic!(
+                    "the tag row is derived from the decorations, so a new \
+                        decoration re-derives it on the spot"
+                );
+            };
+            assert_eq!(
+                tags.as_slice(),
+                &[SharedString::from("2.41.0")],
+                "and the tag row is re-derived with them rather than left \
+                 describing the decorations that are gone"
+            );
+            assert!(
+                matches!(state.diff, LoadState::Loaded(_)),
+                "adopting refs must not restart the loads: the commit did not \
+                 change, only what points at it"
+            );
+            assert!(
+                state.collapsed_dirs.contains(&SharedString::from("src")),
+                "and the tree keeps the directories the user collapsed"
+            );
+        });
+    }
+
+    /// Two Solution members that are clones of the same repository hold the
+    /// same shas, so a staleness guard on the sha alone lets a load started for
+    /// repository A land on a tab that has since been re-pointed at the same
+    /// commit in repository B — pasting A's answer over B's, or masking a
+    /// `Failed` state so `retry_failed_commit_loads` never reruns it.
+    ///
+    /// The re-point is made in place, the way
+    /// `test_a_stale_containment_load_lands_on_neither_row` moves the shas: a
+    /// re-point through `show_commit_selection` replaces `CommitTabState`, and
+    /// dropping it cancels the very tasks this is about, so *that* path cannot
+    /// exhibit the bug and cannot guard against it either.
+    #[gpui::test]
+    async fn test_a_load_from_another_repository_never_lands(cx: &mut gpui::TestAppContext) {
+        let (panel, repository, _fs, mut vcx) = commit_tab_panel(cx).await;
+        let other = another_repository(cx).await;
+        let cx = &mut vcx;
+
+        push_commit_selection(
+            &panel,
+            &repository,
+            &["1a2b3c4d"],
+            CommitRefs::default(),
+            CommitSelectionSource::UserGesture,
+            cx,
+        );
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert!(
+                !matches!(state.details, LoadState::Loading),
+                "precondition: a load for the repository the tab describes does \
+                 land, so `Loading` below means it was dropped"
+            );
+        });
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec![oid("823a3f8a")],
+                    refs: CommitRefs::default(),
+                },
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+            // The tab is re-pointed at the same commit in the other member's
+            // clone while the first member's three loads are in flight — before
+            // any of them has had a chance to resolve.
+            panel
+                .commit_tab
+                .as_mut()
+                .expect("the tab is open")
+                .selection
+                .repository = other.clone();
+        });
+        cx.executor().advance_clock(BRANCHES_CONTAINING_DEBOUNCE);
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            assert!(
+                matches!(state.details, LoadState::Loading),
+                "the first repository's details were pasted onto a tab \
+                 describing the second's"
+            );
+            assert!(
+                matches!(state.diff, LoadState::Loading),
+                "the first repository's diff was pasted onto a tab describing \
+                 the second's"
+            );
+            assert!(
+                matches!(state.branches, LoadState::Loading),
+                "and so were its containing branches"
+            );
+        });
+    }
+
+    /// The tag row is git's `%D`, not a third git process.
+    ///
+    /// The decorations the graph hands over already name every tag pointing at
+    /// the commit, so the row is answered synchronously, before the containment
+    /// debounce has even elapsed. The fake's `tags_pointing_at` is seeded with a
+    /// name that appears in no decoration, so a loader that still asked git
+    /// would be caught red-handed rather than merely being slower.
+    #[gpui::test]
+    async fn test_the_tag_row_is_derived_from_the_decorations(cx: &mut gpui::TestAppContext) {
+        let (panel, repository, fs, mut cx) = commit_tab_panel(cx).await;
+        let cx = &mut cx;
+        let sha = "823a3f8a";
+        fs.with_git_state(util::path!("/project/.git").as_ref(), true, |state| {
+            state
+                .tags_pointing_at
+                .insert(oid(sha).to_string(), vec!["asked-git".into()]);
+        })
+        .expect("the fake project has a git repository");
+
+        push_commit_selection(
+            &panel,
+            &repository,
+            &[sha],
+            CommitRefs {
+                names: vec!["HEAD -> main".into(), "tag: 2.41.0".into()],
+                accent_idx: 0,
+            },
+            CommitSelectionSource::UserGesture,
+            cx,
+        );
+
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            let LoadState::Loaded(tags) = &state.tags else {
+                panic!(
+                    "the tag row is answered by the decorations the graph \
+                        already fetched, so it is loaded before the debounce"
+                );
+            };
+            assert_eq!(
+                tags.as_slice(),
+                &[SharedString::from("2.41.0")],
+                "and it is the decorations that answered it, not `git tag \
+                 --points-at`, which would have said `asked-git`"
+            );
+            assert!(
+                matches!(state.branches, LoadState::Loading),
+                "`branches` and `tags` are no longer in lockstep: reachability \
+                 is not in `%D`, so only that half is still a git process"
+            );
+        });
+
+        cx.executor().advance_clock(BRANCHES_CONTAINING_DEBOUNCE);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let state = panel.commit_tab.as_ref().expect("the tab is open");
+            let LoadState::Loaded(tags) = &state.tags else {
+                panic!("the tag row stays loaded");
+            };
+            assert_eq!(
+                tags.as_slice(),
+                &[SharedString::from("2.41.0")],
+                "and when the debounced branch query lands it does not bring a \
+                 tag query with it"
+            );
+        });
+    }
+
+    /// The collapsed row's fit costs one `shape_line` per decoration plus one
+    /// for the toggle label, and the git panel re-renders on status polls,
+    /// hover, scroll and every tree toggle — so a release commit with a dozen
+    /// decorations was paying a dozen glyph shapings a frame for an answer that
+    /// only changes when its inputs do.
+    ///
+    /// Pinned as the contract rather than as an allocation count: the answer is
+    /// recomputed exactly when one of its inputs moves, and the answer it gives
+    /// is the fit for the width it was given.
+    #[gpui::test]
+    async fn test_the_ref_row_fit_is_computed_once_per_change_of_its_inputs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, repository, _fs, mut cx) = commit_tab_painted_panel(cx).await;
+        let cx = &mut cx;
+        const CHIPS: [&str; 12] = [
+            "CHIP-origin/release/2.40",
+            "CHIP-origin/release/2.41",
+            "CHIP-origin/release/2.42",
+            "CHIP-origin/release/2.43",
+            "CHIP-origin/release/2.44",
+            "CHIP-origin/release/2.45",
+            "CHIP-origin/release/2.46",
+            "CHIP-origin/release/2.47",
+            "CHIP-origin/release/2.48",
+            "CHIP-origin/release/2.49",
+            "CHIP-origin/release/2.410",
+            "CHIP-origin/release/2.411",
+        ];
+        let names: Vec<SharedString> = CHIPS
+            .iter()
+            .map(|selector| {
+                SharedString::from(
+                    selector
+                        .strip_prefix("CHIP-")
+                        .expect("every selector names its chip")
+                        .to_string(),
+                )
+            })
+            .collect();
+        select_commit_with_refs(&panel, &repository, "823a3f8a", names, cx);
+
+        let computations = |cx: &mut VisualTestContext| {
+            panel.read_with(cx, |panel, _| {
+                panel
+                    .commit_tab
+                    .as_ref()
+                    .expect("the tab is open")
+                    .ref_row_fit_computations()
+            })
+        };
+        resize_git_panel(&panel, px(600.0), cx);
+        let wide = painted_chips(&CHIPS, cx);
+        assert!(
+            wide.len() > 1 && wide.len() < CHIPS.len(),
+            "precondition: at 600px the row paints several of the twelve refs \
+             and folds the rest — painted {}",
+            wide.len()
+        );
+        let settled = computations(cx);
+        assert!(settled > 0, "precondition: the fit was computed at all");
+
+        for _ in 0..3 {
+            panel.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            computations(cx),
+            settled,
+            "a render that changes none of the fit's inputs must not re-shape \
+             the names: the panel re-renders on status polls, hover and scroll"
+        );
+
+        resize_git_panel(&panel, px(240.0), cx);
+        assert!(
+            computations(cx) > settled,
+            "and a render that DOES change one of them — here the measured row \
+             width — recomputes, or the memo would be a stale answer"
+        );
+        let narrow = painted_chips(&CHIPS, cx);
+        assert!(
+            narrow.len() < wide.len(),
+            "which is the point: the fit follows the width it is given — \
+             {} chips at 600px, {} at 240px",
+            wide.len(),
+            narrow.len()
+        );
+    }
+
+    /// The width the fit spends is measured by a canvas that used to live only
+    /// inside the painted ref row, and most commits carry no refs at all — so a
+    /// panel resized while an undecorated commit was selected left the next
+    /// decorated commit budgeting against the width the panel had before the
+    /// drag.
+    ///
+    /// The width is a property of the PANEL, not of the commit, so it is
+    /// measured whether or not there are chips to paint: the row is absent for
+    /// an undecorated commit, a zero-height probe is not.
+    #[gpui::test]
+    async fn test_the_ref_row_width_is_measured_with_no_chips_to_paint(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (panel, repository, _fs, mut cx) = commit_tab_painted_panel(cx).await;
+        let cx = &mut cx;
+
+        select_commit_with_refs(&panel, &repository, "823a3f8a", vec!["main".into()], cx);
+        let wide = panel
+            .read_with(cx, |panel, _| panel.commit_refs_row_width)
+            .expect("painting the row measures it");
+        let wide_row = cx
+            .debug_bounds("COMMIT-TAB-REFS")
+            .expect("a decorated commit gets a ref row");
+
+        select_commit_with_refs(&panel, &repository, "1a2b3c4d", Vec::new(), cx);
+        assert!(
+            cx.debug_bounds("COMMIT-TAB-REFS").is_none(),
+            "precondition: an undecorated commit gets no ref row — an empty one \
+             would spend its padding out of the changed-files tree's budget"
+        );
+
+        resize_git_panel(&panel, px(240.0), cx);
+        let narrow = panel
+            .read_with(cx, |panel, _| panel.commit_refs_row_width)
+            .expect("the width survives a commit with nothing to paint");
+        assert!(
+            narrow < wide,
+            "the width follows the panel even with no chips on screen — \
+             otherwise the next decorated commit is fitted against the width \
+             the panel had before the drag: clipped chips, a wrong `Show N \
+             more` count, and `uncharted_tags` subtracting against a prefix \
+             that was never painted. wide={wide:?} narrow={narrow:?}"
+        );
+
+        select_commit_with_refs(
+            &panel,
+            &repository,
+            "823a3f8a",
+            vec!["origin/release/2.41".into(), "origin/release/2.42".into()],
+            cx,
+        );
+        let row = cx
+            .debug_bounds("COMMIT-TAB-REFS")
+            .expect("a decorated commit gets its row back");
+        assert!(
+            row.size.width < wide_row.size.width,
+            "and the row it comes back to is the resized one: row={row:?} \
+             before={wide_row:?}"
         );
     }
 

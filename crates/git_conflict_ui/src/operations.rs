@@ -134,10 +134,85 @@ impl AtomicGitOp for SkipRebaseOp {
     }
 }
 
+/// `git checkout --merge -- <paths>`: put a path that was marked resolved back
+/// into conflict. The reverse of the `Mark Resolved` gesture, which is a
+/// `git add`.
+///
+/// **It is emphatically not `git reset -- <path>`.** A reset writes HEAD's blob
+/// into the index at stage 0, which drops the path out of `git ls-files -u`
+/// without restoring the unmerged stages — `git <op> --continue` would then
+/// commit HEAD's content and the incoming side of the merge would be gone with
+/// no trace in the tree.
+///
+/// `checkout --merge` re-creates stages 1/2/3 from the index's *resolve-undo*
+/// record — git writes one for every unmerged path a `git add` resolves,
+/// precisely so this is undoable — and rewrites the working-tree file with
+/// conflict markers. That rewrite discards whatever resolution the file
+/// currently holds, which is why the gesture confirms before running.
+///
+/// A path with no resolve-undo record — never conflicted, or the record dropped
+/// by something that rebuilt the index — gets **no error from git**:
+/// `checkout --merge` degrades to a plain checkout of the stage-0 entry and
+/// exits 0, i.e. a silent no-op. So the op verifies the path really is unmerged
+/// again afterwards and fails loudly if it is not, rather than leaving a row
+/// that still says "resolved" after the user asked for the opposite.
+pub struct RestoreConflictOp {
+    /// Repo-relative paths, as `git status --porcelain` spells them.
+    pub paths: Vec<String>,
+}
+
+impl AtomicGitOp for RestoreConflictOp {
+    type Output = ();
+
+    fn op_name(&self) -> &'static str {
+        "restore_conflict"
+    }
+
+    /// The working-tree resolution is overwritten with conflict markers and
+    /// cannot be recovered from a backup ref, since it was never committed.
+    fn is_destructive(&self) -> bool {
+        true
+    }
+
+    /// Index and working tree only; no ref moves, so there is nothing for the
+    /// runner to back up.
+    fn affected_branches(&self, _repo_path: &Path) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn run(&mut self, repo_path: &Path) -> Result<()> {
+        if self.paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["checkout", "--merge", "--"];
+        args.extend(self.paths.iter().map(String::as_str));
+        run_git_blocking(repo_path, &args)?;
+
+        let mut still_unmerged = vec!["ls-files", "-u", "-z", "--"];
+        still_unmerged.extend(self.paths.iter().map(String::as_str));
+        let unmerged = run_git_blocking_output(repo_path, &still_unmerged)?;
+        if unmerged.trim_matches('\0').is_empty() {
+            return Err(anyhow!(
+                "git restored no conflict for {}: the index no longer carries a \
+                 resolve-undo record for it. The file is unchanged.",
+                self.paths.join(", ")
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn run_git_blocking(repo_path: &Path, args: &[&str]) -> Result<()> {
     run_git_blocking_output(repo_path, args).map(|_| ())
 }
 
+// Blocking on purpose, and safe to be: every `AtomicGitOp` reaches here through
+// `OpRunner::run`, which each caller drives inside a `background_spawn` — the
+// foreground thread is never the one waiting on git. The lint's replacement
+// (`smol::process::Command`) would force `AtomicGitOp` to become async, and the
+// trait is deliberately sync so an op reads as one straight-line sequence of
+// git invocations (see its doc in `crates/git/src/operations.rs`).
+#[allow(clippy::disallowed_methods)]
 fn run_git_blocking_output(repo_path: &Path, args: &[&str]) -> Result<String> {
     let output = git_command(repo_path, args)
         .output()
@@ -204,9 +279,17 @@ impl StatusRecord<'_> {
 
 /// Parse `git status --porcelain=1 -z` output.
 ///
-/// Records are `XY SP <path> NUL`. Rename/copy records (`R`/`C` in the index
-/// column) are followed by a bare `<origPath> NUL` field with no `XY` prefix,
-/// which has to be consumed rather than parsed as a record of its own.
+/// Records are `XY SP <path> NUL`. Rename/copy records are followed by a bare
+/// `<origPath> NUL` field with no `XY` prefix, which has to be consumed rather
+/// than parsed as a record of its own.
+///
+/// The `R`/`C` can sit in **either** column: `R ` is a rename staged in the
+/// index, ` R` a rename git detected in the working tree (an intent-to-add
+/// file that was moved, for instance). Both carry the origin field. Consuming
+/// it only for the index column leaves the origin path to be parsed as a
+/// record, and an origin like `my old.rs` has a space in the third byte, so it
+/// parses as `index='m'`, `worktree='y'`, `path="old.rs"` — a staged-looking
+/// record for a path that does not exist, which then blocks `Continue`.
 pub(crate) fn parse_porcelain_z(stdout: &str) -> Vec<StatusRecord<'_>> {
     let mut records = Vec::new();
     let mut fields = stdout.split('\0');
@@ -224,7 +307,7 @@ pub(crate) fn parse_porcelain_z(stdout: &str) -> Vec<StatusRecord<'_>> {
         if path.is_empty() {
             continue;
         }
-        if index == 'R' || index == 'C' {
+        if matches!(index, 'R' | 'C') || matches!(worktree, 'R' | 'C') {
             fields.next();
         }
         records.push(StatusRecord {
@@ -312,9 +395,11 @@ fn notify_user(workspace: &WeakEntity<Workspace>, message: String, cx: &mut App)
         return;
     };
     workspace.update(cx, |workspace, cx| {
-        workspace.show_notification(NotificationId::unique::<ConflictOpNotification>(), cx, |cx| {
-            cx.new(|cx| MessageNotification::new(message, cx))
-        });
+        workspace.show_notification(
+            NotificationId::unique::<ConflictOpNotification>(),
+            cx,
+            |cx| cx.new(|cx| MessageNotification::new(message, cx)),
+        );
     });
 }
 
@@ -427,7 +512,10 @@ fn report_failure(
     let Err(err) = outcome else {
         return;
     };
-    log::warn!("conflict resolver: git {} {flag} failed: {err:#}", op.cli_subcommand());
+    log::warn!(
+        "conflict resolver: git {} {flag} failed: {err:#}",
+        op.cli_subcommand()
+    );
     let message = format!("`git {} {flag}` failed: {err}", op.cli_subcommand());
     cx.update(|cx| notify_user(workspace, message, cx));
 }
@@ -473,10 +561,7 @@ mod tests {
 
     /// Build a `-z` porcelain payload from `XY <path>` strings.
     fn porcelain(records: &[&str]) -> String {
-        records
-            .iter()
-            .map(|r| format!("{r}\0"))
-            .collect::<String>()
+        records.iter().map(|r| format!("{r}\0")).collect::<String>()
     }
 
     fn incoming(paths: &[&str]) -> HashSet<String> {
@@ -589,15 +674,46 @@ mod tests {
         let status = "R  new.rs\0my old.rs\0M  after.rs\0";
         let records = parse_porcelain_z(&status);
         assert_eq!(
-            records
-                .iter()
-                .map(|r| r.path)
-                .collect::<Vec<_>>(),
+            records.iter().map(|r| r.path).collect::<Vec<_>>(),
             vec!["new.rs", "after.rs"]
         );
         assert_eq!(
             classify_unrelated_staged(&status, &[], &HashSet::new()),
             vec!["new.rs".to_string(), "after.rs".to_string()]
+        );
+    }
+
+    /// The mirror of the case above: git puts `R`/`C` in the **worktree**
+    /// column for a rename it detected in the working tree, and that record
+    /// carries an origin field too. Parsing the origin as a record invents a
+    /// staged path (`my old.rs` reads as `index='m'`, `worktree='y'`,
+    /// `path="old.rs"`) that nothing can unstage, so `Continue` refuses
+    /// forever naming a file that does not exist.
+    #[test]
+    fn worktree_rename_consumes_its_origin_field() {
+        let status = " R new.rs\0my old.rs\0M  after.rs\0";
+        let records = parse_porcelain_z(status);
+        assert_eq!(
+            records.iter().map(|r| r.path).collect::<Vec<_>>(),
+            vec!["new.rs", "after.rs"]
+        );
+        assert_eq!(
+            classify_unrelated_staged(status, &[], &HashSet::new()),
+            vec!["after.rs".to_string()]
+        );
+    }
+
+    /// `C` in the worktree column is the copy-detection spelling of the same
+    /// record shape.
+    #[test]
+    fn worktree_copy_consumes_its_origin_field() {
+        let status = " C copy.rs\0my old.rs\0";
+        assert_eq!(
+            parse_porcelain_z(status)
+                .iter()
+                .map(|r| r.path)
+                .collect::<Vec<_>>(),
+            vec!["copy.rs"]
         );
     }
 
@@ -607,6 +723,150 @@ mod tests {
         assert_eq!(
             classify_unrelated_staged(&status, &[], &HashSet::new()),
             vec!["dir with spaces/file name.rs".to_string()]
+        );
+    }
+
+    /// `RestoreConflictOp` shells out to the real `git` binary and the whole
+    /// point of it is what git does to the index, so it is exercised against a
+    /// throwaway repository on disk rather than mocked.
+    #[allow(clippy::disallowed_methods)]
+    fn run_fixture_git(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@x")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@x")
+            // The developer's own config must not reach the fixture: a global
+            // `commit.gpgsign`, a `core.hooksPath` or a merge driver would make
+            // these assertions fail on one machine only.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .output()
+            .expect("spawn git")
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let output = run_fixture_git(dir, args);
+        assert!(
+            output.status.success(),
+            "`git {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A repository stopped in a content conflict on `a.txt`, with the conflict
+    /// already marked resolved (`git add`) and the working tree holding the
+    /// user's resolution — the exact state a `Mark Unresolved` click starts
+    /// from.
+    fn repo_with_a_resolved_conflict() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        git_ok(path, &["init", "-q", "-b", "main"]);
+        std::fs::write(path.join("a.txt"), "base\n").expect("write a.txt");
+        git_ok(path, &["add", "."]);
+        git_ok(path, &["commit", "-qm", "init"]);
+        git_ok(path, &["checkout", "-q", "-b", "incoming"]);
+        std::fs::write(path.join("a.txt"), "theirs\n").expect("write a.txt");
+        git_ok(path, &["add", "."]);
+        git_ok(path, &["commit", "-qm", "theirs"]);
+        git_ok(path, &["checkout", "-q", "main"]);
+        std::fs::write(path.join("a.txt"), "ours\n").expect("write a.txt");
+        git_ok(path, &["add", "."]);
+        git_ok(path, &["commit", "-qm", "ours"]);
+        // Conflicts, so this one is expected to exit non-zero.
+        let merge = run_fixture_git(path, &["merge", "incoming"]);
+        assert!(!merge.status.success(), "the fixture must conflict");
+        std::fs::write(path.join("a.txt"), "resolved\n").expect("write resolution");
+        git_ok(path, &["add", "a.txt"]);
+        assert_eq!(
+            git_ok(path, &["ls-files", "-u"]),
+            "",
+            "`git add` must have resolved the unmerged entry"
+        );
+        dir
+    }
+
+    /// The reverse of `Mark Resolved` has to restore the *unmerged index
+    /// entry*, not merely make the row look unstaged.
+    ///
+    /// The gesture used to dispatch `ToggleStaged`, whose unstage arm is
+    /// `git reset -- <path>`: that writes HEAD's blob into the index at stage 0,
+    /// the path leaves `git ls-files -u`, and `git merge --continue` then
+    /// commits *our* side as the merge resolution — the incoming side is gone
+    /// with nothing in the tree to show for it. So the assertion that matters is
+    /// that stage 3 is readable again and still holds the incoming content.
+    #[test]
+    fn restore_conflict_brings_back_the_unmerged_stages() {
+        let repo = repo_with_a_resolved_conflict();
+        let path = repo.path();
+
+        OpRunner::run(
+            RestoreConflictOp {
+                paths: vec!["a.txt".to_string()],
+            },
+            path,
+        )
+        .expect("restore the conflict");
+
+        let unmerged = git_ok(path, &["ls-files", "-u", "--", "a.txt"]);
+        assert!(
+            unmerged.contains("\ta.txt"),
+            "the path must be unmerged again, got: {unmerged:?}"
+        );
+        assert_eq!(
+            git_ok(path, &["show", ":1:a.txt"]),
+            "base\n",
+            "stage 1 (the merge base) must be readable again"
+        );
+        assert_eq!(
+            git_ok(path, &["show", ":2:a.txt"]),
+            "ours\n",
+            "stage 2 (our side) must be readable again"
+        );
+        assert_eq!(
+            git_ok(path, &["show", ":3:a.txt"]),
+            "theirs\n",
+            "stage 3 (the incoming side) is what `git reset` used to destroy"
+        );
+        let worktree = std::fs::read_to_string(path.join("a.txt")).expect("read a.txt");
+        assert!(
+            worktree.contains("<<<<<<<") && worktree.contains("theirs"),
+            "the working tree must carry the conflict again, got: {worktree:?}"
+        );
+    }
+
+    /// Nothing to restore is not silently nothing. Git has no error for a
+    /// `checkout --merge` on a path with no resolve-undo record: it degrades to
+    /// a plain checkout of the stage-0 entry and exits 0. Without the
+    /// verification step the row would simply stay ticked, with no toast and
+    /// nothing in the log, after the user asked for the opposite.
+    #[test]
+    fn restore_conflict_reports_a_path_it_could_not_unresolve() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        git_ok(path, &["init", "-q", "-b", "main"]);
+        std::fs::write(path.join("b.txt"), "one\n").expect("write b.txt");
+        git_ok(path, &["add", "."]);
+        git_ok(path, &["commit", "-qm", "init"]);
+        // Staged, but never conflicted, so there is no resolve-undo record.
+        std::fs::write(path.join("b.txt"), "two\n").expect("write b.txt");
+        git_ok(path, &["add", "b.txt"]);
+
+        let error = OpRunner::run(
+            RestoreConflictOp {
+                paths: vec!["b.txt".to_string()],
+            },
+            path,
+        )
+        .expect_err("a no-op restore must be reported, not swallowed");
+        assert!(
+            error.to_string().contains("b.txt"),
+            "the error must name the path, got: {error}"
         );
     }
 }

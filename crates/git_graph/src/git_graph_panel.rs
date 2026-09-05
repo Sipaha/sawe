@@ -171,8 +171,10 @@ impl GitGraphPanel {
         if self.active_repo_id == repo_id {
             // Switched back to what is still on screen before the incoming log
             // resolved: drop the wait rather than promote a graph the user has
-            // just navigated away from.
+            // just navigated away from. What is on screen describes the
+            // window's repository again, so it takes gestures again.
             if self.pending.take().is_some() {
+                self.set_graph_selection_locked(false, cx);
                 cx.notify();
             }
             return;
@@ -216,12 +218,24 @@ impl GitGraphPanel {
             this.update_in(cx, |this, window, cx| this.promote_pending(window, cx))
                 .ok();
         });
+        // What stays painted for the length of the hold is a picture of a
+        // repository the window has already left: the git panel beside it
+        // describes the incoming one, so a click on these rows would point its
+        // Commit tab at a commit from the project the user just navigated away
+        // from. Keep it visible, but stop it acting.
+        self.set_graph_selection_locked(true, cx);
         self.pending = Some(PendingGraph {
             repo_id,
             graph,
             _subscription: subscription,
             _hold_expiry: hold_expiry,
         });
+    }
+
+    fn set_graph_selection_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
+        if let Some(graph) = self.graph.as_ref() {
+            graph.update(cx, |graph, _| graph.set_selection_locked(locked));
+        }
     }
 
     /// Show the graph that has been waiting off screen. Called both when its
@@ -832,6 +846,54 @@ mod tests {
             Some(first_repo),
             "the abandoned log must not swap itself in when it finally lands"
         );
+    }
+
+    /// For the length of the hold the graph on screen describes a repository
+    /// the window has already left, while the git panel next to it describes
+    /// the incoming one. A click on those rows would point that panel's Commit
+    /// tab at a commit from the project the user just navigated away from, so
+    /// the held graph is a picture and not a surface until the switch resolves.
+    #[gpui::test]
+    async fn the_held_graph_stops_taking_selection_gestures(cx: &mut TestAppContext) {
+        let (window, panel, _band, fs) = bootstrap_with_logs(cx, &[1, 2]).await;
+        toggle(&window, cx);
+        cx.run_until_parked();
+
+        let held = panel
+            .read_with(cx, |panel, _cx| panel.graph.clone())
+            .expect("the bootstrap resolved a repository");
+        assert!(
+            !held.read_with(cx, |graph, _cx| graph.selection_locked_for_test()),
+            "precondition: the graph on screen is the live one"
+        );
+
+        fs.block_graph_load(std::path::Path::new("/repo-1/.git"));
+        let first_repo = panel
+            .read_with(cx, |panel, _cx| panel.active_repo_id)
+            .expect("the bootstrap resolved a repository");
+        let second_repo = repository_other_than_active(&panel, cx);
+        switch_to(&window, &panel, second_repo, cx);
+
+        assert!(
+            held.read_with(cx, |graph, _cx| graph.selection_locked_for_test()),
+            "the previous project's rows are still painted, but they are stale"
+        );
+
+        // Switching back mid-hold makes them current again.
+        window
+            .update(cx, |_workspace, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.set_active_repo(Some(first_repo), window, cx)
+                });
+            })
+            .expect("window is open");
+        assert!(
+            !held.read_with(cx, |graph, _cx| graph.selection_locked_for_test()),
+            "abandoning the switch must give the graph back its gestures"
+        );
+
+        fs.release_graph_load(std::path::Path::new("/repo-1/.git"));
+        cx.run_until_parked();
     }
 
     /// The repository the panel is NOT currently pointed at.

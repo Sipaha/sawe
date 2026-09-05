@@ -59,6 +59,26 @@ impl FilterCursor {
         true
     }
 
+    /// Park the cursor on the first row `matches` accepts, leaving it where it
+    /// is when no row does.
+    ///
+    /// This is how a click moves the cursor: the popovers rebuild `rows` from
+    /// an async match task, so the index a row was painted at can already
+    /// address a different entry (or none) by the time the click lands. The
+    /// caller matches on the value it captured instead, and a value that has
+    /// dropped out of the rebuilt list leaves the cursor alone rather than
+    /// pointing it at an arbitrary neighbour.
+    pub(super) fn move_to_matching(
+        &mut self,
+        row_count: usize,
+        matches: impl Fn(usize) -> bool,
+    ) -> bool {
+        match (0..row_count).find(|ix| matches(*ix)) {
+            Some(index) => self.move_to(index),
+            None => false,
+        }
+    }
+
     pub(super) fn select_next(
         &mut self,
         row_count: usize,
@@ -162,6 +182,20 @@ mod tests {
             "row 0 is a header, so there is nowhere above row 1 to go"
         );
         assert_eq!(cursor.index(), 1);
+    }
+
+    #[test]
+    fn test_move_to_matching_leaves_the_cursor_alone_when_nothing_matches() {
+        let mut cursor = FilterCursor::new();
+        cursor.move_to(2);
+        assert!(cursor.move_to_matching(5, |ix| ix == 4));
+        assert_eq!(cursor.index(), 4);
+        assert!(!cursor.move_to_matching(5, |_| false));
+        assert_eq!(
+            cursor.index(),
+            4,
+            "a value the rebuilt list no longer holds must not move the cursor"
+        );
     }
 
     #[test]

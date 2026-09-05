@@ -220,6 +220,27 @@ impl PathFilterPopover {
         matches!(rows.get(index), Some(Row::Path { .. }))
     }
 
+    /// A click on the row for `repo_path`.
+    ///
+    /// The keyboard cursor follows the mouse so a following arrow key
+    /// continues from there — but it follows the *path* that was clicked, not
+    /// the index that path was painted at: `rebuild_rows` replaces `rows` from
+    /// an async match task, so that index can already address a different path
+    /// by the time the click lands, and the next Enter would toggle that one
+    /// instead.
+    fn click_path(&mut self, repo_path: RepoPath, cx: &mut Context<Self>) {
+        let rows = &self.rows;
+        let paths = &self.paths;
+        self.cursor
+            .move_to_matching(rows.len(), |ix| match rows.get(ix) {
+                Some(Row::Path { index, .. }) => paths
+                    .get(*index)
+                    .is_some_and(|entry| entry.repo_path == repo_path),
+                _ => false,
+            });
+        self.toggle_path(repo_path, cx);
+    }
+
     fn toggle_path(&mut self, repo_path: RepoPath, cx: &mut Context<Self>) {
         if !self.selected.remove(&repo_path) {
             self.selected.insert(repo_path);
@@ -492,12 +513,7 @@ impl Render for PathFilterPopover {
                                                 )),
                                         )
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            // Keep the keyboard cursor on the
-                                            // row the mouse just acted on, so a
-                                            // following arrow key continues
-                                            // from there.
-                                            this.cursor.move_to(ix);
-                                            this.toggle_path(path_for_click.clone(), cx);
+                                            this.click_path(path_for_click.clone(), cx);
                                         }))
                                         .into_any_element()
                                 }
@@ -589,6 +605,77 @@ mod tests {
             Some(Row::Path { index, .. }) => popover.paths.get(*index).map(|p| p.repo_path.clone()),
             _ => None,
         }
+    }
+
+    /// As in `branch_popover`: the cursor follows the path the mouse acted on,
+    /// not the row index that path was painted at — `rebuild_rows` re-ranks
+    /// `rows` from an async match task, so that index can address a different
+    /// path by the time the click lands.
+    #[gpui::test]
+    async fn test_clicking_a_path_parks_the_cursor_on_that_path(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+
+        let popover = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    PathFilterPopover::new(
+                        WeakEntity::<GitGraph>::new_invalid(),
+                        None,
+                        Vec::new(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        // rows: 0 Header(Paths) | 1 crates | 2 docs | 3 readme.md
+        window
+            .update(cx, |_, _window, cx| {
+                popover.update(cx, |popover, cx| {
+                    popover.paths = vec![
+                        path_row("crates", true),
+                        path_row("docs", true),
+                        path_row("readme.md", false),
+                    ];
+                    popover.refresh_matches(cx);
+                });
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        let readme = RepoPath::new("readme.md").expect("valid repo path");
+        let missing = RepoPath::new("Cargo.toml").expect("valid repo path");
+        popover.update(cx, |popover, cx| {
+            assert_eq!(
+                cursored(popover),
+                Some(RepoPath::new("crates").expect("valid repo path")),
+                "precondition: the cursor parks on the first row, not the clicked one"
+            );
+            popover.click_path(readme.clone(), cx);
+            assert_eq!(
+                cursored(popover),
+                Some(readme.clone()),
+                "the cursor must land on the path the mouse acted on"
+            );
+        });
+
+        popover.update(cx, |popover, cx| {
+            let before = popover.cursor.index();
+            popover.click_path(missing, cx);
+            assert_eq!(
+                popover.cursor.index(),
+                before,
+                "a path the rebuilt list no longer holds must leave the cursor \
+                 alone"
+            );
+        });
     }
 
     #[gpui::test]

@@ -253,6 +253,27 @@ impl UserFilterPopover {
         matches!(rows.get(index), Some(Row::Author { .. }))
     }
 
+    /// A click on the row for `email`.
+    ///
+    /// The keyboard cursor follows the mouse so a following arrow key
+    /// continues from there — but it follows the *author* that was clicked,
+    /// not the index that author was painted at: `rebuild_rows` replaces
+    /// `rows` from an async match task, so that index can already address a
+    /// different author by the time the click lands, and the next Enter would
+    /// toggle that one instead.
+    fn click_author(&mut self, email: SharedString, cx: &mut Context<Self>) {
+        let rows = &self.rows;
+        let authors = &self.authors;
+        self.cursor
+            .move_to_matching(rows.len(), |ix| match rows.get(ix) {
+                Some(Row::Author { index, .. }) => authors
+                    .get(*index)
+                    .is_some_and(|author| author.email == email),
+                _ => false,
+            });
+        self.toggle_author(email, cx);
+    }
+
     fn toggle_author(&mut self, email: SharedString, cx: &mut Context<Self>) {
         if !self.selected.remove(&email) {
             self.selected.insert(email);
@@ -526,12 +547,7 @@ impl Render for UserFilterPopover {
                                                     .size(LabelSize::Small),
                                             )
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                // Keep the keyboard cursor on
-                                                // the row the mouse just acted
-                                                // on, so a following arrow key
-                                                // continues from there.
-                                                this.cursor.move_to(ix);
-                                                this.toggle_author(email_for_click.clone(), cx);
+                                                this.click_author(email_for_click.clone(), cx);
                                             }))
                                             .into_any_element()
                                     }
@@ -626,6 +642,76 @@ mod tests {
             Some(Row::Author { index, .. }) => popover.authors.get(*index).map(|a| a.email.clone()),
             _ => None,
         }
+    }
+
+    /// As in `branch_popover`: the cursor follows the author the mouse acted
+    /// on, not the row index that author was painted at — `rebuild_rows`
+    /// re-ranks `rows` from an async match task, so that index can address a
+    /// different author by the time the click lands.
+    #[gpui::test]
+    async fn test_clicking_an_author_parks_the_cursor_on_that_author(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+
+        let popover = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    UserFilterPopover::new(
+                        WeakEntity::<GitGraph>::new_invalid(),
+                        None,
+                        Vec::new(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        // rows: 0 Header(Authors) | 1 ada (3) | 2 grace (2) | 3 linus (1)
+        window
+            .update(cx, |_, _window, cx| {
+                popover.update(cx, |popover, cx| {
+                    popover.authors = vec![
+                        author("Grace Hopper", "grace@example.com", 2),
+                        author("Ada Lovelace", "ada@example.com", 3),
+                        author("Linus Torvalds", "linus@example.com", 1),
+                    ];
+                    popover.load_state = LoadState::Ready;
+                    popover.refresh_matches(cx);
+                });
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        popover.update(cx, |popover, cx| {
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("ada@example.com"),
+                "precondition: the cursor parks on the first row, not the clicked one"
+            );
+            popover.click_author(SharedString::from("linus@example.com"), cx);
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("linus@example.com"),
+                "the cursor must land on the author the mouse acted on"
+            );
+        });
+
+        popover.update(cx, |popover, cx| {
+            let before = popover.cursor.index();
+            popover.click_author(SharedString::from("gone@example.com"), cx);
+            assert_eq!(
+                popover.cursor.index(),
+                before,
+                "an author the rebuilt list no longer holds must leave the \
+                 cursor alone"
+            );
+        });
     }
 
     #[gpui::test]

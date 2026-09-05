@@ -71,6 +71,18 @@ pub fn tag_names(ref_names: &[SharedString]) -> impl Iterator<Item = &str> {
         .filter(|name| !name.is_empty())
 }
 
+/// The tags pointing at the commit these decorations describe, owned.
+///
+/// The same answer `GitRepository::tags_pointing_at` gives — `git log`'s `%D`
+/// lists every tag pointing at the commit — from data the graph has already
+/// fetched. That is why the Commit tab's tag row derives from this rather than
+/// spending a `git tag --points-at` process on every settled selection; the
+/// query survives only as the fallback for a selection that carries no
+/// decorations at all (a caller with none to hand, or a collab repository).
+pub fn tags_pointing_at(ref_names: &[SharedString]) -> Vec<SharedString> {
+    tag_names(ref_names).map(SharedString::from).collect()
+}
+
 /// Which of the two glyphs [`ref_chip`] gives a decoration, if either.
 ///
 /// Split out so [`ref_chip_width`] answers "is there a glyph" from the same
@@ -182,8 +194,10 @@ pub fn ref_chip_width(
     let glyph = match chip_glyph(name, is_head, work_dir) {
         ChipGlyph::None => px(0.),
         // `IconSize::XSmall` plus the chip's `gap_0p5`.
-        _ => IconSize::XSmall.rems().to_pixels(window.rem_size())
-            + rems(0.125).to_pixels(window.rem_size()),
+        _ => {
+            IconSize::XSmall.rems().to_pixels(window.rem_size())
+                + rems(0.125).to_pixels(window.rem_size())
+        }
     };
     chip_chrome_width(window) + glyph + shaped_chip_label_width(name, window, cx)
 }
@@ -242,6 +256,30 @@ mod tests {
             !is_head_ref("origin/main", Some(&head)),
             "a remote-tracking ref that happens to end in the head branch's \
              name is not the checked-out branch"
+        );
+    }
+
+    #[test]
+    fn test_tags_pointing_at_owns_the_tag_decorations() {
+        let refs: Vec<SharedString> = vec![
+            "HEAD -> main".into(),
+            "tag: 2.41.0".into(),
+            "origin/main".into(),
+            "tag: pkg-a@1.2.3".into(),
+        ];
+        assert_eq!(
+            tags_pointing_at(&refs),
+            vec![
+                SharedString::from("2.41.0"),
+                SharedString::from("pkg-a@1.2.3"),
+            ],
+            "every tag decoration, in git's order — this is what the Commit \
+             tab's tag row is derived from instead of a `git tag --points-at`"
+        );
+        assert!(
+            tags_pointing_at(&[]).is_empty(),
+            "and a selection with no decorations derives no tags, which is the \
+             one case that still has to ask git"
         );
     }
 

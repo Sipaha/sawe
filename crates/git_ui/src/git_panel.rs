@@ -33,7 +33,7 @@ use git::{
     StashAll, StashApply, StashPop, ToggleFillCommitEditor, TrashUntrackedFiles, UnstageAll,
     parse_git_remote_url,
 };
-use git_conflict_ui::{InProgressOp, OpenConflictResolver, detect_in_progress_op};
+use git_conflict_ui::{InProgressOp, MarkUnresolved, OpenConflictResolver, detect_in_progress_op};
 use gpui::{
     AbsoluteLength, Action, Anchor, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, DismissEvent,
     DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyContext,
@@ -227,8 +227,16 @@ impl EntryMenuItem {
 /// this row — the same sticky predicate that puts it under the `Conflicts`
 /// header. It is what makes the staging row speak IDEA's resolution vocabulary
 /// (`Mark Resolved`) instead of git's index vocabulary (`Stage File`); the
-/// action behind the row is still [`ToggleStaged`], because marking a conflict
-/// resolved *is* staging it.
+/// action behind `Mark Resolved` is still [`ToggleStaged`], because marking a
+/// conflict resolved *is* staging it.
+///
+/// The reverse is **not** symmetric, and that asymmetry is the whole reason
+/// this row carries a second action. Unstaging is `git reset -- <path>`, which
+/// puts HEAD's blob in the index at stage 0 and drops the path out of
+/// `git ls-files -u` without restoring the unmerged stages; the incoming side
+/// is then simply gone, and `git <op> --continue` commits HEAD's content.
+/// `Mark Unresolved` therefore dispatches [`MarkUnresolved`], which runs
+/// `git checkout --merge` (see [`git_conflict_ui::operations::RestoreConflictOp`]).
 fn entry_context_menu_items(entry: &GitStatusEntry, had_conflict: bool) -> Vec<EntryMenuItem> {
     let is_created = entry.status.is_created();
     // Sticky vs. live: `had_conflict` stays true for the whole merge, while
@@ -236,11 +244,17 @@ fn entry_context_menu_items(entry: &GitStatusEntry, had_conflict: bool) -> Vec<E
     // the latter breaks `git show :<path>`, which is what a single-file diff
     // needs for its base side.
     let is_unmerged = entry.status.is_conflicted();
+    let is_resolved_conflict = had_conflict && entry.status.staging().is_fully_staged();
     let stage_title = match (had_conflict, entry.status.staging().is_fully_staged()) {
         (true, true) => "Mark Unresolved",
         (true, false) => "Mark Resolved",
         (false, true) => "Unstage File",
         (false, false) => "Stage File",
+    };
+    let stage_action: Box<dyn Action> = if is_resolved_conflict {
+        MarkUnresolved.boxed_clone()
+    } else {
+        ToggleStaged.boxed_clone()
     };
     let mut items = Vec::new();
     if had_conflict {
@@ -253,7 +267,7 @@ fn entry_context_menu_items(entry: &GitStatusEntry, had_conflict: bool) -> Vec<E
     items.extend([
         EntryMenuItem::Action {
             label: stage_title,
-            action: ToggleStaged.boxed_clone(),
+            action: stage_action,
             disabled: false,
         },
         EntryMenuItem::Action {
@@ -305,6 +319,47 @@ fn entry_context_menu_items(entry: &GitStatusEntry, had_conflict: bool) -> Vec<E
 pub(crate) struct InProgressOpBanner {
     op: InProgressOp,
     unresolved: usize,
+}
+
+/// Split the paths an un-tick gesture covers into the ones that have to be put
+/// back into conflict and the ones that can simply be unstaged.
+///
+/// Un-ticking a row under `Conflicts` is not an unstage. Unstaging is
+/// `git reset -- <path>`, which writes HEAD's blob into the index at stage 0 and
+/// drops the path out of `git ls-files -u` *without* restoring the unmerged
+/// stages: `git <op> --continue` then commits our side as the merge result and
+/// the incoming side is lost. Those paths go to
+/// [`git_conflict_ui::operations::RestoreConflictOp`] instead.
+///
+/// The split is per path rather than per gesture because one gesture can cover
+/// both kinds: the `Conflicts` section header, or a directory row in tree view
+/// holding a conflicted file next to an ordinary staged one.
+fn split_unstage_gesture(
+    entries: Vec<GitStatusEntry>,
+    had_conflict: impl Fn(&RepoPath) -> bool,
+) -> (Vec<GitStatusEntry>, Vec<GitStatusEntry>) {
+    entries
+        .into_iter()
+        .partition(|entry| had_conflict(&entry.repo_path))
+}
+
+/// Whether a merge / rebase / cherry-pick / revert is unfinished in `repo`,
+/// read from the marker files git writes into the repository's git directory.
+///
+/// The directory is [`RepositorySnapshot::repository_dir_abs_path`], never
+/// `dot_git_abs_path`. The latter is the `.git` entry inside the work
+/// directory, and for a linked worktree or a submodule that entry is a
+/// **GITFILE** — a regular file holding `gitdir: <path>`. Nothing is ever
+/// created under a file, so `MERGE_HEAD` and friends can never be found there
+/// and the banner never appears, while the panel's `Conflicts` section fills up
+/// from the same merge. `repository_dir_abs_path` is the resolved per-checkout
+/// git directory (`<main>/.git/worktrees/<name>` for a linked worktree), which
+/// is where git actually writes them; for an ordinary checkout the two paths
+/// are the same, which is why the bug is invisible in the common case.
+/// `git_conflict_ui::operations::op_for_dir` resolves the same gitfile by hand
+/// for callers that only have a work directory.
+fn in_progress_op_for_repository(repo: &Repository) -> Option<InProgressOp> {
+    detect_in_progress_op(&repo.repository_dir_abs_path)
 }
 
 /// Derives the footer banner from the two facts the panel already tracks: the
@@ -583,10 +638,16 @@ pub fn register(workspace: &mut Workspace) {
 #[derive(Debug, Clone)]
 pub enum Event {
     Focus,
-    /// The Commit tab was closed, carrying the shas it was describing. The git
-    /// graph clears the row selection that opened it when it sees its own shas
-    /// come back — anyone else's tab closing is not its business.
-    CommitTabClosed(Vec<Oid>),
+    /// The Commit tab was closed, carrying the repository AND the shas it was
+    /// describing. The git graph clears the row selection that opened it when
+    /// both come back as its own — anyone else's tab closing is not its
+    /// business. The repository is part of the identity because a Solution can
+    /// hold two clones of one project, where a sha alone names a commit in
+    /// both.
+    CommitTabClosed {
+        repository: RepositoryId,
+        shas: Vec<Oid>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2358,7 +2419,7 @@ impl GitPanel {
     fn toggle_staged_for_entry(
         &mut self,
         entry: &GitListEntry,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(active_repository) = self.active_repository.clone() else {
@@ -2445,6 +2506,15 @@ impl GitPanel {
                 }
             }
         };
+        let (to_restore, to_unstage) = if stage {
+            (Vec::new(), repo_paths)
+        } else {
+            let repo = active_repository.read(cx);
+            split_unstage_gesture(repo_paths, |path| {
+                repo.had_conflict_on_last_merge_head_change(path)
+            })
+        };
+
         if let Some(anchor) = clear_anchor {
             if let Some(op) = self.bulk_staging.clone()
                 && op.anchor == anchor
@@ -2456,7 +2526,98 @@ impl GitPanel {
             self.set_bulk_staging_anchor(anchor, cx);
         }
 
-        self.change_file_stage(stage, repo_paths, cx);
+        if to_restore.is_empty() || !to_unstage.is_empty() {
+            self.change_file_stage(stage, to_unstage, cx);
+        }
+        if !to_restore.is_empty() {
+            self.mark_unresolved(to_restore, window, cx);
+        }
+    }
+
+    /// `git::MarkUnresolved` on the selected row: the reverse of marking a
+    /// conflict resolved.
+    fn mark_unresolved_for_selected(
+        &mut self,
+        _: &MarkUnresolved,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .get_selected_entry()
+            .and_then(|entry| entry.status_entry())
+            .cloned()
+        else {
+            return;
+        };
+        self.mark_unresolved(vec![entry], window, cx);
+    }
+
+    /// Put paths that were marked resolved back into conflict, via
+    /// [`git_conflict_ui::operations::RestoreConflictOp`]
+    /// (`git checkout --merge -- <paths>`).
+    ///
+    /// It confirms first, for the same reason the footer banner's `Abort` does:
+    /// git re-creates the file from the unmerged stages, so whatever resolution
+    /// the working tree currently holds is overwritten with conflict markers,
+    /// and that text was never committed — no backup ref can bring it back.
+    fn mark_unresolved(
+        &mut self,
+        entries: Vec<GitStatusEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+        let paths: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.repo_path.as_unix_str().to_owned())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let work_directory = active_repository
+            .read(cx)
+            .work_directory_abs_path
+            .to_path_buf();
+        let subject = if paths.len() == 1 {
+            paths[0].clone()
+        } else {
+            format!("{} files", paths.len())
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!("Mark {subject} unresolved?"),
+            Some(
+                "`git checkout --merge` re-creates the conflict from the merge's \
+                 own sides, rewriting the file with conflict markers. Any \
+                 resolution it currently holds is discarded.",
+            ),
+            &["Mark Unresolved", "Cancel"],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if prompt.await.ok() != Some(0) {
+                return;
+            }
+            let outcome = cx
+                .background_spawn(async move {
+                    git::operations::OpRunner::run(
+                        git_conflict_ui::operations::RestoreConflictOp { paths },
+                        &work_directory,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = outcome {
+                    this.show_error_toast("checkout --merge", error, cx);
+                }
+                this.update_counts(active_repository.read(cx));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn change_file_stage(
@@ -4205,17 +4366,37 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if repository.as_ref().map(|repo| repo.entity_id())
-            == self.active_repository.as_ref().map(|repo| repo.entity_id())
-        {
+        let new_repository_id = repository.as_ref().map(|repo| repo.entity_id());
+        if new_repository_id == self.active_repository.as_ref().map(|repo| repo.entity_id()) {
             return;
         }
         self.active_repository = repository;
         // A commit belongs to the repository it was read from, so the Commit
-        // tab cannot survive the swap: leaving it up would describe the old
-        // repository's commit under the new repository's panel, and its file
-        // rows would open diffs against a repository the user has left.
-        self.close_commit_tab(window, cx);
+        // tab cannot survive a swap onto a *different* repository: leaving it up
+        // would describe the old repository's commit under the new repository's
+        // panel, and its file rows would open diffs against a repository the
+        // user has left.
+        //
+        // The comparison is against the repository the tab itself describes, not
+        // against the repository the panel is losing, and the panel merely
+        // *having* no repository is not a swap at all. Both matter because
+        // `close_commit_tab` emits `Event::CommitTabClosed`, which reaches every
+        // git graph in the window and makes the graph holding those shas drop
+        // its selection. `solutions::active_member_repository` answers `None`
+        // for a moment while a member's worktree is rescanned; treating that as
+        // a repository change deselected a graph that had nothing to do with the
+        // rescan, and the `Some(same)` arriving a moment later did not bring the
+        // selection back.
+        let tab_repository_id = self
+            .commit_tab
+            .as_ref()
+            .map(|state| state.selection.repository.entity_id());
+        if let (Some(new_repository_id), Some(tab_repository_id)) =
+            (new_repository_id, tab_repository_id)
+            && new_repository_id != tab_repository_id
+        {
+            self.close_commit_tab(window, cx);
+        }
         self.entries.clear();
         cx.notify();
     }
@@ -4313,9 +4494,9 @@ impl GitPanel {
     fn update_counts(&mut self, repo: &Repository) {
         self.show_placeholders = false;
         // Only meaningful for a local checkout: the markers are files inside
-        // `.git`, and a repository reached over collab/SSH has no local ones,
-        // so a remote project simply gets no banner.
-        self.in_progress_op = detect_in_progress_op(&repo.dot_git_abs_path);
+        // the git directory, and a repository reached over collab/SSH has no
+        // local ones, so a remote project simply gets no banner.
+        self.in_progress_op = in_progress_op_for_repository(repo);
         self.conflicted_count = 0;
         self.conflicted_staged_count = 0;
         self.new_count = 0;
@@ -6625,6 +6806,7 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::stash_pop))
                     .when(on_changes_tab, |this| {
                         this.on_action(cx.listener(Self::toggle_staged_for_selected))
+                            .on_action(cx.listener(Self::mark_unresolved_for_selected))
                             .on_action(cx.listener(Self::stage_range))
                             .on_action(cx.listener(Self::stage_selected))
                             .on_action(cx.listener(Self::unstage_selected))
@@ -7662,6 +7844,13 @@ mod tests {
         items.iter().filter_map(EntryMenuItem::label).collect()
     }
 
+    fn menu_item_action_name(items: &[EntryMenuItem], wanted: &str) -> Option<&'static str> {
+        items.iter().find_map(|item| match item {
+            EntryMenuItem::Action { label, action, .. } if *label == wanted => Some(action.name()),
+            _ => None,
+        })
+    }
+
     fn menu_item_disabled(items: &[EntryMenuItem], wanted: &str) -> Option<bool> {
         items.iter().find_map(|item| match item {
             EntryMenuItem::Action {
@@ -7726,6 +7915,206 @@ mod tests {
         assert!(!labels.contains(&"Unstage File"));
         assert!(labels.contains(&"Resolve Conflicts..."));
         assert_eq!(menu_item_disabled(&items, "Open Diff"), Some(false));
+    }
+
+    /// `Mark Unresolved` must not dispatch `ToggleStaged`. Its unstage arm is
+    /// `git reset -- <path>`, which puts HEAD's blob in the index at stage 0 and
+    /// drops the path out of `git ls-files -u` without restoring the unmerged
+    /// stages — `git <op> --continue` then commits our side and the incoming
+    /// side of the merge is gone. The way back is `git checkout --merge`, which
+    /// only `git::MarkUnresolved` runs.
+    #[test]
+    fn test_mark_unresolved_does_not_dispatch_toggle_staged() {
+        let resolved = GitStatusEntry {
+            repo_path: repo_path("src/conflicted.rs"),
+            status: StatusCode::Modified.index(),
+            staging: StageStatus::Staged,
+            diff_stat: None,
+        };
+
+        let items = entry_context_menu_items(&resolved, true);
+        assert_eq!(
+            menu_item_action_name(&items, "Mark Unresolved"),
+            Some("git::MarkUnresolved")
+        );
+
+        // The forward gesture is still plain staging — see FORK.md #132.
+        let unresolved = unmerged_entry("src/conflicted.rs");
+        let items = entry_context_menu_items(&unresolved, true);
+        assert_eq!(
+            menu_item_action_name(&items, "Mark Resolved"),
+            Some("git::ToggleStaged")
+        );
+
+        // And an ordinary staged file keeps the index vocabulary and the index
+        // action: unstaging a path that was never conflicted loses nothing.
+        let plain = GitStatusEntry {
+            repo_path: repo_path("src/plain.rs"),
+            status: StatusCode::Modified.index(),
+            staging: StageStatus::Staged,
+            diff_stat: None,
+        };
+        let items = entry_context_menu_items(&plain, false);
+        assert_eq!(
+            menu_item_action_name(&items, "Unstage File"),
+            Some("git::ToggleStaged")
+        );
+    }
+
+    /// The checkbox is the other half of the same gesture and has to agree with
+    /// the menu: an un-tick that covers a conflicted path routes that path to
+    /// the restore op, and only the rest to `git reset`. One gesture can cover
+    /// both kinds at once — the `Conflicts` header, or a directory row.
+    #[test]
+    fn test_unstage_gesture_routes_conflicted_paths_away_from_reset() {
+        let staged = |path: &str| GitStatusEntry {
+            repo_path: repo_path(path),
+            status: StatusCode::Modified.index(),
+            staging: StageStatus::Staged,
+            diff_stat: None,
+        };
+        let entries = vec![
+            staged("src/conflicted.rs"),
+            staged("src/plain.rs"),
+            staged("src/also_conflicted.rs"),
+        ];
+
+        let (to_restore, to_unstage) =
+            split_unstage_gesture(entries, |path| path.as_unix_str().contains("conflicted"));
+
+        assert_eq!(
+            to_restore
+                .iter()
+                .map(|entry| entry.repo_path.as_unix_str())
+                .collect::<Vec<_>>(),
+            vec!["src/conflicted.rs", "src/also_conflicted.rs"]
+        );
+        assert_eq!(
+            to_unstage
+                .iter()
+                .map(|entry| entry.repo_path.as_unix_str())
+                .collect::<Vec<_>>(),
+            vec!["src/plain.rs"]
+        );
+    }
+
+    /// `detect_in_progress_op` reads real files, so the linked-worktree case
+    /// needs a real repository — `FakeFs` has no `git worktree add`.
+    #[allow(clippy::disallowed_methods)]
+    fn run_fixture_git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@x")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@x")
+            // The developer's own config must not reach the fixture: a global
+            // `commit.gpgsign` or `core.hooksPath` would fail these commits on
+            // one machine only.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .status()
+            .expect("spawn git")
+            .success()
+    }
+
+    fn fixture_git(dir: &Path, args: &[&str]) {
+        assert!(
+            run_fixture_git(dir, args),
+            "`git {}` failed",
+            args.join(" ")
+        );
+    }
+
+    /// `<tmp>/main` with a linked worktree at `<tmp>/wt` stopped in a conflicted
+    /// merge. `<tmp>/wt/.git` is a **GITFILE** and `MERGE_HEAD` lives under
+    /// `<tmp>/main/.git/worktrees/wt`, which is the whole point of the fixture.
+    fn repo_with_a_merge_in_a_linked_worktree() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).expect("mkdir main");
+        fixture_git(&main, &["init", "-q", "-b", "main"]);
+        std::fs::write(main.join("a.txt"), "base\n").expect("write a.txt");
+        fixture_git(&main, &["add", "."]);
+        fixture_git(&main, &["commit", "-qm", "init"]);
+        fixture_git(&main, &["checkout", "-q", "-b", "incoming"]);
+        std::fs::write(main.join("a.txt"), "theirs\n").expect("write a.txt");
+        fixture_git(&main, &["add", "."]);
+        fixture_git(&main, &["commit", "-qm", "theirs"]);
+        fixture_git(&main, &["checkout", "-q", "main"]);
+        std::fs::write(main.join("a.txt"), "ours\n").expect("write a.txt");
+        fixture_git(&main, &["add", "."]);
+        fixture_git(&main, &["commit", "-qm", "ours"]);
+
+        let linked = tmp.path().join("wt");
+        fixture_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt",
+                linked.to_str().expect("utf-8 path"),
+                "main",
+            ],
+        );
+        assert!(
+            !run_fixture_git(&linked, &["merge", "incoming"]),
+            "the fixture merge must conflict"
+        );
+        assert!(
+            main.join(".git/worktrees/wt/MERGE_HEAD").is_file(),
+            "the marker must live under the linked worktree's git directory"
+        );
+        assert!(
+            linked.join(".git").is_file(),
+            "a linked worktree's `.git` is a GITFILE, not a directory"
+        );
+        tmp
+    }
+
+    /// The banner probes the repository's *resolved* git directory. Probing
+    /// `dot_git_abs_path` instead can only ever answer "nothing in progress"
+    /// inside a linked worktree or a submodule, because that path is the `.git`
+    /// GITFILE and `<file>/MERGE_HEAD` never exists — so the user got a
+    /// populated `Conflicts` section, no banner explaining it and no `Abort`.
+    #[gpui::test]
+    async fn test_in_progress_op_is_found_in_a_linked_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let tmp = repo_with_a_merge_in_a_linked_worktree();
+        let linked = tmp.path().join("wt");
+        let fs = Arc::new(fs::RealFs::new(None, cx.executor()));
+        let project = Project::test(fs, [linked.as_path()], cx).await;
+
+        let mut repository = None;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            repository = project.read_with(cx, |project, cx| project.active_repository(cx));
+            if repository.is_some() {
+                break;
+            }
+            cx.executor()
+                .timer(std::time::Duration::from_millis(50))
+                .await;
+        }
+        let repository = repository.expect("the linked worktree must be seen as a repository");
+
+        repository.read_with(cx, |repository, _| {
+            assert!(
+                repository.dot_git_abs_path.is_file(),
+                "the fixture must be a linked worktree, whose `.git` is a file"
+            );
+            assert_eq!(
+                in_progress_op_for_repository(repository),
+                Some(InProgressOp::Merge),
+                "the merge banner has to read the resolved git directory"
+            );
+        });
     }
 
     /// The footer banner is derived, not stored: no in-progress operation means
@@ -9904,7 +10293,7 @@ mod tests {
             cx.subscribe(&panel, {
                 let closed = closed.clone();
                 move |_, event: &Event, _| {
-                    if matches!(event, Event::CommitTabClosed(_)) {
+                    if matches!(event, Event::CommitTabClosed { .. }) {
                         closed.set(closed.get() + 1);
                     }
                 }
@@ -9942,6 +10331,131 @@ mod tests {
             panel.close_commit_tab(window, cx);
         });
         cx.executor().run_until_parked();
+        assert_eq!(closed.get(), 1);
+    }
+
+    async fn commit_tab_fixture_with_two_repositories(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<GitPanel>,
+        Entity<Repository>,
+        Entity<Repository>,
+        VisualTestContext,
+    ) {
+        let NestedRepoSolution {
+            project,
+            member_root,
+            nested_root,
+        } = setup_nested_repo_solution(cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        let outer = repo_with_work_directory(&project, &member_root, &mut cx);
+        let inner = repo_with_work_directory(&project, &nested_root, &mut cx);
+        (panel, outer, inner, cx)
+    }
+
+    /// Count `CommitTabClosed` emissions for the life of the returned guard.
+    fn count_commit_tab_closures(
+        panel: &Entity<GitPanel>,
+        cx: &mut VisualTestContext,
+    ) -> (std::rc::Rc<std::cell::Cell<usize>>, Subscription) {
+        let closed = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let subscription = cx.update(|_window, cx| {
+            cx.subscribe(panel, {
+                let closed = closed.clone();
+                move |_, event: &Event, _| {
+                    if matches!(event, Event::CommitTabClosed { .. }) {
+                        closed.set(closed.get() + 1);
+                    }
+                }
+            })
+        });
+        (closed, subscription)
+    }
+
+    /// `solutions::active_member_repository` answers `None` for a moment while a
+    /// member's worktree is rescanned. Treating that blip as a repository change
+    /// closed the Commit tab, and `CommitTabClosed` reaches every git graph in
+    /// the window: a graph holding those shas dropped the selection it was
+    /// showing over a rescan it had nothing to do with, and the `Some(same)`
+    /// that arrived a moment later did not bring it back.
+    #[gpui::test]
+    async fn test_a_transient_repository_flip_keeps_the_commit_tab(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_repository(Some(repository.clone()), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| assert!(panel.commit_tab_is_open()));
+
+        let (closed, _subscription) = count_commit_tab_closures(&panel, cx);
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_repository(None, window, cx);
+            panel.set_active_repository(Some(repository.clone()), window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.commit_tab_is_open(),
+                "a momentary `None` is not a repository change"
+            );
+        });
+        assert_eq!(
+            closed.get(),
+            0,
+            "no graph may be told to deselect over a rescan"
+        );
+    }
+
+    /// The other half of the same rule: a real switch onto another repository
+    /// still retires the tab, because the commit it describes was read from the
+    /// repository the user has just left.
+    #[gpui::test]
+    async fn test_switching_repositories_still_closes_the_commit_tab(cx: &mut TestAppContext) {
+        let (panel, outer, inner, mut cx) = commit_tab_fixture_with_two_repositories(cx).await;
+        let cx = &mut cx;
+
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_repository(Some(outer.clone()), window, cx);
+            panel.show_commit_selection(
+                commit_selection(&outer, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| assert!(panel.commit_tab_is_open()));
+
+        let (closed, _subscription) = count_commit_tab_closures(&panel, cx);
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_repository(Some(inner.clone()), window, cx);
+        });
+        cx.executor().run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel.commit_tab_is_open(),
+                "the tab describes a commit from the repository just left"
+            );
+        });
         assert_eq!(closed.get(), 1);
     }
 
@@ -10304,8 +10818,13 @@ mod tests {
             );
         });
 
-        // A re-anchor that lands on a different commit still refreshes what the
-        // open tab describes — it just does it in the background.
+        // A re-anchor that lands on a DIFFERENT commit is refused outright. The
+        // tab belongs to the commit the user picked, and a background push is
+        // only ever a refresh of that one: any graph in the window re-anchors
+        // after its own log settles or after a `git fetch` lands in a terminal,
+        // so honouring this would let an unrelated member's graph — or a
+        // file-history pane item — repoint the tab being read, and would
+        // collapse a multi-row selection to the single sha the re-anchor knows.
         let other = test_sha("f01dab1e");
         cx.update_window_entity(&panel, |panel, window, cx| {
             panel.show_commit_selection(
@@ -10317,7 +10836,11 @@ mod tests {
         });
         panel.read_with(cx, |panel, _| {
             assert_eq!(panel.active_tab, GitPanelTab::Changes);
-            assert_eq!(panel.commit_tab_shas(), [other]);
+            assert_eq!(
+                panel.commit_tab_shas(),
+                [sha],
+                "a background push about another commit must not repoint the tab"
+            );
         });
     }
 
@@ -10569,6 +11092,11 @@ mod tests {
     async fn test_the_commit_tab_hides_the_changes_selection_actions(cx: &mut TestAppContext) {
         const SELECTION_SCOPED: &[&str] = &[
             "git::ToggleStaged",
+            // The reverse of `Mark Resolved`, and destructive (`git checkout
+            // --merge` rewrites the file with conflict markers), so it belongs
+            // on this side of the guard more than most: it must not be
+            // palette-reachable against a selection the user cannot see.
+            "git::MarkUnresolved",
             "git::StageRange",
             "git::StageFile",
             "git::UnstageFile",
@@ -10732,7 +11260,7 @@ mod tests {
             cx.subscribe(&panel, {
                 let closed = closed.clone();
                 move |_, event: &Event, _| {
-                    if matches!(event, Event::CommitTabClosed(_)) {
+                    if matches!(event, Event::CommitTabClosed { .. }) {
                         closed.set(closed.get() + 1);
                     }
                 }

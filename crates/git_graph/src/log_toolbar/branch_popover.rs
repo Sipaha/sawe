@@ -197,8 +197,8 @@ impl BranchFilterPopover {
                 .map(|b| b.display_name.to_lowercase())
                 .unwrap_or_default()
         };
-        local.sort_by(|a, b| sort_key(&a.0, &self.branches).cmp(&sort_key(&b.0, &self.branches)));
-        remote.sort_by(|a, b| sort_key(&a.0, &self.branches).cmp(&sort_key(&b.0, &self.branches)));
+        local.sort_by_key(|entry| sort_key(&entry.0, &self.branches));
+        remote.sort_by_key(|entry| sort_key(&entry.0, &self.branches));
 
         let mut rows: Vec<Row> = Vec::with_capacity(local.len() + remote.len() + 2);
         if !local.is_empty() {
@@ -221,6 +221,27 @@ impl BranchFilterPopover {
 
     fn is_actionable(rows: &[Row], index: usize) -> bool {
         matches!(rows.get(index), Some(Row::Branch { .. }))
+    }
+
+    /// A click on the row for `ref_name`.
+    ///
+    /// The keyboard cursor follows the mouse so a following arrow key
+    /// continues from there — but it follows the *branch* that was clicked,
+    /// not the index that branch was painted at: `rebuild_rows` replaces
+    /// `rows` from an async match task, so that index can already address a
+    /// different branch by the time the click lands, and the next Enter would
+    /// toggle that one instead.
+    fn click_branch(&mut self, ref_name: SharedString, cx: &mut Context<Self>) {
+        let rows = &self.rows;
+        let branches = &self.branches;
+        self.cursor
+            .move_to_matching(rows.len(), |ix| match rows.get(ix) {
+                Some(Row::Branch { index, .. }) => branches
+                    .get(*index)
+                    .is_some_and(|branch| branch.ref_name == ref_name),
+                _ => false,
+            });
+        self.toggle_branch(ref_name, cx);
     }
 
     fn toggle_branch(&mut self, ref_name: SharedString, cx: &mut Context<Self>) {
@@ -438,13 +459,7 @@ impl Render for BranchFilterPopover {
                                         )
                                         .child(HighlightedLabel::new(entry.display_name, positions))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            // Keep the keyboard cursor on the
-                                            // row the mouse just acted on, so a
-                                            // following arrow key continues
-                                            // from there rather than jumping
-                                            // back to the top match.
-                                            this.cursor.move_to(ix);
-                                            this.toggle_branch(ref_name_for_click.clone(), cx);
+                                            this.click_branch(ref_name_for_click.clone(), cx);
                                         }))
                                         .into_any_element()
                                 }
@@ -543,6 +558,98 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    /// A click parks the keyboard cursor on the row it acted on so a following
+    /// arrow key continues from there. It has to find that row by the branch
+    /// the click carried, not by the index the row was painted at:
+    /// `rebuild_rows` replaces `rows` from an async match task, so between
+    /// paint and click that index can address a different branch — and the
+    /// next Enter would toggle that one.
+    #[gpui::test]
+    async fn test_clicking_a_branch_parks_the_cursor_on_that_branch(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+
+        let popover = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    BranchFilterPopover::new(
+                        WeakEntity::<GitGraph>::new_invalid(),
+                        None,
+                        Vec::new(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        // rows: 0 Header(Local) | 1 feature | 2 main | 3 Header(Remote) | 4 origin/main
+        window
+            .update(cx, |_, _window, cx| {
+                popover.update(cx, |popover, cx| {
+                    popover.branches = vec![
+                        entry("main", false),
+                        entry("feature", false),
+                        entry("origin/main", true),
+                    ];
+                    popover.refresh_matches(cx);
+                });
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+
+        // The rebuild the click races: `origin/main` was painted at row 4, and
+        // by the time the click is delivered the narrowed list — 0 Header |
+        // 1 main | 2 Header | 3 origin/main — has it at row 3, with the cursor
+        // re-parked on the first match.
+        window
+            .update(cx, |_, window, cx| {
+                popover.read(cx).query.clone().update(cx, |editor, cx| {
+                    editor.set_text("main", window, cx);
+                });
+            })
+            .expect("window is open");
+        cx.run_until_parked();
+        popover.update(cx, |popover, _| {
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("refs/heads/main"),
+                "precondition: the rebuild parked the cursor on the first match"
+            );
+        });
+
+        popover.update(cx, |popover, cx| {
+            popover.click_branch(SharedString::from("refs/remotes/origin/main"), cx);
+            assert_eq!(
+                cursored(popover).as_deref(),
+                Some("refs/remotes/origin/main"),
+                "the cursor must land on the branch the mouse acted on"
+            );
+            assert!(
+                popover
+                    .selected
+                    .contains(&SharedString::from("refs/remotes/origin/main")),
+                "and that branch is the one that got checked"
+            );
+        });
+
+        popover.update(cx, |popover, cx| {
+            let before = popover.cursor.index();
+            popover.click_branch(SharedString::from("refs/heads/feature"), cx);
+            assert_eq!(
+                popover.cursor.index(),
+                before,
+                "a branch the rebuilt list no longer holds must leave the cursor \
+                 alone rather than move it to an unrelated row"
+            );
+        });
     }
 
     #[gpui::test]

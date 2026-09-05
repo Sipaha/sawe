@@ -828,15 +828,26 @@ impl GitPanel {
                                 // `ToggleStaged` action with the same binding,
                                 // but the thing it means to the user is IDEA's
                                 // "Mark as Resolved", not "add to the index".
-                                let action = match (had_conflict, stage_status) {
+                                //
+                                // Unticking one is not `git reset` either, and
+                                // the action stays `ToggleStaged` anyway: it is
+                                // the row's *gesture*, and
+                                // `GitPanel::toggle_staged_for_entry` routes a
+                                // conflicted path to `RestoreConflictOp` instead
+                                // of the unstage that would throw the merge's
+                                // incoming side away. Naming the tooltip's own
+                                // `git::MarkUnresolved` here would drop the
+                                // keystroke hint, since `space` is bound to
+                                // `ToggleStaged` and is what actually performs
+                                // this on the keyboard.
+                                let label = match (had_conflict, stage_status) {
                                     (true, StageStatus::Staged) => "Mark Unresolved",
                                     (true, _) => "Mark Resolved",
                                     (false, StageStatus::Staged) => "Unstage",
                                     (false, _) => "Stage",
                                 };
-                                let tooltip_name = action.to_string();
 
-                                Tooltip::for_action(tooltip_name, &ToggleStaged, cx)
+                                Tooltip::for_action(label.to_string(), &ToggleStaged, cx)
                             }),
                     ),
             )

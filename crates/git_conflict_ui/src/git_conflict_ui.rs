@@ -34,6 +34,23 @@ use workspace::Workspace;
 #[action(namespace = git, name = "OpenConflictResolver")]
 pub struct OpenConflictResolver;
 
+/// Put the selected path back into conflict — the reverse of `Mark Resolved`.
+///
+/// It is a separate action from `git::ToggleStaged` because the two run
+/// different git commands and only one of them is reversible. Staging a
+/// conflict resolves it (`git update-index --add`); *un*staging it is
+/// `git reset`, which replaces the unmerged stages with HEAD's blob and loses
+/// the incoming side outright. The way back is
+/// [`operations::RestoreConflictOp`] (`git checkout --merge`), and it needs its
+/// own action so no keybinding, menu row or checkbox can dispatch the
+/// destructive spelling by accident.
+///
+/// The git panel is the handler; it is the surface that knows which row is
+/// selected. See `GitPanel::mark_unresolved_for_selected`.
+#[derive(Default, Clone, PartialEq, Eq, gpui::Action)]
+#[action(namespace = git, name = "MarkUnresolved")]
+pub struct MarkUnresolved;
+
 pub fn init(cx: &mut App) {
     mcp_tools::register(cx);
 
