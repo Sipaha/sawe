@@ -1,6 +1,6 @@
 # Activating a project tab can hide it: the fold follows the trailing git widgets
 
-**Date:** 2026-09-08 · **Status:** root cause proven live, fix NOT yet chosen (needs the maintainer's call)
+**Date:** 2026-09-08 · **Status:** fixed (option 1, the maintainer's pick) — FORK.md #160
 
 ## Symptom
 
@@ -65,7 +65,21 @@ A local commit makes the push button appear (`↑1`) and can hide a tab with no 
    leaves the residual triggers above (repo/no-repo members, the push button appearing after a
    commit, run-config differences).
 
-Whatever is chosen, the regression test is fix-independent and belongs in `project_toolbar.rs`'s
-existing `VisualTestContext` harness: with two members and different branch names, the painted width
-of `project_tab_strip::STRIP_SELECTOR` (currently `pub(crate)`, needs `pub`) must be identical before
-and after `set_active_member`.
+## What shipped
+
+Option 1. `ProjectTabStrip::available_width` = window width − the strip's own left edge −
+`TRAILING_RESERVE` (420px, measured off the row it describes); the strip is content-sized in the
+toolbar row and the trailing cluster takes the slack (`flex_1 min_w_0 justify_end`) with the branch
+label capped at 140px and truncating. FORK.md #160.
+
+The regression test did not need the toolbar after all, and does not depend on which option was
+picked: `a_trailing_widget_that_grows_must_not_move_the_fold` hosts the strip beside a trailing block
+and grows that block by 240px — the width a long branch name costs the real row. It fails on the old
+behaviour (7 tabs painted → 5) and passes on the new one. `STRIP_SELECTOR` stayed `pub(crate)`; what
+changed is what it means (the tabs' own extent now, not the room they were given), so the two paint
+tests that used it as a boundary re-derive the budget instead.
+
+Verified live at 1100x800 on the same probe: activating the last visible tab (`ecos-model-lib`, on
+`release/4.10.0-integration-fixes`) leaves it visible and highlighted, and the branch label truncates
+to `release/4.10.0-in…` instead of taking the tab's slot. Measured cost of the reserve at that width:
+one tab (five tabs with a short branch before, four now) — the price of a fold that no longer moves.

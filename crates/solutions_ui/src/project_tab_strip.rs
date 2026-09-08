@@ -17,7 +17,7 @@
 //!     since `MultiWorkspace` calls `cx.notify()` on that transition.
 //!
 //! Overflow: the painted tabs are the LEADING members of the stored order,
-//! as many as the strip's MEASURED width can hold; the rest spill into a
+//! as many as the strip's width BUDGET can hold; the rest spill into a
 //! trailing `more` `PopoverMenu` whose rows can be DRAGGED out onto the strip
 //! to reorder.
 //!
@@ -41,11 +41,29 @@
 //! The strip used to cap the visible tabs at a fixed count (six) regardless
 //! of how wide the window was, which on a 1920px window left ~790px — 41% of
 //! the row — empty to the right of the `…` while half the projects sat
-//! hidden behind it. The budget below replaces that count: `available_width`
-//! is measured from a `canvas` covering the strip's own box, each tab's
-//! natural width is derived from its shaped label via
+//! hidden behind it. The budget below replaces that count: each tab's natural
+//! width is derived from its shaped label via
 //! `project_tab::tab_width_for_label`, and tabs are taken greedily until the
 //! budget (minus the trailing controls) runs out.
+//!
+//! That budget comes from the ROW, not from the strip's own box: it runs from
+//! the strip's left edge (measured by the `canvas` below) to the window's
+//! right edge, less [`TRAILING_RESERVE`]. The obvious quantity — the width the
+//! flex row leaves over for the strip — is the wrong one, and using it is the
+//! third way this split has been made to follow the selection. Everything to
+//! the strip's right is sized by the ACTIVE project: the branch label above
+//! all, but also the update/push buttons (they exist only with a repository),
+//! the repository selector and the run-config strip. Switching to a project on
+//! `release/4.10.0-integration-fixes` is worth about one tab of width, and the
+//! tab that pays for it is the last one — so clicking the last visible tab hid
+//! that very tab behind the `…`. Reading only the strip's left edge breaks the
+//! loop: it is decided by the leading dock toggles and their divider, and by
+//! nothing downstream of the tabs.
+//!
+//! The other half of that contract lives in `title_bar::project_toolbar`: the
+//! strip is content-sized in the row and the trailing cluster takes the slack,
+//! so the tabs can actually use the budget this file hands them.
+//! `docs/findings/2026-09-08-project-tab-fold-follows-the-selection.md`.
 
 use gpui::{
     Bounds, Entity, IntoElement, ParentElement, Pixels, Render, Styled, Subscription, TextRun,
@@ -83,9 +101,29 @@ const PLUS_DIVIDER_WIDTH: Pixels = px(3.0);
 /// filling by three is invisible.
 const BUDGET_SAFETY_MARGIN: Pixels = px(4.0);
 
-/// Paint selector for the strip's own box — the width budget itself, so a test
-/// can compare where the tabs actually landed against the space they were
-/// given rather than against a number copied out of this file.
+/// Room the project toolbar's trailing cluster is guaranteed, and which the
+/// tabs may therefore never claim: update + push buttons, the repository
+/// selector, the branch widget (whose label is capped at 140px there), the
+/// run-config strip, the right dock toggles and the row's own right padding.
+///
+/// A floor, not a reservation. When the tabs need less than their budget the
+/// cluster keeps the rest — it is `flex_1 justify_end` in the row — so this
+/// number only bounds how wide the tab run may grow, and the space is never
+/// left blank on the cluster's account.
+///
+/// Measured off the row it describes: ~286px with a short branch name and an
+/// empty run-config strip, ~436px with the branch label at its cap. Sized for
+/// the second so the common case never overflows the row; a member whose
+/// repository selector is also showing can still exceed it, which is what the
+/// cluster's `overflow_hidden` is for. Raising it costs tab slots on narrow
+/// windows (~145px each) and buys nothing on wide ones — the tabs rarely reach
+/// their budget there.
+const TRAILING_RESERVE: Pixels = px(420.0);
+
+/// Paint selector for the strip's own box. That box is now the tabs' own
+/// extent (the strip is content-sized in the row), so it answers "where did
+/// the tabs land", NOT "how much room did they have" — the budget is
+/// [`available_width`], and a test that wants it must compute it the same way.
 pub(crate) const STRIP_SELECTOR: &str = "PROJECT-TAB-STRIP";
 
 pub struct ProjectTabStrip {
@@ -93,11 +131,11 @@ pub struct ProjectTabStrip {
     /// The strip's own painted box, measured by the `canvas` in `render`.
     /// `None` until the first frame has been laid out.
     ///
-    /// This is only safe to feed back into `render` because the measured
-    /// quantity does not depend on the decision it drives: the strip is a
-    /// `flex_1` child of the project toolbar, so its width is "whatever the
-    /// row has left" no matter how many tabs are inside it. A content-sized
-    /// strip would oscillate here.
+    /// Only two things are read out of it, and neither can oscillate: the
+    /// LEFT EDGE, which the tabs cannot move (`available_width`), and the
+    /// HEIGHT, which the row fixes. The box is now content-sized, so its
+    /// width does depend on the decision this drives — which is exactly why
+    /// the width is not an input.
     measured_bounds: Option<Bounds<Pixels>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -224,6 +262,19 @@ fn overflow_menu_row(
 /// A pure function over plain numbers so the boundary cases — everything fits,
 /// nothing fits, the `…` itself being what pushes the last tab out — are
 /// unit-testable without a rendered frame.
+/// The width the strip may paint into: from its own left edge to the window's
+/// right edge, less [`TRAILING_RESERVE`].
+///
+/// `bounds.origin.x` is the one thing about the strip's box that depends
+/// neither on the strip's own content nor on anything to its right — the
+/// leading dock toggles and their divider decide it. The box's WIDTH is the
+/// quantity that made the fold follow the selection (module doc), so it is
+/// deliberately not read here.
+fn available_width(bounds: Bounds<Pixels>, window: &Window) -> Pixels {
+    let width = window.viewport_size().width - bounds.origin.x - TRAILING_RESERVE;
+    if width < px(0.0) { px(0.0) } else { width }
+}
+
 fn fit_count(widths: &[Pixels], budget: Pixels, more_button: Pixels) -> usize {
     let total: Pixels = widths.iter().copied().fold(px(0.0), |a, b| a + b);
     if total <= budget {
@@ -357,10 +408,12 @@ impl Render for ProjectTabStrip {
             })
             .collect();
 
-        // Width budget. The strip is a `flex_1` child of the project toolbar,
-        // so `measured_bounds` is the width the row actually has left for it —
-        // not the width its own content happens to want. Everything that is
-        // painted inside the strip but is not a member tab comes off the top:
+        // Width budget. It is derived from where the strip STARTS in the row
+        // and how wide the window is (`available_width`), never from the box
+        // the row left over for the strip — see the module doc: that leftover
+        // is a function of the active project, so folding against it made a
+        // click on the last tab hide that tab. Everything that is painted
+        // inside the strip but is not a member tab comes off the top:
         // the ghost tabs of in-flight clones (they are never hidden — a failed
         // add has to stay reachable), the `+` cell (a square whose side is the
         // strip height) and the rule before it.
@@ -383,7 +436,7 @@ impl Render for ProjectTabStrip {
                     .map(|(_, name)| tab_width_for_label(shaped_label_width(name, window, cx)))
                     .collect();
                 let plus_cell = bounds.size.height;
-                let budget = bounds.size.width
+                let budget = available_width(bounds, window)
                     - pending_width
                     - plus_cell
                     - PLUS_DIVIDER_WIDTH
@@ -547,11 +600,11 @@ impl Render for ProjectTabStrip {
                 })
         });
 
-        // Measures the box the toolbar row actually gives the strip. It has to
-        // sit OUTSIDE the `overflow_x_scroll` container below: inside one, an
-        // absolutely-positioned child is laid out against the scrollable
-        // content, so it would report the width of the tabs rather than the
-        // width available to them — the exact number this is here to learn.
+        // Measures the strip's box for its LEFT EDGE and its height (see the
+        // field's doc; the width is not an input). It has to sit OUTSIDE the
+        // `overflow_x_scroll` container below: inside one, an absolutely-
+        // positioned child is laid out against the scrollable content, so its
+        // origin would follow the scroll offset rather than the row.
         let measure = canvas(
             cx.processor(|this: &mut Self, bounds: Bounds<Pixels>, _window, cx| {
                 if this.measured_bounds == Some(bounds) {
@@ -575,7 +628,6 @@ impl Render for ProjectTabStrip {
         let strip = h_flex()
             .id("project-tab-strip")
             .h_full()
-            .w_full()
             .overflow_x_scroll()
             .children(tabs)
             .children(pending_tabs)
@@ -619,9 +671,12 @@ impl Render for ProjectTabStrip {
                 )
             });
 
+        // Content-sized on purpose: the row's slack belongs to the trailing
+        // cluster, not to the strip. A `w_full` strip would take the slack, and
+        // the only way to learn how much slack there was would be to measure
+        // this box — the loop the module doc is about.
         div()
             .relative()
-            .w_full()
             .h_full()
             .debug_selector(|| STRIP_SELECTOR.to_string())
             .child(measure)
@@ -709,26 +764,36 @@ mod fit_tests {
 mod paint_tests {
     use super::*;
     use crate::project_tab::{project_tab_selector, project_tab_state_selector};
-    use gpui::{Bounds, TestAppContext, VisualTestContext};
+    use gpui::{Bounds, TestAppContext, VisualTestContext, size};
 
-    /// Hosts a `ProjectTabStrip` at an exact width. The strip's whole contract
-    /// is "fill the box you are given", so a test host with a pinned width
-    /// exercises the budget honestly without standing up the project toolbar's
-    /// flex row (whose own job — handing the strip the row's slack — is a
-    /// separate assertion, in `title_bar`).
+    /// Models the project toolbar's row: the strip content-sized at the leading
+    /// edge, then a trailing block standing in for the git / run-config / dock
+    /// cluster. The strip's budget is read off the WINDOW and its own left edge
+    /// (`available_width`), never off the box the row leaves it, so `trailing`
+    /// is here to be changed mid-test — that it does not move the fold is the
+    /// invariant this whole arrangement exists for.
     struct StripHost {
         strip: Entity<ProjectTabStrip>,
-        width: Pixels,
+        trailing: Pixels,
     }
 
     impl Render for StripHost {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
-                .w(self.width)
-                .h(px(28.))
+                .size_full()
                 .flex()
-                .child(self.strip.clone())
+                .child(div().h(px(28.)).min_w_0().child(self.strip.clone()))
+                .child(div().flex_1().min_w_0())
+                .child(div().flex_none().w(self.trailing).h(px(28.)))
         }
+    }
+
+    /// The right edge of the room the strip was given, re-derived from the
+    /// window the way `available_width` does rather than copied out of the
+    /// strip. The strip's own painted box is its CONTENT now, so asserting
+    /// against `strip.right()` would assert nothing.
+    fn budget_right_edge(cx: &mut VisualTestContext) -> Pixels {
+        cx.update(|window, _cx| window.viewport_size().width) - TRAILING_RESERVE
     }
 
     /// `debug_bounds` wants a `&'static str`; the selectors here are built per
@@ -754,11 +819,33 @@ mod paint_tests {
     ];
 
     /// A window hosting a real `ProjectTabStrip` over a Solution with
-    /// `MEMBER_NAMES` as its members, laid out at exactly `width`.
+    /// `MEMBER_NAMES` as its members, whose width BUDGET is exactly `width`.
+    ///
+    /// The budget is `window width - strip left edge - TRAILING_RESERVE`, so
+    /// the host pins the strip at the leading edge and the window is sized
+    /// `width + TRAILING_RESERVE`. Every expectation below is stated in terms
+    /// of the budget, which is why they survived the change of where that
+    /// number comes from.
     async fn strip_at_width(
         width: Pixels,
         cx: &mut TestAppContext,
     ) -> (Vec<MemberId>, SolutionId, &mut VisualTestContext) {
+        let (member_ids, solution_id, _host, cx) = spawn_strip(width, px(80.), cx).await;
+        (member_ids, solution_id, cx)
+    }
+
+    /// `strip_at_width` plus the host entity, for the tests that need to
+    /// change the row around the strip after it has been painted once.
+    async fn spawn_strip(
+        width: Pixels,
+        trailing: Pixels,
+        cx: &mut TestAppContext,
+    ) -> (
+        Vec<MemberId>,
+        SolutionId,
+        Entity<StripHost>,
+        &mut VisualTestContext,
+    ) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -807,7 +894,8 @@ mod paint_tests {
             })
         });
 
-        let (_host, cx) = cx.add_window_view(|_window, _cx| StripHost { strip, width });
+        let (host, cx) = cx.add_window_view(|_window, _cx| StripHost { strip, trailing });
+        cx.simulate_resize(size(width + TRAILING_RESERVE, px(300.)));
         // Two frames: the first lays the strip out and measures its box, the
         // second is the one that renders the tab split that measurement
         // decided. A single frame would still be showing
@@ -815,7 +903,7 @@ mod paint_tests {
         cx.run_until_parked();
         redraw(cx);
 
-        (member_ids, solution_id, cx)
+        (member_ids, solution_id, host, cx)
     }
 
     /// Force another frame. The strip decides its split from the box it
@@ -904,7 +992,7 @@ mod paint_tests {
     /// the first one that is not could not have fitted in what is left.
     fn assert_no_room_was_wasted(
         painted: &[(MemberId, Bounds<Pixels>)],
-        strip: Bounds<Pixels>,
+        budget_right: Pixels,
         cx: &mut VisualTestContext,
     ) {
         if painted.len() == MEMBER_NAMES.len() {
@@ -914,7 +1002,7 @@ mod paint_tests {
             .iter()
             .map(|(_, b)| b.right())
             .fold(px(0.), |a, b| if b > a { b } else { a });
-        let leftover = strip.right() - rightmost;
+        let leftover = budget_right - rightmost;
         let next = predicted_width(MEMBER_NAMES[painted.len()], cx);
         assert!(
             leftover < next,
@@ -933,9 +1021,9 @@ mod paint_tests {
     ) {
         let (member_ids, _solution_id, cx) = strip_at_width(px(1580.), cx).await;
 
-        let strip = cx
-            .debug_bounds(STRIP_SELECTOR)
+        cx.debug_bounds(STRIP_SELECTOR)
             .expect("the strip must paint");
+        let budget_right = budget_right_edge(cx);
         let painted = painted_tabs(&member_ids, cx);
 
         // The old behaviour, stated as the thing that must not come back: this
@@ -953,17 +1041,16 @@ mod paint_tests {
             .map(|(_, b)| b.right())
             .fold(px(0.), |a, b| if b > a { b } else { a });
         assert!(
-            rightmost <= strip.right(),
-            "no tab may be painted past the strip's own box: last tab ends at \
-             {rightmost:?}, strip ends at {:?}",
-            strip.right()
+            rightmost <= budget_right,
+            "no tab may be painted past the budget the strip was given: last tab \
+             ends at {rightmost:?}, the budget ends at {budget_right:?}"
         );
         assert_eq!(
             cx.debug_bounds("ICON-Ellipsis").is_some(),
             painted.len() < MEMBER_NAMES.len(),
             "the overflow button must be painted exactly when something spilled"
         );
-        assert_no_room_was_wasted(&painted, strip, cx);
+        assert_no_room_was_wasted(&painted, budget_right, cx);
     }
 
     /// The other side: the same projects in a strip that genuinely cannot hold
@@ -974,9 +1061,9 @@ mod paint_tests {
     ) {
         let (member_ids, _solution_id, cx) = strip_at_width(px(660.), cx).await;
 
-        let strip = cx
-            .debug_bounds(STRIP_SELECTOR)
+        cx.debug_bounds(STRIP_SELECTOR)
             .expect("the strip must paint");
+        let budget_right = budget_right_edge(cx);
         let painted = painted_tabs(&member_ids, cx);
 
         assert!(
@@ -989,10 +1076,9 @@ mod paint_tests {
             .map(|(_, b)| b.right())
             .fold(px(0.), |a, b| if b > a { b } else { a });
         assert!(
-            rightmost <= strip.right(),
-            "even when it has to spill, the strip must not paint a tab past its \
-             own box: {rightmost:?} vs {:?}",
-            strip.right()
+            rightmost <= budget_right,
+            "even when it has to spill, the strip must not paint a tab past the \
+             budget it was given: {rightmost:?} vs {budget_right:?}"
         );
         assert!(
             cx.debug_bounds("ICON-Ellipsis").is_some(),
@@ -1003,7 +1089,48 @@ mod paint_tests {
         let painted_ids: Vec<MemberId> = painted.iter().map(|(id, _)| *id).collect();
         assert_eq!(painted_ids, member_ids[..painted.len()].to_vec());
         // …and it spilled because it had to, not because of a leftover cap.
-        assert_no_room_was_wasted(&painted, strip, cx);
+        assert_no_room_was_wasted(&painted, budget_right, cx);
+    }
+
+    /// The bug this whole arrangement exists for. Everything painted to the
+    /// strip's right is sized by the ACTIVE project — the branch label above
+    /// all — so a fold computed from the row's LEFTOVER width moved whenever
+    /// the selection did, and the tab that fell past the new fold was the last
+    /// visible one: the tab that had just been clicked. Growing the trailing
+    /// block models exactly that, and must change nothing about the split.
+    #[gpui::test]
+    async fn a_trailing_widget_that_grows_must_not_move_the_fold(cx: &mut TestAppContext) {
+        let (member_ids, _solution_id, host, cx) = spawn_strip(px(700.), px(80.), cx).await;
+
+        let before: Vec<MemberId> = painted_tabs(&member_ids, cx)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(
+            !before.is_empty() && before.len() < MEMBER_NAMES.len(),
+            "the probe needs a fold that could move: {} of {} tabs painted",
+            before.len(),
+            MEMBER_NAMES.len()
+        );
+
+        // +240px: roughly what `main` → `release/4.10.0-integration-fixes`
+        // costs the real row, which is about one tab.
+        host.update(cx, |host, cx| {
+            host.trailing = px(320.);
+            cx.notify();
+        });
+        redraw(cx);
+        redraw(cx);
+
+        let after: Vec<MemberId> = painted_tabs(&member_ids, cx)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            before, after,
+            "the trailing cluster grew and the fold followed it — the strip is \
+             reading the row's leftover width again"
+        );
     }
 
     /// The width budget is only honest if a tab really lays out at the width

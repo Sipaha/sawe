@@ -3833,3 +3833,30 @@ How to apply: prose that promises a tool to a scoped agent is a contract with th
 comment. When adding a tool name to any agent-facing prompt, assert it against
 `is_solution_scoped_tool` in the same commit; the reverse direction (global-socket reachability) is
 already guarded by `remote_control`'s allow-list test and `handoff`'s.
+
+### 160. The project tab fold is measured from the row, never from the strip's leftover width
+
+`ProjectTabStrip::available_width` is `window width − the strip's own left edge − TRAILING_RESERVE`
+(420px). The strip is content-sized in the project toolbar row; the trailing cluster is
+`flex_1 min_w_0 justify_end` and owns the slack, with the branch label capped at 140px and
+truncating.
+
+Why: the strip used to be the row's `flex_1` child and read its own measured box back as the budget,
+which made the budget a function of everything to its right — and everything to its right is sized by
+the ACTIVE project: the branch label (uncapped), the update/push buttons (they exist only with a
+repository), the repository selector, the run-config strip. So activating a member re-folded the
+strip, and under a prefix rule the tab that falls past a shrinking fold is always the last visible
+one — the tab the user had just clicked. `main` → `release/4.10.0-integration-fixes` is worth about
+one tab. The left edge is the one part of the box that nothing downstream of the tabs can move, which
+is why it is the only part still read. The same defect fires with no gesture at all: a local commit
+makes the push button appear and moves the fold.
+
+This is the third attempt at "a selection must not move the strip" (see the two named in
+`project_tab_strip.rs`'s header) and the first that does not try to fix it inside `fit_count` — the
+earlier two edited the split while leaving its input coupled to the selection.
+
+How to apply: `TRAILING_RESERVE` is a floor, not a reservation — when the tabs need less, the cluster
+keeps the rest, so raising it only costs tab slots on a narrow window (~145px each; the measured cost
+at 1100px is one tab) and buys nothing on a wide one. Any new widget in that row must either be
+inside the trailing cluster (where it is free to vary) or be selection-invariant. A widget that must
+never truncate has to fit inside the reserve, not be added to the strip's side of the row.

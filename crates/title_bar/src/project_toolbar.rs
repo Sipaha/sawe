@@ -331,8 +331,16 @@ impl ProjectToolbar {
                         .child(
                             h_flex()
                                 .gap_1()
+                                // Capped like the repository selector beside
+                                // it: `ButtonLike` is `flex_none`, so an
+                                // uncapped label is an unbounded contribution
+                                // to this row's trailing width — and the tab
+                                // strip's `TRAILING_RESERVE` is sized against
+                                // this cap.
+                                .max_w(px(140.))
+                                .overflow_hidden()
                                 .child(Icon::new(IconName::GitBranch).size(IconSize::Small))
-                                .child(Label::new(name).size(LabelSize::Small))
+                                .child(Label::new(name).size(LabelSize::Small).truncate())
                                 // The unpushed-commit count (`↑ahead`) now lives
                                 // on the dedicated Push button (`render_push_button`),
                                 // so it's intentionally not shown here anymore.
@@ -572,58 +580,67 @@ impl Render for ProjectToolbar {
                         .child(Divider::vertical().color(DividerColor::Border)),
                 )
             })
-            // The strip takes the row's slack instead of a bare `flex_1`
-            // spacer sitting after a content-sized strip. That slack IS the
-            // strip's width budget — `ProjectTabStrip` measures this box to
-            // decide how many tabs fit — and a content-sized strip could never
-            // learn it, which is why the strip used to truncate at a fixed six
-            // tabs with ~790px of the row still empty. `min_w_0` lets it shrink
-            // past its content on a narrow window so the trailing git / run-
-            // config / dock cluster stays on screen instead of being pushed off
-            // the right edge (it was, below ~1050px).
+            // Content-sized, NOT `flex_1`: the row's slack belongs to the
+            // trailing cluster below. The strip used to take the slack and read
+            // its own box back as its width budget, which made the budget a
+            // function of everything to its right — and everything to its right
+            // is sized by the ACTIVE project, so activating the last visible
+            // tab re-folded the strip and hid that tab behind the `…`. The
+            // strip now derives its budget from its left edge and the window
+            // width (`project_tab_strip::available_width`), and only ever
+            // paints tabs that fit inside it. `min_w_0` keeps the pre-
+            // measurement first frame (a generous prefix of tabs) from pushing
+            // the cluster off the right edge before the budget lands.
             .when_some(project_tab_strip, |this, strip| {
-                this.child(div().flex_1().min_w_0().h_full().child(strip))
+                this.child(div().min_w_0().h_full().child(strip))
             })
-            // …but the trailing cluster still needs to be pushed right when
-            // there is no strip at all (a window with no active solution).
-            .when(self.project_tab_strip.is_none(), |this| {
-                this.child(div().flex_1())
-            })
-            // `flex_none` on the trailing widgets, so the row's slack is the
-            // ONE quantity that absorbs a resize. Without it these shrink
-            // whenever the strip's content is momentarily wider than its box,
-            // which both squeezed the branch/run-config widgets for a frame
-            // after every resize and made the width the strip measures larger
-            // than the width it may actually use.
+            // Everything after the tabs, right-aligned, taking the row's slack.
+            // `flex_1` is what pins it to the trailing edge whether or not
+            // there is a strip at all, and what lets the git widgets sit next
+            // to the tabs on a wide window instead of being padded away from
+            // them. The strip's `TRAILING_RESERVE` is the floor this cluster is
+            // guaranteed; `overflow_hidden` on the git group is the last resort
+            // for the case that exceeds it (a member showing the repository
+            // selector as well), clipping that group rather than pushing the
+            // dock toggles off the window as the row did below ~1050px.
             .child(
                 h_flex()
-                    .flex_none()
+                    .flex_1()
+                    .min_w_0()
+                    .justify_end()
                     .gap_1()
-                    .children(
-                        self.render_update_button(cx)
-                            .map(IntoElement::into_any_element),
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .gap_1()
+                            .children(
+                                self.render_update_button(cx)
+                                    .map(IntoElement::into_any_element),
+                            )
+                            .children(
+                                self.render_push_button(cx)
+                                    .map(IntoElement::into_any_element),
+                            )
+                            .children(
+                                self.render_repository_selector(cx)
+                                    .map(IntoElement::into_any_element),
+                            )
+                            .children(
+                                self.render_branch_widget(cx)
+                                    .map(IntoElement::into_any_element),
+                            ),
                     )
-                    .children(
-                        self.render_push_button(cx)
-                            .map(IntoElement::into_any_element),
-                    )
-                    .children(
-                        self.render_repository_selector(cx)
-                            .map(IntoElement::into_any_element),
-                    )
-                    .children(
-                        self.render_branch_widget(cx)
-                            .map(IntoElement::into_any_element),
-                    ),
+                    .children(run_config.map(|strip| div().flex_none().child(strip)))
+                    // Last child in the row, so the right dock's toggles sit
+                    // flush against the trailing padding — the mirror of the
+                    // left dock's toggle at `pl_2`, and on the side those
+                    // panels open on. After the run-config strip rather than
+                    // inside the git cluster, so they stay pinned to the window
+                    // edge instead of drifting as the conditional git widgets
+                    // change.
+                    .child(div().flex_none().child(trailing_dock_buttons)),
             )
-            .children(run_config.map(|strip| div().flex_none().child(strip)))
-            // Last child in the row, so the right dock's toggles sit flush
-            // against the trailing padding — the mirror of the left dock's
-            // toggle at `pl_2`, and on the side those panels open on. Placing
-            // them after the run-config strip rather than inside the git
-            // cluster keeps them pinned to the window edge instead of drifting
-            // as the strip's width and the conditional git widgets change.
-            .child(div().flex_none().child(trailing_dock_buttons))
             .pr_1p5()
     }
 }
