@@ -116,6 +116,29 @@ async fn scoped_socket_injects_and_overrides_the_solution_id(cx: &mut TestAppCon
         Some(&json!(false)),
         "project.list_files must not need an explicit solution_id: {response}"
     );
+
+    // 4. The catalog is app-global state, but a scoped agent still has to be
+    //    able to *read* it: its system prompt sends it to `catalog.list` for
+    //    the `catalog_id` that the (shared) `solutions.add_member` consumes.
+    //    Global-only, this call came back "Tool not found" and the agent
+    //    reported the catalog as unlistable.
+    call_tool(
+        &mut global,
+        13,
+        "catalog.add_project",
+        json!({ "name": "Demo Repo", "remote_url": "git@example.com:demo.git" }),
+    )
+    .await;
+    let response = call_tool(&mut scoped, 14, "catalog.list", json!({})).await;
+    let projects = response
+        .pointer("/result/structuredContent/projects")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("catalog.list on the scoped socket returned: {response}"));
+    assert_eq!(
+        projects.len(),
+        1,
+        "the scoped socket must see the app-global catalog: {response}"
+    );
 }
 
 async fn wait_for(cx: &mut TestAppContext, path: &std::path::Path) {

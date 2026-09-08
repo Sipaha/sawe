@@ -240,7 +240,9 @@ const GLOBAL_TOOLS: &[&str] = &[
     "solutions.add_member",
     "solutions.add_empty_member",
     "solutions.remove_member",
-    // Catalog (registry of cloneable projects) is global state.
+    // Catalog (registry of cloneable projects) is global state. `catalog.list`
+    // is ALSO in SHARED_TOOLS (a scoped subagent has to be able to see what it
+    // may add); the mutating entries below stay operator-only.
     "catalog.list",
     "catalog.add_project",
     "catalog.remove_project",
@@ -356,6 +358,15 @@ const SHARED_TOOLS: &[&str] = &[
     "solutions.add_member",
     "solutions.add_empty_member",
     "solutions.remove_member",
+    // Read-only view of the catalog. The Solution Agent's own system prompt
+    // (`solution_agent::claude_adapter`) tells the subagent to call this for
+    // the `catalog_id` that the shared `solutions.add_member` takes, so
+    // leaving it global-only handed the agent "clone catalog project #N" with
+    // no way to learn any N — it reported the catalog as unlistable and gave
+    // up. Sharing grants nothing it could not already reach: `add_member` is
+    // shared and takes an arbitrary `catalog_id`, so listing is strictly the
+    // weaker capability. The mutating `catalog.*` tools stay global-only.
+    "catalog.list",
     // App-global store, no `solution_id` to inject (see GLOBAL_TOOLS).
     "run_config.list",
     "run_config.create",
@@ -402,6 +413,18 @@ const SHARED_TOOLS: &[&str] = &[
 
 fn is_shared_tool(name: &str) -> bool {
     SHARED_TOOLS.contains(&name)
+}
+
+/// Whether `name` is served from a per-solution socket — i.e. whether an
+/// agent scoped to one Solution can call it at all. That is every tool the
+/// split moved off the global socket, plus the [`SHARED_TOOLS`] that were
+/// cloned back onto it.
+///
+/// Exists so that text which *promises* a tool to a scoped agent (the Solution
+/// Agent system prompt) can be asserted against the tool split instead of
+/// drifting out of sync with it.
+pub fn is_solution_scoped_tool(name: &str) -> bool {
+    !is_global_tool(name) || is_shared_tool(name)
 }
 
 /// Deterministic path of a Solution's per-solution MCP socket. Pure — the
@@ -888,6 +911,37 @@ mod tests {
             "solutions.switch must not be served from per-solution sockets, where \
              solution_id injection would overwrite the caller's target"
         );
+    }
+
+    // The Solution Agent system prompt points the subagent at `catalog.list`
+    // for the `catalog_id` that `solutions.add_member` needs. Both must reach
+    // a per-solution socket or that instruction names a tool the agent cannot
+    // call; `catalog.list` must also stay global for the operator and the
+    // mobile allow-list. Mutating the catalog stays operator-only.
+    #[test]
+    fn catalog_list_is_global_and_shared() {
+        assert!(is_global_tool("catalog.list"));
+        assert!(
+            is_solution_scoped_tool("catalog.list"),
+            "a scoped agent that can add a catalog project must be able to list one"
+        );
+        assert!(
+            is_solution_scoped_tool("solutions.add_member"),
+            "catalog.list is only useful to a scoped agent alongside add_member"
+        );
+        for name in [
+            "catalog.add_project",
+            "catalog.remove_project",
+            "catalog.merge_project",
+            "catalog.edit_project",
+            "catalog.refresh_cache",
+            "catalog.clear_cache",
+        ] {
+            assert!(
+                !is_solution_scoped_tool(name),
+                "{name} mutates app-global catalog state and must stay operator-only"
+            );
+        }
     }
 
     #[test]

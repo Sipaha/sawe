@@ -3812,3 +3812,24 @@ commit into the incoming project's panel.
 
 How to apply: `Background` means "the same thing I was already showing moved"; it is never an open,
 never an activation, and never a repoint.
+
+### 159. `catalog.list` is shared onto per-solution sockets, because the Solution Agent's prompt promises it
+
+`catalog.list` is in `SHARED_TOOLS` alongside `solutions.add_member`; the mutating `catalog.*` tools
+stay global-only. `editor_mcp::is_solution_scoped_tool` exposes "served from a per-solution socket",
+and `solution_agent::claude_adapter`'s test extracts every backticked `namespace.tool` from the
+generated system prompt and asserts each one satisfies it.
+
+Why: a Solution Agent's `--nc` bridge is pointed at its own per-solution socket, which serves only the
+scoped slice of the tool catalog, while `build_initial_system_prompt` tells the agent to call
+`catalog.list` for the `catalog_id` that `solutions.add_member` consumes. `add_member` was shared and
+`catalog.list` was not, so the agent held "clone catalog project #N" with no way to learn any N: the
+call came back `-32601 Tool not found`, and the agent reported the catalog as unlistable and stopped.
+Sharing grants nothing new — the shared `add_member` already takes an arbitrary `catalog_id`, so
+listing is the strictly weaker capability — and the split's fail-safe default (a new tool is
+solution-scoped) does not protect a tool that is *also* legitimately global.
+
+How to apply: prose that promises a tool to a scoped agent is a contract with the tool split, not a
+comment. When adding a tool name to any agent-facing prompt, assert it against
+`is_solution_scoped_tool` in the same commit; the reverse direction (global-socket reachability) is
+already guarded by `remote_control`'s allow-list test and `handoff`'s.

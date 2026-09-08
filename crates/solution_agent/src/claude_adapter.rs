@@ -157,6 +157,61 @@ mod tests {
         assert!(prompt.contains("\"solution_id\": 14"));
     }
 
+    /// Every backticked `namespace.tool` the prompt names, in the order it
+    /// names them. Derived from the prompt text rather than hard-coded, so a
+    /// tool added to the prompt later is checked without anyone remembering to
+    /// list it here too.
+    fn tools_named_in(prompt: &str) -> Vec<&str> {
+        prompt
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter_map(|span| span.split_whitespace().next())
+            .filter(|token| {
+                let mut parts = token.split('.');
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(namespace), Some(tool), None) => {
+                        !namespace.is_empty()
+                            && !tool.is_empty()
+                            && token
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c == '_' || c == '.')
+                    }
+                    _ => false,
+                }
+            })
+            .collect()
+    }
+
+    // A Solution Agent talks to its *per-solution* MCP socket
+    // (`agent_servers::acp::mcp_servers_for_project` points the `--nc` bridge
+    // at it), which serves only the solution-scoped slice of the catalog. A
+    // tool this prompt promises but the split keeps global-only is an
+    // instruction the agent physically cannot follow: that is what happened to
+    // `catalog.list`, leaving the agent with `solutions.add_member` and no way
+    // to learn a `catalog_id` for it.
+    #[test]
+    fn every_tool_the_prompt_promises_reaches_a_scoped_socket() {
+        let prompt = ClaudeAcpAdapter.build_initial_system_prompt(&solution(vec!["m"]));
+        let named = tools_named_in(&prompt);
+        for expected in [
+            "catalog.list",
+            "solutions.add_member",
+            "solutions.add_empty_member",
+        ] {
+            assert!(
+                named.contains(&expected),
+                "the extractor stopped seeing the prompt's tool names: {named:?}"
+            );
+        }
+        for name in named {
+            assert!(
+                editor_mcp::is_solution_scoped_tool(name),
+                "the prompt tells the agent to call `{name}`, but it is not served                  from a per-solution socket — add it to editor_mcp's SHARED_TOOLS                  or stop promising it"
+            );
+        }
+    }
+
     #[test]
     fn prompt_includes_working_principles() {
         let prompt = ClaudeAcpAdapter.build_initial_system_prompt(&solution(vec!["m"]));
