@@ -57,54 +57,7 @@ impl Process {
                 log::debug!("Codex event receiver closed");
             }
         });
-        let reader_pending = pending.clone();
-        let reader = cx.background_spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next().await {
-                let value = match line
-                    .map_err(anyhow::Error::from)
-                    .and_then(|line| serde_json::from_str::<Value>(&line).map_err(Into::into))
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        log::error!("Codex protocol read failed: {error}");
-                        break;
-                    }
-                };
-                if value.get("method").is_none() {
-                    if let Some(id) = value["id"].as_u64()
-                        && let Some(sender) = reader_pending
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .remove(&id)
-                    {
-                        let result = if let Some(error) = value.get("error") {
-                            Err(anyhow!(
-                                "Codex: {}",
-                                error["message"].as_str().unwrap_or("request failed")
-                            ))
-                        } else {
-                            Ok(value["result"].clone())
-                        };
-                        if sender.send(result).is_err() {
-                            log::debug!("Codex response receiver dropped");
-                        }
-                    }
-                } else if incoming_tx.unbounded_send(value).is_err() {
-                    break;
-                }
-            }
-            if incoming_tx
-                .unbounded_send(json!({"method":"sawe/disconnected"}))
-                .is_err()
-            {
-                log::debug!("Codex event receiver closed");
-            }
-            reader_pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clear();
-        });
+        let reader = cx.background_spawn(read_messages(stdout, pending.clone(), incoming_tx));
         let writer_pending = pending.clone();
         let writer = cx.background_spawn(async move {
             while let Some(value) = outgoing_rx.next().await {
@@ -190,5 +143,109 @@ impl Process {
 impl Drop for Process {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+async fn read_messages(
+    stdout: impl futures::io::AsyncRead + Unpin,
+    pending: Pending,
+    incoming_tx: mpsc::UnboundedSender<Value>,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines.next().await {
+        let value = match line
+            .map_err(anyhow::Error::from)
+            .and_then(|line| serde_json::from_str::<Value>(&line).map_err(Into::into))
+        {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("Codex protocol read failed: {error}");
+                break;
+            }
+        };
+        if value.get("method").is_none() {
+            if let Some(id) = value["id"].as_u64()
+                && let Some(sender) = pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id)
+            {
+                let result = if let Some(error) = value.get("error") {
+                    Err(anyhow!(
+                        "Codex: {}",
+                        error["message"].as_str().unwrap_or("request failed")
+                    ))
+                } else {
+                    Ok(value["result"].clone())
+                };
+                if sender.send(result).is_err() {
+                    log::debug!("Codex response receiver dropped");
+                }
+            }
+        } else if incoming_tx.unbounded_send(value).is_err() {
+            break;
+        }
+    }
+    if incoming_tx
+        .unbounded_send(json!({"method":"sawe/disconnected"}))
+        .is_err()
+    {
+        log::debug!("Codex event receiver closed");
+    }
+    pending.lock().unwrap_or_else(|p| p.into_inner()).clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn routes_interleaved_replies_and_server_requests() {
+        smol::block_on(async {
+            let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+            let (first, first_rx) = oneshot::channel();
+            let (second, second_rx) = oneshot::channel();
+            pending.lock().unwrap().insert(1, first);
+            pending.lock().unwrap().insert(2, second);
+            let (events, mut receiver) = mpsc::unbounded();
+            let bytes = concat!(
+                "{\"id\":2,\"result\":{\"ok\":true}}\n",
+                "{\"id\":1,\"method\":\"item/commandExecution/requestApproval\",\"params\":{}}\n",
+                "{\"id\":1,\"error\":{\"message\":\"denied\"}}\n"
+            );
+            read_messages(futures::io::Cursor::new(bytes), pending.clone(), events).await;
+            assert_eq!(second_rx.await.unwrap().unwrap()["ok"], true);
+            assert!(
+                first_rx
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("denied")
+            );
+            assert_eq!(
+                receiver.next().await.unwrap()["method"],
+                "item/commandExecution/requestApproval"
+            );
+            assert_eq!(
+                receiver.next().await.unwrap()["method"],
+                "sawe/disconnected"
+            );
+            assert!(pending.lock().unwrap().is_empty());
+        });
+    }
+    #[test]
+    fn malformed_output_resolves_pending_requests_as_disconnected() {
+        smol::block_on(async {
+            let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+            let (sender, receiver) = oneshot::channel();
+            pending.lock().unwrap().insert(1, sender);
+            let (events, mut incoming) = mpsc::unbounded();
+            read_messages(futures::io::Cursor::new("not JSON\n"), pending, events).await;
+            assert!(receiver.await.is_err());
+            assert_eq!(
+                incoming.next().await.unwrap()["method"],
+                "sawe/disconnected"
+            );
+        });
     }
 }

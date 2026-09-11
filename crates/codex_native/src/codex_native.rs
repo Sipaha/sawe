@@ -72,12 +72,21 @@ struct Session {
     models: Vec<CodexModelInfo>,
     _pump: Task<()>,
 }
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.process.kill();
+        self.state
+            .borrow_mut()
+            .finish(Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)));
+    }
+}
 #[derive(Default)]
 struct TurnState {
     sender: Option<oneshot::Sender<Result<acp::PromptResponse>>>,
     turn_id: Option<String>,
     cancel_requested: bool,
     disconnected: bool,
+    generation: u64,
     active_model: Option<String>,
 }
 impl TurnState {
@@ -191,16 +200,18 @@ impl CodexConnection {
             let process = Rc::new(process);
             let state = Rc::new(RefCell::new(TurnState {active_model, ..Default::default()}));
             let pump_state = state.clone(); let weak_thread = thread.downgrade(); let weak_process = Rc::downgrade(&process);
+            let pump_id = id.clone();
             let pump = cx.spawn(async move |cx| {
                 let mut translator = translate::Translator::default();
                 while let Some(message) = incoming.next().await {
                     if message.get("id").is_some() {
-                        if let Some(process) = weak_process.upgrade() { handle_approval(message, weak_thread.clone(), process, cx); }
+                        if let Some(process) = weak_process.upgrade() { handle_approval(message, &pump_id, weak_thread.clone(), process, cx); }
                         continue;
                     }
                     let method = message["method"].as_str().unwrap_or("");
                     if method == "sawe/disconnected" { break; }
                     let params = &message["params"];
+                    if !belongs_to_thread(params, &pump_id) {continue;}
                     if method == "turn/started" { pump_state.borrow_mut().turn_id = params["turn"]["id"].as_str().map(str::to_owned); }
                     for update in translator.translate(method, params) { weak_thread.update(cx, |thread, cx| thread.handle_session_update(update, cx).log_err()).log_err(); }
                     if method == "turn/completed" { let result = translate::turn_result(&params["turn"]); pump_state.borrow_mut().finish(result); translator = translate::Translator::default(); }
@@ -299,6 +310,7 @@ impl AgentConnection for CodexConnection {
         }
         let (sender, receiver) = oneshot::channel();
         session.state.borrow_mut().sender = Some(sender);
+        session.state.borrow_mut().generation += 1;
         let process = session.process.clone();
         let state = session.state.clone();
         let model = self
@@ -321,7 +333,7 @@ impl AgentConnection for CodexConnection {
             let response = process.request("turn/start",json!({"threadId":params.session_id.0,"input":input,"model":model,"effort":effort})).await;
             match response {
                 Ok(response) => {let mut state = state.borrow_mut(); if state.sender.is_some() {state.turn_id = response["turn"]["id"].as_str().map(str::to_owned); state.active_model = model.or(state.active_model.take());}}
-                Err(error) => {state.borrow_mut().finish(Err(error));}
+                Err(error) => {process.kill(); state.borrow_mut().disconnected = true; state.borrow_mut().finish(Err(error));}
             }
             receiver.await.context("Codex session closed during response")?
         })
@@ -335,18 +347,25 @@ impl AgentConnection for CodexConnection {
             return;
         }
         session.state.borrow_mut().cancel_requested = true;
+        let generation = session.state.borrow().generation;
         let state = session.state.clone();
         let process = session.process.clone();
         let id = id.clone();
         cx.spawn(async move |cx| {
             // A stop can arrive before turn/start responds; wait briefly for its id.
             for _ in 0..100 {
+                if state.borrow().generation != generation {
+                    return;
+                }
                 if state.borrow().turn_id.is_some() || state.borrow().sender.is_none() {
                     break;
                 }
                 cx.background_executor()
                     .timer(Duration::from_millis(100))
                     .await;
+            }
+            if state.borrow().generation != generation || !state.borrow().cancel_requested {
+                return;
             }
             let turn_id = state.borrow().turn_id.clone();
             if let Some(turn_id) = turn_id {
@@ -358,7 +377,7 @@ impl AgentConnection for CodexConnection {
             cx.background_executor()
                 .timer(Duration::from_secs(10))
                 .await;
-            if state.borrow().cancel_requested {
+            if state.borrow().generation == generation && state.borrow().cancel_requested {
                 process.kill();
                 state
                     .borrow_mut()
@@ -424,15 +443,21 @@ fn mcp_config(servers: &[acp::McpServer]) -> Value {
 }
 fn handle_approval(
     message: Value,
+    session_id: &acp::SessionId,
     thread: gpui::WeakEntity<AcpThread>,
     process: Rc<Process>,
     cx: &mut AsyncApp,
 ) {
+    let permitted_thread = belongs_to_thread(&message["params"], session_id);
     let outgoing = process.outgoing.clone();
     drop(process);
     cx.spawn(async move |cx| {
         let method = message["method"].as_str().unwrap_or_default(); let params = &message["params"];
         let result = if matches!(method,"item/commandExecution/requestApproval"|"item/fileChange/requestApproval") {
+            if !permitted_thread {
+                outgoing.unbounded_send(json!({"id":message["id"],"result":{"decision":"decline"}})).log_err();
+                return;
+            }
             let title = params["command"].as_str().or(params["reason"].as_str()).unwrap_or("Codex requests permission");
             let call = acp::ToolCallUpdate::new(acp::ToolCallId::new(params["itemId"].as_str().unwrap_or("approval").to_owned()), acp::ToolCallUpdateFields::new().title(title.to_owned()).raw_input(params.clone()));
             let options = vec![acp::PermissionOption::new("allow", "Allow once", acp::PermissionOptionKind::AllowOnce),acp::PermissionOption::new("deny", "Deny", acp::PermissionOptionKind::RejectOnce)];
@@ -445,4 +470,19 @@ fn handle_approval(
         else {outgoing.unbounded_send(json!({"id":message["id"],"error":{"code":-32601,"message":"This Codex request is not supported by Sawe"}})).log_err();return;};
         outgoing.unbounded_send(json!({"id":message["id"],"result":result})).log_err();
     }).detach();
+}
+
+fn belongs_to_thread(params: &Value, id: &acp::SessionId) -> bool {
+    params["threadId"].as_str() == Some(id.0.as_ref())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn child_and_unscoped_events_cannot_complete_parent_turn() {
+        let id = acp::SessionId::new("parent");
+        assert!(belongs_to_thread(&json!({"threadId":"parent"}), &id));
+        assert!(!belongs_to_thread(&json!({"threadId":"child"}), &id));
+        assert!(!belongs_to_thread(&json!({}), &id));
+    }
 }

@@ -94,10 +94,11 @@ impl Translator {
                 }
                 let failed = matches!(item["status"].as_str(), Some("failed" | "declined"))
                     || item["exitCode"].as_i64().is_some_and(|code| code != 0);
+                let streamed_output = self.output.remove(id);
                 let output = item["aggregatedOutput"]
                     .as_str()
                     .map(str::to_owned)
-                    .or_else(|| self.output.remove(id))
+                    .or(streamed_output)
                     .unwrap_or_else(|| item.to_string());
                 vec![acp::SessionUpdate::ToolCallUpdate(
                     acp::ToolCallUpdate::new(
