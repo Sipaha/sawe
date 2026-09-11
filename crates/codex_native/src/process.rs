@@ -276,6 +276,28 @@ async fn read_messages(
 mod tests {
     use super::*;
     #[test]
+    fn request_timeout_does_not_retry_or_keep_a_pending_receiver() {
+        smol::block_on(async {
+            let pending: Pending = Default::default();
+            let (outgoing, mut requests) = mpsc::unbounded();
+            let error = request_on_wire(
+                &outgoing,
+                &pending,
+                9,
+                "turn/steer",
+                json!({"expectedTurnId":"old"}),
+                futures::future::ready(()),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+            assert_eq!(requests.try_recv().unwrap()["id"], 9);
+            assert!(pending.lock().unwrap().is_empty());
+            assert!(requests.try_recv().is_err());
+        });
+    }
+
+    #[test]
     fn routes_interleaved_replies_and_server_requests() {
         smol::block_on(async {
             let pending: Pending = Arc::new(Mutex::new(HashMap::new()));

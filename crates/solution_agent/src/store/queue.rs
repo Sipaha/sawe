@@ -656,7 +656,7 @@ impl SolutionAgentStore {
         if is_compaction
             && (matches!(
                 session_entity.read(cx).state,
-                SessionState::AwaitingInput | SessionState::Stopping
+                SessionState::AwaitingInput | SessionState::Stopping { .. }
             ) || session_entity
                 .read(cx)
                 .acp_thread()

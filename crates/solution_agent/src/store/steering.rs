@@ -24,12 +24,48 @@ fn apply_receipt_to_queue(
     delivered
 }
 
+fn steerable_bundles(s: &crate::model::SolutionSession) -> HashSet<uuid::Uuid> {
+    s.pending_messages
+        .iter()
+        .filter(|b| {
+            b.target == QueueTarget::Main
+                && (s.pending_compaction.is_none()
+                    || crate::compact::is_compaction_blocks(&b.blocks))
+        })
+        .map(|b| b.id)
+        .collect()
+}
+
 pub(super) struct PendingSteer {
     token: uuid::Uuid,
     pub bundles: HashSet<uuid::Uuid>,
 }
 
 impl SolutionAgentStore {
+    pub(super) fn rotation_steering_ready(
+        &self,
+        id: SolutionSessionId,
+        expected: &(u64, acp::SessionId, Option<u64>),
+        cx: &App,
+    ) -> Result<bool> {
+        let session = self
+            .session(id)
+            .ok_or_else(|| anyhow!("Session closed during context rotation"))?;
+        let s = session.read(cx);
+        if (s.epoch, &s.acp_session_id, s.pending_compaction)
+            != (expected.0, &expected.1, expected.2)
+            || matches!(
+                s.state,
+                SessionState::Stopping { .. } | SessionState::Errored(_)
+            )
+        {
+            return Err(anyhow!(
+                "The session changed while context rotation was waiting"
+            ));
+        }
+        Ok(!self.active_steers.contains_key(&id))
+    }
+
     pub(crate) fn bundle_is_steering(
         &self,
         session: SolutionSessionId,
@@ -58,7 +94,7 @@ impl SolutionAgentStore {
         let Some(thread) = s.acp_thread().cloned() else {
             return;
         };
-        let Some(native) = thread
+        let Some(connection) = thread
             .read(cx)
             .connection()
             .clone()
@@ -66,12 +102,10 @@ impl SolutionAgentStore {
         else {
             return;
         };
-        let bundles: HashSet<_> = s
-            .pending_messages
-            .iter()
-            .filter(|b| b.target == QueueTarget::Main)
-            .map(|b| b.id)
-            .collect();
+        // Once the handoff request is in flight, newer user intent belongs in
+        // the replacement context. A receipt only proves acceptance, not that
+        // the worker incorporated it into the handoff file already written.
+        let bundles = steerable_bundles(s);
         if bundles.is_empty() {
             return;
         }
@@ -84,11 +118,29 @@ impl SolutionAgentStore {
         let epoch = s.epoch;
         let acp_id = s.acp_session_id.clone();
         let token = uuid::Uuid::new_v4();
-        let task = native.steer(&acp_id, blocks, token.to_string(), cx);
+        let task = connection.steer(&acp_id, blocks, token.to_string(), cx);
         self.active_steers
             .insert(session_id, PendingSteer { token, bundles });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
+            // Reconnect can briefly detach the thread while preserving this
+            // context. Keep the receipt reserved until its user entry can be
+            // recorded on the replacement thread; never discard the text or
+            // resend an accepted/ambiguous message during that gap.
+            if !matches!(outcome, codex_native::SteerOutcome::Rejected(_)) {
+                loop {
+                    let wait_for_thread = this.update(cx, |store, cx| {
+                        store.active_steers.get(&session_id).is_some_and(|pending|
+                            pending.token == token && store.session(session_id).is_some_and(|session| {
+                                let s = session.read(cx);
+                                s.epoch == epoch && s.acp_session_id == acp_id && s.acp_thread().is_none()
+                                    && s.pending_messages.iter().any(|b| pending.bundles.contains(&b.id))
+                            }))
+                    }).unwrap_or(false);
+                    if !wait_for_thread { break; }
+                    cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                }
+            }
             this.update(cx, |store, cx| {
                 let Some(pending) = store.active_steers.get(&session_id) else { return; };
                 if pending.token != token { return; }
@@ -99,16 +151,18 @@ impl SolutionAgentStore {
                 if !retry {
                     let delivered = session.update(cx, |s, _| apply_receipt_to_queue(&mut s.pending_messages, &pending.bundles, &outcome));
                     if !delivered.is_empty() {
-                        thread.update(cx, |thread, cx| {thread.push_user_message_entry(None, delivered, cx);});
+                        if let Some(current_thread) = session.read(cx).acp_thread().cloned() {
+                            current_thread.update(cx, |thread, cx| {thread.push_user_message_entry(None, delivered, cx);});
+                        }
                         store.mark_queue_changed(session_id, cx);
                     }
                 }
                 match outcome {
                     codex_native::SteerOutcome::Accepted => {},
-                    codex_native::SteerOutcome::Rejected(error) => log::info!("Codex follow-up remains queued: {error}"),
+                    codex_native::SteerOutcome::Rejected(error) => log::info!("Agent follow-up remains queued: {error}"),
                     codex_native::SteerOutcome::Uncertain(error) => {
                         store.push_system_note(session_id, acp_thread::SystemNoteLevel::Error,
-                            format!("Codex follow-up delivery could not be confirmed: {error}. It was not resent automatically; verify the conversation before retrying."), cx);
+                            format!("Agent follow-up delivery could not be confirmed: {error}. It was not resent automatically; verify the conversation before retrying."), cx);
                     }
                 }
                 if matches!(session.read(cx).state, SessionState::Idle) {
@@ -258,6 +312,25 @@ mod tests {
         );
     }
     #[gpui::test]
+    async fn newer_intent_stays_queued_while_handoff_is_pending(cx: &mut gpui::TestAppContext) {
+        let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
+        store.update(cx, |store, cx| {
+            let session = store.session(id).unwrap();
+            session.update(cx, |s, _| {
+                s.begin_compaction_request();
+                let compact = bundle(crate::compact::COMPACT_PROMPT_HEADING);
+                let human = bundle("Newer user instruction");
+                let compact_id = compact.id;
+                let human_id = human.id;
+                s.pending_messages.extend([compact, human]);
+                assert_eq!(steerable_bundles(s), HashSet::from([compact_id]));
+                s.clear_compaction_request();
+                assert_eq!(steerable_bundles(s), HashSet::from([human_id]));
+            });
+        });
+    }
+
+    #[gpui::test]
     async fn stopped_flush_waits_for_inflight_receipt(cx: &mut gpui::TestAppContext) {
         let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
         store.update(cx, |store, cx| {
@@ -274,6 +347,12 @@ mod tests {
                     bundles: reserved,
                 },
             );
+            let expected = {
+                let session = store.session(id).unwrap();
+                let s = session.read(cx);
+                (s.epoch, s.acp_session_id.clone(), s.pending_compaction)
+            };
+            assert!(!store.rotation_steering_ready(id, &expected, cx).unwrap());
             store.flush_stopped_queue(id, false, cx);
             assert_eq!(
                 store.session(id).unwrap().read(cx).pending_messages.len(),
@@ -281,6 +360,9 @@ mod tests {
             );
             store.forget_client_send_ids(id);
             assert!(!store.active_steers.contains_key(&id));
+            assert!(store.rotation_steering_ready(id, &expected, cx).unwrap());
+            store.session(id).unwrap().update(cx, |s, _| s.bump_epoch());
+            assert!(store.rotation_steering_ready(id, &expected, cx).is_err());
         });
     }
 }

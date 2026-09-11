@@ -3465,6 +3465,10 @@ impl SolutionAgentStore {
                 s.cwd.clone(),
             )
         };
+        let expected_context = {
+            let s = session_entity.read(cx);
+            (s.epoch, s.acp_session_id.clone(), s.pending_compaction)
+        };
         let pair = (solution_id, agent_id);
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
@@ -3511,6 +3515,29 @@ impl SolutionAgentStore {
                     .new_session_with_meta(project.clone(), work_dirs, acp_meta, cx)
             });
             let new_thread = new_thread_task.await?;
+
+            // A steer can be accepted before its receipt is observed. Do not
+            // migrate that reserved queue into the replacement context and
+            // accidentally deliver it again. The native transport bounds its
+            // receipt wait; the outer bound also covers a failed backend.
+            let receipt_wait: Result<()> = async {
+                for _ in 0..600 {
+                    let ready = this.update(cx, |store, cx| {
+                        store.rotation_steering_ready(session_id, &expected_context, cx)
+                    })??;
+                    if ready { return Ok(()); }
+                    cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                }
+                Err(anyhow!("Context rotation is waiting for a follow-up delivery receipt; retry after it resolves"))
+            }.await;
+            if let Err(error) = receipt_wait {
+                let new_id = new_thread.read_with(cx, |thread, _| thread.session_id().clone());
+                if connection.supports_close_session() {
+                    cx.update(|cx| connection.clone().close_session(&new_id, cx)).await.log_err();
+                }
+                this.update(cx, |store, cx| store.pool_release_session(pair.clone(), cx)).log_err();
+                return Err(error);
+            }
 
             let new_count = this.update(cx, |store, cx| {
                 // The PRE-rotation ACP session id, captured before the graft

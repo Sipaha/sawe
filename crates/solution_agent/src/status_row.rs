@@ -140,6 +140,8 @@ pub(crate) fn render_status_row(
     // Without this split the mutating section would clash with the
     // immutable borrow of `s` through `cx`.
     let s = session.read(cx);
+    let compact_pending = s.is_compaction_pending();
+    let compact_permission_pending = crate::compact::has_pending_compact_approval(s, cx);
     let agent_id = s.agent_id.clone();
     let agent_label: SharedString = match agent_id.as_ref() {
         crate::codex_adapter::CODEX_AGENT_ID => "Codex".into(),
@@ -411,10 +413,8 @@ pub(crate) fn render_status_row(
     let remaining = max.saturating_sub(used);
     let too_full = remaining < compact_headroom_tokens(max);
     let pct_ok = pct >= COMPACT_BUTTON_MIN_PCT;
-    let compact_pending = s.is_compaction_pending();
-    let can_compact_context = (can_clean_context || is_running)
-        && !compact_pending
-        && !crate::compact::has_pending_compact_approval(s, cx);
+    let can_compact_context =
+        (can_clean_context || is_running) && !compact_pending && !compact_permission_pending;
     let compact_enabled = can_compact_context && pct_ok && !too_full;
     let clear_enabled = can_clean_context;
     let trigger_enabled = compact_enabled || clear_enabled;
