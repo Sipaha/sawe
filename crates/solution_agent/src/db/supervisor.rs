@@ -128,6 +128,8 @@ impl SolutionAgentDb {
                     // Transient: the per-process watch baseline is established
                     // on the first tick, not restored from disk.
                     watch_started_ms: None,
+                    observer_schedule: Default::default(),
+                    active_review: None,
                 });
             }
             Ok(out)

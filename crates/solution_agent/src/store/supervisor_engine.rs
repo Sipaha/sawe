@@ -359,8 +359,8 @@ impl SolutionAgentStore {
         // (see `apply_verdict_authenticated`). Minted before the briefing so it
         // rides into the template, and stored on the handle below.
         let nonce = crate::supervisor::new_verdict_nonce();
-        let briefing =
-            crate::supervisor::build_judge_briefing(&crate::supervisor::JudgeBriefingContext {
+        let briefing = crate::supervisor::build_judge_briefing(
+            &crate::supervisor::JudgeBriefingContext {
                 supervised_session_id: id.to_string(),
                 diary_path: crate::supervisor::diary_path(&dir)
                     .to_string_lossy()
@@ -378,11 +378,26 @@ impl SolutionAgentStore {
                     .into_owned(),
                 custom_prompt,
                 context_usage,
+                observation_context: if audit {
+                    None
+                } else {
+                    self.supervisor_states.get(&id).map(|state| {
+                        let reason = state.observer_schedule.last_trigger
+                            .unwrap_or(crate::supervisor::ObserverTrigger::Idle)
+                            .description();
+                        if let Some(snapshot) = state.active_review {
+                            format!("{reason} Snapshot epoch: {}. The worker was already Running; it may progress during this review. Do not interrupt it or queue a redundant nudge. Only cooperative compaction can act from this active review.", snapshot.epoch)
+                        } else {
+                            reason
+                        }
+                    })
+                },
                 audit,
                 bridge_bin,
                 socket_path,
                 nonce: nonce.clone(),
-            });
+            },
+        );
 
         // Spawn the judge/auditor as a CHILD of the supervised session
         // (`parent_session_id = Some(id)`) instead of a top-level session.
@@ -451,6 +466,15 @@ impl SolutionAgentStore {
             // path (transient failure) is handled by the judge-stuck watchdog
             // in `tick_supervisor`, which applies backoff/retry on timeout.
         });
+        if !audit && let Some(state) = self.supervisor_states.get_mut(&id) {
+            let trigger = state
+                .observer_schedule
+                .last_trigger
+                .unwrap_or(crate::supervisor::ObserverTrigger::Idle);
+            state
+                .observer_schedule
+                .fired(trigger, chrono::Utc::now().timestamp_millis());
+        }
         let handle = JudgeHandle {
             judge_id: None,
             started_ms: chrono::Utc::now().timestamp_millis(),
@@ -681,7 +705,7 @@ impl SolutionAgentStore {
         // direct-`apply_verdict` paths (e.g. a `Done` verdict from `Watching`,
         // and the unit tests) still act. The verdict is still logged below for
         // audit — it just isn't acted on when dropped.
-        let (verdict_superseded, supervising) = self
+        let (verdict_superseded, supervising, active_review) = self
             .supervisor_states
             .get_mut(&id)
             .map(|s| {
@@ -690,31 +714,42 @@ impl SolutionAgentStore {
                     s.enabled
                         && !matches!(
                             s.status,
-                            SupervisorStatus::Held | SupervisorStatus::Stopped(_)
+                            SupervisorStatus::Disabled
+                                | SupervisorStatus::Held
+                                | SupervisorStatus::WaitingUser
+                                | SupervisorStatus::Stopped(_)
                         ),
+                    s.active_review.take(),
                 )
             })
-            .unwrap_or((false, false));
-        // Send-time SESSION-state re-check: `should_fire` only lets a judge
-        // fire while the session is idle/errored, but the judge turn runs
-        // seconds→minutes and the agent can resume ON ITS OWN in the meantime
-        // (a `Bash(run_in_background)` continuation lands as an orphan result
-        // and flips the session back to `Running`; a tool-auth prompt →
-        // `AwaitingInput`). Delivering a nudge now would just queue a spurious
-        // extra turn behind the live one (the reported "supervisor reacted
-        // while the agent was still alive and the message got queued"). Drop
-        // the verdict unless the session is still genuinely idle/errored — the
-        // same premise `should_fire` required at the start.
-        let session_idle = self
+            .unwrap_or((false, false, None));
+        // Idle reviews still cannot nudge a worker that resumed. Active reviews
+        // may only request cooperative compaction from the same task snapshot;
+        // even a now-idle worker must not receive an old Continue/Done verdict.
+        let session_allows_verdict = self
             .session(id)
-            .map(|s| {
-                matches!(
-                    s.read(cx).state,
-                    SessionState::Idle | SessionState::Errored(_)
-                )
+            .map(|session| {
+                let session = session.read(cx);
+                let idle = matches!(session.state, SessionState::Idle | SessionState::Errored(_));
+                if let Some(snapshot) = active_review {
+                    let started_at = match session.state {
+                        SessionState::Running { started_at, .. } => Some(started_at),
+                        _ => None,
+                    };
+                    snapshot.permits(action, session.epoch, started_at, idle)
+                        && !session.is_compaction_pending()
+                        && !self.supervisor_states.get(&id).is_some_and(|state| {
+                            state.last_user_input_ms.is_some_and(|typed| {
+                                chrono::Utc::now().timestamp_millis().saturating_sub(typed)
+                                    < (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000
+                            })
+                        })
+                } else {
+                    idle
+                }
             })
-            .unwrap_or(true);
-        let drop_verdict = verdict_superseded || !supervising || !session_idle;
+            .unwrap_or(active_review.is_none());
+        let drop_verdict = verdict_superseded || !supervising || !session_allows_verdict;
 
         if let Some(root) = self.solution_root_for(id, cx) {
             let dir = crate::supervisor::supervisor_dir(&root, id);
@@ -1251,6 +1286,8 @@ impl SolutionAgentStore {
         // consecutive-continue cap) — a fresh on/off starts the tally over.
         state.trigger_count = 0;
         state.consecutive_continues = 0;
+        state.observer_schedule = Default::default();
+        state.active_review = None;
         if enabled {
             state.status = crate::supervisor::SupervisorStatus::Watching;
             state.consecutive_continues = 0;
@@ -2082,10 +2119,31 @@ impl SolutionAgentStore {
             let Some(session) = self.session(id) else {
                 continue;
             };
-            let (idle_or_errored, last_activity_ms, has_live_background_work) = {
+            let (
+                idle_or_errored,
+                last_activity_ms,
+                has_live_background_work,
+                running_started_at,
+                epoch,
+                usage,
+                compact_pending,
+            ) = {
                 let s = session.read(cx);
+                if s.is_supervisor_ephemeral || s.is_ephemeral {
+                    continue;
+                }
                 let idle_or_errored =
                     matches!(s.state, SessionState::Idle | SessionState::Errored(_));
+                let running_started_at = match s.state {
+                    SessionState::Running { started_at, .. } => Some(started_at),
+                    _ => None,
+                };
+                let used = s
+                    .acp_thread()
+                    .and_then(|thread| thread.read(cx).token_usage().map(|usage| usage.used_tokens))
+                    .or(s.cached_total_tokens);
+                // A missing context capacity is unknown, never a fabricated 1M.
+                let usage = used.zip(s.cached_max_tokens).filter(|(_, max)| *max > 0);
                 // A session sitting idle OVER a background command/agent it
                 // launched is legitimately idle — the agent is waiting on that
                 // work, so there is nothing for the supervisor to judge. Live =
@@ -2102,8 +2160,17 @@ impl SolutionAgentStore {
                     idle_or_errored,
                     s.last_activity_at.timestamp_millis(),
                     has_live_background_work,
+                    running_started_at,
+                    s.epoch,
+                    usage,
+                    s.is_compaction_pending(),
                 )
             };
+            let proactive_trigger = self.supervisor_states.get_mut(&id).and_then(|state| {
+                state
+                    .observer_schedule
+                    .observe(epoch, running_started_at.is_some(), usage, now_ms)
+            });
 
             // Don't fire the supervisor while a background command/agent is
             // running: the agent's idleness is expected (it's waiting on that
@@ -2113,7 +2180,7 @@ impl SolutionAgentStore {
             // once the work finishes and the agent goes genuinely idle. This is
             // what keeps the judge from firing a stream of `wait` verdicts over
             // a session parked on a long build/test.
-            if has_live_background_work {
+            if (has_live_background_work && running_started_at.is_none()) || compact_pending {
                 continue;
             }
             // Treat live human typing as activity: the supervisor's idle clock
@@ -2220,19 +2287,50 @@ impl SolutionAgentStore {
                 continue;
             }
 
+            // A failed active review has already consumed its crossing. Its
+            // explicit retry/backoff deadline still deserves another attempt;
+            // do not silently defer that recovery until the next hour.
+            let proactive_trigger = proactive_trigger.or_else(|| {
+                next_eligible_ms.and_then(|_| {
+                    self.supervisor_states.get(&id).and_then(|state| {
+                        (running_started_at.is_some() && state.active_review.is_some())
+                            .then_some(state.observer_schedule.last_trigger)
+                            .flatten()
+                    })
+                })
+            });
+            let typing_quiet = last_user_input_ms.is_none_or(|typed| {
+                now_ms.saturating_sub(typed)
+                    >= (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000
+            });
+            let trigger = if enabled
+                && matches!(status, crate::supervisor::SupervisorStatus::Watching)
+                && typing_quiet
+                && proactive_trigger.is_some()
+            {
+                proactive_trigger
+            } else if crate::supervisor::should_fire(
+                enabled,
+                &status,
+                idle_or_errored,
+                quiet_since_ms,
+                now_ms,
+                crate::supervisor::IDLE_THRESHOLD_SECS,
+            ) {
+                Some(crate::supervisor::ObserverTrigger::Idle)
+            } else {
+                None
+            };
             if now_ms >= next_eligible_ms.unwrap_or(0)
                 && eligible_for_watch
-                && crate::supervisor::should_fire(
-                    enabled,
-                    &status,
-                    idle_or_errored,
-                    quiet_since_ms,
-                    now_ms,
-                    crate::supervisor::IDLE_THRESHOLD_SECS,
-                )
+                && let Some(trigger) = trigger
             {
                 if let Some(st) = self.supervisor_states.get_mut(&id) {
                     st.status = crate::supervisor::SupervisorStatus::Judging;
+                    st.observer_schedule.last_trigger = Some(trigger);
+                    st.active_review = running_started_at.map(|started_at| {
+                        crate::supervisor::ActiveReviewSnapshot { epoch, started_at }
+                    });
                     // Fresh judge cycle: clear any stale supersede marker from a
                     // prior reply whose judge never emitted, so this verdict
                     // isn't pre-suppressed (bug #1).

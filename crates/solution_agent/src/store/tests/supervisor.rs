@@ -830,6 +830,8 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         pending_nudge: None,
         wait_until_ms: None,
         watch_started_ms: None,
+        observer_schedule: Default::default(),
+        active_review: None,
     };
     db.save_supervisor_state(state.clone())
         .await
@@ -3571,5 +3573,155 @@ async fn cancelled_turn_does_not_clear_quota_stop_self_or_sibling(cx: &mut TestA
                 "a cancelled turn must NOT propagate an un-park to siblings either"
             );
         });
+    });
+}
+
+#[gpui::test]
+async fn proactive_observer_context_honors_pauses_typing_and_backoff(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::supervisor::{StoppedReason, SupervisorStatus};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.session(id).unwrap().update(cx, |s, _| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            s.cached_total_tokens = Some(800_000);
+            s.cached_max_tokens = Some(1_000_000);
+        });
+        for status in [
+            SupervisorStatus::Held,
+            SupervisorStatus::WaitingUser,
+            SupervisorStatus::Disabled,
+            SupervisorStatus::Stopped(StoppedReason::Done),
+        ] {
+            store.supervisor_states.get_mut(&id).unwrap().status = status.clone();
+            store.tick_supervisor(cx);
+            assert_eq!(store.supervisor_states[&id].trigger_count, 0);
+            assert_eq!(store.supervisor_states[&id].status, status);
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let state = store.supervisor_states.get_mut(&id).unwrap();
+        state.status = SupervisorStatus::Watching;
+        state.last_user_input_ms = Some(now);
+        store.tick_supervisor(cx);
+        assert_eq!(store.supervisor_states[&id].trigger_count, 0);
+        let state = store.supervisor_states.get_mut(&id).unwrap();
+        state.last_user_input_ms = None;
+        state.next_eligible_ms = Some(now + 60_000);
+        store.tick_supervisor(cx);
+        assert_eq!(store.supervisor_states[&id].trigger_count, 0);
+        store
+            .supervisor_states
+            .get_mut(&id)
+            .unwrap()
+            .next_eligible_ms = None;
+        store.tick_supervisor(cx);
+        assert_eq!(store.supervisor_states[&id].trigger_count, 1);
+        assert!(store.supervisor_states[&id].active_review.is_some());
+        store.tick_supervisor(cx);
+        assert_eq!(store.supervisor_states[&id].trigger_count, 1);
+    });
+}
+
+#[gpui::test]
+async fn active_review_cannot_stop_or_nudge_even_after_worker_finishes(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::supervisor::{ActiveReviewSnapshot, SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        let started_at = std::time::Instant::now();
+        for idle in [false, true] {
+            for action in [
+                VerdictAction::Continue,
+                VerdictAction::Ask,
+                VerdictAction::AskAgent,
+                VerdictAction::Wait,
+                VerdictAction::Done,
+            ] {
+                let session = store.session(id).unwrap();
+                session.update(cx, |s, _| {
+                    s.state = if idle {
+                        SessionState::Idle
+                    } else {
+                        SessionState::Running {
+                            started_at,
+                            notified: false,
+                        }
+                    };
+                });
+                let epoch = session.read(cx).epoch;
+                let state = store.supervisor_states.get_mut(&id).unwrap();
+                state.status = SupervisorStatus::Judging;
+                state.active_review = Some(ActiveReviewSnapshot { epoch, started_at });
+                store.apply_verdict(
+                    id,
+                    action,
+                    "active snapshot".into(),
+                    Some("nudge".into()),
+                    Some("question".into()),
+                    None,
+                    None,
+                    cx,
+                );
+                assert_eq!(
+                    store.supervisor_states[&id].status,
+                    SupervisorStatus::Watching
+                );
+                assert_eq!(store.supervisor_states[&id].consecutive_continues, 0);
+                assert!(store.supervisor_states[&id].wait_until_ms.is_none());
+                assert!(session.read(cx).pending_messages.is_empty());
+            }
+        }
+    });
+}
+
+#[gpui::test]
+async fn active_compact_verdict_drops_after_epoch_change_or_user_supersede(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::supervisor::{ActiveReviewSnapshot, SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        let started_at = std::time::Instant::now();
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = SessionState::Running {
+                started_at,
+                notified: false,
+            }
+        });
+        for superseded in [false, true] {
+            let epoch = session.read(cx).epoch;
+            let state = store.supervisor_states.get_mut(&id).unwrap();
+            state.status = SupervisorStatus::Judging;
+            state.active_review = Some(ActiveReviewSnapshot { epoch, started_at });
+            state.judge_superseded = superseded;
+            if !superseded {
+                session.update(cx, |s, _| s.bump_epoch());
+            }
+            store.apply_verdict(
+                id,
+                VerdictAction::Compact,
+                "old snapshot".into(),
+                None,
+                None,
+                None,
+                None,
+                cx,
+            );
+            assert_eq!(
+                store.supervisor_states[&id].status,
+                SupervisorStatus::Watching
+            );
+            assert!(!session.read(cx).is_compaction_pending());
+            assert!(session.read(cx).pending_messages.is_empty());
+        }
     });
 }
