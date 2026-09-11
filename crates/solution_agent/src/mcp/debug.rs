@@ -12,7 +12,7 @@ use crate::store::SolutionAgentStore;
 use gpui::SharedString;
 use solutions::SolutionId;
 
-/// Debug/verification-only tool: register a COLD session (no live claude
+/// Debug/verification-only tool: register a COLD session (no live agent
 /// subprocess) pre-populated with the given entries, so an agent driving the
 /// editor over MCP can screenshot arbitrary multi-stream render states — Main
 /// plus a `Task` teammate (any entry with a `subagent_id`), background shells,

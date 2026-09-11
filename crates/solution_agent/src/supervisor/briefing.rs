@@ -85,17 +85,48 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         ),
         None => String::new(),
     };
-    template
-        .replace("{SUPERVISED_SESSION_ID}", &ctx.supervised_session_id)
-        .replace("{DIARY_PATH}", &ctx.diary_path)
-        .replace("{VERDICTS_PATH}", &ctx.verdicts_path)
-        .replace("{INTENT_PATH}", &ctx.intent_path)
-        .replace("{COMPACT_DIR}", &ctx.compact_dir)
-        .replace("{BRIDGE_BIN}", &ctx.bridge_bin)
-        .replace("{SOCKET_PATH}", &ctx.socket_path)
-        .replace("{VERDICT_NONCE}", &ctx.nonce)
-        .replace("{CONTEXT_USAGE_SECTION}", &context_section)
-        .replace("{CUSTOM_PROMPT_SECTION}", &custom_section)
+    // Keep human-readable paths separate from arguments in the executable
+    // example: a solution or binary path may contain spaces or apostrophes.
+    let shell_quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let bridge_shell = shell_quote(&ctx.bridge_bin);
+    let socket_shell = shell_quote(&ctx.socket_path);
+    let replacements = [
+        ("{BRIDGE_BIN_SHELL}", bridge_shell.as_str()),
+        ("{SOCKET_PATH_SHELL}", socket_shell.as_str()),
+        (
+            "{SUPERVISED_SESSION_ID}",
+            ctx.supervised_session_id.as_str(),
+        ),
+        ("{DIARY_PATH}", ctx.diary_path.as_str()),
+        ("{VERDICTS_PATH}", ctx.verdicts_path.as_str()),
+        ("{INTENT_PATH}", ctx.intent_path.as_str()),
+        ("{COMPACT_DIR}", ctx.compact_dir.as_str()),
+        ("{BRIDGE_BIN}", ctx.bridge_bin.as_str()),
+        ("{SOCKET_PATH}", ctx.socket_path.as_str()),
+        ("{VERDICT_NONCE}", ctx.nonce.as_str()),
+        ("{CONTEXT_USAGE_SECTION}", context_section.as_str()),
+        ("{CUSTOM_PROMPT_SECTION}", custom_section.as_str()),
+    ];
+    // Substitute only template text, never placeholder-looking text in a path
+    // or user instruction inserted above (which could undo shell quoting).
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(start) = remaining.find('{') {
+        rendered.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+        if let Some((key, value)) = replacements
+            .iter()
+            .find(|(key, _)| remaining.starts_with(*key))
+        {
+            rendered.push_str(value);
+            remaining = &remaining[key.len()..];
+        } else {
+            rendered.push('{');
+            remaining = &remaining[1..];
+        }
+    }
+    rendered.push_str(remaining);
+    rendered
 }
 
 /// Mint a fresh single-use credential for one judge/auditor briefing. It rides

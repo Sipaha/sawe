@@ -246,7 +246,7 @@ fn project_for_solution(solution_id: SolutionId, cx: &mut App) -> Option<Entity<
 
 /// Delete a session, dropping its `AcpThread` and removing it from the
 /// store. Mirrors `SolutionAgentStore::close_session` directly, which now
-/// kills the session's `claude` subprocess (via the connection's
+/// kills the session's agent subprocess (via the connection's
 /// `close_session`) and decrements the pool's per-pair `live_session_count`
 /// so the shared connection shuts down once its last session closes — no
 /// extra teardown is needed here.
@@ -382,7 +382,7 @@ impl McpServerTool for RenameSessionTool {
 // solution_agent.push_system_note
 // =====================================================================
 
-/// Restart the agent backing `session_id`: kill its `claude` subprocess and
+/// Restart the agent backing `session_id`: kill its agent subprocess and
 /// bring the SAME session back by resuming its `acp_session_id`, so the
 /// conversation survives. Same mechanics as `reconnect_agent` — that one is
 /// what the stuck-session watchdog calls, this one is the user's Restart
@@ -456,7 +456,7 @@ impl McpServerTool for RestartAgentTool {
 
 /// Non-destructively recover a wedged session: respawn its subprocess and
 /// replay the SAME `acp_session_id` from the transcript, keeping the
-/// conversation (entries + claude context). Identical to `restart_agent`
+/// conversation (entries + agent context). Identical to `restart_agent`
 /// apart from the wording the user is shown; this is the watchdog's entry
 /// point. Returns the session id.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]

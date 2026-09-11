@@ -37,7 +37,7 @@ limitation rather than claiming a verdict was submitted:
 
 ```bash
 req='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"<TOOL>","arguments":<ARGS_JSON>}}'
-( printf '%s\n' "$req"; sleep 2 ) | timeout 12 {BRIDGE_BIN} --nc {SOCKET_PATH}
+( printf '%s\n' "$req"; sleep 2 ) | timeout 12 {BRIDGE_BIN_SHELL} --nc {SOCKET_PATH_SHELL}
 ```
 
 The response is one JSON-RPC line; the data is in `.result.structuredContent`.

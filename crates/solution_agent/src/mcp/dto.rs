@@ -111,9 +111,9 @@ pub struct SessionSummary {
     /// Working directory the agent subprocess was launched with — either
     /// `solution.root` (default) or a member project's `local_path` when
     /// the chat was opened via the "+" popover's "New AI Chat" submenu.
-    /// Drives `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` bucketing
-    /// so the field is the only authoritative way to locate the on-disk
-    /// transcript without poking at the DB. `None` for legacy DB rows
+    /// For Claude, determines `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
+    /// bucketing. Other backends have their own transcript storage; use
+    /// `get_session` to read a conversation independently of its provider. `None` for legacy DB rows
     /// that predate the `session_cwd` column (empty `PathBuf` in
     /// `SolutionSession::cwd`); those sessions implicitly run at
     /// `solution.root`.

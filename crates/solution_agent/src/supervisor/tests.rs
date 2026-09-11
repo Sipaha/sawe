@@ -232,7 +232,7 @@ fn briefing_substitutes_paths_and_custom_prompt() {
     assert!(out.contains("don't stop before tests pass"));
     assert!(out.contains("187,000 / 200,000 tokens (94%)"));
     // The `--nc` bridge command is fully materialized for the judge.
-    assert!(out.contains("/path/to/sawe --nc /run/sol/mcp.sock"));
+    assert!(out.contains("'/path/to/sawe' --nc '/run/sol/mcp.sock'"));
     // The verdict nonce reaches the briefing verbatim so the judge can echo it.
     assert!(out.contains("noncevalue123"));
     assert!(
@@ -264,6 +264,42 @@ fn briefing_omits_custom_section_when_absent() {
     let out = build_judge_briefing(&ctx);
     assert!(!out.contains("{CUSTOM_PROMPT_SECTION}"));
     assert!(!out.contains("{CONTEXT_USAGE_SECTION}"));
+}
+
+#[cfg(unix)]
+#[test]
+fn briefing_shell_arguments_roundtrip_without_executing_paths() {
+    let mut ctx = JudgeBriefingContext {
+        supervised_session_id: "test".into(),
+        diary_path: "d".into(),
+        verdicts_path: "v".into(),
+        intent_path: "i".into(),
+        compact_dir: "c".into(),
+        custom_prompt: Some("Keep {SOCKET_PATH} literal".into()),
+        context_usage: None,
+        audit: false,
+        bridge_bin: "/path with space/it's-{SOCKET_PATH}-$(false)-`false`\\sawe".into(),
+        socket_path: "/run/it's $(false) `false`\n/socket".into(),
+        nonce: "n".into(),
+    };
+    for audit in [false, true] {
+        ctx.audit = audit;
+        let rendered = build_judge_briefing(&ctx);
+        let arguments = rendered
+            .split_once("timeout 12 ")
+            .and_then(|(_, rest)| rest.split_once("\n```"))
+            .map(|(arguments, _)| arguments)
+            .expect("bridge command");
+        // Only printf is executed; the generated binary/socket paths are data.
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("printf '%s\\0' {arguments}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let expected = format!("{}\0--nc\0{}\0", ctx.bridge_bin, ctx.socket_path);
+        assert_eq!(output.stdout, expected.as_bytes());
+        assert!(rendered.contains("Keep {SOCKET_PATH} literal"));
+    }
 }
 
 #[test]
