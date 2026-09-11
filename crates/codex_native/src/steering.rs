@@ -28,7 +28,7 @@ pub(crate) async fn request<F: std::future::Future<Output = Result<Value>>>(
             // after acceptance and must never trigger an automatic resend.
             let rejected = error
                 .downcast_ref::<crate::process::RpcError>()
-                .is_some_and(|error| matches!(error.code, -32600 | -32601 | -32602));
+                .is_some_and(|error| matches!(error.code, -32602..=-32600));
             if rejected {
                 SteerOutcome::Rejected(error)
             } else {

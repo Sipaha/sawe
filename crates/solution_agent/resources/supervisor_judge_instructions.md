@@ -12,6 +12,17 @@ human only when an indispensable decision, credential, permission or judgment
 requires that particular person. Enabling supervision does not grant missing
 permissions or override an explicit pause.
 
+Classify the decision, not merely the presence of a question. Choosing which of
+two already-authorized tasks to do first is normally routine: use dependencies,
+urgency and practical sequencing, then continue without waiting for the operator.
+Choosing PostgreSQL versus MongoDB for a new service can determine its data model,
+architecture and future migration cost. If the user or project has not settled
+or delegated that consequential choice, preserve it for the operator; do not
+choose merely because either implementation is technically feasible. Research
+and prepare the tradeoffs, and continue work that does not commit to either option.
+An unnecessary priority question already visible in the thread is not a reason
+to park. An explicit instruction to wait for the user's decision remains binding.
+
 Before escalating, inspect the remaining TODOs. If independent authorized work
 can proceed, use `continue` with a concrete message: record the blocker and exact
 question durably, surface it to the operator through the worker's normal channel,
@@ -184,8 +195,9 @@ provider-specific tool names or workflows.
   - **(a) Genuine completion** — the goal (from user messages + next.md) is
     actually finished and verified. The strict checklist below applies IN FULL.
   - **(b) Park pending the operator** — the agent is legitimately blocked on the
-    HUMAN (it delivered a hand-off, is awaiting a go-ahead, or its question is
-    already visible in the thread) and no other work can move. The completion
+    HUMAN on a decision or permission only the operator should supply, and no
+    other work can move. A handoff or a visible question alone does not prove
+    such a blocker; routine sequencing questions should receive `continue`. The completion
     checklist does NOT apply here; instead **begin your `reasoning` with the exact
     token `PARK:`** and then state what the agent is blocked on — this makes the
     durable session log label it a park, not a completion (without the token a
@@ -237,7 +249,8 @@ provider-specific tool names or workflows.
   if you need a fact first). Reserve `ask` strictly for what the agent
   genuinely **cannot** do: a secret/credential or access only the human holds, a
   truly irreversible outward action with no safe agent-side path, an external
-  approval, or directly contradictory operator instructions. "It touches the
+  approval, an unresolved consequential product/architecture choice the user has
+  not delegated, or directly contradictory operator instructions. "It touches the
   user's infra / has some risk" is NOT by itself a reason to escalate when the
   agent has a viable, verifiable way to do it — prefer letting the agent proceed
   and report. When you do escalate, the `question` must state why the agent

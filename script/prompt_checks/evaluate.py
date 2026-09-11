@@ -21,7 +21,8 @@ def load_cases():
         raise ValueError('unsupported behavioral case version')
     seen = set()
     for case in data['cases']:
-        if case['id'] in seen or case['expected_action'] not in ACTIONS:
+        if (case['id'] in seen or case['expected_action'] not in ACTIONS
+                or any(action not in ACTIONS for action in case.get('alternative_actions', []))):
             raise ValueError('invalid or duplicate behavioral case')
         seen.add(case['id'])
     return data['cases']
@@ -92,7 +93,7 @@ def parse_decision(text):
 
 def grade(case, decision):
     errors = []
-    if decision['action'] != case['expected_action']:
+    if decision['action'] not in [case['expected_action'], *case.get('alternative_actions', [])]:
         errors.append('unexpected next action')
     message = decision['message']
     if case.get('language') == 'ru' and not re.search('[А-Яа-яЁё]', message):
@@ -189,7 +190,7 @@ def main():
     parser.add_argument('--provider', choices=['claude', 'codex'])
     parser.add_argument('--executable', help='CLI path, defaults to provider on PATH')
     parser.add_argument('--model', help='explicit model; no automatic provider/model substitution')
-    parser.add_argument('--case', action='append', default=[], help='case id (repeatable; default all eight)')
+    parser.add_argument('--case', action='append', default=[], help='case id (repeatable; default all eleven)')
     parser.add_argument('--timeout', type=int, default=60, help='per-case seconds, maximum 120')
     parser.add_argument('--budget-usd', type=float, default=0.1, help='Claude per-case API budget, maximum 1')
     args = parser.parse_args()

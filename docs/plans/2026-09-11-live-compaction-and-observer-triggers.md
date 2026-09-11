@@ -25,3 +25,6 @@ Deterministic tests for active requests, deduplication, approval gates, safe com
 
 ## Active follow-up delivery
 The user additionally requested verification of both native runtimes. Codex uses `turn/steer` with the current `expectedTurnId`; reserve stable queue bundles until a receipt, retry only definite rejection, and surface ambiguous delivery without automatic repetition. A local Claude Code 2.1.258 experiment sent a stream-json user message during a running Bash command: the new instruction was consumed before the single final result. Evaluate a receipt-aware native stream path against the existing PostToolUse/Stop hooks, preserving turn ownership, targeted teammate delivery and queue ordering.
+
+## Clarified autonomy boundary
+Routine ordering between approved tasks is an agent decision unless the user explicitly reserves it. Consequential architecture/product choices that are unresolved and undelegated remain human decisions. A visible question alone is not a blocker; preserve real blockers and continue independent TODOs. Added three synthetic regression cases and checked both installed providers.

@@ -39,6 +39,7 @@ fn spec_for(binary: PathBuf, capture: Option<PathBuf>) -> ClaudeCommandSpec {
         session: SessionArg::New("mock-session".into()),
         mcp_servers_json: r#"{"mcpServers":{}}"#.into(),
         append_system_prompt: None,
+        generation_only: false,
         extra_env,
         model: None,
         settings_path: None,
