@@ -12,9 +12,7 @@ use ui::{
 use util::ResultExt as _;
 use workspace::Workspace;
 
-use crate::compact::{
-    COMPACT_BUTTON_MIN_PCT, COMPACT_BUTTON_WARN_PCT, COMPACT_HEADROOM_MIN_TOKENS,
-};
+use crate::compact::{COMPACT_BUTTON_MIN_PCT, COMPACT_BUTTON_WARN_PCT, compact_headroom_tokens};
 use crate::model::SessionState;
 use crate::session_view::SolutionSessionView;
 use crate::store::SolutionAgentStore;
@@ -408,16 +406,10 @@ pub(crate) fn render_status_row(
         cx.theme().colors().text_accent
     };
 
-    // The compact prompt + the agent's dump need real headroom (~3k
-    // for the prompt, ~10–20k for state.md / decisions.md / next.md
-    // / continue.md combined). A percentage gate misbehaves across
-    // model sizes — 10 % of a 200 k window is only 20 k tokens
-    // (tight) while 10 % of a 1 M window is 100 k (more than
-    // enough). Tie the disable threshold to absolute remaining
-    // tokens instead so the button stays usable on long-context
-    // models even past 90 %.
+    // Match the backend's size-aware reserve, including smaller windows whose
+    // proactive observer threshold would be blocked by a fixed 30k minimum.
     let remaining = max.saturating_sub(used);
-    let too_full = remaining < COMPACT_HEADROOM_MIN_TOKENS;
+    let too_full = remaining < compact_headroom_tokens(max);
     let pct_ok = pct >= COMPACT_BUTTON_MIN_PCT;
     let compact_pending = s.is_compaction_pending();
     let can_compact_context = (can_clean_context || is_running)

@@ -3725,3 +3725,39 @@ async fn active_compact_verdict_drops_after_epoch_change_or_user_supersede(
         }
     });
 }
+
+/// An autonomous follow-up can start AND finish while the observer is reading.
+/// Idle alone cannot prove the old Running snapshot still belongs to this turn.
+#[gpui::test]
+async fn active_compact_verdict_drops_after_worker_returns_idle(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::{ActiveReviewSnapshot, SupervisorStatus, VerdictAction};
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        let session = store.session(id).unwrap();
+        let epoch = session.read(cx).epoch;
+        let state = store.supervisor_states.get_mut(&id).unwrap();
+        state.status = SupervisorStatus::Judging;
+        state.active_review = Some(ActiveReviewSnapshot {
+            epoch,
+            started_at: std::time::Instant::now(),
+        });
+        session.update(cx, |s, _| s.state = SessionState::Idle);
+        store.apply_verdict(
+            id,
+            VerdictAction::Compact,
+            "old active review".into(),
+            None,
+            None,
+            None,
+            None,
+            cx,
+        );
+        assert_eq!(
+            store.supervisor_states[&id].status,
+            SupervisorStatus::Watching
+        );
+        assert!(!session.read(cx).is_compaction_pending());
+        assert!(session.read(cx).pending_messages.is_empty());
+    });
+}

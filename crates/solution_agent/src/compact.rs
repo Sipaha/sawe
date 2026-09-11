@@ -101,7 +101,7 @@ fn compact_unavailable_reason(session_id: SolutionSessionId, cx: &App) -> Result
                 pct * 100.0
             )));
         }
-        if remaining < COMPACT_HEADROOM_MIN_TOKENS {
+        if remaining < compact_headroom_tokens(max) {
             return Ok(Some(format!(
                 "only {} tokens of headroom left — start a fresh session manually",
                 remaining
@@ -437,12 +437,13 @@ pub(crate) const COMPACT_BUTTON_MIN_PCT: f64 = 0.10;
 /// context off the back of the window.
 pub(crate) const COMPACT_BUTTON_WARN_PCT: f64 = 0.50;
 
-/// Minimum free tokens we require before allowing a compact: enough
-/// for the instruction prompt (~3 k) and the agent's dump (state.md +
-/// decisions.md + next.md + continue.md, typically ~10–20 k combined),
-/// plus a buffer for tool-call traces. Below this, refuse the button —
-/// a half-truncated compact loses more than just starting over does.
-pub(crate) const COMPACT_HEADROOM_MIN_TOKENS: u64 = 30_000;
+/// Reserve ten percent of small windows, capped at 30k for larger models.
+/// A fixed 30k reserve made the approved 80% observer threshold unusable on
+/// 128k (and smaller) windows: only 25.6k remains when that threshold fires.
+/// Share this policy between the backend gate and the rendered control.
+pub(crate) fn compact_headroom_tokens(max_tokens: u64) -> u64 {
+    max_tokens.div_ceil(10).clamp(1, 30_000)
+}
 
 /// Markdown template fed to the agent on compact. `{{var}}` placeholders
 /// are filled from session state at click time. Source-of-truth lives in
@@ -753,6 +754,44 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn small_context_gate_allows_observer_threshold_but_rejects_exhausted_reserve(
+        cx: &mut TestAppContext,
+    ) {
+        let (session_id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store
+                .read(cx)
+                .session(session_id)
+                .unwrap()
+                .update(cx, |session, _| {
+                    session.state = SessionState::Running {
+                        started_at: std::time::Instant::now(),
+                        notified: false,
+                    };
+                });
+            for (used, allowed) in [(102_400, true), (115_200, true), (115_201, false)] {
+                thread.update(cx, |thread, cx| {
+                    thread.update_token_usage(
+                        Some(acp_thread::TokenUsage {
+                            used_tokens: used,
+                            max_tokens: 128_000,
+                            ..Default::default()
+                        }),
+                        cx,
+                    )
+                });
+                assert_eq!(
+                    compact_unavailable_reason(session_id, cx)
+                        .unwrap()
+                        .is_none(),
+                    allowed
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
     async fn running_compact_is_queued_once_without_rotating_and_cleans_up_on_stop(
         cx: &mut TestAppContext,
     ) {
@@ -927,5 +966,32 @@ mod tests {
                 "only compact_session may rotate after handoff writes"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::compact_headroom_tokens;
+
+    #[test]
+    fn approved_context_crossings_have_compaction_headroom() {
+        for max in [
+            8_000_u64, 32_000, 128_000, 128_001, 256_000, 256_001, 512_000, 1_000_000,
+        ] {
+            let threshold = crate::supervisor::observer_context_threshold(max).unwrap();
+            let used = (max * threshold).div_ceil(100);
+            assert!(max - used >= compact_headroom_tokens(max), "window {max}");
+        }
+    }
+
+    #[test]
+    fn reserve_is_proportional_capped_and_rounds_up() {
+        assert_eq!(compact_headroom_tokens(128_000), 12_800);
+        assert_eq!(compact_headroom_tokens(200_000), 20_000);
+        assert_eq!(compact_headroom_tokens(256_000), 25_600);
+        assert_eq!(compact_headroom_tokens(300_001), 30_000);
+        assert_eq!(compact_headroom_tokens(u64::MAX), 30_000);
+        assert_eq!(compact_headroom_tokens(10_001), 1_001);
+        assert_eq!(compact_headroom_tokens(0), 1);
     }
 }

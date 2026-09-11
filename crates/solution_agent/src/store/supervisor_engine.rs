@@ -736,7 +736,7 @@ impl SolutionAgentStore {
                         SessionState::Running { started_at, .. } => Some(started_at),
                         _ => None,
                     };
-                    snapshot.permits(action, session.epoch, started_at, idle)
+                    snapshot.permits(action, session.epoch, started_at)
                         && !session.is_compaction_pending()
                         && !self.supervisor_states.get(&id).is_some_and(|state| {
                             state.last_user_input_ms.is_some_and(|typed| {

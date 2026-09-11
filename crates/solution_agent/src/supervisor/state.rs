@@ -313,6 +313,8 @@ impl ObserverSchedule {
 
 /// Only compaction may act on a review of already-running work. A new turn or
 /// transcript rotation invalidates that snapshot; streamed output does not.
+/// Idle cannot establish which turn ended: a later autonomous turn may already
+/// have completed. Drop that stale review and let the idle observer reassess.
 #[derive(Debug, Clone, Copy)]
 pub struct ActiveReviewSnapshot {
     pub epoch: u64,
@@ -325,11 +327,10 @@ impl ActiveReviewSnapshot {
         action: VerdictAction,
         epoch: u64,
         running_started_at: Option<std::time::Instant>,
-        idle_or_errored: bool,
     ) -> bool {
         action == VerdictAction::Compact
             && self.epoch == epoch
-            && (running_started_at == Some(self.started_at) || idle_or_errored)
+            && running_started_at == Some(self.started_at)
     }
 }
 
@@ -1030,16 +1031,14 @@ mod observer_trigger_tests {
             epoch: 3,
             started_at,
         };
-        assert!(snapshot.permits(VerdictAction::Compact, 3, Some(started_at), false));
-        assert!(snapshot.permits(VerdictAction::Compact, 3, None, true));
-        assert!(!snapshot.permits(VerdictAction::Compact, 4, Some(started_at), false));
+        assert!(snapshot.permits(VerdictAction::Compact, 3, Some(started_at)));
+        assert!(!snapshot.permits(VerdictAction::Compact, 3, None));
+        assert!(!snapshot.permits(VerdictAction::Compact, 4, Some(started_at)));
         assert!(!snapshot.permits(
             VerdictAction::Compact,
             3,
-            Some(started_at + std::time::Duration::from_secs(1)),
-            false
+            Some(started_at + std::time::Duration::from_secs(1))
         ));
-        assert!(!snapshot.permits(VerdictAction::Compact, 3, None, false));
         for action in [
             VerdictAction::Continue,
             VerdictAction::Ask,
@@ -1047,8 +1046,8 @@ mod observer_trigger_tests {
             VerdictAction::Wait,
             VerdictAction::Done,
         ] {
-            assert!(!snapshot.permits(action, 3, Some(started_at), false));
-            assert!(!snapshot.permits(action, 3, None, true));
+            assert!(!snapshot.permits(action, 3, Some(started_at)));
+            assert!(!snapshot.permits(action, 3, None));
         }
     }
 
