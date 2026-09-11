@@ -1,3 +1,4 @@
+mod approval;
 mod process;
 mod steering;
 mod translate;
@@ -546,10 +547,19 @@ fn handle_approval(
             }
             let title = params["command"].as_str().or(params["reason"].as_str()).unwrap_or("Codex requests permission");
             let call = acp::ToolCallUpdate::new(acp::ToolCallId::new(params["itemId"].as_str().unwrap_or("approval").to_owned()), acp::ToolCallUpdateFields::new().title(title.to_owned()).raw_input(params.clone()));
-            let options = vec![acp::PermissionOption::new("allow", "Allow once", acp::PermissionOptionKind::AllowOnce),acp::PermissionOption::new("deny", "Deny", acp::PermissionOptionKind::RejectOnce)];
-            let task = thread.update(cx, |thread,cx| thread.request_tool_call_authorization(call, PermissionOptions::Flat(options), AuthorizationKind::PermissionGrant,cx));
-            let allow = match task {Ok(Ok(task)) => {let outcome: acp::RequestPermissionOutcome = task.await.into(); matches!(outcome, acp::RequestPermissionOutcome::Selected(selected) if selected.option_id.0.as_ref() == "allow")}, _ => false};
-            json!({"decision":if allow {"accept"} else {"decline"}})
+            let choices = approval::ApprovalChoices::from_params(params);
+            let task = thread.update(cx, |thread,cx| thread.request_tool_call_authorization(call, PermissionOptions::Flat(choices.options()), AuthorizationKind::PermissionGrant,cx));
+            let decision = match task {
+                Ok(Ok(task)) => {
+                    let outcome: acp::RequestPermissionOutcome = task.await.into();
+                    match outcome {
+                        acp::RequestPermissionOutcome::Selected(selected) => choices.decision(Some(selected.option_id.0.as_ref())),
+                        _ => choices.decision(None),
+                    }
+                },
+                _ => choices.decision(None),
+            };
+            json!({"decision":decision})
         } else if method == "item/permissions/requestApproval" {json!({"permissions":{},"scope":"turn"})}
         else if method == "mcpServer/elicitation/request" {json!({"action":"decline","content":null})}
         else if method == "item/tool/requestUserInput" {json!({"answers":{}})}
