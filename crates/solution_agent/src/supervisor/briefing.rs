@@ -87,9 +87,8 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
     };
     // Keep human-readable paths separate from arguments in the executable
     // example: a solution or binary path may contain spaces or apostrophes.
-    let shell_quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
-    let bridge_shell = shell_quote(&ctx.bridge_bin);
-    let socket_shell = shell_quote(&ctx.socket_path);
+    let bridge_shell = crate::prompt_template::quote_shell_argument(&ctx.bridge_bin);
+    let socket_shell = crate::prompt_template::quote_shell_argument(&ctx.socket_path);
     let replacements = [
         ("{BRIDGE_BIN_SHELL}", bridge_shell.as_str()),
         ("{SOCKET_PATH_SHELL}", socket_shell.as_str()),
@@ -107,26 +106,7 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         ("{CONTEXT_USAGE_SECTION}", context_section.as_str()),
         ("{CUSTOM_PROMPT_SECTION}", custom_section.as_str()),
     ];
-    // Substitute only template text, never placeholder-looking text in a path
-    // or user instruction inserted above (which could undo shell quoting).
-    let mut rendered = String::with_capacity(template.len());
-    let mut remaining = template;
-    while let Some(start) = remaining.find('{') {
-        rendered.push_str(&remaining[..start]);
-        remaining = &remaining[start..];
-        if let Some((key, value)) = replacements
-            .iter()
-            .find(|(key, _)| remaining.starts_with(*key))
-        {
-            rendered.push_str(value);
-            remaining = &remaining[key.len()..];
-        } else {
-            rendered.push('{');
-            remaining = &remaining[1..];
-        }
-    }
-    rendered.push_str(remaining);
-    rendered
+    crate::prompt_template::render(template, &replacements)
 }
 
 /// Mint a fresh single-use credential for one judge/auditor briefing. It rides

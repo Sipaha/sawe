@@ -6,6 +6,7 @@ use solutions::SolutionStore;
 use workspace::notifications::{NotificationId, simple_message_notification::MessageNotification};
 
 use crate::model::{SessionState, SolutionSessionId};
+use crate::prompt_template::quote_shell_argument;
 use crate::session_view::SolutionSessionView;
 use crate::status_row::DEFAULT_CONTEXT_WINDOW;
 use crate::store::SolutionAgentStore;
@@ -273,29 +274,27 @@ pub(crate) fn render_compact_prompt_inner(
             }
         }
     });
-    Ok(COMPACT_INSTRUCTIONS_TEMPLATE
-        .replace(
-            "{{compact_request_shell}}",
-            &quote_shell_argument(&request.to_string()),
-        )
-        .replace(
-            "{{solution_socket_shell}}",
-            &quote_shell_argument(&solution_socket),
-        )
-        .replace("{{session_id}}", &session_id.to_string())
-        .replace("{{compact_dir}}", &compact_dir_str)
-        .replace("{{solution_socket}}", &solution_socket)
-        .replace("{{solution_id}}", &solution_id.0.to_string())
-        .replace("{{agent_id}}", agent_id.as_ref())
-        .replace("{{started_at_iso}}", &started_at.to_rfc3339())
-        .replace("{{tokens_used}}", &used.to_string())
-        .replace("{{tokens_max}}", &max.to_string()))
-}
-
-/// Quote one argument for the POSIX shell command embedded in the handoff.
-/// JSON serialization alone cannot protect an apostrophe from the shell.
-fn quote_shell_argument(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
+    Ok(crate::prompt_template::render(
+        COMPACT_INSTRUCTIONS_TEMPLATE,
+        &[
+            (
+                "{{compact_request_shell}}",
+                &quote_shell_argument(&request.to_string()),
+            ),
+            (
+                "{{solution_socket_shell}}",
+                &quote_shell_argument(&solution_socket),
+            ),
+            ("{{session_id}}", &session_id.to_string()),
+            ("{{compact_dir}}", &compact_dir_str),
+            ("{{solution_socket}}", &solution_socket),
+            ("{{solution_id}}", &solution_id.0.to_string()),
+            ("{{agent_id}}", agent_id.as_ref()),
+            ("{{started_at_iso}}", &started_at.to_rfc3339()),
+            ("{{tokens_used}}", &used.to_string()),
+            ("{{tokens_max}}", &max.to_string()),
+        ],
+    ))
 }
 
 /// How many most-recent `cNN/` rotation handoff dirs to keep per session.

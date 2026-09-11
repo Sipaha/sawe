@@ -1,6 +1,6 @@
 # Supervisor mode — multi-agent workflow for sawe
 
-> Read by the **top-level supervisor** (main Claude Code session). Sub-agents
+> Read by the **top-level supervisor** (main coding-agent session). Sub-agents
 > have a narrow task scope from their dispatch prompt — they do NOT read this
 > file.
 >

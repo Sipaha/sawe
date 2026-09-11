@@ -3467,8 +3467,7 @@ impl Thread {
                         _ => continue,
                     };
 
-                    let mut lines = text.lines();
-                    summary.extend(lines.next());
+                    summary.push_str(&text);
                 }
 
                 log::debug!("Setting summary: {}", summary);
@@ -6254,6 +6253,31 @@ mod tests {
                 ));
                 assert!(matches!(&*thread.messages[3], Message::User(_)));
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_summary_preserves_multiline_stream_chunks(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let task = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_summarization_model(Some(model.clone()), cx);
+                thread.summary(cx)
+            })
+        });
+        cx.run_until_parked();
+        let request = model.pending_completions().pop().unwrap();
+        model.send_completion_stream_text_chunk(&request, "# Context\n\n- First");
+        model.send_completion_stream_text_chunk(&request, " item\n- Second item\n");
+        model.end_completion_stream(&request);
+        let summary = task.await.unwrap();
+        assert_eq!(
+            summary.as_ref(),
+            "# Context\n\n- First item\n- Second item\n"
+        );
+        cx.update(|cx| {
+            assert!(!thread.read(cx).is_generating_summary());
         });
     }
 

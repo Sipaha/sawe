@@ -25,6 +25,7 @@ pub mod model_catalog;
 pub(crate) mod native_controls;
 pub mod notifier;
 pub(crate) mod pool;
+pub(crate) mod prompt_template;
 pub mod rename_session_modal;
 pub mod reopen_session_modal;
 pub mod session_entry;

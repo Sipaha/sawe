@@ -79,6 +79,11 @@ pub struct SeedColdSessionParams {
     /// `Running`, so the screenshot gate can exercise the pending-queue render
     /// — including its height cap for very long messages. Omitted = no queue.
     pub pending_message: Option<String>,
+    /// Optional terminal error for rendering recovery controls. Debug-only.
+    pub error: Option<String>,
+    /// Cached context usage for rendering the compaction gate. Debug-only.
+    pub tokens_used: Option<u64>,
+    pub tokens_max: Option<u64>,
 }
 
 #[cfg(debug_assertions)]
@@ -167,7 +172,7 @@ impl McpServerTool for SeedColdSessionTool {
         let session_id = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.seed_cold_session(
+                let id = store.seed_cold_session(
                     solution_id,
                     title,
                     entries,
@@ -185,7 +190,18 @@ impl McpServerTool for SeedColdSessionTool {
                     }),
                     input.pending_message,
                     cx,
-                )
+                );
+                if let Some(session) = store.session(id) {
+                    session.update(cx, |session, cx| {
+                        if let Some(error) = input.error {
+                            session.state = crate::model::SessionState::Errored(error.into());
+                        }
+                        session.cached_total_tokens = input.tokens_used;
+                        session.cached_max_tokens = input.tokens_max;
+                        cx.notify();
+                    });
+                }
+                id
             })
         });
 

@@ -311,15 +311,15 @@ impl McpServerTool for CompactSessionTool {
 // solution_agent.start_compact
 // =====================================================================
 
-/// Kick off the "Compact context" workflow on a hot session — the same
+/// Kick off the "Compact context" workflow on an idle or errored session — the same
 /// orchestration the desktop's status-row popover "Compact context"
 /// entry runs. Sends the compact-instructions template as a user
 /// message; the agent then writes its handoff files and calls back
 /// into the lower-level `solution_agent.compact_session` to rotate.
 ///
 /// Surface contract: this tool is what a human client (e.g. the phone)
-/// invokes from a "Compact" button. `compact_session` is what Claude
-/// Code itself invokes after producing the handoff dump. Don't mix
+/// invokes from a "Compact" button. `compact_session` is what the running
+/// agent invokes after producing the handoff dump. Don't mix
 /// them up — `compact_session` rotates the ACP thread immediately and
 /// would discard the user's intent on a hot conversation.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]

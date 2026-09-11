@@ -1,61 +1,66 @@
 #!/usr/bin/env bash
+# Manage Sawe prompt overrides without deleting user-authored prompt directories.
+set -euo pipefail
 
-# This script manages prompt overrides for the Zed editor.
-#
-# It provides functionality to:
-# 1. Link the current repository's prompt templates to Zed's configuration.
-# 2. Create and link a separate Git worktree for prompt management.
-# 3. Unlink previously linked prompt overrides.
-#
-# Usage:
-#   ./script_name.sh link             # Link current repo's prompts
-#   ./script_name.sh link --worktree  # Create and link a separate worktree
-#   ./script_name.sh unlink           # Remove existing prompt override link
-#
-# The script ensures proper Git branch and worktree setup when using the
-# --worktree option. It also provides informative output and error handling.
-
-if [ "$1" = "link" ]; then
-    # Remove existing link (or directory)
-    rm -rf ~/.config/zed/prompt_overrides
-    if [ "$2" = "--worktree" ]; then
-        # Check if 'prompts' branch exists, create if not
-        if ! git show-ref --quiet refs/heads/prompts; then
-            git branch prompts
-        fi
-        # Check if 'prompts' worktree exists
-        if git worktree list | grep -q "../zed_prompts"; then
-            echo "Worktree already exists at ../zed_prompts."
-        else
-            # Create worktree if it doesn't exist
-            git worktree add ../zed_prompts prompts || git worktree add ../zed_prompts -b prompts
-        fi
-        ln -sf "$(realpath "$(pwd)/../zed_prompts/assets/prompts")" ~/.config/zed/prompt_overrides
-        echo "Linked $(realpath "$(pwd)/../zed_prompts/assets/prompts") to ~/.config/zed/prompt_overrides"
-        echo -e "\033[0;33mDon't forget you have it linked, or your prompts will go stale\033[0m"
-    else
-        ln -sf "$(pwd)/assets/prompts" ~/.config/zed/prompt_overrides
-        echo "Linked $(pwd)/assets/prompts to ~/.config/zed/prompt_overrides"
-    fi
-elif [ "$1" = "unlink" ]; then
-    if [ -e ~/.config/zed/prompt_overrides ]; then
-        # Remove symbolic link
-        rm -rf ~/.config/zed/prompt_overrides
-        echo "Unlinked ~/.config/zed/prompt_overrides"
-    else
-        echo -e "\033[33mWarning: No file exists at ~/.config/zed/prompt_overrides\033[0m"
-    fi
-else
-    echo "This script helps you manage prompt overrides for Zed."
-    echo "You can link this directory to have Zed use the contents of your current repo templates as your active prompts,"
-    echo "or store your modifications in a separate Git worktree."
-    echo
+usage() {
     echo "Usage: $0 [link [--worktree]|unlink]"
-    echo
-    echo "Options:"
-    echo "  link               Create a symbolic link from ./assets/prompts to ~/.config/zed/prompt_overrides"
-    echo "  link --worktree    Create a 'prompts' Git worktree in ../prompts, then link ../prompts/assets/prompts"
-    echo "                     to ~/.config/zed/prompt_overrides"
-    echo "  unlink             Remove the symbolic link at ~/.config/zed/prompt_overrides"
+    echo "Link this repository's assets/prompts, or a sibling sawe_prompts worktree."
+    echo "SAWE_HOME redirects the profile root; SAWE_DEV_DIRS=1 selects the dev profile."
+}
+
+operation="${1:-}"
+if [[ "$operation" != link && "$operation" != unlink ]] || (( $# > 2 )) ||
+    { (( $# == 2 )) && [[ "$operation" != link || "$2" != --worktree ]]; }; then
+    usage
     exit 1
 fi
+
+repo_root="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+channel_dir=sawe
+case "$(printf '%s' "${SAWE_DEV_DIRS:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1 | true | yes | on) channel_dir=sawe-dev ;;
+esac
+profile_root="${SAWE_HOME:-$HOME}/.spk/$channel_dir"
+if [[ "$(uname -s)" == Darwin ]]; then
+    override_path="$profile_root/config/prompt_overrides"
+else
+    override_path="$profile_root/data/prompt_overrides"
+fi
+
+# Both link and unlink may replace a symlink, including a dangling one, but
+# must never remove a real file or a directory containing custom prompts.
+if [[ -e "$override_path" && ! -L "$override_path" ]]; then
+    echo "Refusing to replace $override_path: move your existing prompts explicitly first." >&2
+    exit 1
+fi
+
+if [[ "$operation" == unlink ]]; then
+    if [[ -L "$override_path" ]]; then
+        rm -- "$override_path"
+        echo "Unlinked $override_path"
+    else
+        echo "No prompt override link at $override_path"
+    fi
+    exit 0
+fi
+
+source_path="$repo_root/assets/prompts"
+if [[ "${2:-}" == --worktree ]]; then
+    worktree_path="$(dirname "$repo_root")/sawe_prompts"
+    if ! git -C "$repo_root" worktree list --porcelain | grep -Fx "worktree $worktree_path" > /dev/null; then
+        if git -C "$repo_root" show-ref --verify --quiet refs/heads/prompts; then
+            git -C "$repo_root" worktree add "$worktree_path" prompts
+        else
+            git -C "$repo_root" worktree add -b prompts "$worktree_path"
+        fi
+    fi
+    source_path="$worktree_path/assets/prompts"
+fi
+[[ -d "$source_path" ]] || { echo "Missing prompt templates: $source_path" >&2; exit 1; }
+mkdir -p "$(dirname "$override_path")"
+if [[ -L "$override_path" ]]; then
+    rm -- "$override_path"
+fi
+ln -s -- "$source_path" "$override_path"
+echo "Linked $source_path to $override_path"
+echo "Prompt overrides remain active until you run '$0 unlink'."

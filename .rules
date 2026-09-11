@@ -134,10 +134,10 @@ history rewrites still need an explicit go-ahead.
 ## What's kept
 
 - **Extension registry on `zed.dev`** — extensions panel still browses / installs from upstream registry.
-- **External agents via ACP** (Claude Code subprocess, Gemini CLI, etc.) — `agent_servers` + `acp*` are wired up; the upstream `AgentPanel` UI surface is hidden in this fork. AI in this fork = `claude` subprocess driven by `solution_agent`, NOT API tokens.
+- **External agents via ACP** (Claude Code subprocess, Gemini CLI, etc.) — `agent_servers` + `acp*` are wired up; the upstream `AgentPanel` UI surface is hidden in this fork. The fork uses `solution_agent` for native Claude and Codex runtime sessions.
 - **BYOK providers** (Copilot, Anthropic via API key, Ollama, etc.) — defined but not promoted in UI.
 - **Multi-project Solutions** (`solutions` + `solutions_ui`) — group N catalog projects into one window. See `FORK.md`.
-- **Solution-scoped AI sessions** (`solution_agent`) — N parallel Claude Code sessions per Solution, multiplexed onto a shared subprocess per `(solution, agent)` pair. Auth via subscription, not API key. See `FORK.md`.
+- **Solution-scoped AI sessions** (`solution_agent`) — parallel chats per Solution with native Claude and Codex runtimes. Runtime adapters own their process lifecycle; Codex uses `codex app-server` and installed CLI authentication. See `FORK.md`.
 
 ## Build + test conventions
 
