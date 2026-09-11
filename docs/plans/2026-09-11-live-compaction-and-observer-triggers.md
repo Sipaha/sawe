@@ -6,7 +6,7 @@ Status: implementation
 Allow context compaction during active work, and make an enabled observer sustain autonomous progress with periodic/context-driven checks.
 
 ## Approved behavior
-The user approved context thresholds: 80% for windows up to128k,75% up to256k,65% up to512k,50% above512k. Hourly checks apply only while a session has active work. Existing idle checks remain. Explain why a check fired to the judge.
+The user approved context thresholds: 80% for windows up to 128k, 75% up to 256k, 65% up to 512k, 50% above 512k. Hourly checks apply only while a session has active work. Existing idle checks remain. Explain why a check fired to the judge.
 
 ## Compaction
 A live request asks the worker to finish its current step at a safe boundary, write the standard handoff and call the existing compaction completion tool. Never force-kill a running tool or erase context at request time. Use existing native steering/queue semantics; when immediate steering is unsupported, queue safely. Deduplicate pending requests. Preserve clear-context protections, explicit approval waits, cancellation and newer user intent.
@@ -22,3 +22,6 @@ Live-compaction agent owns compact.rs, relevant model/queue/lifecycle/status-row
 
 ## Verification
 Deterministic tests for active requests, deduplication, approval gates, safe completion, timer boundaries, thresholds, resets and stale active reviews. Run affected suites, prompt contracts, debug clippy/build and headless rendered UI smoke. Build release-fast, update docs, commit/push without screenshots.
+
+## Active follow-up delivery
+The user additionally requested verification of both native runtimes. Codex uses `turn/steer` with the current `expectedTurnId`; reserve stable queue bundles until a receipt, retry only definite rejection, and surface ambiguous delivery without automatic repetition. A local Claude Code 2.1.258 experiment sent a stream-json user message during a running Bash command: the new instruction was consumed before the single final result. Evaluate a receipt-aware native stream path against the existing PostToolUse/Stop hooks, preserving turn ownership, targeted teammate delivery and queue ordering.

@@ -14,15 +14,20 @@ Default instructions use English and do not assume a particular model. Responses
 - `script/prompts` targeted an obsolete Zed directory and recursively removed existing overrides. It now resolves the actual Sawe per-platform override directory, supports `SAWE_HOME` and the dev suffix, works outside the checkout cwd, and removes only symlinks. Real prompt files/directories are preserved with an actionable error. Isolated shell smoke tests cover link/relink/unlink, real-directory refusal, and worktree creation/reuse with spaces/apostrophes.
 - `agent::Thread::summary` dropped every line after the first in each streaming chunk. It now preserves whole chunks; a real fake-model stream regression checks multiline Markdown across chunk boundaries.
 - Compaction and supervisor executable examples JSON-serialize requests and shell-quote paths. A shared single-pass placeholder renderer preserves placeholder-like text in paths and user instructions instead of recursively interpreting it.
-- The error-state context controls now share the Idle/Errored eligibility rule. Active turns remain protected; clear rechecks session identity/activity before replacing history. Failed cold wakes report an error instead of staying Running.
+- The error-state context controls now share the Idle/Errored eligibility rule. Clear remains protected during active turns; it rechecks session identity/activity before replacing history. Failed cold wakes report an error instead of staying Running.
 
-## Prioritized improvements
+## Follow-up implementation
 
-1. Add behavioral evaluations across installed model providers for interrupted tools, ambiguous handoffs, multilingual output, pending approvals and malicious source text. Static checks prove syntax/contracts, not model behavior.
-2. Supply generation-only tasks with a narrow read-only role and capability set; do not combine a commit-title request with full autonomous implementation instructions.
-3. Shorten the supervisor judge/audit prompts by moving deterministic state transitions, limits and checks into host code. Keep only current task context and the response contract in the prompt.
-4. Enrich cherry-pick applicability advice with the actual diff and target context; names alone support candidate discovery, not a confident compatibility verdict.
-5. Version the prompt inventory and validate placeholders/output parsers on change. Keep harness selection separate from prompt text; maintenance scripts still need explicit transport adapters to run under a different harness.
+The uncontroversial recommendations are implemented and under final verification in
+[`../plans/2026-09-11-prompt-audit-improvements.md`](../plans/2026-09-11-prompt-audit-improvements.md):
+
+1. Versioned synthetic behavior cases and opt-in installed-provider probes distinguish heuristic grading from human review of the model's reasoning.
+2. Text generators receive supplied evidence, a narrow replacement role, and enforced empty built-in/MCP tool sets. Native Claude safe mode suppresses project customizations; interactive and supervisor sessions retain their policies.
+3. Duplicate judge wording was shortened; existing wait/nudge limits are rendered from host constants. Subsequent user-approved additions explicitly describe autonomous TODO progress and distinguish active observations from idle reviews.
+4. Cherry-pick advice uses the actual source patch and target HEAD contents. Cache keys reflect that evidence and revision, budgets account for larger inputs, and bounded Git reads skip unsupported oversized/binary cases.
+5. A versioned inventory and executable checks cover file-template placeholders, renderer bindings and selected output parser fixtures; behavioral Rust tests cover the production parser/runtime paths.
+
+The user subsequently approved cooperative live compaction, hourly checks only during active sessions, and context thresholds of 80% / 75% / 65% / 50% for windows up to 128k / 256k / 512k / larger. These schedule a review; they do not mechanically declare completion or grant missing authorization. Desktop feature proposals remain separate from this prompt audit.
 
 ## Solution runtime inventory
 
@@ -65,9 +70,9 @@ User-entered supervisor instructions, user messages, uploaded file contents, pro
 | `script/run-background-agent-mvp-local` | Crash maintenance runner's embedded workflow | Already English/model-neutral prompt. Droid execution is harness wiring, not prompt identity |
 | `script/github-check-new-issue-for-duplicates.py` | Area classification, duplicate selection, candidate critique | Natural-language system prompts are English/model-neutral. call_claude, model names and API shape intentionally remain Anthropic-specific implementation; output enums/schema preserved |
 | `crates/prompt_store`, `agent_ui` prompt stores/editors, provider request conversion | User prompt loading and transport | User content remains verbatim; provider schemas/protocol field names not rewritten |
-| `script/prompts` | Override management, not a model prompt | Root is fixing stale Zed paths and destructive directory removal separately |
+| `script/prompts` | Override management, not a model prompt | Fixed stale Zed paths and destructive directory removal |
 
-Explicit non-prompt exclusions: `open_path_prompt`, `ui_prompt`, GPUI prompts and `git_ui/picker_prompt.rs` are user dialogs; `task_template` and license templates are unrelated template data. `edit_prediction_cli/split_commit.rs` generates eval cases without a model prompt. Historical docs, fixtures, tests containing foreign text, provider names, API roles and protocol fields are not English-default migration targets. Root separately audits `.rules`, AGENTS and skill/workflow instructions.
+Explicit non-prompt exclusions: `open_path_prompt`, `ui_prompt`, GPUI prompts and `git_ui/picker_prompt.rs` are user dialogs; `task_template` and license templates are unrelated template data. `edit_prediction_cli/split_commit.rs` generates eval cases without a model prompt. Historical docs, fixtures, tests containing foreign text, provider names, API roles and protocol fields are not English-default migration targets. The audit also covers `.rules`, AGENTS and skill/workflow instructions.
 
 
 ## Verification
@@ -75,3 +80,7 @@ Explicit non-prompt exclusions: `open_path_prompt`, `ui_prompt`, GPUI prompts an
 Affected suites passed: 915 tests, one existing ignored test. Debug build, workspace formatting and scoped debug clippy passed without code warnings. Native Codex smoke covered streaming, command approval, cancellation and restart recovery. The final rendered debug editor showed both context actions enabled in Errored, with the error text visible even when its process is unloaded.
 
 The final release-fast build also completed successfully.
+
+## Follow-up live probe observations
+
+On 2026-09-11, eight synthetic cases passed heuristic grading with Codex `gpt-5.6-luna`; manual review found the intended decisions. Claude `sonnet` produced the intended recovery and supervisor decisions, but several responses wrapped JSON in Markdown even after the synthetic wrapper explicitly requested raw JSON. Strict format failures remain visible rather than being silently accepted. The source-instruction case safely rejected the malicious instruction but quoted its marker, a heuristic false positive confirmed by manual review. These observations cover the installed model/CLI combinations, not all models or production reliability. Raw model answers are retained in temporary evaluation reports; they are not committed.

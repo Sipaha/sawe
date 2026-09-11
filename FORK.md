@@ -474,7 +474,7 @@ How to apply:
 Why: the fork spawns the main `claude` agent with `--permission-mode bypassPermissions` (+ `--allow-dangerously-skip-permissions`, `command.rs`), so it never sends a `can_use_tool` control request. Enabling Agent Teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, decision in `command.rs`) means the agent delegates to teammates — and `claude` deliberately does NOT let an auto-spawned sub-agent inherit `bypassPermissions` (an autonomous sub-agent with blanket bypass is a safety hole). So every teammate tool call would pop an Allow/Reject prompt, the session would sit in `AwaitingInput` until each is answered, and answering from a paired mobile could leave the turn looking hung. Since the user already opted the whole workspace into bypass for the main agent, we extend the same trust to its teammates.
 
 How to apply:
-- `claude_native::connection::spawn_tool_authorization` answers `can_use_tool` with `behavior:"allow"` **synchronously** and returns `None` — it no longer drives `AcpThread::request_tool_call_authorization`. The tool call stays visible in the teammate's transcript (claude streams the `tool_use` block before the request), so nothing is hidden; only the per-call gate is dropped.
+- `claude_native::connection::answer_tool_authorization` answers interactive `can_use_tool` with `behavior:"allow"` **synchronously**; generation-only sessions deny requests — it no longer drives `AcpThread::request_tool_call_authorization`. The tool call stays visible in the teammate's transcript (claude streams the `tool_use` block before the request), so nothing is hidden; only the per-call gate is dropped.
 - This is a **deliberate, security-reviewed choice** (an automated review flags it HIGH "permission bypass" — that finding is acknowledged and accepted: it matches the existing main-agent bypass posture, it is NOT a new exposure). Do not "fix" it back to a gated prompt without the maintainer's say-so.
 - The gating machinery (`request_tool_call_authorization`, the Allow/Reject UI, the `ToolAuthorizationRequested/Received` store events) stays in tree. To re-enable per-call prompts, re-point `spawn_tool_authorization` at it; for defense-in-depth, gate auto-approval behind a `tool_name`/`input` classifier (allow read-only, prompt for `Bash`/`Write`/network) — explicitly declined for now since it would re-introduce prompts for exactly the `Bash` case this removes.
 
@@ -3983,3 +3983,53 @@ the temporary anchor; splices adjust it or discard a removed anchor row.
 The wheel handler sums signed pixel deltas relative to one painted anchor;
 the generic direction-resetting coalescer is unsuitable here. Never accumulate
 those deltas a second time in the measurement correction.
+
+### 164. Generation-only tasks require runtime enforcement
+
+Short-lived text generators receive supplied evidence, a narrow role and no
+built-in/MCP tools or project customizations. The store checks the explicit
+`AgentConnection::supports_generation_only` capability before sending metadata;
+unsupported ACP implementations must not silently ignore that restriction.
+Native policy survives respawn; interactive and supervisor policies are separate.
+See ADR-0004. Prompt instructions alone are not a capability boundary.
+
+### 165. Cherry-pick advice is tied to bounded revision evidence
+
+Applicability suggestions compare the actual source patch with target HEAD file
+contents, not filenames alone. Cache validity includes target revision, evidence,
+repository location and prompt version; explicit user dismissals remain distinct.
+Read Git objects without external diff/textconv, bound subprocess output and scan
+size, and charge the supplied prompt size to the estimated budget. Binary or
+oversized evidence is skipped and counted, never presented as a supported yes.
+
+Supervisor prompt limits are rendered from the state machine constants; do not
+maintain a second set of counters/thresholds in prose. The versioned prompt
+inventory and structural checks live under `script/prompt_checks`.
+
+### 166. Active observation requests cooperative compaction
+
+Enabled observers also inspect Running sessions after one hour since their last
+launch and on context threshold crossings: 80% through 128k, 75% through 256k,
+65% through 512k, and 50% above. Unknown capacity never invents a threshold.
+Crossings latch on an actual judge launch and rearm below the threshold or after
+context rotation. Existing idle reviews, typing, pause and backoff gates remain.
+
+A review of active work can only request compaction of the same Running turn and
+transcript epoch. Other verdicts are recorded without acting; idle review
+reassesses completed work. Compaction sends the standard handoff instruction
+cooperatively and deduplicates pending requests. Context resets only after the
+worker completes the handoff. User-requested observer-memory reset is deferred
+until successful rotation and invalidated by newer user instructions. The
+required handoff reserve is 10% of the known window, capped at 30k tokens.
+
+### 167. Codex follow-ups use acknowledged active-turn steering
+
+`turn/steer` uses the original active `expectedTurnId`, preserving the original
+prompt completion future. Stable queue bundle IDs separate in-flight input from
+newer submissions; acceptance consumes only reserved bundles. Definite rejection
+retains queued fallback. Ambiguous delivery is surfaced without automatic replay.
+Turn completion and context rotation must respect outstanding delivery receipts.
+
+Claude retains PostToolUse/Stop queue delivery: CLI 2.1.258's native stream-json
+input can continue after interrupt as a new turn. See the streaming-input finding
+for the bounded experiment; a replay UUID alone does not establish cancellation.

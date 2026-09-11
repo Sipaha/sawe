@@ -22,6 +22,7 @@ How sessions are run.
 
 - [`workflow/supervisor-mode.md`](workflow/supervisor-mode.md) — the supervisor's playbook (READ → DECIDE → DISPATCH → VERIFY → FINALIZE).
 - [`workflow/doc-discipline.md`](workflow/doc-discipline.md) — when to create / update which doc.
+- [`workflow/prompt-checks.md`](workflow/prompt-checks.md) — versioned prompt contracts and opt-in synthetic provider evaluations.
 - [`workflow/adr-template.md`](workflow/adr-template.md) — template for new ADRs.
 
 ---
@@ -36,6 +37,7 @@ contracts, multi-crate invariants). Each ADR is dated `accepted`/`superseded`.
 | 0001 | Fork philosophy: no scheduled upstream merge | accepted | [`architecture/decisions/0001-fork-philosophy.md`](architecture/decisions/0001-fork-philosophy.md) |
 | 0002 | Native headless GPUI platform for autonomous agent driving | accepted | [`architecture/decisions/0002-native-headless-platform.md`](architecture/decisions/0002-native-headless-platform.md) |
 | 0003 | Remote Control transport — WebSocket over TLS, fingerprint-pinned, secret-authenticated | accepted | [`architecture/decisions/0003-remote-control-protocol.md`](architecture/decisions/0003-remote-control-protocol.md) |
+| 0004 | Generation-only sessions enforce runtime capabilities | accepted | [`architecture/decisions/0004-generation-only-agent-sessions.md`](architecture/decisions/0004-generation-only-agent-sessions.md) |
 
 ---
 
@@ -50,6 +52,7 @@ can read them.
 
 | Date | Status | Plan |
 |---|---|---|
+| 2026-09-11 | implementation | [`plans/2026-09-11-live-compaction-and-observer-triggers.md`](plans/2026-09-11-live-compaction-and-observer-triggers.md) — cooperative compaction, active observer checks and native follow-up delivery. |
 | 2026-09-11 | implementation | [`plans/2026-09-11-prompt-audit-improvements.md`](plans/2026-09-11-prompt-audit-improvements.md) — bounded generation tasks, grounded suggestions and prompt checks. |
 | 2026-09-11 | complete | [`plans/2026-09-11-prompt-audit-and-error-compaction.md`](plans/2026-09-11-prompt-audit-and-error-compaction.md) — English model-neutral prompt audit and Error-state context recovery. |
 | 2026-09-11 | complete | [`plans/2026-09-11-chat-scroll-anchoring.md`](plans/2026-09-11-chat-scroll-anchoring.md) — preserve the visual anchor when wrapped history rows are measured. |
@@ -127,6 +130,7 @@ Short, dated, single-fact notes from sessions: "ran a benchmark and got X",
 
 | Date | Status | Topic |
 |---|---|---|
+| 2026-09-11 | verified | [`findings/2026-09-11-claude-native-streaming-input.md`](findings/2026-09-11-claude-native-streaming-input.md) — active stdin works, but queued input survives interrupt; retain the editor-owned hook queue. |
 | 2026-09-11 | audited | [`findings/2026-09-11-model-neutral-prompt-audit.md`](findings/2026-09-11-model-neutral-prompt-audit.md) — prompt inventory, English defaults, protocol boundaries and prioritized improvements. |
 | 2026-09-11 | fixed | [`findings/2026-09-11-chat-scroll-anchoring.md`](findings/2026-09-11-chat-scroll-anchoring.md) — preserve visible content when upward scrolling discovers taller wrapped rows. |
 | 2026-09-08 | fixed | [`findings/2026-09-08-project-tab-fold-follows-the-selection.md`](findings/2026-09-08-project-tab-fold-follows-the-selection.md) — **Клик по последней видимой вкладке проекта прячет её в `…`.** `ProjectTabStrip` считает свёртку от собственной коробки — то есть от ОСТАТКА ширины строки `ProjectToolbar`, — а хвост строки (`BranchWidget` без ограничения ширины, кнопки update/push, селектор репозитория, run-config) зависит от АКТИВНОГО проекта. Активация меняет остаток → меняется `fit_count` → вкладка, по которой только что кликнули, уезжает за свёртку. Инвариант, записанный в шапке `project_tab_strip.rs` («активный участник не влияет на разбиение»), держится внутри стрипа и ломается уровнем выше, в layout. Доказано вживую: 5 вкладок при ветке `main` → 3 вкладки + `…` при `release/4.10.0-integration-fixes`, изменилась только подпись ветки. Тот же триггер срабатывает без жеста — локальный коммит показывает `↑1` и тоже двигает свёртку. Починено вариантом 1 (выбор мейнтейнера): бюджет = ширина окна − левый край стрипа − `TRAILING_RESERVE` (420px), стрип в строке размером по контенту, хвост забирает слак и обрезает подпись ветки (кап 140px). FORK.md #160; тест `a_trailing_widget_that_grows_must_not_move_the_fold` красный на старом поведении (7 вкладок → 5). Цена резерва на 1100px — одна вкладка. |
