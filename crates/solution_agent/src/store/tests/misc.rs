@@ -2669,6 +2669,19 @@ fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
                 "prompt mentions member project, got {append:?}"
             );
 
+            // A newly reserved identity has no session entity yet. It still
+            // reaches the launch prompt and is not confused with another tab.
+            let sender_id = SolutionSessionId::new();
+            let other_id = SolutionSessionId::new();
+            for id in [sender_id, other_id] {
+                let identity_meta = store.build_session_meta(
+                    &SharedString::from(CLAUDE_ACP_AGENT_ID), &solution, Some(id), None, cx,
+                ).unwrap();
+                let prompt = identity_meta["systemPrompt"]["append"].as_str().unwrap();
+                assert!(prompt.contains(&format!("Your stable Sawe session ID is `{id}`")));
+                assert!(prompt.contains("solution_agent.send_agent_message"));
+            }
+
             // Unknown agent → None (registry lookup fails)
             let none_meta =
                 store.build_session_meta(

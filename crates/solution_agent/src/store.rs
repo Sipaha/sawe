@@ -1360,6 +1360,9 @@ impl SolutionAgentStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<SolutionSessionId>> {
         let pair = (solution_id, agent_id.clone());
+        // Reserve the stable editor identity before creating the native session
+        // so its initial instructions can identify the sender of peer messages.
+        let session_id = SolutionSessionId::new();
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             // 1. Resolve the solution. Cloned out so we don't hold the store
@@ -1390,8 +1393,13 @@ impl SolutionAgentStore {
                 // chosen in the new-chat row is passed as the override so
                 // `claude` launches on it immediately.
                 let mut meta =
-                    store.build_session_meta(&pair.1, &solution, None, model.clone(), cx);
-                if ephemeral {
+                    store.build_session_meta(&pair.1, &solution, Some(session_id), model.clone(), cx);
+                if ephemeral_supervisor {
+                    meta.get_or_insert_with(acp::Meta::new).insert(
+                        "systemPrompt".into(),
+                        serde_json::json!({ "append": crate::supervisor::SUPERVISOR_SYSTEM_PROMPT }),
+                    );
+                } else if ephemeral {
                     let meta = meta.get_or_insert_with(acp::Meta::new);
                     meta.insert("generationOnly".into(), serde_json::json!(true));
                     meta.insert(
@@ -1478,7 +1486,6 @@ impl SolutionAgentStore {
                         .model_catalog
                         .set_models(agent_id.clone(), live_models.clone());
                 }
-                let session_id = SolutionSessionId::new();
                 // Default tab title = the Solution name. Dedup'd against
                 // existing sessions in the same Solution so successive opens
                 // land as `name`, `name 2`, `name 3`, …
@@ -1628,7 +1635,14 @@ impl SolutionAgentStore {
                 }),
             );
         } else if let Some(adapter) = self.adapters.get(agent_id) {
-            let prompt = adapter.build_initial_system_prompt(solution);
+            let mut prompt = adapter.build_initial_system_prompt(solution);
+            if !prompt.is_empty()
+                && let Some(id) = session_id
+            {
+                prompt.push_str(&format!(
+                    "\nYour stable Sawe session ID is `{id}`. Use this exact ID as from_session_id for agent messages; it is not the provider thread ID.\n"
+                ));
+            }
             if !prompt.is_empty() {
                 meta.insert(
                     "systemPrompt".to_string(),

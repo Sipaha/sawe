@@ -37,6 +37,7 @@ contracts, multi-crate invariants). Each ADR is dated `accepted`/`superseded`.
 | 0001 | Fork philosophy: no scheduled upstream merge | accepted | [`architecture/decisions/0001-fork-philosophy.md`](architecture/decisions/0001-fork-philosophy.md) |
 | 0002 | Native headless GPUI platform for autonomous agent driving | accepted | [`architecture/decisions/0002-native-headless-platform.md`](architecture/decisions/0002-native-headless-platform.md) |
 | 0003 | Remote Control transport — WebSocket over TLS, fingerprint-pinned, secret-authenticated | accepted | [`architecture/decisions/0003-remote-control-protocol.md`](architecture/decisions/0003-remote-control-protocol.md) |
+| 0005 | Solution peer messages retain collaborator provenance | accepted | [`architecture/decisions/0005-solution-peer-messaging.md`](architecture/decisions/0005-solution-peer-messaging.md) |
 | 0004 | Generation-only sessions enforce runtime capabilities | accepted | [`architecture/decisions/0004-generation-only-agent-sessions.md`](architecture/decisions/0004-generation-only-agent-sessions.md) |
 
 ---
@@ -52,6 +53,7 @@ can read them.
 
 | Date | Status | Plan |
 |---|---|---|
+| 2026-09-11 | implementation | [`plans/2026-09-11-solution-agent-messaging.md`](plans/2026-09-11-solution-agent-messaging.md) — scoped, attributed peer messages without human-origin side effects. |
 | 2026-09-11 | complete | [`plans/2026-09-11-live-compaction-and-observer-triggers.md`](plans/2026-09-11-live-compaction-and-observer-triggers.md) — cooperative compaction, active observer checks and native follow-up delivery. |
 | 2026-09-11 | complete | [`plans/2026-09-11-prompt-audit-improvements.md`](plans/2026-09-11-prompt-audit-improvements.md) — bounded generation tasks, grounded suggestions and prompt checks. |
 | 2026-09-11 | complete | [`plans/2026-09-11-prompt-audit-and-error-compaction.md`](plans/2026-09-11-prompt-audit-and-error-compaction.md) — English model-neutral prompt audit and Error-state context recovery. |
