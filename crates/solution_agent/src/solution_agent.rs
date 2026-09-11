@@ -10,6 +10,7 @@ pub mod agent_settings;
 pub mod background_agent;
 pub mod background_shell;
 pub mod claude_adapter;
+pub mod codex_adapter;
 pub(crate) mod cold_persistence;
 pub(crate) mod compact;
 pub(crate) mod conversation_render;
@@ -21,6 +22,7 @@ pub mod message_generator;
 pub(crate) mod metrics_emitter;
 pub mod model;
 pub mod model_catalog;
+pub(crate) mod native_controls;
 pub mod notifier;
 pub(crate) mod pool;
 pub mod rename_session_modal;
@@ -39,7 +41,7 @@ pub(crate) mod teammate_watchers;
 pub mod upload;
 pub mod utility_buttons;
 
-pub use claude_native::ModelInfo;
+pub use acp_thread::NativeAgentModelInfo as ModelInfo;
 pub use metrics_emitter::MetricsEmitter;
 
 #[cfg(any(feature = "test-support", test))]
@@ -68,6 +70,7 @@ pub fn init(cx: &mut App) {
 
     let mut adapters = adapter::AdapterRegistry::new();
     adapters.register(Arc::new(claude_adapter::ClaudeAcpAdapter));
+    adapters.register(Arc::new(codex_adapter::CodexAdapter));
     let adapters = Arc::new(adapters);
 
     store::SolutionAgentStore::init_global(cx, adapters);
@@ -84,6 +87,12 @@ pub fn init(cx: &mut App) {
         store.register_agent_server(
             SharedString::from(claude_adapter::CLAUDE_ACP_AGENT_ID),
             claude_server,
+        );
+        store.register_agent_server(
+            SharedString::from(codex_adapter::CODEX_AGENT_ID),
+            Rc::new(codex_native::CodexAgentServer::new(AgentId(
+                SharedString::from(codex_adapter::CODEX_AGENT_ID),
+            ))),
         );
     });
 

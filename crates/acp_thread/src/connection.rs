@@ -65,6 +65,14 @@ impl From<&str> for AgentModelId {
     }
 }
 
+/// Persistable model descriptor shared by native agent integrations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeAgentModelInfo {
+    pub value: String,
+    pub display_name: String,
+    pub description: String,
+}
+
 pub fn build_terminal_auth_task(
     id: String,
     label: String,

@@ -487,12 +487,12 @@ impl SolutionAgentStore {
                     });
                     // The initialize response (carrying `models`) only lands after the
                     // first turn, so the first TokenUsageUpdated is the earliest capture.
-                    let live_models = s.read(cx).acp_thread().and_then(|t| {
+                    let live_models = s.read(cx).acp_thread().map(|t| {
                         let t = t.read(cx);
-                        t.connection()
-                            .clone()
-                            .downcast::<claude_native::ClaudeNativeConnection>()
-                            .map(|c| c.available_models(t.session_id()))
+                        crate::native_controls::available_models(
+                            t.connection().clone(),
+                            t.session_id(),
+                        )
                     });
                     if let Some(models) = live_models {
                         if !models.is_empty() {

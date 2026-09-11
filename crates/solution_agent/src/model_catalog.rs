@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use claude_native::ModelInfo;
+use acp_thread::NativeAgentModelInfo as ModelInfo;
 
 use crate::model::AgentServerId;
 

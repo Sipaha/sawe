@@ -178,7 +178,7 @@ pub struct PersistedSession {
     /// Models advertised for this session (`ModelInfo`). `#[serde(default)]`
     /// → blobs written before this feature decode to an empty vec.
     #[serde(default)]
-    pub available_models: Vec<claude_native::ModelInfo>,
+    pub available_models: Vec<acp_thread::NativeAgentModelInfo>,
     /// The session's chosen model (SDK `value`). `#[serde(default)]`.
     #[serde(default)]
     pub desired_model: Option<String>,
@@ -603,19 +603,10 @@ impl SolutionAgentStore {
             // session was cold would otherwise be lost — `open_session`
             // consults `desired_models` when the ACP meta has no `modelId`.
             this.update(cx, |store, cx| {
-                if let Some(native) = connection
-                    .clone()
-                    .downcast::<claude_native::ClaudeNativeConnection>()
-                {
-                    let desired = store
-                        .session(meta.id)
-                        .and_then(|s| s.read(cx).desired_model.clone());
-                    native.set_desired_model(&acp_session_id, desired);
-                    let effort = store
-                        .session(meta.id)
-                        .and_then(|s| s.read(cx).desired_effort.clone());
-                    native.set_desired_effort(&acp_session_id, effort);
-                }
+                let desired = store.session(meta.id).and_then(|s| s.read(cx).desired_model.clone());
+                let effort = store.session(meta.id).and_then(|s| s.read(cx).desired_effort.clone());
+                crate::native_controls::set_model(connection.clone(), &acp_session_id, desired, false);
+                crate::native_controls::set_effort(connection.clone(), &acp_session_id, effort, false);
             })?;
 
             let mut last_err: Option<anyhow::Error> = None;

@@ -27,32 +27,36 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
     }
 
     fn build_initial_system_prompt(&self, solution: &Solution) -> String {
-        let mut buf = String::new();
-        buf.push_str("You are working inside a Solution — a multi-project workspace.\n\n");
-        buf.push_str(&format!("Solution root: {}\n", solution.root.display()));
-        buf.push_str("Member projects (subdirectories you can navigate freely):\n");
-        if solution.members.is_empty() {
-            buf.push_str("  (none yet — solution is empty)\n");
-        } else {
-            for member in &solution.members {
-                let label = member
-                    .local_path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| member.local_path.display().to_string());
-                buf.push_str(&format!("  - {label}\n"));
-            }
+        solution_system_prompt(solution, "CLAUDE.md")
+    }
+}
+
+pub(crate) fn solution_system_prompt(solution: &Solution, instruction_file: &str) -> String {
+    let mut buf = String::new();
+    buf.push_str("You are working inside a Solution — a multi-project workspace.\n\n");
+    buf.push_str(&format!("Solution root: {}\n", solution.root.display()));
+    buf.push_str("Member projects (subdirectories you can navigate freely):\n");
+    if solution.members.is_empty() {
+        buf.push_str("  (none yet — solution is empty)\n");
+    } else {
+        for member in &solution.members {
+            let label = member
+                .local_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| member.local_path.display().to_string());
+            buf.push_str(&format!("  - {label}\n"));
         }
-        buf.push_str(
-            "\nEach member may contain its own CLAUDE.md with project-specific guidance — \
-             read them on demand when working in that subdirectory.\n\n",
-        );
-        buf.push_str(
-            "Build / test / git commands must be run from within a member subdirectory \
+    }
+    buf.push_str(&format!(
+            "\nEach member may contain its own {instruction_file} with project-specific guidance — read them on demand when working in that subdirectory.\n\n"
+        ));
+    buf.push_str(
+        "Build / test / git commands must be run from within a member subdirectory \
              (the solution root has no .git, no Cargo.toml, etc.).\n",
-        );
-        buf.push_str(&format!(
-            "\nThis solution's id is `{id}`. You can manage its member projects with \
+    );
+    buf.push_str(&format!(
+        "\nThis solution's id is `{id}`. You can manage its member projects with \
              these MCP tools (provided by the `sawe` server):\n\
              - `catalog.list` — list every available registry (catalog) project.\n\
              - `solutions.add_member {{\"solution_id\": {id}, \"catalog_id\": \
@@ -63,10 +67,10 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
              project in THIS solution.\n\
              Use these whenever the user asks to add an existing project or create a \
              new one in this solution.\n",
-            id = solution.id.0,
-        ));
-        buf.push_str(
-            "Stay inside the solution. All file edits, git operations, and shell \
+        id = solution.id.0,
+    ));
+    buf.push_str(
+        "Stay inside the solution. All file edits, git operations, and shell \
              commands that mutate source code must be confined to the solution \
              root and its member subdirectories. Paths outside it — including \
              other clones of the same repository on disk (~/IdeaProjects, \
@@ -77,9 +81,9 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
              user gives an explicit per-action go-ahead. A generic \"do \
              whatever you need\" or blanket up-front permission does not \
              count — confirm each out-of-scope action.\n",
-        );
-        buf.push_str(
-            "\nHow to work (standing rules for this session):\n\
+    );
+    buf.push_str(
+        "\nHow to work (standing rules for this session):\n\
              - Quality over speed. Do the task correctly and robustly, not just \
              fast enough to pass; settle for a lesser solution only after you have \
              genuinely exhausted the viable approaches.\n\
@@ -107,9 +111,8 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
              on something only the human can resolve, first record the blocker durably \
              in the project docs, then switch to other independent work that doesn't \
              need the human — don't sit waiting.\n",
-        );
-        buf
-    }
+    );
+    buf
 }
 
 #[cfg(test)]
@@ -155,6 +158,17 @@ mod tests {
         assert!(prompt.contains("solutions.add_member"));
         assert!(prompt.contains("solutions.add_empty_member"));
         assert!(prompt.contains("\"solution_id\": 14"));
+    }
+
+    #[test]
+    fn codex_prompt_uses_agents_instructions_and_preserves_solution_scope() {
+        let sol = solution(vec!["app"]);
+        let prompt = crate::codex_adapter::CodexAdapter.build_initial_system_prompt(&sol);
+        assert!(prompt.contains("AGENTS.md"));
+        assert!(!prompt.contains("CLAUDE.md"));
+        assert!(prompt.contains("Solution root: /tmp/sol-x"));
+        assert!(prompt.contains("solutions.add_member"));
+        assert!(prompt.contains("Stay inside the solution"));
     }
 
     /// Every backticked `namespace.tool` the prompt names, in the order it

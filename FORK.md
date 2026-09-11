@@ -36,6 +36,7 @@ Consequences for future upstream merges:
 
 | Crate | Purpose | Notes |
 |---|---|---|
+| `crates/codex_native` | Runs the installed Codex app-server and translates its thread, turn, tool and approval protocol into Solution conversations. | Uses CLI authentication; owns one subprocess per live session. See decision 161. |
 | `crates/editor_mcp` | Embedded JSON-RPC MCP server (`~/.spk/sawe/state/mcp.sock`) so an external agent can drive a live editor for E2E tests + autonomous work. Owns `SingleInstanceLock`, server bind, broadcast. | 50 builtin tools across `editor.*` / `windows.*` / `workspace.*` / `project.*` / `diagnostics.*` namespaces. Tools registered from each domain crate's `init`. |
 | `crates/solutions` | Multi-project workspace abstraction. A **Solution** groups N catalog projects (each a remote git URL) into one editor window with all members mounted as worktrees. Persisted to SQLite via `SolutionsDb` (one-time migration from legacy `solutions.json`); warm clone cache at `~/.cache/sawe/catalog/<sha256>/`. | Adds 11 `solutions.*` + 6 `catalog.*` MCP tools. Emits `solution_changed` events. |
 | `crates/solutions_ui` | UI for Solutions: title-bar tab strip, picker, modals, welcome integration, plus the per-panel `ActiveProjectSelector` element hosted by `project_panel` and `git_panel`. | Touches upstream `title_bar`, `welcome`, `app_menus`, `project_panel`, `git_ui` for integration points. |
@@ -3921,3 +3922,26 @@ keeps the rest, so raising it only costs tab slots on a narrow window (~145px ea
 at 1100px is one tab) and buys nothing on a wide one. Any new widget in that row must either be
 inside the trailing cluster (where it is free to vary) or be selection-invariant. A widget that must
 never truncate has to fit inside the reserve, not be added to the strip's side of the row.
+
+
+### 161. Codex runs through app-server behind the existing Solution conversation UI
+
+`codex_native` implements `AgentServer` and `AgentConnection` with an owned
+stdio app-server process per open session. Sawe owns its transcript projection;
+Codex owns execution and durable thread history. Resume attaches without
+replaying server history over the locally restored transcript.
+
+Why: a second agent panel or an external ACP wrapper would duplicate the
+existing Solution session lifecycle and introduce another transport dependency.
+`NativeAgentModelInfo` lives in `acp_thread`; Claude re-exports its existing
+`ModelInfo` alias so the persisted JSON shape remains unchanged. Native runtime
+controls are dispatched centrally in `solution_agent::native_controls`.
+Codex effort options come from its selected model, never Claude's fixed list.
+
+Each session pump routes only its own thread's events. Closing a session must
+kill its process and resolve any outstanding prompt; cancellation timers must
+belong to the turn that created them. An ambiguous start failure terminates
+the runtime so edits cannot continue after the UI reports a failed turn.
+Command and file-change approvals use the existing permission UI; unsupported
+requests fail closed. The plain chat `+` remains Claude; its adjacent visible
+agent menu exposes Codex without changing that gesture.

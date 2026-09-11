@@ -655,6 +655,30 @@ impl SessionTabStrip {
             })
     }
 
+    fn render_agent_menu(&self) -> impl IntoElement {
+        PopoverMenu::new("session-tab-strip-agent-menu")
+            .trigger(
+                IconButton::new("session-tab-strip-agent-trigger", IconName::ChevronDown)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Choose an agent for a new chat")),
+            )
+            .menu(|window, cx| {
+                Some(ContextMenu::build(window, cx, |menu, _, _| {
+                    menu.entry("New Claude chat", None, |window, cx| {
+                        if let Ok(action) = cx.build_action("console_panel::NewChat", None) {
+                            window.dispatch_action(action, cx);
+                        }
+                    })
+                    .entry("New Codex chat", None, |window, cx| {
+                        if let Ok(action) = cx.build_action("console_panel::NewCodexChat", None) {
+                            window.dispatch_action(action, cx);
+                        }
+                    })
+                }))
+            })
+    }
+
     /// The reopen-a-closed-chat button, immediately right of the `+`.
     ///
     /// It sits on the strip rather than in any menu because the state it
@@ -854,6 +878,7 @@ impl Render for SessionTabStrip {
             .children(tabs)
             .when_some(overflow_popover, |this, popover| this.child(popover))
             .child(self.render_plus_button(cx))
+            .child(self.render_agent_menu())
             .child(self.render_reopen_button(solution_id, weak_workspace.clone(), cx));
 
         // The rule is a sibling of the scrolling group, not its last child:

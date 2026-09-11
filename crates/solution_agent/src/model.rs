@@ -517,7 +517,7 @@ pub struct SolutionSession {
     /// Models advertised by claude for this session, cached so the status-row
     /// dropdown works on a cold tab (no live process to ask). Captured from
     /// the live `initialize` response and persisted; reloaded on cold restore.
-    pub cached_models: Vec<claude_native::ModelInfo>,
+    pub cached_models: Vec<acp_thread::NativeAgentModelInfo>,
     /// The user's chosen model (SDK `value`). Persisted. Applied via `--model`
     /// at the next spawn; for a live session also pushed via `set_model`.
     /// `None` → claude's default.
@@ -1242,7 +1242,7 @@ pub struct SolutionSessionMetadata {
     pub desired_effort: Option<String>,
     /// Persisted copy of [`SolutionSession::cached_models`]. Empty for
     /// sessions that haven't yet fetched the model list from the agent.
-    pub cached_models: Vec<claude_native::ModelInfo>,
+    pub cached_models: Vec<acp_thread::NativeAgentModelInfo>,
     /// Persisted copy of [`SolutionSession::tab_order`]. Carried through so the
     /// metadata INSERT can COALESCE it against any value a concurrent
     /// `update_tab_orders` already wrote, instead of clobbering it to NULL. A

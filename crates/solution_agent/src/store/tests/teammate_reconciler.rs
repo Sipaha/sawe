@@ -3032,17 +3032,6 @@ async fn cold_load_drops_all_background_agents(cx: &mut TestAppContext) {
     });
 }
 
-/// Removes a directory subtree on drop — used to clean up the
-/// `~/.claude/projects/<encoded-cwd>/` dir the live-scan test must create at
-/// the real (home-derived) path the resolver computes.
-struct CleanupDir(PathBuf);
-
-impl Drop for CleanupDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// End-to-end: a Running shell flips to `Exited(Some(0))` when a realistic
 /// single-line `<task-notification>` JSON `user` message is appended to the
 /// parent session JSONL and `scan_parent_jsonl_for_completions` runs. Also
@@ -3055,21 +3044,10 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());
     cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
 
-    // Unique cwd so the home-derived JSONL path never collides with a real
-    // session or a parallel test run.
-    let unique = format!(
-        "/tmp/spk-scan-test-{}-{}",
-        std::process::id(),
-        SolutionSessionId::new()
-    );
-    let cwd = PathBuf::from(&unique);
+    let directory = tempfile::tempdir().expect("temporary transcript directory");
+    let cwd = directory.path().to_path_buf();
     let acp_id = "ses-scan-xyz";
-
-    let jsonl =
-        crate::store::parent_session_jsonl_for(&cwd, acp_id).expect("home_dir resolves in test");
-    let project_dir = jsonl.parent().expect("jsonl has parent").to_path_buf();
-    let _cleanup = CleanupDir(project_dir.clone());
-    std::fs::create_dir_all(&project_dir).expect("create project dir");
+    let jsonl = directory.path().join("parent.jsonl");
     // Pre-existing historical content the scan must skip past (offset lazy-init
     // to current EOF on first sight).
     std::fs::write(&jsonl, b"{\"type\":\"system\",\"old\":true}\n").expect("seed jsonl");
@@ -3109,7 +3087,7 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
                 .or_default()
                 .push(session_id);
             // First scan: lazy-inits the offset to current EOF, flips nothing.
-            store.scan_parent_jsonl_for_completions(session_id, cx);
+            store.scan_parent_jsonl_with_resolver(session_id, cx, |_, _| Some(jsonl.clone()));
         });
     });
 
@@ -3143,7 +3121,7 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            store.scan_parent_jsonl_for_completions(session_id, cx);
+            store.scan_parent_jsonl_with_resolver(session_id, cx, |_, _| Some(jsonl.clone()));
         });
     });
 
@@ -3167,7 +3145,7 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            store.scan_parent_jsonl_for_completions(session_id, cx);
+            store.scan_parent_jsonl_with_resolver(session_id, cx, |_, _| Some(jsonl.clone()));
         });
         let session = store.read(cx).session(session_id).unwrap();
         let shell = session
@@ -3192,7 +3170,7 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            store.scan_parent_jsonl_for_completions(session_id, cx);
+            store.scan_parent_jsonl_with_resolver(session_id, cx, |_, _| Some(jsonl.clone()));
         });
         let session = store.read(cx).session(session_id).unwrap();
         assert_eq!(session.read(cx).background_shells.len(), 1);

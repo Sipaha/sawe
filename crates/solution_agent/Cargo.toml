@@ -37,6 +37,7 @@ base64.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 claude_native.workspace = true
+codex_native.workspace = true
 context_server.workspace = true
 dirs.workspace = true
 editor.workspace = true

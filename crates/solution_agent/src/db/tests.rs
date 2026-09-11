@@ -1132,8 +1132,8 @@ async fn purge_session_removes_rows_from_all_six_tables(cx: &mut gpui::TestAppCo
 // ── Task 3a: session model/effort/cached_models columns ──────────────────
 
 /// Helper: build a `ModelInfo` for use in tests.
-fn make_model_info(value: &str) -> claude_native::ModelInfo {
-    claude_native::ModelInfo {
+fn make_model_info(value: &str) -> acp_thread::NativeAgentModelInfo {
+    acp_thread::NativeAgentModelInfo {
         value: value.into(),
         display_name: format!("{value} Display"),
         description: format!("{value} description"),

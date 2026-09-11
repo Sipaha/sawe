@@ -143,6 +143,11 @@ pub(crate) fn render_status_row(
     // immutable borrow of `s` through `cx`.
     let s = session.read(cx);
     let agent_id = s.agent_id.clone();
+    let agent_label: SharedString = match agent_id.as_ref() {
+        crate::codex_adapter::CODEX_AGENT_ID => "Codex".into(),
+        crate::claude_adapter::CLAUDE_ACP_AGENT_ID => "Claude".into(),
+        _ => agent_id.clone(),
+    };
     // For most states the short label ("Idle", "Running", …) is
     // the right thing to show. For `Errored(msg)` we surface the
     // full message inline so the user actually learns *what* went
@@ -599,10 +604,9 @@ pub(crate) fn render_status_row(
         !is_subagent_tab && !is_task_tab && !model_options.is_empty() && model_select_enabled;
 
     let effort_value = store.read(cx).selected_effort(view.session_id(), cx);
-    // Effort always has a fixed option list, so the dropdown shows whenever the
-    // model dropdown would (main tab, not running/resuming). It does NOT depend
-    // on a captured list.
-    let show_effort_dropdown = !is_subagent_tab && !is_task_tab && model_select_enabled;
+    let effort_options = store.read(cx).session_effort_options(view.session_id(), cx);
+    let show_effort_dropdown =
+        !is_subagent_tab && !is_task_tab && model_select_enabled && !effort_options.is_empty();
     // Claude doesn't stream the current effort level (unlike the model, which
     // it reports every turn), so when the user hasn't set an explicit override
     // we show "auto" — i.e. Claude Code's own default effort, no override —
@@ -830,7 +834,7 @@ pub(crate) fn render_status_row(
                 this.child(div().flex_none().child(cleanup_button))
             })
             .child(
-                Label::new(agent_id)
+                Label::new(agent_label)
                     .color(Color::Muted)
                     .size(LabelSize::Small),
             )
@@ -909,6 +913,7 @@ pub(crate) fn render_status_row(
             .when(show_effort_dropdown, |this| {
                 let session_id = view.session_id();
                 let effort_value = effort_value.clone();
+                let effort_options = effort_options.clone();
                 let trigger =
                     ui::Button::new("solution-status-effort-trigger", effort_label.clone())
                         .label_size(LabelSize::Small)
@@ -924,12 +929,13 @@ pub(crate) fn render_status_row(
                             .trigger(trigger)
                             .menu(move |window, cx| {
                                 let effort_value = effort_value.clone();
+                                let effort_options = effort_options.clone();
                                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    for level in crate::store::EFFORT_LEVELS {
-                                        let is_current = effort_value.as_deref() == Some(*level);
+                                    for level in &effort_options {
+                                        let is_current = effort_value.as_deref() == Some(level.as_str());
                                         let value = level.to_string();
                                         let entry =
-                                            ui::ContextMenuEntry::new(SharedString::from(*level))
+                                            ui::ContextMenuEntry::new(SharedString::from(level.clone()))
                                                 .when(is_current, |e| {
                                                     e.icon(IconName::Check)
                                                         .icon_color(Color::Accent)

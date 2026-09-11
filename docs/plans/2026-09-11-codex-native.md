@@ -26,3 +26,19 @@ Protocol fixtures cover deltas, tools, failed/cancelled turns, permissions and t
 
 ## Completion
 Document configuration and limitations, record architecture decisions, update docs/INDEX.md, commit and push to origin/main. Do not include screenshots or temporary reports.
+
+## Desktop feature candidates requested by the maintainer
+
+Prioritize review from the Git panel with line comments, followed by account rate limits and reset times beside the model selector. Next: fork from a selected turn, a task-owned worktree with lifecycle management, and goals/budgets integrated with the existing supervisor. Scheduled project checks need a durable scheduler with overlap prevention and meaningful-change notifications.
+
+App-server exposes review/start, thread/fork, turn/steer, thread/goal and account/rateLimits operations. Task worktree orchestration and the scheduler belong to Sawe. Do not restore per-turn Git checkpoints casually: FORK.md decision 23 disabled them for CPU/IO and object churn. Existing queue, supervisor, Git tools and RunConfig should be extended rather than duplicated.
+
+References: https://learn.chatgpt.com/docs/app-server ; https://learn.chatgpt.com/docs/code-review ; https://learn.chatgpt.com/docs/environments/git-worktrees ; https://learn.chatgpt.com/docs/long-running-work ; https://learn.chatgpt.com/docs/automations . These are candidates, not claims that the features ship in this change.
+
+## Implementation notes
+
+Native session registration, CLI authentication, streamed text/reasoning/tools, approvals, images, resume, model discovery, per-model effort options and stdio/HTTP MCP configuration are connected to the existing Solution UI. The adjacent new-chat menu preserves the existing direct Claude `+` action. Model metadata now has a runtime-neutral persisted representation, with unchanged JSON fields.
+
+Lifecycle review fixed child-thread event contamination, abandoned processes on session close or transport EOF, stale cancellation timers, uncertain turn-start failures and retained tool-output buffers. Selecting another model clears an unsupported effort override. The existing parent-transcript completion test now injects its path resolver and uses a temporary directory instead of creating files under the real Claude home.
+
+Live checks with the installed CLI confirmed a streamed reply, context after agent restart, command approval and output, interruption followed by another successful turn, and the new-chat menu/model controls in a rendered headless editor. Screenshots and probe data are temporary artifacts outside the repository.

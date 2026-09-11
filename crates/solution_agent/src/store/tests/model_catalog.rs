@@ -19,7 +19,7 @@ fn persisted_session_round_trips_models() {
         entry_summaries: vec![],
         entries_v2: vec![],
         entry_created_ms: vec![],
-        available_models: vec![claude_native::ModelInfo {
+        available_models: vec![acp_thread::NativeAgentModelInfo {
             value: "opus".into(),
             display_name: "Opus".into(),
             description: "".into(),
@@ -67,12 +67,12 @@ fn select_model_on_cold_session_records_desired(cx: &mut TestAppContext) {
             );
             session.update(cx, |s, _| {
                 s.cached_models = vec![
-                    claude_native::ModelInfo {
+                    acp_thread::NativeAgentModelInfo {
                         value: "opus".into(),
                         display_name: "Opus".into(),
                         description: "".into(),
                     },
-                    claude_native::ModelInfo {
+                    acp_thread::NativeAgentModelInfo {
                         value: "sonnet".into(),
                         display_name: "Sonnet".into(),
                         description: "".into(),
@@ -126,12 +126,12 @@ fn new_chat_model_options_from_latest_session(cx: &mut TestAppContext) {
             let session = insert_cold_session(id, sol, agent.clone(), None, None, store, cx);
             session.update(cx, |s, _| {
                 s.cached_models = vec![
-                    claude_native::ModelInfo {
+                    acp_thread::NativeAgentModelInfo {
                         value: "opus".into(),
                         display_name: "Opus".into(),
                         description: "".into(),
                     },
-                    claude_native::ModelInfo {
+                    acp_thread::NativeAgentModelInfo {
                         value: "sonnet".into(),
                         display_name: "Sonnet".into(),
                         description: "".into(),
@@ -169,12 +169,12 @@ fn session_models_falls_back_to_global_agent_cache(cx: &mut TestAppContext) {
             store.model_catalog.set_models(
                 agent.clone(),
                 vec![
-                    claude_native::ModelInfo {
+                    acp_thread::NativeAgentModelInfo {
                         value: "opus".into(),
                         display_name: "Opus".into(),
                         description: "".into(),
                     },
-                    claude_native::ModelInfo {
+                    acp_thread::NativeAgentModelInfo {
                         value: "sonnet".into(),
                         display_name: "Sonnet".into(),
                         description: "".into(),
@@ -198,6 +198,42 @@ fn session_models_falls_back_to_global_agent_cache(cx: &mut TestAppContext) {
             );
             assert_eq!(models[0].value, "opus");
             assert_eq!(models[1].value, "sonnet");
+        });
+    });
+}
+
+#[gpui::test]
+fn cold_codex_does_not_offer_claude_only_efforts(cx: &mut TestAppContext) {
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let codex_id = SolutionSessionId::new();
+            insert_cold_session(
+                codex_id,
+                SolutionId(1),
+                crate::codex_adapter::CODEX_AGENT_ID.into(),
+                None,
+                None,
+                store,
+                cx,
+            );
+            assert!(store.session_effort_options(codex_id, cx).is_empty());
+            let claude_id = SolutionSessionId::new();
+            insert_cold_session(
+                claude_id,
+                SolutionId(1),
+                crate::claude_adapter::CLAUDE_ACP_AGENT_ID.into(),
+                None,
+                None,
+                store,
+                cx,
+            );
+            assert!(
+                store
+                    .session_effort_options(claude_id, cx)
+                    .contains(&"ultracode".to_owned())
+            );
         });
     });
 }

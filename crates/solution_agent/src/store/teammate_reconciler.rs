@@ -1468,6 +1468,15 @@ impl SolutionAgentStore {
         session_id: SolutionSessionId,
         cx: &mut Context<Self>,
     ) {
+        self.scan_parent_jsonl_with_resolver(session_id, cx, parent_session_jsonl_for);
+    }
+
+    pub(super) fn scan_parent_jsonl_with_resolver(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+        resolve_path: impl FnOnce(&std::path::Path, &str) -> Option<PathBuf>,
+    ) {
         let Some(session) = self.session(session_id) else {
             self.teammate_watchers.clear_scan_offset(session_id);
             return;
@@ -1496,7 +1505,7 @@ impl SolutionAgentStore {
             // Everything already terminal — nothing left to flip.
             return;
         }
-        let Some(path) = parent_session_jsonl_for(&cwd, &acp_session_id) else {
+        let Some(path) = resolve_path(&cwd, &acp_session_id) else {
             return;
         };
         let metadata = match std::fs::metadata(&path) {

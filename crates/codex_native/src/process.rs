@@ -21,6 +21,7 @@ use util::{ResultExt as _, process::Child};
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 pub struct Process {
     child: Mutex<Child>,
+    executor: gpui::BackgroundExecutor,
     pub outgoing: mpsc::UnboundedSender<Value>,
     pub incoming: mpsc::UnboundedReceiver<Value>,
     pending: Pending,
@@ -91,6 +92,7 @@ impl Process {
         });
         Ok(Self {
             child: Mutex::new(child),
+            executor: cx.background_executor().clone(),
             outgoing,
             incoming,
             pending,
@@ -118,7 +120,7 @@ impl Process {
         }
         let result = futures::select_biased! {
             response = receiver.fuse() => response.context("Codex process disconnected. Reopen this chat to reconnect.")?,
-            _ = futures::FutureExt::fuse(smol::Timer::after(Duration::from_secs(45))) => Err(anyhow!("Codex {method} timed out. Reopen this chat to reconnect.")),
+            _ = futures::FutureExt::fuse(self.executor.timer(Duration::from_secs(45))) => Err(anyhow!("Codex {method} timed out. Reopen this chat to reconnect.")),
         };
         self.pending
             .lock()

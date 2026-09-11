@@ -1251,7 +1251,7 @@ async fn hydrate_all_restores_model_and_effort(cx: &mut TestAppContext) {
         parent_session_id: None,
         desired_model: Some("opus".into()),
         desired_effort: Some("high".into()),
-        cached_models: vec![claude_native::ModelInfo {
+        cached_models: vec![acp_thread::NativeAgentModelInfo {
             value: "opus".into(),
             display_name: "Opus".into(),
             description: String::new(),

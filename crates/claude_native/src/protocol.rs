@@ -223,17 +223,7 @@ pub struct UserPayload {
     pub content: serde_json::Value,
 }
 
-/// Descriptor for one selectable model, mirroring the SDK `ModelInfo`
-/// (`SDKControlInitializeResponse.models[]`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelInfo {
-    /// Alias or full id passed to `set_model` / `--model` (SDK `value`).
-    pub value: String,
-    /// Human-facing label (SDK `displayName`).
-    pub display_name: String,
-    /// One-line description (SDK `description`).
-    pub description: String,
-}
+pub use acp_thread::NativeAgentModelInfo as ModelInfo;
 
 /// One entry in the `hooks` map of an `initialize` control_request: a matcher
 /// pattern (or `null` for "all"), the list of callback ids the SDK should

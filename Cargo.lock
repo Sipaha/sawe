@@ -17951,6 +17951,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "claude_native",
+ "codex_native",
  "context_server",
  "dirs",
  "editor",

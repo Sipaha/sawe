@@ -1377,7 +1377,14 @@ impl SolutionAgentStore {
                 // persisted `desired_model` to thread in. An explicit `model`
                 // chosen in the new-chat row is passed as the override so
                 // `claude` launches on it immediately.
-                let meta = store.build_session_meta(&pair.1, &solution, None, model.clone(), cx);
+                let mut meta =
+                    store.build_session_meta(&pair.1, &solution, None, model.clone(), cx);
+                if let Some(effort) = &effort {
+                    meta.get_or_insert_with(acp::Meta::new).insert(
+                        "reasoningEffort".into(),
+                        serde_json::Value::String(effort.clone()),
+                    );
+                }
                 (task, meta)
             })?;
             let connection = connection_task.await?;
@@ -1426,15 +1433,21 @@ impl SolutionAgentStore {
                 // for any future respawn, `select_effort` (`apply_flag_settings`)
                 // so the FIRST turn already uses it.
                 if let Some(e) = effort.clone() {
-                    if let Some(native) = acp_thread
-                        .read(cx)
-                        .connection()
-                        .clone()
-                        .downcast::<claude_native::ClaudeNativeConnection>()
-                    {
-                        native.set_desired_effort(&acp_session_id, Some(e.clone()));
-                        native.select_effort(&acp_session_id, e);
-                    }
+                    crate::native_controls::set_effort(
+                        acp_thread.read(cx).connection().clone(),
+                        &acp_session_id,
+                        Some(e),
+                        true,
+                    );
+                }
+                let live_models = crate::native_controls::available_models(
+                    acp_thread.read(cx).connection().clone(),
+                    &acp_session_id,
+                );
+                if !live_models.is_empty() {
+                    store
+                        .model_catalog
+                        .set_models(agent_id.clone(), live_models.clone());
                 }
                 let session_id = SolutionSessionId::new();
                 // Default tab title = the Solution name. Dedup'd against
@@ -1460,6 +1473,7 @@ impl SolutionAgentStore {
                     s.desired_model = model.clone();
                     // Same for the effort level chosen in the new-chat row.
                     s.desired_effort = effort.clone();
+                    s.cached_models = live_models.clone();
                     s.set_acp_thread(Some(acp_thread.clone()), cx);
                     s
                 });
@@ -1593,6 +1607,12 @@ impl SolutionAgentStore {
         });
         if let Some(model) = desired_model {
             meta.insert("modelId".to_string(), serde_json::Value::String(model));
+        }
+        if let Some(effort) = session_id
+            .and_then(|id| self.sessions.get(&id))
+            .and_then(|session| session.read(cx).desired_effort.clone())
+        {
+            meta.insert("reasoningEffort".into(), serde_json::Value::String(effort));
         }
         if meta.is_empty() {
             return None;
@@ -2213,7 +2233,7 @@ impl SolutionAgentStore {
         &self,
         session_id: SolutionSessionId,
         cx: &App,
-    ) -> Vec<claude_native::ModelInfo> {
+    ) -> Vec<acp_thread::NativeAgentModelInfo> {
         let Some(session) = self.session(session_id) else {
             return Vec::new();
         };
@@ -2254,7 +2274,7 @@ impl SolutionAgentStore {
         solution_id: &SolutionId,
         agent_id: &AgentServerId,
         cx: &App,
-    ) -> (Vec<claude_native::ModelInfo>, Option<String>) {
+    ) -> (Vec<acp_thread::NativeAgentModelInfo>, Option<String>) {
         let latest = self
             .sessions
             .values()
@@ -2282,15 +2302,8 @@ impl SolutionAgentStore {
         solution_id: &SolutionId,
         agent_id: &AgentServerId,
         cx: &mut App,
-    ) -> Task<Result<Vec<claude_native::ModelInfo>>> {
+    ) -> Task<Result<Vec<acp_thread::NativeAgentModelInfo>>> {
         let Some(server) = self.server_registry.get(agent_id).cloned() else {
-            return Task::ready(Ok(Vec::new()));
-        };
-        let Some(native) = server
-            .into_any()
-            .downcast::<claude_native::ClaudeNativeAgentServer>()
-            .ok()
-        else {
             return Task::ready(Ok(Vec::new()));
         };
         let work_dir = SolutionStore::try_global(cx).and_then(|st| {
@@ -2303,7 +2316,7 @@ impl SolutionAgentStore {
         let Some(work_dir) = work_dir else {
             return Task::ready(Ok(Vec::new()));
         };
-        native.probe_models(work_dir, &cx.to_async())
+        crate::native_controls::probe_models(server, work_dir, &cx.to_async())
     }
 
     /// If we have no model list for `agent_id` yet, fire a one-shot probe to fill
@@ -2355,18 +2368,26 @@ impl SolutionAgentStore {
         let Some(session) = self.session(session_id) else {
             return;
         };
-        let live = session.read(cx).acp_thread().and_then(|t| {
+        let live = session.read(cx).acp_thread().map(|t| {
             let t = t.read(cx);
             let acp_sid = t.session_id().clone();
-            t.connection()
-                .clone()
-                .downcast::<claude_native::ClaudeNativeConnection>()
-                .map(|c| (c, acp_sid))
+            (t.connection().clone(), acp_sid)
         });
         session.update(cx, |s, _| s.desired_model = Some(value.clone()));
         if let Some((conn, acp_sid)) = live {
-            conn.select_model(&acp_sid, value.clone());
-            conn.set_desired_model(&acp_sid, Some(value));
+            crate::native_controls::set_model(conn.clone(), &acp_sid, Some(value), true);
+            if session.read(cx).agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID {
+                let supported = self.session_effort_options(session_id, cx);
+                if session
+                    .read(cx)
+                    .desired_effort
+                    .as_ref()
+                    .is_some_and(|effort| !supported.contains(effort))
+                {
+                    session.update(cx, |s, _| s.desired_effort = None);
+                    crate::native_controls::set_effort(conn, &acp_sid, None, false);
+                }
+            }
         }
         self.persist_session_row(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
@@ -2375,6 +2396,33 @@ impl SolutionAgentStore {
     /// The session's chosen effort (`desired_effort`), if any.
     pub fn selected_effort(&self, session_id: SolutionSessionId, cx: &App) -> Option<String> {
         self.session(session_id)?.read(cx).desired_effort.clone()
+    }
+
+    pub fn session_effort_options(&self, session_id: SolutionSessionId, cx: &App) -> Vec<String> {
+        let Some(session) = self.session(session_id) else {
+            return Vec::new();
+        };
+        let session = session.read(cx);
+        if session.agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID {
+            return session
+                .acp_thread()
+                .map(|thread| {
+                    let thread = thread.read(cx);
+                    crate::native_controls::codex_efforts(
+                        thread.connection().clone(),
+                        thread.session_id(),
+                        session.desired_model.as_deref(),
+                    )
+                })
+                .unwrap_or_default();
+        }
+        if session.agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID {
+            return EFFORT_LEVELS
+                .iter()
+                .map(|level| (*level).to_owned())
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Record + apply an effort choice. Persists `desired_effort`; seeds the
@@ -2389,18 +2437,14 @@ impl SolutionAgentStore {
         let Some(session) = self.session(session_id) else {
             return;
         };
-        let live = session.read(cx).acp_thread().and_then(|t| {
+        let live = session.read(cx).acp_thread().map(|t| {
             let t = t.read(cx);
             let acp_sid = t.session_id().clone();
-            t.connection()
-                .clone()
-                .downcast::<claude_native::ClaudeNativeConnection>()
-                .map(|c| (c, acp_sid))
+            (t.connection().clone(), acp_sid)
         });
         session.update(cx, |s, _| s.desired_effort = Some(value.clone()));
         if let Some((conn, acp_sid)) = live {
-            conn.set_desired_effort(&acp_sid, Some(value.clone()));
-            conn.select_effort(&acp_sid, value);
+            crate::native_controls::set_effort(conn, &acp_sid, Some(value), true);
         }
         self.persist_session_row(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
@@ -2412,13 +2456,10 @@ impl SolutionAgentStore {
         let Some(session) = self.session(session_id) else {
             return;
         };
-        let live = session.read(cx).acp_thread().and_then(|t| {
+        let live = session.read(cx).acp_thread().map(|t| {
             let t = t.read(cx);
             let acp_sid = t.session_id().clone();
-            t.connection()
-                .clone()
-                .downcast::<claude_native::ClaudeNativeConnection>()
-                .map(|c| c.available_models(&acp_sid))
+            crate::native_controls::available_models(t.connection().clone(), &acp_sid)
         });
         // Live-non-empty → update the per-session + global cache and persist.
         // Otherwise (the session is live but its list is still empty — a fresh
@@ -2451,14 +2492,7 @@ impl SolutionAgentStore {
         let Some(server) = self.server_registry.get(&agent_id).cloned() else {
             return;
         };
-        let Some(native) = server
-            .into_any()
-            .downcast::<claude_native::ClaudeNativeAgentServer>()
-            .ok()
-        else {
-            return;
-        };
-        let task = native.probe_models(work_dir, &cx.to_async());
+        let task = crate::native_controls::probe_models(server, work_dir, &cx.to_async());
         cx.spawn(async move |this, cx| {
             let models = task.await.log_err().unwrap_or_default();
             if models.is_empty() {

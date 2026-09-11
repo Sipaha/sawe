@@ -692,7 +692,7 @@ fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
     };
     // Parse cached_models tolerantly: a corrupt JSON cell logs a warning
     // and falls back to empty rather than failing the whole listing.
-    let cached_models: Vec<claude_native::ModelInfo> = cached_models_json
+    let cached_models: Vec<acp_thread::NativeAgentModelInfo> = cached_models_json
         .and_then(|s| match serde_json::from_str(&s) {
             Ok(v) => Some(v),
             Err(e) => {
