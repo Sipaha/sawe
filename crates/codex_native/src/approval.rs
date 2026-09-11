@@ -78,7 +78,7 @@ mod tests {
             assert_eq!(
                 options
                     .iter()
-                    .map(|option| option.id.0.as_ref())
+                    .map(|option| option.option_id.0.as_ref())
                     .collect::<Vec<_>>(),
                 ["allow", "allow_session", "deny"]
             );

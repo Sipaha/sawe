@@ -2816,10 +2816,7 @@ mod tests {
                 {"name": "todos", "description": "filtered"},
             ],
         });
-        let mut commands = parse_available_commands(&payload);
-        if shared.read_only {
-            commands.retain(|command| read_only_command_allowed(&command.name));
-        }
+        let commands = parse_available_commands(&payload);
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["context", "compact", "agents", "skill"]);
         let agents = commands.iter().find(|c| c.name == "agents").unwrap();
@@ -2850,10 +2847,7 @@ mod tests {
         let payload = serde_json::json!({
             "commands": ["garbage", {"name": "context", "description": "ok"}],
         });
-        let mut commands = parse_available_commands(&payload);
-        if shared.read_only {
-            commands.retain(|command| read_only_command_allowed(&command.name));
-        }
+        let commands = parse_available_commands(&payload);
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["context"]);
     }
