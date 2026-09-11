@@ -322,8 +322,8 @@ PROMPT_HEADER
 - **Internal links minimum**: Non-reference pages should include at least 3
   useful internal docs links; reference pages can include fewer when extra links
   would be noise
-- **Marketing links**: For main feature pages, include a relevant `zed.dev`
-  marketing link alongside docs links
+- **External links**: Include external product links only when relevant to the
+  documented feature. Do not add upstream Zed marketing links for Sawe features.
 
 ### Brand Voice Rubric (Required)
 

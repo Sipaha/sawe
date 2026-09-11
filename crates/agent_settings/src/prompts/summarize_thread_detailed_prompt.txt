@@ -4,3 +4,4 @@ Generate a detailed summary of this conversation. Include:
 3. Outcomes or conclusions reached
 4. Any action items or next steps if any
 Format it in Markdown with headings and bullet points.
+Use the conversation's language unless the user requests another language. Distinguish confirmed results from plans and unverified claims; do not invent missing details.

@@ -6,7 +6,7 @@ You are linking a crash to potentially related GitHub issues so human reviewers 
 
 Before starting, you should have:
 
-1. **Crash report** (from `script/sentry-fetch <issue-id>` or Sentry MCP)
+1. **Crash report** (provided directly, from local logs, or from a configured crash-report service)
 2. **ANALYSIS.md** from investigation phase, including root cause and crash site
 
 If either is missing, stop and report what is missing.
@@ -35,14 +35,14 @@ Extract concrete signals from the crash + analysis:
 
 ### Step 2: Search GitHub Issues
 
-Search **only** issues in `zed-industries/zed` (prefer `gh issue list` / `gh issue view` / GraphQL if available) by:
+Use the repository explicitly named by the user, or resolve the current repository from its Git remote. For Sawe this is normally `Sipaha/sawe`; do not assume the upstream repository. Search that repository (prefer `gh issue list` / `gh issue view` / GraphQL if available) by:
 
 1. Panic/error text
 2. Function/file names
 3. Crate/module names + symptom keywords
 4. Similar reproduction patterns
 
-Check both open and recently closed issues in `zed-industries/zed`.
+Check both open and recently closed issues in the selected repository.
 
 ### Step 3: Score Confidence
 
@@ -62,7 +62,7 @@ Write `LINKED_ISSUES.md` using this exact structure:
 # Potentially Related GitHub Issues
 
 ## High Confidence
-- [#12345](https://github.com/zed-industries/zed/issues/12345) — <title>
+- [#12345](https://github.com/OWNER/REPO/issues/12345) — <title>
   - Why: <1-2 sentence evidence-backed rationale>
   - Evidence: <stack frame / error text / repro alignment>
 
@@ -83,7 +83,7 @@ If no credible matches are found, keep sections present and write `- None found`
 ## Rules
 
 - Do not fabricate issues or URLs.
-- Do not include issues from any repository other than `zed-industries/zed`.
+- Keep results scoped to the selected repository unless the user asks to include others. Replace example URL placeholders with verified issue links.
 - Do not add closing keywords automatically.
 - Keep rationale short and evidence-based.
 - Favor precision over recall.

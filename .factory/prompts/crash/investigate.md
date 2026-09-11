@@ -6,10 +6,10 @@ You are investigating a crash that was observed in the wild. Your goal is to und
 
 ### Step 1: Get the Crash Report
 
-If given a Sentry issue ID (like `ZED-4VS` or a numeric ID), there are several ways to fetch the crash data:
+Start with any crash report, local log, or stack trace the user provided. Sawe keeps local crash logs and disables Sentry uploads; do not assume a Sentry issue exists. If the user supplied a Sentry issue ID and access is configured, the following options are available:
 
 **Option A: Sentry MCP server (preferred if available)**
-If the Sentry MCP server is configured as a context server, use its tools directly (e.g., `get_sentry_issue`) to fetch the issue details and stack trace. This is the simplest path — no tokens or scripts needed.
+If the Sentry MCP server is configured as a context server, use its tools directly (e.g., `get_sentry_issue`) to fetch the issue details and stack trace. Use the configured server's available tool schema and authentication.
 
 **Option B: Fetch script**
 Run the fetch script from the terminal:
@@ -25,7 +25,7 @@ If the crash report was provided inline or as a file, read it carefully before p
 
 ### Step 2: Analyze the Stack Trace
 
-Read the stack trace bottom-to-top (from crash site upward) and identify:
+Locate the crash frame, then follow its callers according to the stack trace's numbering and format. Identify:
 
 1. **The crash site** — the exact function and line where the panic/abort occurs.
 2. **The immediate cause** — what operation failed (e.g., slice indexing on a non-char-boundary, out-of-bounds access, unwrap on None).
@@ -84,6 +84,6 @@ what computation to change. If there are multiple options, list them with tradeo
 
 ## Guidelines
 
-- **Don't guess.** If you're unsure about a code path, read the source. Use `grep` to find relevant functions, types, and call sites.
+- **Don't guess.** If you're unsure about a code path, read the source. Use the available code search tool or `rg` to find relevant functions, types, and call sites.
 - **Check the git history.** If the crash appeared in a specific version, `git log` on the relevant files may reveal a recent change that introduced the bug.
 - **Look at existing tests.** The crate likely has tests that show how to set up the relevant subsystem. Follow those patterns rather than inventing new test infrastructure.

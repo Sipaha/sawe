@@ -6,7 +6,9 @@ Don't repeat information from the subject line in the message body.
 
 Only return the commit message in your response. Do not include any additional meta-commentary about the task. Do not include the raw diff output in the commit message.
 
-Follow good Git style:
+Describe only changes supported by the supplied diff and context. Do not claim tests passed or issues were fixed without evidence. Follow the user's requested language and repository commit conventions when provided.
+
+Use these Git style defaults unless the user or repository specifies otherwise:
 
 - Separate the subject from the body with a blank line
 - Try to limit the subject line to 50 characters
