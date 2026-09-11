@@ -1,6 +1,6 @@
 # Clear, single-use agent approval controls
 
-Status: implementation
+Status: complete
 
 ## Goal
 Make tool approval controls readable, expose Codex's session-scoped approval,
@@ -37,3 +37,34 @@ Test protocol option/response mappings and single-use authorization behavior.
 Inspect the visible approval control in a debug editor. Run affected tests and
 clippy, build debug for smoke and release-fast for handoff. Document final
 results, commit/push relevant files; exclude temporary screenshot/report files.
+
+## Automated results
+The affected crate suites pass 1156 tests (acp_thread 85, claude_native 94,
+codex_native 16, console_panel 39, solution_agent 867, solution_git 55).
+Three tests are ignored: the two upstream checkpoint tests require capture
+intentionally disabled by FORK.md #23, and one pre-existing ignored test.
+The second checkpoint test's known failure was recorded on 2026-07-06; it now
+has the same explicit ignore as its companion rather than a misleading failure.
+The single-use authorization regression and provider-menu paint/click test pass.
+Scoped debug clippy passes with warnings denied. Prompt inventory/contracts and
+21 prompt-check unit tests pass.
+
+## Editor and provider verification
+A real Codex session read a neighboring synthetic session through
+`solution_agent.get_session`: the MCP tool completed without elicitation,
+returned its state and latest assistant message, and reported 828400 context
+capacity. After selecting Read only in the status menu, the same native chat
+resumed and reported its one attempted temporary-file write failed with
+`Read-only file system`; the marker was absent. Read only survived an editor
+restart. No working-session content was sent in these checks.
+
+A synthetic app-server requested approval in an isolated debug editor. The
+render showed Allow once / Allow for this session / Deny at the larger size.
+Clicking the session option returned native `acceptForSession`; all buttons
+immediately disappeared while the tool remained running and the provider sent
+no completion event (intentionally delayed 120 seconds). Screenshots also
+confirmed the plus menu's two provider labels and the permission dropdown.
+The synthetic provider is test scaffolding only, not part of the product.
+
+Debug and release-fast builds completed. Screenshots, model transcripts and
+smoke harnesses remain under /tmp; unrelated user report files were excluded.

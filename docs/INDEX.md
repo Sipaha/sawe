@@ -54,7 +54,7 @@ can read them.
 
 | Date | Status | Plan |
 |---|---|---|
-| 2026-09-11 | in progress | [`plans/2026-09-11-agent-approval-controls.md`](plans/2026-09-11-agent-approval-controls.md) — readable approvals, per-session native permissions and peer inspection. |
+| 2026-09-11 | complete | [`plans/2026-09-11-agent-approval-controls.md`](plans/2026-09-11-agent-approval-controls.md) — readable approvals, per-session native permissions and peer inspection. |
 | 2026-09-11 | complete | [`plans/2026-09-11-solution-agent-messaging.md`](plans/2026-09-11-solution-agent-messaging.md) — scoped, attributed peer messages without human-origin side effects. |
 | 2026-09-11 | complete | [`plans/2026-09-11-live-compaction-and-observer-triggers.md`](plans/2026-09-11-live-compaction-and-observer-triggers.md) — cooperative compaction, active observer checks and native follow-up delivery. |
 | 2026-09-11 | complete | [`plans/2026-09-11-prompt-audit-improvements.md`](plans/2026-09-11-prompt-audit-improvements.md) — bounded generation tasks, grounded suggestions and prompt checks. |
