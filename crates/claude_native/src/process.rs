@@ -499,6 +499,7 @@ mod tests {
             session: crate::command::SessionArg::New("drop-reap-test".to_string()),
             mcp_servers_json: "{}".to_string(),
             append_system_prompt: None,
+            generation_only: false,
             extra_env: Vec::new(),
             model: None,
             settings_path: None,

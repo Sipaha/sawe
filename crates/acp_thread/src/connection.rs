@@ -98,6 +98,14 @@ pub fn build_terminal_auth_task(
 pub trait AgentConnection {
     fn agent_id(&self) -> AgentId;
 
+    /// Whether `_meta.generationOnly = true` enforces a text-only session:
+    /// no built-in or MCP tools, project customizations, or tool approvals.
+    /// Unknown ACP extensions are otherwise silently ignored, so callers must
+    /// check this before relying on the restriction.
+    fn supports_generation_only(&self) -> bool {
+        false
+    }
+
     fn telemetry_id(&self) -> SharedString;
 
     fn agent_version(&self) -> Option<SharedString> {

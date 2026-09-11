@@ -1266,7 +1266,8 @@ impl SolutionAgentStore {
     }
 
     /// Create a hidden one-shot session for an internal AI helper (commit-message
-    /// generation, AI conflict-resolve, etc.). Unlike `create_session` it is NOT
+    /// generation, AI conflict-resolve, etc.), with no tools or project hooks.
+    /// Fails when the backend cannot enforce these restrictions. Unlike `create_session` it is NOT
     /// pinned into the tab strip and emits no `SessionCreated`, so its brief
     /// lifetime never surfaces a (possibly orphaned) console tab.
     pub fn create_ephemeral_session(
@@ -1387,6 +1388,16 @@ impl SolutionAgentStore {
                 // `claude` launches on it immediately.
                 let mut meta =
                     store.build_session_meta(&pair.1, &solution, None, model.clone(), cx);
+                if ephemeral {
+                    let meta = meta.get_or_insert_with(acp::Meta::new);
+                    meta.insert("generationOnly".into(), serde_json::json!(true));
+                    meta.insert(
+                        "systemPrompt".into(),
+                        serde_json::json!({
+                            "append": crate::message_generator::GENERATION_SYSTEM_PROMPT
+                        }),
+                    );
+                }
                 if let Some(effort) = &effort {
                     meta.get_or_insert_with(acp::Meta::new).insert(
                         "reasoningEffort".into(),
@@ -1396,6 +1407,13 @@ impl SolutionAgentStore {
                 (task, meta)
             })?;
             let connection = connection_task.await?;
+            if ephemeral && !connection.supports_generation_only() {
+                this.update(cx, |store, cx| store.pool_release_session(pair.clone(), cx))
+                    .log_err();
+                return Err(anyhow!(
+                    "This agent does not enforce generation-only sessions"
+                ));
+            }
 
             // 3. Create an ACP session on that connection. An explicit `cwd`
             //    wins; otherwise the session is rooted at the solution root.
@@ -1560,8 +1578,9 @@ impl SolutionAgentStore {
     /// expects: `{ "systemPrompt": { "append": "<prompt>" } }`. The
     /// `append` form preserves Claude's default `claude_code` preset and
     /// concatenates our text after it (string-form would replace the
-    /// preset entirely — wrong for our needs since we want the standard
-    /// CLI behavior plus solution awareness).
+    /// preset entirely for ordinary chats). Generation-only native sessions
+    /// deliberately replace the preset with their narrow role and enforce a
+    /// separate tool policy; they use the same metadata envelope.
     ///
     /// Returns `None` when no adapter is registered for `agent_id` or
     /// the adapter produced an empty prompt; ACP agents that don't
@@ -1593,6 +1612,17 @@ impl SolutionAgentStore {
             meta.insert(
                 "systemPrompt".to_string(),
                 serde_json::json!({ "append": crate::supervisor::SUPERVISOR_SYSTEM_PROMPT }),
+            );
+        } else if session_id
+            .and_then(|id| self.sessions.get(&id))
+            .is_some_and(|session| session.read(cx).is_ephemeral)
+        {
+            meta.insert("generationOnly".into(), serde_json::json!(true));
+            meta.insert(
+                "systemPrompt".into(),
+                serde_json::json!({
+                    "append": crate::message_generator::GENERATION_SYSTEM_PROMPT
+                }),
             );
         } else if let Some(adapter) = self.adapters.get(agent_id) {
             let prompt = adapter.build_initial_system_prompt(solution);

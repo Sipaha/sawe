@@ -298,6 +298,7 @@ impl ClaudeNativeAgentServer {
                 session: SessionArg::New(uuid::Uuid::new_v4().to_string()),
                 mcp_servers_json: "{\"mcpServers\":{}}".to_string(),
                 append_system_prompt: None,
+                generation_only: false,
                 extra_env,
                 model: None,
                 // A throwaway probe never runs a turn, so it needs no worktree
@@ -381,6 +382,7 @@ impl AgentServer for ClaudeNativeAgentServer {
 /// death. `sticky_window` retains the last advertised context window so the
 /// token meter never regresses (the 200k/1M flicker fix).
 struct SessionShared {
+    generation_only: bool,
     prompt_tx: RefCell<Option<oneshot::Sender<Result<TurnEnd>>>>,
     sticky_window: Cell<Option<u64>>,
     /// Wall time (executor clock) of the last message the pump pulled off
@@ -436,6 +438,7 @@ struct SessionShared {
 /// a fresh `ClaudeCommandSpec` without re-deriving it from scratch.
 #[derive(Clone)]
 struct RespawnBlueprint {
+    generation_only: bool,
     project: Entity<Project>,
     work_dirs: PathList,
     append_system_prompt: Option<String>,
@@ -710,7 +713,11 @@ fn dispatch_initialize(
     cx: &mut gpui::AsyncApp,
 ) {
     let Ok(receiver) = process.send_control(ControlRequestOut::Initialize {
-        hooks: build_default_hooks(),
+        hooks: if shared.generation_only {
+            Default::default()
+        } else {
+            build_default_hooks()
+        },
     }) else {
         log::warn!(
             target: "claude_native::initialize",
@@ -992,8 +999,26 @@ impl ClaudeNativeConnection {
         let Some(work_dir) = work_dirs.ordered_paths().next().cloned() else {
             return Task::ready(Err(anyhow!("Working directory cannot be empty")));
         };
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let generation_only = extra_meta
+            .as_ref()
+            .and_then(|m| m.get("generationOnly"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let mcp_servers = if generation_only {
+            Vec::new()
+        } else {
+            mcp_servers_for_project(&project, cx)
+        };
         let append_system_prompt = Self::append_system_prompt_from_meta(&extra_meta);
+        if generation_only
+            && append_system_prompt
+                .as_ref()
+                .is_none_or(|prompt| prompt.trim().is_empty())
+        {
+            return Task::ready(Err(anyhow!(
+                "Generation-only sessions require an explicit system prompt"
+            )));
+        }
 
         // `claude --input-format stream-json` does NOT emit `init` on spawn — it
         // blocks on stdin and only emits `init` (echoing this id) after the first
@@ -1004,9 +1029,14 @@ impl ClaudeNativeConnection {
         let model = Self::model_from_meta(&extra_meta)
             .or_else(|| self.desired_models.borrow().get(&session_id).cloned());
 
-        let settings_path = Self::editor_settings_path(&project, &work_dir, cx);
+        let settings_path = if generation_only {
+            None
+        } else {
+            Self::editor_settings_path(&project, &work_dir, cx)
+        };
 
         let blueprint = RespawnBlueprint {
+            generation_only,
             project: project.clone(),
             work_dirs: work_dirs.clone(),
             append_system_prompt: append_system_prompt.clone(),
@@ -1020,6 +1050,7 @@ impl ClaudeNativeConnection {
             session,
             mcp_servers_json: mcp_config_json(&mcp_servers),
             append_system_prompt,
+            generation_only,
             extra_env: self.extra_env.clone(),
             model,
             settings_path,
@@ -1032,6 +1063,7 @@ impl ClaudeNativeConnection {
 
         cx.spawn(async move |cx| {
             let shared = Rc::new(SessionShared {
+                generation_only,
                 prompt_tx: RefCell::new(None),
                 sticky_window: Cell::new(None),
                 last_output: Rc::new(Cell::new(cx.background_executor().now())),
@@ -1255,8 +1287,13 @@ impl ClaudeNativeConnection {
                 binary: self.binary.clone(),
                 work_dir,
                 session: SessionArg::Resume(session_id.0.to_string()),
-                mcp_servers_json: mcp_config_json(&mcp_servers_for_project(&blueprint.project, cx)),
+                mcp_servers_json: if blueprint.generation_only {
+                    mcp_config_json(&[])
+                } else {
+                    mcp_config_json(&mcp_servers_for_project(&blueprint.project, cx))
+                },
                 append_system_prompt: blueprint.append_system_prompt.clone(),
+                generation_only: blueprint.generation_only,
                 extra_env: self.extra_env.clone(),
                 model: blueprint.model.clone(),
                 settings_path: blueprint.settings_path.clone(),
@@ -1274,6 +1311,7 @@ impl ClaudeNativeConnection {
             // next user turn, and we already know the (unchanged) session id.
 
             let shared = Rc::new(SessionShared {
+                generation_only: blueprint.generation_only,
                 prompt_tx: RefCell::new(None),
                 sticky_window: Cell::new(None),
                 last_output: Rc::new(Cell::new(cx.background_executor().now())),
@@ -1387,11 +1425,6 @@ async fn run_update_pump(
     shared: Rc<SessionShared>,
     cx: &mut gpui::AsyncApp,
 ) {
-    // A `can_use_tool` authorization can take arbitrarily long (it waits on the
-    // user). The await is spawned off the pump so the loop keeps draining
-    // `incoming`; the tasks are retained here for the pump's lifetime (= the
-    // session's) so they aren't cancelled before the user responds.
-    let mut authorization_tasks: Vec<Task<()>> = Vec::new();
     let mut exited = std::pin::pin!(exited.fuse());
     // Per-turn diagnostic accumulator. Reset after each terminating `Result`
     // and logged alongside the turn_end summary so a "no response where I
@@ -1728,11 +1761,7 @@ async fn run_update_pump(
                         .log_err();
                 }
                 ControlRequestKind::CanUseTool { .. } => {
-                    if let Some(task) =
-                        spawn_tool_authorization(envelope, outgoing.clone(), thread.clone(), cx)
-                    {
-                        authorization_tasks.push(task);
-                    }
+                    answer_tool_authorization(envelope, outgoing.clone(), !shared.generation_only);
                 }
                 ControlRequestKind::Other => {
                     log::debug!(
@@ -2074,7 +2103,8 @@ async fn run_update_pump(
     }
 }
 
-/// Answer a `can_use_tool` control request by AUTO-APPROVING it, without
+/// Answer a `can_use_tool` control request according to the session policy.
+/// Generation-only sessions deny every request; interactive sessions auto-approve without
 /// surfacing an Allow/Reject prompt.
 ///
 /// Why auto-approve: the fork spawns the MAIN agent with
@@ -2090,36 +2120,37 @@ async fn run_update_pump(
 /// in the teammate's transcript (`claude` streams the `tool_use` block before
 /// this request), so nothing is hidden — only the per-call gate is dropped.
 ///
-/// Returns `None` (no task to retain — the response is sent synchronously
-/// here) for every input, including non-`can_use_tool` requests. To restore
-/// per-call gating, revert to driving `AcpThread::request_tool_call_authorization`
-/// and awaiting the user's outcome.
-fn spawn_tool_authorization(
+fn answer_tool_authorization(
     envelope: ControlRequestEnvelope,
     outgoing: futures::channel::mpsc::UnboundedSender<InputMessage>,
-    _thread: WeakEntity<AcpThread>,
-    _cx: &mut gpui::AsyncApp,
-) -> Option<Task<()>> {
+    allow: bool,
+) {
     let ControlRequestKind::CanUseTool {
         tool_name,
         tool_use_id,
         ..
     } = envelope.request
     else {
-        return None;
+        return;
     };
     log::debug!(
-        "claude_native: auto-approving teammate tool call {tool_name} (tool_use_id={tool_use_id}, \
+        "claude_native: tool authorization allow={allow} for {tool_name} (tool_use_id={tool_use_id}, \
          request_id={})",
         envelope.request_id,
     );
     outgoing
-        .unbounded_send(InputMessage::permission_response(envelope.request_id, true))
+        .unbounded_send(InputMessage::permission_response(
+            envelope.request_id,
+            allow,
+        ))
         .log_err();
-    None
 }
 
 impl AgentConnection for ClaudeNativeConnection {
+    fn supports_generation_only(&self) -> bool {
+        true
+    }
+
     fn agent_id(&self) -> AgentId {
         self.agent_id.clone()
     }
@@ -2385,6 +2416,26 @@ impl AgentConnection for ClaudeNativeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_tool_requests_are_denied_without_changing_interactive_permissions() {
+        for allow in [false, true] {
+            let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+            let envelope = serde_json::from_value(serde_json::json!({
+                "request_id": "unexpected-tool",
+                "request": {"subtype": "can_use_tool", "tool_name": "Bash",
+                    "tool_use_id": "t", "input": {"command": "touch should-not-exist"}}
+            }))
+            .unwrap();
+            answer_tool_authorization(envelope, sender, allow);
+            let response = receiver.try_recv().unwrap();
+            let response = serde_json::to_value(response).unwrap();
+            assert_eq!(
+                response["response"]["behavior"],
+                if allow { "allow" } else { "deny" }
+            );
+        }
+    }
 
     #[test]
     fn final_text_block_suffix_cases() {

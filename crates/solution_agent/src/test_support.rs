@@ -36,6 +36,7 @@ pub struct PromptGate(pub async_channel::Receiver<()>);
 /// gate before returning `Ok(EndTurn)`.
 pub struct MockConnection {
     next_session: Cell<u64>,
+    pub session_meta: std::cell::RefCell<Option<agent_client_protocol::schema::Meta>>,
     prompt_gate: parking_lot::Mutex<Option<PromptGate>>,
     // Counts `cancel()` calls so tests can assert the store forwarded a stop
     // exactly once (and didn't double-forward on a repeated cancel).
@@ -61,6 +62,7 @@ impl MockConnection {
     ) -> Self {
         Self {
             next_session: Cell::new(0),
+            session_meta: Default::default(),
             prompt_gate: parking_lot::Mutex::new(prompt_gate),
             cancel_count: cancel_count.unwrap_or_else(|| Arc::new(AtomicUsize::new(0))),
             supports_resume,
@@ -94,6 +96,20 @@ impl Default for MockConnection {
 }
 
 impl acp_thread::AgentConnection for MockConnection {
+    fn supports_generation_only(&self) -> bool {
+        true
+    }
+    fn new_session_with_meta(
+        self: Rc<Self>,
+        project: gpui::Entity<project::Project>,
+        work_dirs: util::path_list::PathList,
+        meta: Option<agent_client_protocol::schema::Meta>,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<gpui::Entity<acp_thread::AcpThread>>> {
+        *self.session_meta.borrow_mut() = meta;
+        self.new_session(project, work_dirs, cx)
+    }
+
     fn agent_id(&self) -> project::AgentId {
         project::AgentId::new("mock-agent")
     }

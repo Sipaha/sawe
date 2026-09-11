@@ -39,8 +39,11 @@ pub struct ClaudeCommandSpec {
     pub session: SessionArg,
     /// The value for `--mcp-config` (see [`mcp_config_json`]).
     pub mcp_servers_json: String,
-    /// Appended to the default system prompt via `--append-system-prompt`.
+    /// Appended via `--append-system-prompt` for chats; generation-only tasks
+    /// use it as the replacement `--system-prompt`.
     pub append_system_prompt: Option<String>,
+    /// Text generation only; suppress all tools and customizations.
+    pub generation_only: bool,
     pub extra_env: Vec<(String, String)>,
     /// Model alias or full id passed as `--model`. `None` → claude uses
     /// its default. Used both for the initial spawn and every respawn so
@@ -93,30 +96,44 @@ impl ClaudeCommandSpec {
             "stdio",
             "--disallowedTools",
             "AskUserQuestion",
-            "--tools",
-            "default",
         ]);
-        cmd.args(["--mcp-config", &self.mcp_servers_json]);
-        cmd.args(["--setting-sources", "user,project,local"]);
-        // `--settings` sits at the command-line precedence tier: it overrides the
-        // *same keys* in user/project/local settings but does not stop those
-        // sources from loading. `claude_settings` therefore re-emits the user's
-        // own `hooks` alongside ours, since `hooks` is one such key.
-        if let Some(settings) = &self.settings_path {
-            cmd.arg("--settings").arg(settings);
+        if self.generation_only {
+            // Verified against the installed CLI help. Safe mode retains OAuth
+            // authentication (unlike --bare) while suppressing project hooks,
+            // plugins, skills, rules, and other customizations.
+            cmd.args(["--safe-mode", "--tools", "", "--strict-mcp-config"]);
+            cmd.args(["--mcp-config", r#"{"mcpServers":{}}"#]);
+            cmd.args(["--setting-sources", "", "--permission-mode", "default"]);
+            cmd.env_remove("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS");
+            cmd.env_remove("CLAUDE_CODE_HARBOR_KITE");
+        } else {
+            cmd.args(["--tools", "default"]);
+            cmd.args(["--mcp-config", &self.mcp_servers_json]);
+            cmd.args(["--setting-sources", "user,project,local"]);
+            // `--settings` sits at the command-line precedence tier: it overrides the
+            // *same keys* in user/project/local settings but does not stop those
+            // sources from loading. `claude_settings` therefore re-emits the user's
+            // own `hooks` alongside ours, since `hooks` is one such key.
+            if let Some(settings) = &self.settings_path {
+                cmd.arg("--settings").arg(settings);
+            }
+            cmd.args(["--permission-mode", "bypassPermissions"]);
+            cmd.arg("--allow-dangerously-skip-permissions");
         }
-        cmd.args(["--permission-mode", "bypassPermissions"]);
-        cmd.args([
-            "--allow-dangerously-skip-permissions",
-            "--include-partial-messages",
-            "--replay-user-messages",
-        ]);
+        cmd.args(["--include-partial-messages", "--replay-user-messages"]);
         match &self.session {
             SessionArg::New(id) => cmd.args(["--session-id", id]),
             SessionArg::Resume(id) => cmd.args(["--resume", id]),
         };
         if let Some(prompt) = &self.append_system_prompt {
-            cmd.args(["--append-system-prompt", prompt]);
+            cmd.args([
+                if self.generation_only {
+                    "--system-prompt"
+                } else {
+                    "--append-system-prompt"
+                },
+                prompt,
+            ]);
         }
         if let Some(model) = &self.model {
             cmd.args(["--model", model]);
@@ -164,6 +181,7 @@ mod tests {
             session: SessionArg::Resume("sid".into()),
             mcp_servers_json: r#"{"mcpServers":{}}"#.into(),
             append_system_prompt: Some("SYS".into()),
+            generation_only: false,
             extra_env: vec![("K".into(), "V".into())],
             model: None,
             settings_path: None,
@@ -213,6 +231,47 @@ mod tests {
     }
 
     #[test]
+    fn generation_disables_tools_customizations_and_bypass_on_new_and_resume() {
+        for session in [
+            SessionArg::New("sid".into()),
+            SessionArg::Resume("sid".into()),
+        ] {
+            let spec = ClaudeCommandSpec {
+                binary: "claude".into(),
+                work_dir: "/w".into(),
+                session,
+                mcp_servers_json: r#"{"mcpServers":{"unsafe":{"command":"touch"}}}"#.into(),
+                append_system_prompt: Some("Generate text".into()),
+                generation_only: true,
+                extra_env: vec![],
+                model: None,
+                settings_path: Some("/project/hooks.json".into()),
+            };
+            let cmd = spec.to_std_command();
+            let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+            for pair in [
+                ["--tools", ""],
+                ["--mcp-config", r#"{"mcpServers":{}}"#],
+                ["--permission-mode", "default"],
+                ["--setting-sources", ""],
+                ["--system-prompt", "Generate text"],
+            ] {
+                assert!(args.windows(2).any(|w| w == pair));
+            }
+            assert!(args.contains(&"--safe-mode"));
+            assert!(args.contains(&"--strict-mcp-config"));
+            for forbidden in [
+                "--settings",
+                "--append-system-prompt",
+                "--allow-dangerously-skip-permissions",
+                "bypassPermissions",
+            ] {
+                assert!(!args.contains(&forbidden));
+            }
+        }
+    }
+
+    #[test]
     fn new_session_uses_session_id_not_resume() {
         let spec = ClaudeCommandSpec {
             binary: "claude".into(),
@@ -220,6 +279,7 @@ mod tests {
             session: SessionArg::New("uuid".into()),
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
+            generation_only: false,
             extra_env: vec![],
             model: None,
             settings_path: None,
@@ -245,6 +305,7 @@ mod tests {
             session: SessionArg::New("uuid".into()),
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
+            generation_only: false,
             extra_env: vec![],
             model: Some("opus".into()),
             settings_path: None,
@@ -265,6 +326,7 @@ mod tests {
             session: SessionArg::New("uuid".into()),
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
+            generation_only: false,
             extra_env: vec![],
             model: None,
             settings_path: None,
@@ -285,6 +347,7 @@ mod tests {
             session: SessionArg::New("uuid".into()),
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
+            generation_only: false,
             extra_env: vec![],
             model: None,
             settings_path: Some("/state/solutions/7/claude-settings.json".into()),
@@ -314,6 +377,7 @@ mod tests {
             session: SessionArg::New("uuid".into()),
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
+            generation_only: false,
             extra_env: vec![],
             model: None,
             settings_path: None,

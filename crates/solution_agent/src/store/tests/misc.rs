@@ -6512,6 +6512,47 @@ async fn ephemeral_session_is_not_pinned_and_emits_no_session_created(cx: &mut T
         "ephemeral session must not appear in TabsChanged{{opened}}",
     );
 
+    // Recreating a hidden helper must keep its narrow role; an interactive
+    // session and the separately marked supervisor judge must not inherit it.
+    cx.update(|cx| {
+        let solutions = solutions::SolutionStore::global(cx);
+        let solution = solutions
+            .read(cx)
+            .solutions()
+            .iter()
+            .find(|s| s.id == solution_id)
+            .unwrap()
+            .clone();
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let normal = store.build_session_meta(&agent_id, &solution, Some(normal_id), None, cx);
+            assert!(
+                normal
+                    .as_ref()
+                    .is_none_or(|m| !m.contains_key("generationOnly"))
+            );
+            let meta = store
+                .build_session_meta(&agent_id, &solution, Some(ephemeral_id), None, cx)
+                .unwrap();
+            assert_eq!(meta["generationOnly"], true);
+            assert_eq!(
+                meta["systemPrompt"]["append"],
+                crate::message_generator::GENERATION_SYSTEM_PROMPT
+            );
+            let session = store.session(ephemeral_id).unwrap();
+            session.update(cx, |session, _| session.is_supervisor_ephemeral = true);
+            let judge = store
+                .build_session_meta(&agent_id, &solution, Some(ephemeral_id), None, cx)
+                .unwrap();
+            assert!(!judge.contains_key("generationOnly"));
+            assert_eq!(
+                judge["systemPrompt"]["append"],
+                crate::supervisor::SUPERVISOR_SYSTEM_PROMPT
+            );
+            session.update(cx, |session, _| session.is_supervisor_ephemeral = false);
+        });
+    });
+
     // Close side: closing a normal session emits `SessionClosed` (which
     // `finalize_session_teardown` also mirrors to `workspace.session_deleted`
     // via the same `was_ephemeral` gate); closing an ephemeral one-shot must
