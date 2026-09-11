@@ -56,8 +56,11 @@ impl SolutionAgentStore {
             != (expected.0, &expected.1, expected.2)
             || matches!(
                 s.state,
-                SessionState::Stopping { .. } | SessionState::Errored(_)
+                SessionState::Stopping { .. }
+                    | SessionState::Errored(_)
+                    | SessionState::AwaitingInput
             )
+            || crate::compact::has_pending_compact_approval(s, cx)
         {
             return Err(anyhow!(
                 "The session changed while context rotation was waiting"
@@ -177,12 +180,35 @@ impl SolutionAgentStore {
         }).detach();
     }
 
+    /// Consume the one-shot even when delivery must wait for a receipt. A
+    /// later ordinary Stop must never inherit the previous Send-now request.
+    pub(super) fn settle_stopping_queue(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        let flush = self.session(id).is_some_and(|session| {
+            session.update(cx, |s, _| std::mem::take(&mut s.flush_after_cancel))
+        });
+        if flush {
+            self.flush_stopped_queue(id, true, cx);
+        }
+    }
+
+    pub(super) fn recover_lost_stopped_queue(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.mutate_state(id, |state| *state = SessionState::Idle, cx);
+        self.flush_stopped_queue(id, false, cx);
+    }
+
     pub(super) fn flush_stopped_queue(
         &mut self,
         session_id: SolutionSessionId,
         flush_after_cancel: bool,
         cx: &mut Context<Self>,
     ) {
+        if let Some(session) = self.session(session_id) {
+            session.update(cx, |s, _| s.flush_after_cancel = false);
+        }
         // turn/completed may race ahead of the steer response. Only the
         // receipt may decide whether these bundles need a new turn.
         if self.active_steers.contains_key(&session_id) {
@@ -311,6 +337,69 @@ mod tests {
                 .is_empty()
         );
     }
+    #[gpui::test]
+    async fn recovery_and_stop_safety_net_respect_pending_receipts(cx: &mut gpui::TestAppContext) {
+        let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
+        store.update(cx, |store, cx| {
+            let original = bundle("pending followup");
+            let ids = HashSet::from([original.id]);
+            let session = store.session(id).unwrap();
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+                s.pending_messages.push_back(original);
+                s.flush_after_cancel = true;
+            });
+            store.active_steers.insert(
+                id,
+                PendingSteer {
+                    token: uuid::Uuid::new_v4(),
+                    bundles: ids.clone(),
+                },
+            );
+            store.recover_lost_stopped_queue(id, cx);
+            assert!(matches!(session.read(cx).state, SessionState::Idle));
+            assert_eq!(session.read(cx).pending_messages.len(), 1);
+            assert!(!session.read(cx).flush_after_cancel);
+            session.update(cx, |s, _| s.flush_after_cancel = true);
+            store.settle_stopping_queue(id, cx);
+            assert!(!session.read(cx).flush_after_cancel);
+            assert_eq!(session.read(cx).pending_messages.len(), 1);
+            session.update(cx, |s, _| {
+                assert_eq!(
+                    apply_receipt_to_queue(
+                        &mut s.pending_messages,
+                        &ids,
+                        &codex_native::SteerOutcome::Accepted
+                    )
+                    .len(),
+                    1
+                );
+            });
+            store.active_steers.remove(&id);
+            store.flush_stopped_queue(id, false, cx);
+            assert!(session.read(cx).pending_messages.is_empty());
+            assert!(!session.read(cx).flush_after_cancel);
+        });
+    }
+
+    #[gpui::test]
+    async fn approval_arriving_during_rotation_refuses_graft(cx: &mut gpui::TestAppContext) {
+        let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
+        store.update(cx, |store, cx| {
+            let session = store.session(id).unwrap();
+            let expected = {
+                let s = session.read(cx);
+                (s.epoch, s.acp_session_id.clone(), s.pending_compaction)
+            };
+            assert!(store.rotation_steering_ready(id, &expected, cx).unwrap());
+            session.update(cx, |s, _| s.state = SessionState::AwaitingInput);
+            assert!(store.rotation_steering_ready(id, &expected, cx).is_err());
+        });
+    }
+
     #[gpui::test]
     async fn newer_intent_stays_queued_while_handoff_is_pending(cx: &mut gpui::TestAppContext) {
         let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;

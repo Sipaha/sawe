@@ -5,9 +5,10 @@
 //!
 //!   - Idle session → flip to `Running`, route through `AcpThread::send`,
 //!     persist on success, transition to `Errored` on failure.
-//!   - Already-`Running` session → merge into the queued bundle in
-//!     `pending_messages` (one bundle ever; subsequent submissions
-//!     append to it). The bundle is flushed when `Stopped` arrives.
+//!   - Running session → queue by addressee, keeping compaction requests and
+//!     bundles awaiting steering receipts separate. Codex uses active-turn
+//!     steering; Claude delivers at its hooks. Remaining input starts a new
+//!     turn after completion, once any steering receipt has resolved.
 //!
 //! Each enqueued follow-up gets a compact `[HH:MM:SS] ` timestamp prefix
 //! baked onto its leading text (see `queue_timestamp_prefix`) so the agent
@@ -417,37 +418,7 @@ impl SolutionAgentStore {
                 // promised — this is the same settle the `Stopped` branch does,
                 // minus the Cancelled-drop path (a flag-less force-flip keeps the
                 // queue for the normal idle-flush, exactly as before).
-                if store.active_steers.contains_key(&session_id) { return; }
-                let flush_after_cancel = session.update(cx, |s, _| {
-                    let was = s.flush_after_cancel;
-                    s.flush_after_cancel = false;
-                    was
-                });
-                if !flush_after_cancel {
-                    return;
-                }
-                let main_blocks: Vec<agent_client_protocol::schema::ContentBlock> = session
-                    .update(cx, |s, _| {
-                        let mut main = Vec::new();
-                        for bundle in s.pending_messages.drain(..) {
-                            // A `Subagent`-targeted bundle belongs to a teammate of
-                            // the turn we just force-stopped; it has no live
-                            // addressee now, and routing it to the parent would
-                            // mis-deliver it (see the `Stopped` branch).
-                            if matches!(bundle.target, crate::model::QueueTarget::Main) {
-                                main.extend(bundle.blocks);
-                            }
-                        }
-                        main
-                    });
-                if main_blocks.is_empty() {
-                    return;
-                }
-                use gpui::TaskExt as _;
-                store.mark_queue_changed(session_id, cx);
-                store
-                    .send_message_blocks(session_id, main_blocks, cx)
-                    .detach_and_log_err(cx);
+                store.settle_stopping_queue(session_id, cx);
             });
         });
         session.update(cx, |s, _| s.stopping_safety_net = Some(task));
@@ -742,9 +713,8 @@ impl SolutionAgentStore {
             // this message and the `Stopped` handler flushes it.
         }
 
-        // Already running → merge into `pending_messages`; flushed on `Stopped`.
-        // In-turn delivery for the native backend will be restored via a
-        // pull-closure in a later task; for now all mid-turn sends queue.
+        // Queue follow-ups, then let the native steering/hook path claim them.
+        // A completed turn still awaits receipts before starting queued work.
         let already_running = matches!(session_entity.read(cx).state, SessionState::Running { .. })
             || self.active_steers.contains_key(&session_id);
         if already_running {
@@ -984,37 +954,7 @@ impl SolutionAgentStore {
                                  Running — no AcpThreadEvent::Stopped arrived; force-flipping to \
                                  Idle and flushing queue (lost-Stopped recovery)",
                             );
-                            // mutate_state(Idle) also GCs stranded inline subagents.
-                            store.mutate_state(session_id, |st| *st = SessionState::Idle, cx);
-                            // Drain Main-targeted pending and re-send as the next
-                            // turn (mirrors the Stopped EndTurn idle-flush).
-                            // Subagent-targeted leftovers are dropped: their
-                            // teammate ended with this turn.
-                            let main_blocks = store
-                                .session(session_id)
-                                .map(|s| {
-                                    s.update(cx, |s, _| {
-                                        let mut main: Vec<acp::ContentBlock> = Vec::new();
-                                        for bundle in s.pending_messages.drain(..) {
-                                            if let QueueTarget::Main = bundle.target {
-                                                main.extend(bundle.blocks);
-                                            }
-                                        }
-                                        main
-                                    })
-                                })
-                                .unwrap_or_default();
-                            if !main_blocks.is_empty() {
-                                store.mark_queue_changed(session_id, cx);
-                                let mut with_hint = Vec::with_capacity(main_blocks.len() + 1);
-                                with_hint.push(acp::ContentBlock::Text(acp::TextContent::new(
-                                    format!("{QUEUE_HINT_LINE}\n\n"),
-                                )));
-                                with_hint.extend(main_blocks);
-                                store
-                                    .send_message_blocks(session_id, with_hint, cx)
-                                    .detach();
-                            }
+                            store.recover_lost_stopped_queue(session_id, cx);
                         }
                     })
                     .map_err(SendFailure::consumed)?;

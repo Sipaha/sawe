@@ -333,39 +333,6 @@ impl SolutionSessionView {
         .detach();
     }
 
-    /// Drop a single text block into `pending_send` and start the
-    /// cold-resume handshake. Used by callers outside the compose path
-    /// that need to drive the same "wake the agent, then send" flow
-    /// without going through the editor. No images supported — the
-    /// argument must be plain text.
-    pub(crate) fn enqueue_text_pending_send_and_resume(
-        &mut self,
-        text: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        if self.resuming {
-            // Already mid-resume from an earlier Send — refuse to
-            // double-fire. The compose-side suppression in
-            // `submit_compose_now` does the same and logs; mirror that
-            // here so a missing resume has a breadcrumb.
-            let session_id = self.session_id;
-            log::info!(
-                target: "solution_agent::queue",
-                "session={session_id} enqueue_text_pending_send_and_resume suppressed (resuming=true)",
-            );
-            return;
-        }
-        let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
-        self.pending_send = Some(blocks);
-        self.resuming = true;
-        self.start_resume(window, cx);
-        cx.notify();
-    }
-
     /// Drain `pending_send` once the session has gone live (acp_thread
     /// attached). Called from the session-observe callback so the
     /// dispatch happens on the same tick the resume completes.
