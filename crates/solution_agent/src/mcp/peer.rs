@@ -126,7 +126,11 @@ impl McpServerTool for SendAgentMessageTool {
 
 pub(crate) fn register_peer(cx: &mut App) {
     // No GLOBAL_TOOLS entry: this tool belongs to per-Solution sockets.
-    editor_mcp::register_tool(cx, |server| server.add_tool(SendAgentMessageTool));
+    editor_mcp::register_typed_tool_with_tier(
+        cx,
+        editor_mcp::ToolTier::Write,
+        SendAgentMessageTool,
+    );
 }
 
 #[cfg(test)]

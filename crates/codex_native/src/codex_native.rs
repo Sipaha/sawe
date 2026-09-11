@@ -494,7 +494,10 @@ fn mcp_config(servers: &[acp::McpServer]) -> Value {
                 // enforces scope and user-input gates in the host. Approve only
                 // discovery and peer send on the built-in bridge, not arbitrary
                 // MCP writes or the separate human-input endpoint.
-                if server.name == "sawe" && server.args.iter().any(|arg| arg == "--mcp-bridge") {
+                if server.name == "sawe"
+                    && server.args.first().is_some_and(|arg| arg == "--nc")
+                    && server.args.len() == 2
+                {
                     entry["tools"] = json!({
                         "solution_agent.list_sessions": {"approval_mode":"approve"},
                         "solution_agent.send_agent_message": {"approval_mode":"approve"}
@@ -560,7 +563,7 @@ mod tests {
         let config = mcp_config(&[
             acp::McpServer::Stdio(
                 acp::McpServerStdio::new("sawe", "/bin/sawe")
-                    .args(vec!["--mcp-bridge".into()])
+                    .args(vec!["--nc".into(), "/tmp/solution/mcp.sock".into()])
                     .env(vec![acp::EnvVariable::new("SCOPE", "test")]),
             ),
             acp::McpServer::Http(
