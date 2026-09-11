@@ -244,6 +244,11 @@ fn briefing_substitutes_paths_and_custom_prompt() {
     assert!(!out.contains("{VERDICT_NONCE}"));
     assert!(!out.contains("{CUSTOM_PROMPT_SECTION}"));
     assert!(!out.contains("{CONTEXT_USAGE_SECTION}"));
+    assert!(!out.contains("{RUNTIME_LIMITS_SECTION}"));
+    assert!(out.contains(&format!("at {MAX_CONSECUTIVE_CONTINUES};")));
+    assert!(out.contains(&format!("every {AUDIT_EVERY} triggers")));
+    assert!(out.contains(&format!("defaults to {DEFAULT_WAIT_SECS}")));
+    assert!(out.contains(&format!("{MIN_WAIT_SECS}–{MAX_WAIT_SECS}")));
 }
 
 #[test]

@@ -74,15 +74,9 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         }
         None => String::new(),
     };
+    let runtime_limits = runtime_limits_section();
     let context_section = match &ctx.context_usage {
-        Some(usage) => format!(
-            "## Context-window fullness (right now)\n\n{usage}\n\nWeigh this against \
-             what comes next (see the `compact` verdict): the higher the fullness AND \
-             the heavier the next step, the stronger the case for a `compact` verdict \
-             now. Don't treat any single percentage as a hard gate — a long/expensive \
-             next run may warrant compacting before it, \
-             while a short next step is fine at higher fullness.\n"
-        ),
+        Some(usage) => format!("## Context-window fullness (right now)\n\n{usage}\n"),
         None => String::new(),
     };
     // Keep human-readable paths separate from arguments in the executable
@@ -90,6 +84,7 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
     let bridge_shell = crate::prompt_template::quote_shell_argument(&ctx.bridge_bin);
     let socket_shell = crate::prompt_template::quote_shell_argument(&ctx.socket_path);
     let replacements = [
+        ("{RUNTIME_LIMITS_SECTION}", runtime_limits.as_str()),
         ("{BRIDGE_BIN_SHELL}", bridge_shell.as_str()),
         ("{SOCKET_PATH_SHELL}", socket_shell.as_str()),
         (
@@ -107,6 +102,22 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         ("{CUSTOM_PROMPT_SECTION}", custom_section.as_str()),
     ];
     crate::prompt_template::render(template, &replacements)
+}
+
+// Share the values used by the state machine so prompt prose cannot drift
+// into a second, contradictory implementation of these deterministic limits.
+fn runtime_limits_section() -> String {
+    use super::{
+        AUDIT_EVERY, DEFAULT_WAIT_SECS, MAX_CONSECUTIVE_CONTINUES, MAX_WAIT_SECS, MIN_WAIT_SECS,
+    };
+    format!(
+        "## Limits enforced by the editor\n\n\
+         Consecutive `continue`/`ask_agent` verdicts escalate to the human at \
+         {MAX_CONSECUTIVE_CONTINUES}; every {AUDIT_EVERY} triggers an independent audit \
+         before that cap. `wait_seconds` defaults to {DEFAULT_WAIT_SECS} and is \
+         clamped to {MIN_WAIT_SECS}–{MAX_WAIT_SECS}. The editor owns these counters \
+         and timers; choose the action and estimate, do not maintain duplicate counters.\n"
+    )
 }
 
 /// Mint a fresh single-use credential for one judge/auditor briefing. It rides
