@@ -88,6 +88,7 @@ fn make_meta(seq: u32, sol: i64) -> SolutionSessionMetadata {
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     }
@@ -1721,4 +1722,39 @@ async fn an_in_memory_connection_reports_memory_journal_mode_and_still_opens(
         .expect("prepare busy_timeout")()
     .expect("read busy_timeout");
     assert_eq!(busy_timeout, Some(500));
+}
+
+#[gpui::test]
+async fn permissions_roundtrip_legacy_default_and_stale_metadata(cx: &mut gpui::TestAppContext) {
+    use crate::model::SessionPermissionMode;
+    let db = SolutionAgentDb::open(cx.executor()).unwrap();
+    let mut meta = make_meta(1, 913);
+    db.save_metadata(meta.clone()).await.unwrap();
+    assert_eq!(
+        db.list_for_solution(meta.solution_id).await.unwrap()[0].permission_mode,
+        SessionPermissionMode::FullAccess
+    );
+    let stale = meta.clone();
+    meta.permission_mode = SessionPermissionMode::ReadOnly;
+    db.save_permission_mode(&meta).unwrap();
+    db.save_metadata(stale).await.unwrap();
+    assert_eq!(
+        db.list_for_solution(meta.solution_id).await.unwrap()[0].permission_mode,
+        SessionPermissionMode::ReadOnly
+    );
+    meta.permission_mode = SessionPermissionMode::FullAccess;
+    db.save_permission_mode(&meta).unwrap();
+    assert_eq!(
+        db.list_for_solution(meta.solution_id).await.unwrap()[0].permission_mode,
+        SessionPermissionMode::FullAccess
+    );
+    db.connection
+        .lock()
+        .exec_bound::<String>("UPDATE solution_sessions SET permission_mode = NULL WHERE id = ?")
+        .unwrap()(meta.id.to_string())
+    .unwrap();
+    assert_eq!(
+        db.list_for_solution(meta.solution_id).await.unwrap()[0].permission_mode,
+        SessionPermissionMode::FullAccess
+    );
 }

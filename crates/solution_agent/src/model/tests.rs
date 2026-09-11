@@ -121,6 +121,7 @@ fn build_session() -> SolutionSession {
         cached_models: Vec::new(),
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         parent_session_id: None,
         stopping_safety_net: None,
         teammate_labels: HashMap::new(),

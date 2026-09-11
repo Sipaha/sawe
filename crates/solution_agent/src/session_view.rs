@@ -984,6 +984,7 @@ impl SolutionSessionView {
             parent_session_id: session.parent_session_id,
             desired_model: session.desired_model.clone(),
             desired_effort: session.desired_effort.clone(),
+            permission_mode: session.permission_mode,
             cached_models: session.cached_models.clone(),
             tab_order: session.tab_order,
         };

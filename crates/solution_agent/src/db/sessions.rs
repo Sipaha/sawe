@@ -21,6 +21,22 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Explicit selections are authoritative. Generic metadata upserts never
+    /// update this column, so delayed snapshots cannot undo a user selection.
+    pub fn save_permission_mode(&self, meta: &SolutionSessionMetadata) -> Result<()> {
+        let connection = self.connection.lock();
+        connection.with_savepoint("set_session_permissions", || {
+            insert_or_update_metadata(&connection, meta)?;
+            connection.exec_bound::<(String, String)>(
+                "UPDATE solution_sessions SET permission_mode = ?1 WHERE id = ?2",
+            )?((
+                meta.permission_mode.as_str().to_owned(),
+                meta.id.to_string(),
+            ))?;
+            Ok(())
+        })
+    }
+
     pub fn list_for_solution(
         &self,
         solution_id: SolutionId,
@@ -316,15 +332,21 @@ pub(crate) fn insert_or_update_metadata(
             Option<String>,
             Option<String>,
         ),
-        (Option<String>, Option<String>, Option<String>, Option<i64>),
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        ),
     )>(indoc! {"
         INSERT INTO solution_sessions (
             id, solution_id, agent_id, acp_session_id, title,
             created_at, last_activity_at, preview, total_tokens,
             context_count, cwd, parent_session_id,
-            desired_model, desired_effort, cached_models, tab_order
+            desired_model, desired_effort, cached_models, tab_order, permission_mode
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         ON CONFLICT(id) DO UPDATE SET
             solution_id        = excluded.solution_id,
             agent_id           = excluded.agent_id,
@@ -377,6 +399,7 @@ pub(crate) fn insert_or_update_metadata(
             meta.desired_effort.clone(),
             cached_models_json,
             meta.tab_order,
+            Some(meta.permission_mode.as_str().to_owned()),
         ),
     ))?;
 
@@ -646,7 +669,13 @@ type MetadataRow = (
         Option<String>,
         Option<String>,
     ),
-    (Option<String>, Option<String>, Option<String>, Option<i64>),
+    (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ),
 );
 
 /// The `solution_sessions` columns [`metadata_from_row`] decodes, in
@@ -657,7 +686,7 @@ const METADATA_SELECT_LIST: &str = indoc! {"
     id, solution_id, agent_id, acp_session_id, title,
     created_at, last_activity_at, preview, total_tokens,
     context_count, cwd, parent_session_id,
-    desired_model, desired_effort, cached_models, tab_order
+    desired_model, desired_effort, cached_models, tab_order, permission_mode
 "};
 
 fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
@@ -672,7 +701,7 @@ fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
             cwd,
             parent_session_id,
         ),
-        (desired_model, desired_effort, cached_models_json, tab_order),
+        (desired_model, desired_effort, cached_models_json, tab_order, permission_mode),
     ) = row;
     let id = SolutionSessionId::parse(&id)
         .map_err(|e| anyhow!("invalid SolutionSessionId in db: {e}"))?;
@@ -717,6 +746,9 @@ fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
         parent_session_id,
         desired_model,
         desired_effort,
+        permission_mode: crate::model::SessionPermissionMode::from_persisted(
+            permission_mode.as_deref(),
+        ),
         cached_models,
         tab_order,
     })

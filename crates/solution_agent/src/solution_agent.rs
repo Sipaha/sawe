@@ -54,7 +54,8 @@ pub use background_shell::{
 };
 pub use db::{IdentityMigrationReport, SolutionAgentDb};
 pub use model::{
-    AgentServerId, SessionState, SolutionSession, SolutionSessionId, SolutionSessionMetadata,
+    AgentServerId, SessionPermissionMode, SessionState, SolutionSession, SolutionSessionId,
+    SolutionSessionMetadata,
 };
 pub use store::EFFORT_LEVELS;
 

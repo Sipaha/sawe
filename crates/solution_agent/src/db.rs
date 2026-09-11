@@ -254,6 +254,7 @@ impl SolutionAgentDb {
         // `hydrate_all_for_solution`.
         apply_idempotent_add_column(&connection, "desired_model TEXT");
         apply_idempotent_add_column(&connection, "desired_effort TEXT");
+        apply_idempotent_add_column(&connection, "permission_mode TEXT");
         apply_idempotent_add_column(&connection, "cached_models TEXT");
         // Phase 1 (rename/identity) added this column to stamp a session's
         // project as a fact rather than an inference; the 2026-08-26

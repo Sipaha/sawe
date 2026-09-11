@@ -250,6 +250,7 @@ pub(crate) async fn resume_a_row_native_session_through_a_failed_row_read(
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };

@@ -16,6 +16,30 @@ use crate::background_agent;
 use crate::background_shell;
 use crate::session_entry::SessionEntry;
 
+/// Effective native tool permissions, changed only while the session is idle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPermissionMode {
+    #[default]
+    FullAccess,
+    ReadOnly,
+}
+
+impl SessionPermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAccess => "full_access",
+            Self::ReadOnly => "read_only",
+        }
+    }
+    pub(crate) fn from_persisted(value: Option<&str>) -> Self {
+        match value {
+            None | Some("full_access") => Self::FullAccess,
+            _ => Self::ReadOnly,
+        }
+    }
+}
+
 /// Length of a `SolutionSessionId` in ASCII characters. 8 chars over a
 /// 36-char alphabet ≈ 36⁸ ≈ 2.8 × 10¹² combinations — comfortably
 /// collision-free for the realistic upper bound of a few thousand
@@ -542,6 +566,7 @@ pub struct SolutionSession {
     /// session wakes onto it; for a live session also pushed via
     /// `apply_flag_settings`. `None` → claude's default.
     pub desired_effort: Option<String>,
+    pub permission_mode: SessionPermissionMode,
     /// F: parent session reference for sub-agent indication. `None` for
     /// top-level sessions. Set at creation time via
     /// `solution_agent.create_session({parent_session_id})` and
@@ -720,6 +745,7 @@ impl SolutionSession {
             cached_models: Vec::new(),
             desired_model: None,
             desired_effort: None,
+            permission_mode: Default::default(),
             parent_session_id: None,
             stopping_safety_net: None,
             teammate_labels: HashMap::new(),
@@ -1283,6 +1309,7 @@ pub struct SolutionSessionMetadata {
     /// Persisted copy of [`SolutionSession::desired_effort`]. `None` for
     /// sessions where the user hasn't made an effort selection yet.
     pub desired_effort: Option<String>,
+    pub permission_mode: SessionPermissionMode,
     /// Persisted copy of [`SolutionSession::cached_models`]. Empty for
     /// sessions that haven't yet fetched the model list from the agent.
     pub cached_models: Vec<acp_thread::NativeAgentModelInfo>,

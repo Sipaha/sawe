@@ -69,7 +69,7 @@ impl SolutionAgentStore {
                     id: s.id, solution_id:s.solution_id, agent_id:s.agent_id.clone(), acp_session_id:s.acp_session_id.clone(),
                     title:s.title.clone(), created_at:s.created_at,last_activity_at:s.last_activity_at,
                     preview:None,total_tokens:None,context_count:s.context_count,cwd:s.cwd.clone(),parent_session_id:s.parent_session_id,
-                    desired_model:s.desired_model.clone(),desired_effort:s.desired_effort.clone(),cached_models:s.cached_models.clone(),tab_order:s.tab_order,
+                    desired_model:s.desired_model.clone(),desired_effort:s.desired_effort.clone(),permission_mode:s.permission_mode,cached_models:s.cached_models.clone(),tab_order:s.tab_order,
                 };
                 let project = s.project.clone();
                 let solution = SolutionStore::try_global(cx).ok_or_else(|| anyhow!("Solution store unavailable"))?.read(cx).solutions().iter().find(|s| s.id == solution_id).cloned().ok_or_else(|| anyhow!("Solution not found"))?;

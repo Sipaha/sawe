@@ -21,8 +21,9 @@ use crate::adapter::AdapterRegistry;
 use crate::db::{EntryRow, SolutionAgentDb};
 use crate::metrics_emitter::MetricsEmitter;
 use crate::model::{
-    AgentServerId, BandState, SessionContextCount, SessionState, SolutionSession,
-    SolutionSessionId, SolutionSessionMetadata, clamp_band_height, clamp_divider_ratio,
+    AgentServerId, BandState, SessionContextCount, SessionPermissionMode, SessionState,
+    SolutionSession, SolutionSessionId, SolutionSessionMetadata, clamp_band_height,
+    clamp_divider_ratio,
 };
 use crate::model_catalog::ModelCatalog;
 use crate::notifier;
@@ -1617,6 +1618,14 @@ impl SolutionAgentStore {
         cx: &App,
     ) -> Option<acp::Meta> {
         let mut meta = acp::Meta::new();
+        let permission_mode = session_id
+            .and_then(|id| self.sessions.get(&id))
+            .map(|session| session.read(cx).permission_mode)
+            .unwrap_or_default();
+        meta.insert(
+            "sawePermissionMode".into(),
+            serde_json::json!(permission_mode.as_str()),
+        );
         // Ephemeral supervisor judge/auditor sessions get a Supervisor system
         // prompt instead of the solution's worker framing, so they judge from
         // the outside rather than drifting into doing the task.
@@ -1748,6 +1757,7 @@ impl SolutionAgentStore {
             parent_session_id: s.parent_session_id,
             desired_model: s.desired_model.clone(),
             desired_effort: s.desired_effort.clone(),
+            permission_mode: s.permission_mode,
             cached_models: s.cached_models.clone(),
             // Carried through so the INSERT's ON CONFLICT path COALESCEs it
             // against any value a concurrent `persist_tab_order` already wrote;
@@ -2511,6 +2521,120 @@ impl SolutionAgentStore {
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
     }
 
+    pub fn can_set_session_permission_mode(&self, id: SolutionSessionId, cx: &App) -> Result<()> {
+        let session = self
+            .session(id)
+            .ok_or_else(|| anyhow!("Session not found"))?;
+        let s = session.read(cx);
+        if !matches!(s.state, SessionState::Idle)
+            || !s.pending_messages.is_empty()
+            || self.active_steers.contains_key(&id)
+            || s.is_compaction_pending()
+            || s.background_agents
+                .values()
+                .any(|agent| agent.is_messageable())
+            || s.background_shells.values().any(|shell| {
+                matches!(
+                    shell.state,
+                    crate::background_shell::ShellRuntimeState::Running
+                )
+            })
+            || crate::compact::has_pending_compact_approval(s, cx)
+            || s.is_ephemeral
+            || s.is_supervisor_ephemeral
+            || s.transcript_unavailable
+        {
+            return Err(anyhow!(
+                "Permissions can change only in an idle chat without pending work or approvals"
+            ));
+        }
+        if s.agent_id.as_ref() != crate::claude_adapter::CLAUDE_ACP_AGENT_ID
+            && s.agent_id.as_ref() != crate::codex_adapter::CODEX_AGENT_ID
+        {
+            return Err(anyhow!(
+                "This provider does not support session permissions"
+            ));
+        }
+        if let Some(thread) = s.acp_thread() {
+            let connection = thread.read(cx).connection().clone();
+            // These native close methods synchronously remove/kill the old
+            // process before returning a ready task. A generic async close
+            // could otherwise race the next resume of the same provider ID.
+            if connection
+                .clone()
+                .downcast::<claude_native::ClaudeNativeConnection>()
+                .is_none()
+                && connection
+                    .downcast::<codex_native::CodexConnection>()
+                    .is_none()
+            {
+                return Err(anyhow!(
+                    "This provider cannot safely restart its permission policy"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_session_permission_mode(
+        &mut self,
+        id: SolutionSessionId,
+        mode: SessionPermissionMode,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.can_set_session_permission_mode(id, cx)?;
+        let session = self.session(id).unwrap();
+        let s = session.read(cx);
+        if s.permission_mode == mode {
+            return Ok(());
+        }
+        let meta = SolutionSessionMetadata {
+            id,
+            solution_id: s.solution_id,
+            agent_id: s.agent_id.clone(),
+            acp_session_id: s.acp_session_id.clone(),
+            title: s.title.clone(),
+            created_at: s.created_at,
+            last_activity_at: s.last_activity_at,
+            preview: None,
+            total_tokens: None,
+            context_count: s.context_count,
+            cwd: s.cwd.clone(),
+            parent_session_id: s.parent_session_id,
+            desired_model: s.desired_model.clone(),
+            desired_effort: s.desired_effort.clone(),
+            permission_mode: mode,
+            cached_models: s.cached_models.clone(),
+            tab_order: s.tab_order,
+        };
+        // Commit before acknowledging the UI. Generic asynchronous metadata
+        // snapshots never overwrite this column, including older queued saves.
+        if let Some(db) = &self.persistence {
+            db.save_permission_mode(&meta)?;
+        }
+        let pair = (s.solution_id, s.agent_id.clone());
+        let live = s.acp_thread().cloned();
+        if let Some(thread) = live {
+            let (connection, provider_id) = {
+                let t = thread.read(cx);
+                (t.connection().clone(), t.session_id().clone())
+            };
+            connection
+                .close_session(&provider_id, cx)
+                .detach_and_log_err(cx);
+            self.pool_release_session(pair.clone(), cx);
+            self.pool.lock().remove(&pair);
+        }
+        session.update(cx, |s, cx| {
+            s.permission_mode = mode;
+            s.last_activity_at = Utc::now();
+            s.set_acp_thread(None, cx);
+        });
+        self.mark_state_changed(id, cx);
+        cx.notify();
+        Ok(())
+    }
+
     /// Re-query the model list. Live → re-read the connection's captured list.
     /// Cold → probe (wired in a later task). Updates `cached_models` + persists.
     pub fn refresh_models(&mut self, session_id: SolutionSessionId, cx: &mut Context<Self>) {
@@ -3009,6 +3133,7 @@ impl SolutionAgentStore {
                 parent_session_id: s.parent_session_id,
                 desired_model: s.desired_model.clone(),
                 desired_effort: s.desired_effort.clone(),
+                permission_mode: s.permission_mode,
                 cached_models: s.cached_models.clone(),
                 tab_order: s.tab_order,
             }
@@ -3489,6 +3614,7 @@ impl SolutionAgentStore {
                 s.cwd.clone(),
             )
         };
+        let expected_permission_mode = session_entity.read(cx).permission_mode;
         let expected_context = {
             let s = session_entity.read(cx);
             (s.epoch, s.acp_session_id.clone(), s.pending_compaction)
@@ -3547,6 +3673,9 @@ impl SolutionAgentStore {
             let receipt_wait: Result<()> = async {
                 for _ in 0..600 {
                     let ready = this.update(cx, |store, cx| {
+                        if store.session(session_id).is_none_or(|s| s.read(cx).permission_mode != expected_permission_mode) {
+                            return Err(anyhow!("Session permissions changed while rotating context"));
+                        }
                         store.rotation_steering_ready(session_id, &expected_context, cx)
                     })??;
                     if ready { return Ok(()); }
@@ -3564,6 +3693,12 @@ impl SolutionAgentStore {
             }
 
             let new_count = this.update(cx, |store, cx| {
+                if store.session(session_id).is_none_or(|s| s.read(cx).permission_mode != expected_permission_mode) {
+                    let new_id = new_thread.read(cx).session_id().clone();
+                    connection.clone().close_session(&new_id, cx).detach_and_log_err(cx);
+                    store.pool_release_session(pair.clone(), cx);
+                    return Err(anyhow!("Session permissions changed while rotating context"));
+                }
                 // The PRE-rotation ACP session id, captured before the graft
                 // overwrites it — needed to tear down its now-orphaned subprocess.
                 // Only meaningful if the session was actually live (a cold session
@@ -5558,5 +5693,93 @@ mod subagent_view_tests {
             "case-insensitive: agent → do NOT auto-close"
         );
         assert!(!tool_name_is_agent(None), "unknown tool → auto-close path");
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    #[gpui::test]
+    async fn permission_selection_requires_idle_and_survives_context_metadata(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (store, id, _tmp) = test_support::seed_store_with_session(cx).await;
+        store.update(cx, |store, cx| {
+            let session = store.session(id).unwrap();
+            for state in [
+                SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                },
+                SessionState::AwaitingInput,
+                SessionState::Stopping {
+                    started_at: std::time::Instant::now(),
+                },
+            ] {
+                session.update(cx, |s, _| s.state = state);
+                assert!(
+                    store
+                        .set_session_permission_mode(id, SessionPermissionMode::ReadOnly, cx)
+                        .is_err()
+                );
+                assert_eq!(
+                    session.read(cx).permission_mode,
+                    SessionPermissionMode::FullAccess
+                );
+            }
+            session.update(cx, |s, _| {
+                s.state = SessionState::Idle;
+                s.pending_messages.push_back(crate::model::PendingBundle {
+                    id: uuid::Uuid::new_v4(),
+                    target: crate::model::QueueTarget::Main,
+                    origin: crate::model::MessageOrigin::User,
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new("pending"))],
+                });
+            });
+            assert!(store.can_set_session_permission_mode(id, cx).is_err());
+            session.update(cx, |s, _| {
+                s.pending_messages.clear();
+            });
+            let provider_id = session.read(cx).acp_session_id.clone();
+            let epoch = session.read(cx).epoch;
+            store
+                .set_session_permission_mode(id, SessionPermissionMode::ReadOnly, cx)
+                .unwrap();
+            assert_eq!(session.read(cx).acp_session_id, provider_id);
+            assert_eq!(session.read(cx).epoch, epoch);
+            let solution = SolutionStore::global(cx)
+                .read(cx)
+                .solutions()
+                .iter()
+                .find(|s| s.id == session.read(cx).solution_id)
+                .unwrap()
+                .clone();
+            let agent_id = session.read(cx).agent_id.clone();
+            assert_eq!(
+                store
+                    .build_session_meta(&agent_id, &solution, Some(id), None, cx)
+                    .unwrap()["sawePermissionMode"],
+                "read_only"
+            );
+            session.update(cx, |s, _| s.context_count += 1);
+            assert_eq!(
+                store
+                    .build_session_meta(&agent_id, &solution, Some(id), None, cx)
+                    .unwrap()["sawePermissionMode"],
+                "read_only"
+            );
+            assert_eq!(
+                store
+                    .build_session_meta(
+                        &agent_id,
+                        &solution,
+                        Some(SolutionSessionId::new()),
+                        None,
+                        cx
+                    )
+                    .unwrap()["sawePermissionMode"],
+                "full_access"
+            );
+        });
     }
 }

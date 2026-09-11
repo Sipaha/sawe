@@ -1164,6 +1164,7 @@ impl SolutionAgentStore {
                 parent_session_id: s.parent_session_id,
                 desired_model: s.desired_model.clone(),
                 desired_effort: s.desired_effort.clone(),
+                permission_mode: s.permission_mode,
                 cached_models: s.cached_models.clone(),
                 tab_order: s.tab_order,
             };

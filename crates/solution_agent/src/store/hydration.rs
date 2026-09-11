@@ -474,6 +474,7 @@ pub(crate) fn build_cold_session(
         s.cached_models = restored_available_models;
         s.desired_model = restored_desired_model;
         s.desired_effort = restored_desired_effort;
+        s.permission_mode = meta.permission_mode;
         s
     });
     ColdSessionBuild {
@@ -609,6 +610,12 @@ impl SolutionAgentStore {
                 crate::native_controls::set_effort(connection.clone(), &acp_session_id, effort, false);
             })?;
 
+            let resume_meta = this.update(cx, |store, cx| {
+                let mut native_meta = store.build_session_meta(&pair.1, &solution, Some(meta.id), None, cx).unwrap_or_default();
+                let mode = store.session(meta.id).map(|s| s.read(cx).permission_mode).unwrap_or(meta.permission_mode);
+                native_meta.insert("sawePermissionMode".into(), serde_json::json!(mode.as_str()));
+                native_meta
+            })?;
             let mut last_err: Option<anyhow::Error> = None;
             let mut attached: Option<(Entity<acp_thread::AcpThread>, PathBuf)> = None;
             // `true` only while EVERY cwd candidate so far has failed
@@ -624,16 +631,13 @@ impl SolutionAgentStore {
                     .into_owned()]);
                 let acp_thread_task: Task<Result<Entity<acp_thread::AcpThread>>> = cx
                     .update(|cx| {
-                        if connection.supports_load_session() {
-                            Ok(connection.clone().load_session(
-                                acp_session_id.clone(),
-                                project.clone(),
-                                work_dirs.clone(),
-                                title_for_load.clone(),
-                                cx,
+                        if connection.supports_resume_session() {
+                            Ok(connection.clone().resume_session_with_meta(
+                                acp_session_id.clone(), project.clone(), work_dirs.clone(),
+                                title_for_load.clone(), Some(resume_meta.clone()), cx,
                             ))
-                        } else if connection.supports_resume_session() {
-                            Ok(connection.clone().resume_session(
+                        } else if connection.supports_load_session() {
+                            Ok(connection.clone().load_session(
                                 acp_session_id.clone(),
                                 project.clone(),
                                 work_dirs.clone(),
@@ -692,9 +696,7 @@ impl SolutionAgentStore {
             // the navigator stay aligned with claude-acp on the next
             // round-trip.
             if attached.is_none() && all_resource_gone {
-                let acp_meta = this.update(cx, |store, cx| {
-                    store.build_session_meta(&pair.1, &solution, Some(meta.id), None, cx)
-                })?;
+                let acp_meta = Some(resume_meta.clone());
                 let fallback_cwd = if primary_cwd != solution.root {
                     primary_cwd.clone()
                 } else {
@@ -916,6 +918,16 @@ impl SolutionAgentStore {
             };
 
             let session_id = this.update(cx, |store, cx| {
+                let current_mode = store.session(meta.id).map(|s| s.read(cx).permission_mode).unwrap_or(meta.permission_mode);
+                if resume_meta.get("sawePermissionMode").and_then(serde_json::Value::as_str) != Some(current_mode.as_str()) {
+                    let (connection, provider_id) = {
+                        let thread = acp_thread.read(cx);
+                        (thread.connection().clone(), thread.session_id().clone())
+                    };
+                    connection.close_session(&provider_id, cx).detach_and_log_err(cx);
+                    store.pool_release_session(pair.clone(), cx);
+                    return Err(anyhow!("Session permissions changed while resuming; retry with the selected permissions"));
+                }
                 // Reuse the metadata's existing internal id — minting a fresh
                 // SolutionSessionId on every resume duplicated the row in the
                 // History popover (each restart added another "Session
@@ -1049,6 +1061,7 @@ impl SolutionAgentStore {
                         s.parent_session_id = meta.parent_session_id;
                         s.desired_model = meta.desired_model.clone();
                         s.desired_effort = meta.desired_effort.clone();
+                        s.permission_mode = meta.permission_mode;
                         s.cached_models = meta.cached_models.clone();
                         s.entries =
                             entries.into_iter().map(std::sync::Arc::new).collect();

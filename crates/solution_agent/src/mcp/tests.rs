@@ -2468,6 +2468,7 @@ async fn read_session_history_closed_row_native_returns_entries(cx: &mut gpui::T
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -2596,6 +2597,7 @@ async fn read_session_history_distinguishes_a_wiped_session_from_a_legacy_one(
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -3743,6 +3745,7 @@ async fn seed_closed_db_only_session(
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: Some(0),
     };
@@ -4214,6 +4217,7 @@ async fn get_session_legacy_blob_closed_session_serves_bumped_epoch(cx: &mut gpu
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -4361,6 +4365,7 @@ async fn get_session_refuses_to_serve_an_undecodable_blob_as_empty(cx: &mut gpui
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -4566,6 +4571,7 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -4608,6 +4614,7 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -4938,6 +4945,7 @@ async fn get_session_ignores_the_blob_of_a_wiped_row_native_session(cx: &mut gpu
             parent_session_id: None,
             desired_model: None,
             desired_effort: None,
+            permission_mode: Default::default(),
             cached_models: vec![],
             tab_order: None,
         })
@@ -5016,6 +5024,7 @@ async fn get_session_ignores_the_blob_of_a_wiped_row_native_session(cx: &mut gpu
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -5106,6 +5115,7 @@ async fn seed_closed_session_with_entries(
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: Some(0),
     })
@@ -5175,6 +5185,7 @@ async fn add_closed_session(
         parent_session_id: None,
         desired_model: None,
         desired_effort: None,
+        permission_mode: Default::default(),
         cached_models: vec![],
         tab_order: Some(0),
     })
