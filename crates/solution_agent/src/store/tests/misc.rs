@@ -7326,3 +7326,72 @@ fn csid_release_is_idempotent_and_restores_claimability() {
         "a send that never enqueued must be retryable"
     );
 }
+
+#[gpui::test]
+async fn reset_context_recovers_error_and_rejects_busy_without_losing_history(
+    cx: &mut TestAppContext,
+) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(
+                Some(acp_thread::UserMessageId::new()),
+                agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new("keep until reset succeeds"),
+                ),
+                cx,
+            );
+        })
+    });
+    cx.executor().run_until_parked();
+    for state in [
+        SessionState::Running {
+            started_at: std::time::Instant::now(),
+            notified: false,
+        },
+        SessionState::Stopping {
+            started_at: std::time::Instant::now(),
+        },
+        SessionState::AwaitingInput,
+    ] {
+        let result = cx
+            .update(|cx| {
+                let store = SolutionAgentStore::global(cx);
+                store
+                    .read(cx)
+                    .session(session_id)
+                    .unwrap()
+                    .update(cx, |session, _| session.state = state);
+                store.update(cx, |store, cx| store.reset_context(session_id, cx))
+            })
+            .await;
+        assert!(result.is_err());
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).unwrap();
+            assert_eq!(session.read(cx).entries.len(), 1);
+            assert_eq!(session.read(cx).acp_thread().unwrap(), &thread);
+        });
+    }
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .update(cx, |session, _| {
+                session.state = SessionState::Errored("agent failed".into())
+            });
+        store.update(cx, |store, cx| store.reset_context(session_id, cx))
+    })
+    .await
+    .expect("clear must recover an errored session");
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let session = session.read(cx);
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(session.entries.is_empty());
+        assert_ne!(session.acp_thread().unwrap(), &thread);
+    });
+}

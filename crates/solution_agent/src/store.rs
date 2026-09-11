@@ -3607,10 +3607,22 @@ impl SolutionAgentStore {
         let Some(session_entity) = self.sessions.get(&session_id).cloned() else {
             return Task::ready(Err(anyhow!("unknown session {session_id}")));
         };
-        // Human-initiated `/clear`: give the observer a clean slate (wipe its
-        // diary/verdicts/user-intent + reset its reasoning cursor) so it doesn't
-        // carry stale reasoning across the reset.
-        self.wipe_supervisor_memory(session_id, cx);
+        // Recheck here: MCP callers and a delayed confirmation dialog can
+        // bypass the status row's gate. An error is recoverable; an active
+        // turn must finish before its context can be replaced.
+        let reset_snapshot = {
+            let session = session_entity.read(cx);
+            if !matches!(session.state, SessionState::Idle | SessionState::Errored(_)) {
+                return Task::ready(Err(anyhow!(
+                    "session is busy; wait for the current turn to finish"
+                )));
+            }
+            (
+                session.epoch,
+                session.last_activity_at,
+                session.acp_session_id.clone(),
+            )
+        };
         // `project` is None for a COLD session (loaded from the DB, never
         // promoted to live this run) — the common case for `/clear` on a
         // session whose conversation was generated in a previous editor
@@ -3679,6 +3691,25 @@ impl SolutionAgentStore {
             let new_thread = new_thread_task.await?;
 
             this.update(cx, |store, cx| {
+                // Creating a replacement can await authentication or process startup.
+                // Never wipe a conversation that changed while we were waiting.
+                let unchanged = store.session(session_id).is_some_and(|current| {
+                    let current = current.read(cx);
+                    matches!(current.state, SessionState::Idle | SessionState::Errored(_))
+                        && (current.epoch, current.last_activity_at, current.acp_session_id.clone())
+                            == reset_snapshot
+                });
+                if !unchanged {
+                    if connection.supports_close_session() {
+                        let abandoned_id = new_thread.read(cx).session_id().clone();
+                        connection.clone().close_session(&abandoned_id, cx).detach();
+                    }
+                    store.pool_release_session(pair.clone(), cx);
+                    return Err(anyhow!("session changed while clearing; retry after the current turn finishes"));
+                }
+                // Only wipe observer memory once the replacement exists and
+                // the reset can commit successfully.
+                store.wipe_supervisor_memory(session_id, cx);
                 // Capture the PRE-clear ACP session id + liveness before the graft
                 // overwrites them, so we can reap its orphaned subprocess + release
                 // the pool slot it held (skipped for a cold session — it never
@@ -3795,7 +3826,8 @@ impl SolutionAgentStore {
                     store.mark_queue_changed(session_id, cx);
                 }
                 cx.notify();
-            })?;
+                Ok(())
+            })??;
 
             Ok(session_id)
         })

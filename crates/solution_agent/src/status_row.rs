@@ -229,9 +229,9 @@ pub(crate) fn render_status_row(
             other => (SharedString::from(other.short_label()), None),
         }
     };
-    let is_idle = matches!(s.state, SessionState::Idle) && !is_cold && !is_resuming;
+    let can_clean_context =
+        matches!(s.state, SessionState::Idle | SessionState::Errored(_)) && !is_resuming;
     let is_running = matches!(s.state, SessionState::Running { .. }) && !is_resuming;
-    let is_errored = matches!(s.state, SessionState::Errored(_));
     // Live thread → live `TokenUsage`; cold / sleeping → fall
     // back to the `cached_total_tokens` mirrored from metadata
     // at restore time + refreshed on every live
@@ -418,15 +418,13 @@ pub(crate) fn render_status_row(
     let remaining = max.saturating_sub(used);
     let too_full = remaining < COMPACT_HEADROOM_MIN_TOKENS;
     let pct_ok = pct >= COMPACT_BUTTON_MIN_PCT;
-    let compact_enabled = (is_idle || is_cold) && !is_errored && pct_ok && !too_full;
-    let clear_enabled = !is_running && !is_resuming;
+    let compact_enabled = can_clean_context && pct_ok && !too_full;
+    let clear_enabled = can_clean_context;
     let trigger_enabled = compact_enabled || clear_enabled;
 
     let compact_warning = pct >= COMPACT_BUTTON_WARN_PCT && !too_full;
-    let compact_tooltip: SharedString = if is_running || is_resuming {
+    let compact_tooltip: SharedString = if !can_clean_context {
         "Wait for the current turn to finish before compacting".into()
-    } else if is_errored {
-        "Compact unavailable while the session is in error".into()
     } else if too_full {
         format!(
             "Only {} of headroom left — start a fresh session manually",

@@ -46,17 +46,14 @@ pub(crate) enum CompactInitiator {
     Observer,
 }
 
-pub(crate) fn start_compact_for_session(
-    session_id: SolutionSessionId,
-    initiator: CompactInitiator,
-    cx: &mut App,
-) -> Result<StartCompactOutcome> {
+fn compact_unavailable_reason(session_id: SolutionSessionId, cx: &App) -> Result<Option<String>> {
     let store = SolutionAgentStore::global(cx);
     let session_entity = store
         .read_with(cx, |s, _| s.session(session_id))
         .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
 
-    // Precondition: must be Idle. A Running/AwaitingInput session would
+    // Idle and terminal errors can recover by sending the summary request.
+    // A Running/AwaitingInput/Stopping session would
     // race with the in-flight turn (claude-acp queues prompts in
     // `pending_messages`, which would deliver the compact instructions
     // AFTER the active turn — possibly minutes later — and surprise
@@ -68,14 +65,11 @@ pub(crate) fn start_compact_for_session(
     // sleeping session in one tap.
     {
         let s = session_entity.read(cx);
-        if !matches!(s.state, SessionState::Idle) {
-            return Ok(StartCompactOutcome {
-                queued: false,
-                reason: Some(format!(
-                    "session is busy ({:?}); wait for the current turn to finish",
-                    s.state
-                )),
-            });
+        if !matches!(s.state, SessionState::Idle | SessionState::Errored(_)) {
+            return Ok(Some(format!(
+                "session is busy ({:?}); wait for the current turn to finish",
+                s.state
+            )));
         }
 
         // Precondition: meaningful context to compact AND headroom to
@@ -102,24 +96,34 @@ pub(crate) fn start_compact_for_session(
         };
         let remaining = max.saturating_sub(used);
         if pct < COMPACT_BUTTON_MIN_PCT {
-            return Ok(StartCompactOutcome {
-                queued: false,
-                reason: Some(format!(
-                    "conversation is short ({:.1}%); compact later",
-                    pct * 100.0
-                )),
-            });
+            return Ok(Some(format!(
+                "conversation is short ({:.1}%); compact later",
+                pct * 100.0
+            )));
         }
         if remaining < COMPACT_HEADROOM_MIN_TOKENS {
-            return Ok(StartCompactOutcome {
-                queued: false,
-                reason: Some(format!(
-                    "only {} tokens of headroom left — start a fresh session manually",
-                    remaining
-                )),
-            });
+            return Ok(Some(format!(
+                "only {} tokens of headroom left — start a fresh session manually",
+                remaining
+            )));
         }
     }
+
+    Ok(None)
+}
+
+pub(crate) fn start_compact_for_session(
+    session_id: SolutionSessionId,
+    initiator: CompactInitiator,
+    cx: &mut App,
+) -> Result<StartCompactOutcome> {
+    if let Some(reason) = compact_unavailable_reason(session_id, cx)? {
+        return Ok(StartCompactOutcome {
+            queued: false,
+            reason: Some(reason),
+        });
+    }
+    let store = SolutionAgentStore::global(cx);
 
     let rendered = render_compact_prompt_inner(session_id, cx)?;
     let is_user = initiator == CompactInitiator::User;
@@ -257,7 +261,27 @@ pub(crate) fn render_compact_prompt_inner(
         .to_string_lossy()
         .into_owned();
 
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "solution_agent.compact_session",
+            "arguments": {
+                "session_id": session_id.to_string(),
+                "prompt_file": compact_dir.join("continue.md").to_string_lossy(),
+            }
+        }
+    });
     Ok(COMPACT_INSTRUCTIONS_TEMPLATE
+        .replace(
+            "{{compact_request_shell}}",
+            &quote_shell_argument(&request.to_string()),
+        )
+        .replace(
+            "{{solution_socket_shell}}",
+            &quote_shell_argument(&solution_socket),
+        )
         .replace("{{session_id}}", &session_id.to_string())
         .replace("{{compact_dir}}", &compact_dir_str)
         .replace("{{solution_socket}}", &solution_socket)
@@ -266,6 +290,12 @@ pub(crate) fn render_compact_prompt_inner(
         .replace("{{started_at_iso}}", &started_at.to_rfc3339())
         .replace("{{tokens_used}}", &used.to_string())
         .replace("{{tokens_max}}", &max.to_string()))
+}
+
+/// Quote one argument for the POSIX shell command embedded in the handoff.
+/// JSON serialization alone cannot protect an apostrophe from the shell.
+fn quote_shell_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// How many most-recent `cNN/` rotation handoff dirs to keep per session.
@@ -355,6 +385,17 @@ impl SolutionSessionView {
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
+        match compact_unavailable_reason(self.session_id(), cx) {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                self.toast_compact_error(reason.into(), cx);
+                return;
+            }
+            Err(err) => {
+                self.toast_compact_error(err.to_string().into(), cx);
+                return;
+            }
+        }
         let Some(rendered) = self.render_compact_prompt(cx) else {
             return;
         };
@@ -417,6 +458,24 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    #[cfg(unix)]
+    #[test]
+    fn compact_shell_arguments_round_trip_special_paths() {
+        let path = "/tmp/project's \"quoted\" $HOME `name`\\dir/continue.md";
+        let request = serde_json::json!({"prompt_file": path}).to_string();
+        for value in [path, request.as_str()] {
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("printf '%s' {}", quote_shell_argument(value)),
+                ])
+                .output()
+                .expect("run shell");
+            assert!(output.status.success());
+            assert_eq!(output.stdout, value.as_bytes());
+        }
+    }
 
     /// The renderer (desktop `conversation_render::is_compaction_prompt_text`
     /// and the mobile `SessionDetailScreen.kt`) folds the compact prompt by
@@ -582,7 +641,7 @@ mod tests {
     /// sessions windowless via `send_message_blocks_with_wake`, so the
     /// orchestrator no longer needs a `&mut Window` for the cold case.
     #[gpui::test]
-    async fn cold_session_above_gate_queues_compact_via_mcp(cx: &mut TestAppContext) {
+    async fn errored_cold_session_above_gate_queues_compact_via_mcp(cx: &mut TestAppContext) {
         let (solution_id, _tmp, project) =
             crate::store::tests::setup_solution_and_project(cx).await;
         let agent_id = gpui::SharedString::from("mock-agent");
@@ -620,6 +679,15 @@ mod tests {
             });
         });
 
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(session_id)
+                .unwrap()
+                .update(cx, |session, _| {
+                    session.state = SessionState::Errored("wake failed".into())
+                });
+        });
         let outcome = cx
             .update(|cx| start_compact_for_session(session_id, CompactInitiator::User, cx))
             .expect("start_compact_for_session dispatches");
@@ -629,5 +697,67 @@ mod tests {
             "cold session above the usage gate must queue a compact; got reason={:?}",
             outcome.reason
         );
+    }
+    #[gpui::test]
+    async fn errored_live_session_can_compact_but_busy_sessions_cannot(cx: &mut TestAppContext) {
+        let (session_id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    Some(acp_thread::TokenUsage {
+                        used_tokens: 250_000,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+        });
+        cx.executor().run_until_parked();
+        for state in [
+            SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            },
+            SessionState::Stopping {
+                started_at: std::time::Instant::now(),
+            },
+            SessionState::AwaitingInput,
+        ] {
+            cx.update(|cx| {
+                let store = SolutionAgentStore::global(cx);
+                store
+                    .read(cx)
+                    .session(session_id)
+                    .unwrap()
+                    .update(cx, |s, _| s.state = state);
+                let result =
+                    start_compact_for_session(session_id, CompactInitiator::User, cx).unwrap();
+                assert!(!result.queued);
+                assert!(result.reason.unwrap().contains("busy"));
+            });
+        }
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store
+                .read(cx)
+                .session(session_id)
+                .unwrap()
+                .update(cx, |s, _| {
+                    s.state = SessionState::Errored("transient error".into())
+                });
+            assert!(
+                start_compact_for_session(session_id, CompactInitiator::User, cx)
+                    .unwrap()
+                    .queued
+            );
+        });
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                !thread.read(cx).entries().is_empty(),
+                "compact prompt reaches the live thread"
+            );
+        });
     }
 }
