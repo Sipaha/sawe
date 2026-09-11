@@ -28,4 +28,20 @@ isolated debug editor. Run affected tests and clippy; build release-fast.
 ## Delivery
 Document runtime semantics and checks, commit/push main. Exclude report junk.
 
-Status: in progress
+Status: complete
+
+## Automated results
+`cargo test -p solution_agent --lib`: 871 passed, one pre-existing ignored.
+Added coverage includes a file-backed database reopen, default/existing-chat
+isolation, unsuccessful and same-current selections, persistence attachment
+after an early selection, and a gated native startup whose runtime metadata and
+session state retain the captured policy despite a concurrent default change.
+
+Scoped debug clippy passes with warnings denied. Debug and release-fast builds
+completed. In the isolated debug editor, the two existing modes render with
+icons, descriptions and a trailing checkmark; all text fits the menu. Re-selecting
+Read only in an existing read-only chat sets the preference. A newly created
+Codex chat displays Read only and the synthetic app-server receives
+`sandbox: read-only`. After quitting and restarting the editor, another new
+chat again launches with `sandbox: read-only`. No model inference or working
+session contents were needed; screenshots and harness logs remain in /tmp.
