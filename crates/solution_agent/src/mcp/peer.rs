@@ -306,10 +306,126 @@ mod tests {
                 .session(live)
                 .unwrap();
             assert_eq!(session.read(cx).pending_messages.len(), 1);
+            let text = queued_text(&session.read(cx).pending_messages[0].blocks);
+            assert!(
+                text.contains(&format!("[Agent message from session {cold},")),
+                "{text}"
+            );
+            assert!(
+                text.contains("Review the already authorized patch when free."),
+                "{text}"
+            );
             assert!(matches!(
                 session.read(cx).state,
                 crate::model::SessionState::Running { .. }
             ));
+        });
+    }
+
+    fn queued_text(blocks: &[agent_client_protocol::schema::ContentBlock]) -> String {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                agent_client_protocol::schema::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[gpui::test]
+    async fn peers_can_reply_using_sender_id_in_delivered_text(cx: &mut TestAppContext) {
+        let (first, _unused_cold, solution_id, _tmp) = setup_peer(cx).await;
+        let second = cx
+            .update(|cx| {
+                let store = SolutionAgentStore::global(cx);
+                let project = store
+                    .read(cx)
+                    .session(first)
+                    .unwrap()
+                    .read(cx)
+                    .project
+                    .clone()
+                    .unwrap();
+                store.update(cx, |store, cx| {
+                    store.create_session(solution_id, "mock-agent".into(), project, cx)
+                })
+            })
+            .await
+            .unwrap();
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            for id in [first, second] {
+                store
+                    .read(cx)
+                    .session(id)
+                    .unwrap()
+                    .update(cx, |session, _| {
+                        session.state = crate::model::SessionState::Running {
+                            started_at: std::time::Instant::now(),
+                            notified: false,
+                        };
+                    });
+            }
+        });
+        let outbound = SendAgentMessageTool
+            .run(
+                SendAgentMessageParams {
+                    content: "Please reply to this sender after reviewing the patch.".into(),
+                    ..params(solution_id, first, second)
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outbound.structured_content.delivery, "queued");
+        let reply_to = cx.update(|cx| {
+            let session = SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(second)
+                .unwrap();
+            let session = session.read(cx);
+            assert_eq!(session.pending_messages.len(), 1);
+            let text = queued_text(&session.pending_messages[0].blocks);
+            let header = text
+                .lines()
+                .find_map(|line| line.strip_prefix("[Agent message from session "))
+                .expect("sender header must reach recipient");
+            let sender = header.split(',').next().unwrap().to_string();
+            assert_eq!(sender, first.to_string());
+            assert!(text.contains("Please reply to this sender after reviewing the patch."));
+            sender
+        });
+        let reply = SendAgentMessageTool
+            .run(
+                SendAgentMessageParams {
+                    solution_id: solution_id.0,
+                    from_session_id: second.to_string(),
+                    to_session_id: reply_to,
+                    content: "Review complete; no additional authorization was inferred.".into(),
+                },
+                &mut cx.to_async(),
+            )
+            .await
+            .unwrap();
+        assert!(reply.structured_content.accepted);
+        assert_eq!(reply.structured_content.delivery, "queued");
+        cx.update(|cx| {
+            let session = SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(first)
+                .unwrap();
+            let session = session.read(cx);
+            assert_eq!(session.pending_messages.len(), 1);
+            let text = queued_text(&session.pending_messages[0].blocks);
+            assert!(
+                text.contains(&format!("[Agent message from session {second},")),
+                "{text}"
+            );
+            assert!(
+                text.contains("Review complete; no additional authorization was inferred."),
+                "{text}"
+            );
         });
     }
 
