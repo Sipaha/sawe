@@ -79,10 +79,12 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         None => String::new(),
     };
     let runtime_limits = runtime_limits_section();
-    let observation_section = ctx.observation_context.as_ref().map_or_else(
-        String::new,
-        |context| format!("## Why this review started\n\n{context}\n"),
-    );
+    let observation_section = ctx
+        .observation_context
+        .as_ref()
+        .map_or_else(String::new, |context| {
+            format!("## Why this review started\n\n{context}\n")
+        });
     let context_section = match &ctx.context_usage {
         Some(usage) => format!("## Context-window fullness (right now)\n\n{usage}\n"),
         None => String::new(),
@@ -93,7 +95,10 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
     let socket_shell = crate::prompt_template::quote_shell_argument(&ctx.socket_path);
     let replacements = [
         ("{RUNTIME_LIMITS_SECTION}", runtime_limits.as_str()),
-        ("{OBSERVATION_CONTEXT_SECTION}", observation_section.as_str()),
+        (
+            "{OBSERVATION_CONTEXT_SECTION}",
+            observation_section.as_str(),
+        ),
         ("{BRIDGE_BIN_SHELL}", bridge_shell.as_str()),
         ("{SOCKET_PATH_SHELL}", socket_shell.as_str()),
         (

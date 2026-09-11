@@ -190,6 +190,20 @@ pub trait AgentConnection {
         )))
     }
 
+    /// Resume with editor-owned session settings. Connections without custom
+    /// settings retain their existing resume behavior.
+    fn resume_session_with_meta(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        _meta: Option<acp::Meta>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.resume_session(session_id, project, work_dirs, title, cx)
+    }
+
     /// Whether this agent supports showing session history.
     fn supports_session_history(&self) -> bool {
         self.supports_load_session() || self.supports_resume_session()

@@ -2994,6 +2994,12 @@ impl AcpThread {
             return;
         };
 
+        // A stale rendered button or a duplicate client reply must not
+        // change an already-authorized/completed call's status.
+        if !matches!(call.status, ToolCallStatus::WaitingForConfirmation { .. }) {
+            return;
+        }
+
         let is_action_choice = matches!(
             call.status,
             ToolCallStatus::WaitingForConfirmation {
@@ -3021,6 +3027,7 @@ impl AcpThread {
         }
 
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
+        cx.notify();
     }
 
     pub fn plan(&self) -> &Plan {
@@ -5676,7 +5683,9 @@ mod tests {
         assert_eq!(fs.files(), vec![Path::new(path!("/test/file-0"))]);
     }
 
+    // Like test_checkpoints, this requires capture disabled by FORK.md #23.
     #[gpui::test(iterations = 10)]
+    #[ignore]
     async fn test_checkpoint_shows_when_file_changes_during_pending_message(
         cx: &mut TestAppContext,
     ) {
@@ -7565,6 +7574,83 @@ mod tests {
                 "## Assistant\n\nи это моя регрессия\n\n"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn tool_authorization_accepts_only_the_first_reply(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+        let id = acp::ToolCallId::new("single-reply");
+        let authorization = thread.update(cx, |thread, cx| {
+            thread
+                .request_tool_call_authorization(
+                    acp::ToolCallUpdate::new(
+                        id.clone(),
+                        acp::ToolCallUpdateFields::new().title("Test command"),
+                    ),
+                    PermissionOptions::Flat(vec![
+                        acp::PermissionOption::new(
+                            "allow",
+                            "Allow once",
+                            acp::PermissionOptionKind::AllowOnce,
+                        ),
+                        acp::PermissionOption::new(
+                            "deny",
+                            "Deny",
+                            acp::PermissionOptionKind::RejectOnce,
+                        ),
+                    ]),
+                    AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+                .unwrap()
+        });
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(
+                id.clone(),
+                SelectedPermissionOutcome {
+                    option_id: "allow".into(),
+                    option_kind: acp::PermissionOptionKind::AllowOnce,
+                    params: None,
+                },
+                cx,
+            );
+            thread.authorize_tool_call(
+                id.clone(),
+                SelectedPermissionOutcome {
+                    option_id: "deny".into(),
+                    option_kind: acp::PermissionOptionKind::RejectOnce,
+                    params: None,
+                },
+                cx,
+            );
+            let call = thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(call) if call.id == id => Some(call),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                matches!(call.status, ToolCallStatus::InProgress),
+                "a stale Deny click must not undo approval"
+            );
+        });
+        match authorization.await {
+            RequestPermissionOutcome::Selected(outcome) => {
+                assert_eq!(outcome.option_id.0.as_ref(), "allow")
+            }
+            _ => panic!("approval was lost"),
+        }
     }
 
     #[gpui::test]

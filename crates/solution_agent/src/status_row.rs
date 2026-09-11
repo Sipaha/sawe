@@ -140,6 +140,12 @@ pub(crate) fn render_status_row(
     // Without this split the mutating section would clash with the
     // immutable borrow of `s` through `cx`.
     let s = session.read(cx);
+    let permission_mode = s.permission_mode;
+    let permission_change_error = SolutionAgentStore::global(cx)
+        .read(cx)
+        .can_set_session_permission_mode(session_id, cx)
+        .err()
+        .map(|error| error.to_string());
     let session_cached_max_tokens = s.cached_max_tokens;
     let compact_pending = s.is_compaction_pending();
     let compact_permission_pending = crate::compact::has_pending_compact_approval(s, cx);
@@ -842,6 +848,46 @@ pub(crate) fn render_status_row(
                     .color(Color::Muted)
                     .size(LabelSize::Small),
             )
+            .when(!is_subagent_tab && !is_task_tab, |this| {
+                use crate::model::SessionPermissionMode;
+                let label = match permission_mode {
+                    SessionPermissionMode::FullAccess => "Full access",
+                    SessionPermissionMode::ReadOnly => "Read only",
+                };
+                let enabled = permission_change_error.is_none() && !is_resuming;
+                let tooltip = permission_change_error.clone().unwrap_or_else(|| {
+                    "Permissions for this session. Changes apply when its agent reconnects.".into()
+                });
+                let trigger = ui::Button::new("solution-status-permissions-trigger", label)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .disabled(!enabled)
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .tooltip(ui::Tooltip::text(tooltip));
+                this.child(PopoverMenu::new("solution-status-permissions-menu")
+                    .trigger(trigger)
+                    .menu(move |window, cx| {
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for (mode, label) in [
+                                (SessionPermissionMode::FullAccess, "Full access"),
+                                (SessionPermissionMode::ReadOnly, "Read only"),
+                            ] {
+                                menu = menu.item(ui::ContextMenuEntry::new(label)
+                                    .when(mode == permission_mode, |entry| entry.icon(IconName::Check).icon_color(Color::Accent))
+                                    .handler(move |window, cx| {
+                                        let result = SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                                            store.set_session_permission_mode(session_id, mode, cx)
+                                        });
+                                        if let Err(error) = result {
+                                            let prompt = window.prompt(gpui::PromptLevel::Warning, "Could not change permissions", Some(&error.to_string()), &["OK"], cx);
+                                            window.spawn(cx, async move |_| { let _ = prompt.await; }).detach();
+                                        }
+                                    }));
+                            }
+                            menu
+                        }))
+                    }))
+            })
             .when(show_model_dropdown, |this| {
                 let session_id = view.session_id();
                 let options = model_options.clone();

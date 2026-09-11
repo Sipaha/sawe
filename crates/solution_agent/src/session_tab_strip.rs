@@ -639,13 +639,13 @@ impl SessionTabStrip {
             )
             .menu(|window, cx| {
                 Some(ContextMenu::build(window, cx, |menu, _, _| {
-                    menu.entry("New Claude chat", None, |window, cx| {
-                        if let Ok(action) = cx.build_action("console_panel::NewChat", None) {
+                    menu.entry("Codex (OpenAI)", None, |window, cx| {
+                        if let Ok(action) = cx.build_action("console_panel::NewCodexChat", None) {
                             window.dispatch_action(action, cx);
                         }
                     })
-                    .entry("New Codex chat", None, |window, cx| {
-                        if let Ok(action) = cx.build_action("console_panel::NewCodexChat", None) {
+                    .entry("Claude (Anthropic)", None, |window, cx| {
+                        if let Ok(action) = cx.build_action("console_panel::NewChat", None) {
                             window.dispatch_action(action, cx);
                         }
                     })
@@ -1216,13 +1216,11 @@ mod tests {
         (new_chat_dispatches, workspace, visual)
     }
 
-    /// The `+`'s plain left click must still create a session in one click —
-    /// and must NOT open the reopen picker, which now lives on the button
-    /// immediately next to it. Both sides asserted: a regression that wired
-    /// the two buttons to each other's handler would otherwise show up as
-    /// only one of "no dispatch" or "a modal appeared".
+    /// The plus opens provider selection; creation waits for a menu choice.
     #[gpui::test]
-    async fn left_clicking_the_plus_creates_a_session_and_opens_no_picker(cx: &mut TestAppContext) {
+    async fn left_clicking_the_plus_selects_provider_before_creating_a_session(
+        cx: &mut TestAppContext,
+    ) {
         let (new_chat_dispatches, workspace, mut cx) = paint_strip_with_no_tabs(cx).await;
 
         let plus = cx
@@ -1245,14 +1243,30 @@ mod tests {
 
         assert_eq!(
             *new_chat_dispatches.borrow(),
-            1,
-            "a plain left click on `+` must dispatch console_panel::NewChat"
+            0,
+            "opening provider selection must not create a session"
         );
         assert_eq!(
             workspace.read_with(&cx, |workspace, cx| workspace.active_modal_kind(cx)),
             None,
             "a left click on `+` must not open the reopen picker"
         );
+        let codex = cx
+            .debug_bounds("MENU_ITEM-Codex (OpenAI)")
+            .expect("Codex must be offered");
+        let claude = cx
+            .debug_bounds("MENU_ITEM-Claude (Anthropic)")
+            .expect("Claude must be offered");
+        assert!(codex.origin.y < claude.origin.y);
+        cx.simulate_event(gpui::MouseMoveEvent {
+            position: claude.center(),
+            pressed_button: None,
+            modifiers: gpui::Modifiers::default(),
+        });
+        cx.simulate_click(claude.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(*new_chat_dispatches.borrow(), 1);
+        assert!(cx.debug_bounds("MENU_ITEM-Claude (Anthropic)").is_none());
     }
 
     /// The reopen-a-closed-chat flow is a **visible button** next to the `+`
@@ -1491,6 +1505,7 @@ mod tests {
             parent_session_id: None,
             desired_model: None,
             desired_effort: None,
+            permission_mode: Default::default(),
             cached_models: vec![],
             tab_order: None,
         };

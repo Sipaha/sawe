@@ -4068,3 +4068,25 @@ See [the verification finding](docs/findings/2026-09-11-codex-large-context.md).
 The session strip uses one plus button to open the Claude/Codex new-chat menu.
 The separate chevron and immediate-Claude left-click path were removed. The
 existing provider actions and the separate reopen-closed-session button remain.
+
+
+### 171. Native session permissions are explicit, persisted runtime policy
+
+Solution chats default to full access; read-only is an explicit per-session
+choice in the status row. The Solution is the working scope, not an OS sandbox
+boundary for full access. Changing policy requires an idle session without
+pending input or background work, persists before acknowledging, and closes
+only that session's native runtime. Resuming carries permission metadata;
+ordinary metadata upserts cannot overwrite a newer policy choice.
+
+Codex uses native sandbox/approval settings and disables MCP and plugins in
+read-only mode. Claude read-only launches with safe mode, only Read/Glob/Grep,
+no inherited settings/hooks/MCP, and a restricted command catalog. This is a
+Claude tool policy, not an OS sandbox. Full-access Codex explicitly approves
+editor MCP tools so inspecting peer sessions does not fall into the generic
+elicitation decline path. Host scope and human-input checks still apply.
+
+Approval controls use readable buttons and support Codex's acceptForSession
+choice. Authorization is single-use in the shared thread model and redraws
+immediately; stale UI/MCP answers cannot overwrite an accepted status. Session
+approval remains a provider-scoped grant, not a persistent global permission.

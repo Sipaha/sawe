@@ -564,10 +564,10 @@ fn session_config(servers: &[acp::McpServer]) -> Value {
                     .map(|entry| (entry.name.clone(), json!(entry.value)))
                     .collect();
                 let mut entry = json!({"command":server.command,"args":server.args,"env":env,"default_tools_approval_mode":"approve"});
-                // Solution collaboration is an editor capability: peer delivery
-                // enforces scope and user-input gates in the host. Approve only
-                // session reads and peer send on the built-in bridge, not arbitrary
-                // MCP writes or the separate human-input endpoint.
+                // Full-access sessions approve editor MCP tools. Explicit peer
+                // entries preserve that policy for collaboration; host checks
+                // still enforce Solution scope and human-input boundaries.
+                // Read-only sessions disable MCP separately.
                 if server.name == "sawe"
                     && server.args.first().is_some_and(|arg| arg == "--nc")
                     && server.args.len() == 2

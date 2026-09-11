@@ -199,18 +199,14 @@ pub(crate) fn render_tool_call(
     if let Some((live_tool_call_id, buttons)) = live_authorization {
         if !buttons.is_empty() {
             let tool_call_id = live_tool_call_id;
-            let mut row = h_flex().gap_1().mt_0p5().flex_wrap();
+            let mut row = h_flex().gap_2().mt_2().flex_wrap();
             for (button_idx, button) in buttons.into_iter().enumerate() {
                 let style = if button.is_allow() {
                     ButtonStyle::Filled
                 } else {
                     ButtonStyle::Subtle
                 };
-                let label_color = if button.is_allow() {
-                    Color::Default
-                } else {
-                    Color::Muted
-                };
+                let label_color = Color::Default;
                 let thread = thread.clone();
                 let tool_call_id = tool_call_id.clone();
                 // Composite id: a named-integer per entry, with the
@@ -225,9 +221,10 @@ pub(crate) fn render_tool_call(
                 row = row.child(
                     Button::new(button_id, button.label.clone())
                         .style(style)
-                        .label_size(LabelSize::Small)
+                        .size(ButtonSize::Large)
+                        .label_size(LabelSize::Default)
                         .color(label_color)
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             let outcome = button.outcome();
                             let tool_call_id = tool_call_id.clone();
                             thread
@@ -235,6 +232,9 @@ pub(crate) fn render_tool_call(
                                     thread.authorize_tool_call(tool_call_id, outcome, cx);
                                 })
                                 .log_err();
+                            // Drop the answered controls on the next frame,
+                            // even before the provider sends another update.
+                            window.refresh();
                         }),
                 );
             }
