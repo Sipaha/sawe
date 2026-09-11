@@ -216,6 +216,7 @@ impl CodexConnection {
                     for update in translator.translate(method, params) { weak_thread.update(cx, |thread, cx| thread.handle_session_update(update, cx).log_err()).log_err(); }
                     if method == "turn/completed" { let result = translate::turn_result(&params["turn"]); pump_state.borrow_mut().finish(result); translator = translate::Translator::default(); }
                 }
+                if let Some(process) = weak_process.upgrade() { process.kill(); }
                 pump_state.borrow_mut().disconnected = true;
                 pump_state.borrow_mut().finish(Err(anyhow!("Codex process disconnected. Reopen this chat to reconnect.")));
             });
