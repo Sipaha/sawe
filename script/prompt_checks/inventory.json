@@ -340,6 +340,14 @@
     {
       "path": "script/github-check-new-issue-for-duplicates.py",
       "kind": "instruction"
+    },
+    {
+      "path": "crates/solution_agent/src/mcp/peer.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/solution_agent/src/store/peer.rs",
+      "kind": "inline-owner"
     }
   ],
   "output_contracts": [

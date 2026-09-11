@@ -519,9 +519,9 @@ mod tests {
             if !process_alive(pid) {
                 return;
             }
-            cx.background_executor
-                .timer(std::time::Duration::from_millis(20))
-                .await;
+            // The child and OS reaper use wall time; GPUI's test timer can
+            // advance all 100 retries before the OS schedules either one.
+            smol::Timer::after(std::time::Duration::from_millis(20)).await;
         }
         panic!("subprocess {pid} survived the drop — the Drop impl is not reaping");
     }

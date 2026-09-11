@@ -4035,3 +4035,20 @@ Turn completion and context rotation must respect outstanding delivery receipts.
 Claude retains PostToolUse/Stop queue delivery: CLI 2.1.258's native stream-json
 input can continue after interrupt as a new turn. See the streaming-input finding
 for the bounded experiment; a replay UUID alone does not establish cancellation.
+
+### 168. Solution agents exchange attributed peer messages
+
+`solution_agent.send_agent_message` is available on the Solution MCP socket.
+The listener binds the Solution ID and the tool validates both ordinary session
+IDs, rejecting cross-Solution, self-addressed and internal-session messages.
+Initial instructions give Claude and Codex their stable Sawe session ID; every
+delivered message includes the sender ID so the recipient can reply to it.
+Identity is declared on the shared socket, not independently authenticated.
+
+Peer provenance survives queues, steering, retries and transcript recovery.
+Messages use the existing runtime delivery paths without granting user approval
+or resetting observer controls. Stop and user-input gates reject peer delivery;
+cold sessions restored after restart require user participation before peer wake.
+Acceptance reports queued/submitted input, not completed work. See
+[the communication guide](docs/workflow/solution-agent-communication.md) and
+[ADR-0005](docs/architecture/decisions/0005-solution-peer-messaging.md).
