@@ -318,6 +318,10 @@ impl SolutionAgentStore {
         let session = self
             .session(session_id)
             .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
+        // Explicit Stop revokes peer wake even during a cold handshake,
+        // before there is a native connection to cancel.
+        session.update(cx, |s, _| s.peer_messages_held = true);
+        self.peer_wake_sessions.remove(&session_id);
         // Idempotent: only an in-flight turn can be stopped. A cancel in
         // Stopping/Idle/Errored is a safe no-op (covers repeated taps and the
         // mobile's deferred resend-on-reconnect).
@@ -350,6 +354,7 @@ impl SolutionAgentStore {
             },
             cx,
         );
+
         connection.cancel(&acp_session_id, cx);
         self.arm_stopping_safety_net(session_id, cx);
         Ok(())
@@ -580,6 +585,39 @@ impl SolutionAgentStore {
         from_user: bool,
         cx: &mut Context<Self>,
     ) -> Task<std::result::Result<(), SendFailure>> {
+        let mut blocks = blocks;
+        super::peer::set_peer_origin(&mut blocks, false);
+        self.send_message_blocks_origin(
+            session_id,
+            blocks,
+            target,
+            if from_user {
+                crate::model::MessageOrigin::User
+            } else {
+                crate::model::MessageOrigin::Internal
+            },
+            cx,
+        )
+    }
+
+    pub(super) fn send_message_blocks_origin(
+        &mut self,
+        session_id: SolutionSessionId,
+        blocks: Vec<acp::ContentBlock>,
+        target: QueueTarget,
+        origin: crate::model::MessageOrigin,
+        cx: &mut Context<Self>,
+    ) -> Task<std::result::Result<(), SendFailure>> {
+        let mut blocks = blocks;
+        if origin == crate::model::MessageOrigin::Peer {
+            super::peer::set_peer_origin(&mut blocks, true);
+        }
+        let from_user = origin == crate::model::MessageOrigin::User;
+        if origin == crate::model::MessageOrigin::Peer {
+            if let Err(error) = self.peer_recipient_ready(session_id, cx) {
+                return Task::ready(Err(SendFailure::not_consumed(error)));
+            }
+        }
         let Some(session_entity) = self.session(session_id) else {
             return Task::ready(Err(SendFailure::not_consumed(anyhow!(
                 "unknown session {session_id}"
@@ -611,7 +649,7 @@ impl SolutionAgentStore {
         // appended turn sorts at or below the preserved rows and is invisible to
         // every client cursor.
         if session_entity.read(cx).transcript_unavailable {
-            return self.send_after_transcript_retry(session_id, blocks, target, from_user, cx);
+            return self.send_after_transcript_retry(session_id, blocks, target, origin, cx);
         }
 
         // A cooperative compaction request must never answer a permission
@@ -653,6 +691,8 @@ impl SolutionAgentStore {
         // nudge passes `from_user: false` (it must NOT zero the counter it just
         // incremented).
         if from_user {
+            session_entity.update(cx, |s, _| s.peer_messages_held = false);
+            self.peer_wake_sessions.insert(session_id);
             self.reset_supervisor_continue_counter(session_id, cx);
             // A reply mid-`Judging` supersedes the in-flight judge so its stale
             // verdict can't nudge the agent after the user already steered it
@@ -690,7 +730,8 @@ impl SolutionAgentStore {
         // (The "submit typed text AS a custom/free-text answer" branch is
         // intentionally absent: the current ACP protocol can't express a
         // free-text permission answer — see `pending_authorization_reject`.)
-        if let Some(thread) = session_entity.read(cx).acp_thread().cloned()
+        if origin != crate::model::MessageOrigin::Peer
+            && let Some(thread) = session_entity.read(cx).acp_thread().cloned()
             && let Some((tool_call_id, reject_outcome)) = pending_authorization_reject(&thread, cx)
         {
             log::info!(
@@ -745,6 +786,7 @@ impl SolutionAgentStore {
                 // bundle so each addressee's hook drains only its own.
                 let merge = s.pending_messages.back().is_some_and(|last| {
                     last.target == target
+                        && last.origin == origin
                         && !reserved.contains(&last.id)
                         && !is_compaction
                         && !crate::compact::is_compaction_blocks(&last.blocks)
@@ -761,6 +803,7 @@ impl SolutionAgentStore {
                     last.blocks.extend(stamped);
                 } else {
                     s.pending_messages.push_back(PendingBundle {
+                        origin,
                         id: uuid::Uuid::new_v4(),
                         target: target.clone(),
                         blocks: stamped,
@@ -835,7 +878,7 @@ impl SolutionAgentStore {
             // the Window — MCP-driven sends don't have one). Re-enters
             // `send_message_blocks` once the thread is attached so the
             // normal hot-path code below runs unchanged.
-            let wake = self.send_message_blocks_with_wake(session_id, blocks, cx);
+            let wake = self.send_message_blocks_with_wake(session_id, blocks, origin, cx);
             return cx.spawn(async move |this, cx| {
                 let result = wake.await;
                 if let Err(failure) = &result {
@@ -984,7 +1027,7 @@ impl SolutionAgentStore {
         session_id: SolutionSessionId,
         blocks: Vec<agent_client_protocol::schema::ContentBlock>,
         target: QueueTarget,
-        from_user: bool,
+        origin: crate::model::MessageOrigin,
         cx: &mut Context<Self>,
     ) -> Task<std::result::Result<(), SendFailure>> {
         log::warn!(
@@ -1066,7 +1109,7 @@ impl SolutionAgentStore {
                 }
                 // `_inner`, so the re-entered send's own consumed/not-consumed
                 // verdict reaches the caller instead of being flattened here.
-                store.send_message_blocks_targeted_inner(session_id, blocks, target, from_user, cx)
+                store.send_message_blocks_origin(session_id, blocks, target, origin, cx)
             })
             .map_err(SendFailure::not_consumed)?
             .await
@@ -1097,6 +1140,7 @@ impl SolutionAgentStore {
         &mut self,
         session_id: SolutionSessionId,
         blocks: Vec<agent_client_protocol::schema::ContentBlock>,
+        origin: crate::model::MessageOrigin,
         cx: &mut Context<Self>,
     ) -> Task<std::result::Result<(), SendFailure>> {
         let Some(session_entity) = self.session(session_id) else {
@@ -1175,11 +1219,11 @@ impl SolutionAgentStore {
             let task = this
                 .update(cx, |store, cx| {
                     // `_inner`, so the re-entered send's own verdict survives.
-                    store.send_message_blocks_targeted_inner(
+                    store.send_message_blocks_origin(
                         session_id,
                         blocks,
                         QueueTarget::Main,
-                        true,
+                        origin,
                         cx,
                     )
                 })

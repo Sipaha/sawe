@@ -32,7 +32,10 @@ use crate::teammate_watchers::TeammateWatchers;
 mod acp_event;
 mod connection_pool;
 mod hydration;
+mod peer;
 mod queue;
+pub use peer::PeerMessageAcceptance;
+pub(crate) use peer::is_peer_only_blocks;
 mod steering;
 mod supervisor_engine;
 mod teammate_reconciler;
@@ -230,6 +233,7 @@ fn tail_is_unanswered_user_message(
                     // "your process hung" message).
                     if !acp_thread::is_observer_nudge_blocks(chunks)
                         && !acp_thread::is_editor_recovery_blocks(chunks)
+                        && !is_peer_only_blocks(chunks)
             )
         })
 }
@@ -359,6 +363,7 @@ impl PersistChains {
 
 pub struct SolutionAgentStore {
     active_steers: HashMap<SolutionSessionId, steering::PendingSteer>,
+    peer_wake_sessions: std::collections::HashSet<SolutionSessionId>,
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
     pool: parking_lot::Mutex<SubprocessPool>,
@@ -1108,6 +1113,7 @@ impl SolutionAgentStore {
         });
         Self {
             active_steers: HashMap::new(),
+            peer_wake_sessions: Default::default(),
             sessions: HashMap::new(),
             by_solution: HashMap::new(),
             pool: parking_lot::Mutex::new(SubprocessPool::new()),
@@ -2677,6 +2683,7 @@ impl SolutionAgentStore {
         // subagent's `agent_id`) and was declared "wedged … no progress 300s" at
         // 17:48:09 — the second such false reconnect in six minutes.
         session.update(cx, |s, _| s.last_activity_at = Utc::now());
+        let peer_allowed = self.peer_recipient_ready(session_id, cx).is_ok();
         let combined: Vec<acp::ContentBlock> = session.update(cx, |s, _| {
             let mut taken: Vec<acp::ContentBlock> = Vec::new();
             let mut kept: std::collections::VecDeque<crate::model::PendingBundle> =
@@ -2694,7 +2701,10 @@ impl SolutionAgentStore {
                     .iter()
                     .any(|b| matches!(b, acp::ContentBlock::Image(_)));
                 let defer_image = has_image && is_end_of_turn;
-                if bundle.target.matches_hook(agent_id) && !defer_image {
+                if bundle.target.matches_hook(agent_id)
+                    && !defer_image
+                    && (bundle.origin != crate::model::MessageOrigin::Peer || peer_allowed)
+                {
                     taken.extend(bundle.blocks);
                 } else {
                     kept.push_back(bundle);
@@ -4204,6 +4214,7 @@ impl SolutionAgentStore {
             }
             if let Some(text) = pending_message {
                 s.pending_messages.push_back(crate::model::PendingBundle {
+            origin: crate::model::MessageOrigin::User,
                         id: uuid::Uuid::new_v4(),
                     target: crate::model::QueueTarget::Main,
                     blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],

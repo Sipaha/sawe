@@ -304,6 +304,14 @@ impl QueueTarget {
     }
 }
 
+/// Host-owned provenance. Never inferred from model text or transport metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessageOrigin {
+    User,
+    Internal,
+    Peer,
+}
+
 /// One queued follow-up bundle: the (timestamp-baked) content blocks plus
 /// the agent they're addressed to. Consecutive same-target follow-ups merge
 /// into one bundle's `blocks` (so the agent gets a single prompt); a
@@ -312,6 +320,7 @@ impl QueueTarget {
 #[derive(Clone, Debug)]
 pub struct PendingBundle {
     pub id: uuid::Uuid,
+    pub(crate) origin: MessageOrigin,
     pub target: QueueTarget,
     pub blocks: Vec<acp::ContentBlock>,
 }
@@ -385,6 +394,7 @@ pub struct SolutionSession {
     /// matches the Claude Code CLI experience where you can keep
     /// typing follow-ups while the agent is still working.
     pub pending_messages: VecDeque<PendingBundle>,
+    pub(crate) peer_messages_held: bool,
     /// Transient cooperative compaction request; never restored after a crash.
     pub(crate) pending_compaction: Option<u64>,
     pub(crate) compact_reset_observer_memory: bool,
@@ -686,6 +696,7 @@ impl SolutionSession {
             project: None,
             _acp_subscription: None,
             pending_messages: VecDeque::new(),
+            peer_messages_held: false,
             pending_compaction: None,
             compact_reset_observer_memory: false,
             compact_request_serial: 0,

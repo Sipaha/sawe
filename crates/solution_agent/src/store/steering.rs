@@ -108,7 +108,13 @@ impl SolutionAgentStore {
         // Once the handoff request is in flight, newer user intent belongs in
         // the replacement context. A receipt only proves acceptance, not that
         // the worker incorporated it into the handoff file already written.
-        let bundles = steerable_bundles(s);
+        let peer_allowed = self.peer_recipient_ready(session_id, cx).is_ok();
+        let mut bundles = steerable_bundles(s);
+        bundles.retain(|id| {
+            s.pending_messages.iter().any(|b| {
+                b.id == *id && (b.origin != crate::model::MessageOrigin::Peer || peer_allowed)
+            })
+        });
         if bundles.is_empty() {
             return;
         }
@@ -221,24 +227,47 @@ impl SolutionAgentStore {
         // teammate X is meaningless to the parent), so drop it
         // with a WARN rather than mis-route it to the main
         // thread. Partition the queue in one update.
-        let (main_blocks, dropped_subagent) = self
+        let peer_allowed = self.peer_recipient_ready(session_id, cx).is_ok();
+        let (main_blocks, dropped_subagent, origin) = self
             .sessions
             .get(&session_id)
             .cloned()
             .map(|s| {
                 s.update(cx, |s, _| {
                     let mut main: Vec<acp::ContentBlock> = Vec::new();
+                    let mut origin = crate::model::MessageOrigin::Peer;
                     let mut dropped: Vec<crate::model::PendingBundle> = Vec::new();
+                    let mut kept = std::collections::VecDeque::new();
                     for bundle in s.pending_messages.drain(..) {
+                        if bundle.origin == crate::model::MessageOrigin::Peer && !peer_allowed {
+                            kept.push_back(bundle);
+                            continue;
+                        }
                         match bundle.target {
-                            crate::model::QueueTarget::Main => main.extend(bundle.blocks),
+                            crate::model::QueueTarget::Main => {
+                                if bundle.origin == crate::model::MessageOrigin::User {
+                                    origin = bundle.origin;
+                                } else if origin != crate::model::MessageOrigin::User
+                                    && bundle.origin == crate::model::MessageOrigin::Internal
+                                {
+                                    origin = bundle.origin;
+                                }
+                                main.extend(bundle.blocks)
+                            }
                             crate::model::QueueTarget::Subagent(_) => dropped.push(bundle),
                         }
                     }
-                    (main, dropped)
+                    s.pending_messages = kept;
+                    (main, dropped, origin)
                 })
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    crate::model::MessageOrigin::Internal,
+                )
+            });
         if !dropped_subagent.is_empty() {
             let previews: Vec<String> = dropped_subagent
                 .iter()
@@ -280,7 +309,8 @@ impl SolutionAgentStore {
                 queue::QUEUE_HINT_LINE
             ))));
             with_hint.extend(main_blocks);
-            self.send_message_blocks(session_id, with_hint, cx).detach();
+            self.send_message_blocks_origin(session_id, with_hint, QueueTarget::Main, origin, cx)
+                .detach();
         }
     }
 }
@@ -290,6 +320,7 @@ mod tests {
     use super::*;
     fn bundle(text: &str) -> crate::model::PendingBundle {
         crate::model::PendingBundle {
+            origin: crate::model::MessageOrigin::User,
             id: uuid::Uuid::new_v4(),
             target: QueueTarget::Main,
             blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],

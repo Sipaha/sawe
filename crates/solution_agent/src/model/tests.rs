@@ -97,6 +97,7 @@ fn build_session() -> SolutionSession {
         project: None,
         _acp_subscription: None,
         pending_messages: VecDeque::new(),
+        peer_messages_held: false,
         pending_compaction: None,
         compact_request_serial: 0,
         compact_reset_observer_memory: false,
