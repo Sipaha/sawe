@@ -1229,11 +1229,13 @@ impl StateInner {
                 });
             }
             anchor.offset_in_item = anchor.offset_in_item.max(px(0.));
+            drop(cursor);
             let mut cursor = self.items.cursor::<Count>(());
             let mut items = cursor.slice(&Count(anchor.item_ix), Bias::Right);
             items.extend(measured, ());
             cursor.seek(&Count(end), Bias::Right);
             items.append(cursor.suffix(), ());
+            drop(cursor);
             self.items = items;
             self.logical_scroll_top = Some(anchor);
         }
