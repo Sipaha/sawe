@@ -1,0 +1,194 @@
+use anyhow::{Context as _, Result, anyhow, bail};
+use futures::{
+    FutureExt as _, StreamExt as _,
+    channel::{mpsc, oneshot},
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
+};
+use gpui::{App, AppContext as _, Task};
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    path::Path,
+    process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use util::{ResultExt as _, process::Child};
+
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+pub struct Process {
+    child: Mutex<Child>,
+    pub outgoing: mpsc::UnboundedSender<Value>,
+    pub incoming: mpsc::UnboundedReceiver<Value>,
+    pending: Pending,
+    next_id: AtomicU64,
+    _tasks: Vec<Task<()>>,
+}
+impl Process {
+    pub fn spawn(directory: &Path, cx: &App) -> Result<Self> {
+        let mut command = Command::new("codex");
+        command.args(["app-server"]).current_dir(directory);
+        let mut child = Child::spawn(command, Stdio::piped(), Stdio::piped(), Stdio::piped())
+            .context("Could not start Codex. Install the Codex CLI and ensure `codex` is on PATH, then run `codex login` in a terminal.")?;
+        let stdout = child.stdout.take().context("Codex stdout missing")?;
+        let mut stdin = child.stdin.take().context("Codex stdin missing")?;
+        let stderr = child.stderr.take().context("Codex stderr missing")?;
+        let (outgoing, mut outgoing_rx) = mpsc::unbounded::<Value>();
+        let (incoming_tx, incoming) = mpsc::unbounded();
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let exit_sender = incoming_tx.clone();
+        let status = child.status();
+        let exit_pending = pending.clone();
+        let exited = cx.background_spawn(async move {
+            if let Err(error) = status.await {
+                log::debug!("Codex exit: {error}");
+            }
+            exit_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+            if exit_sender
+                .unbounded_send(json!({"method":"sawe/disconnected"}))
+                .is_err()
+            {
+                log::debug!("Codex event receiver closed");
+            }
+        });
+        let reader_pending = pending.clone();
+        let reader = cx.background_spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next().await {
+                let value = match line
+                    .map_err(anyhow::Error::from)
+                    .and_then(|line| serde_json::from_str::<Value>(&line).map_err(Into::into))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::error!("Codex protocol read failed: {error}");
+                        break;
+                    }
+                };
+                if value.get("method").is_none() {
+                    if let Some(id) = value["id"].as_u64()
+                        && let Some(sender) = reader_pending
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&id)
+                    {
+                        let result = if let Some(error) = value.get("error") {
+                            Err(anyhow!(
+                                "Codex: {}",
+                                error["message"].as_str().unwrap_or("request failed")
+                            ))
+                        } else {
+                            Ok(value["result"].clone())
+                        };
+                        if sender.send(result).is_err() {
+                            log::debug!("Codex response receiver dropped");
+                        }
+                    }
+                } else if incoming_tx.unbounded_send(value).is_err() {
+                    break;
+                }
+            }
+            if incoming_tx
+                .unbounded_send(json!({"method":"sawe/disconnected"}))
+                .is_err()
+            {
+                log::debug!("Codex event receiver closed");
+            }
+            reader_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        });
+        let writer_pending = pending.clone();
+        let writer = cx.background_spawn(async move {
+            while let Some(value) = outgoing_rx.next().await {
+                let mut bytes = value.to_string().into_bytes();
+                bytes.push(b'\n');
+                if let Err(error) = stdin.write_all(&bytes).await {
+                    log::error!("Codex stdin: {error}");
+                    break;
+                }
+                if let Err(error) = stdin.flush().await {
+                    log::error!("Codex flush: {error}");
+                    break;
+                }
+            }
+            writer_pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
+        });
+        let stderr = cx.background_spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Some(line) = lines.next().await {
+                match line {
+                    Ok(line) => log::debug!("Codex stderr: {line}"),
+                    Err(error) => {
+                        log::debug!("Codex stderr closed: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            child: Mutex::new(child),
+            outgoing,
+            incoming,
+            pending,
+            next_id: AtomicU64::new(1),
+            _tasks: vec![reader, writer, stderr, exited],
+        })
+    }
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, sender);
+        if self
+            .outgoing
+            .unbounded_send(json!({"id":id,"method":method,"params":params}))
+            .is_err()
+        {
+            self.pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            bail!("Codex input closed. Reopen this chat to reconnect.");
+        }
+        let result = futures::select_biased! {
+            response = receiver.fuse() => response.context("Codex process disconnected. Reopen this chat to reconnect.")?,
+            _ = futures::FutureExt::fuse(smol::Timer::after(Duration::from_secs(45))) => Err(anyhow!("Codex {method} timed out. Reopen this chat to reconnect.")),
+        };
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+        result
+    }
+    pub async fn initialize(&self) -> Result<()> {
+        self.request("initialize", json!({"clientInfo":{"name":"sawe","title":"Sawe","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}})).await?;
+        self.outgoing
+            .unbounded_send(json!({"method":"initialized"}))?;
+        Ok(())
+    }
+    pub fn kill(&self) {
+        self.child
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .kill()
+            .log_err();
+    }
+}
+impl Drop for Process {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}

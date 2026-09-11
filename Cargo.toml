@@ -26,6 +26,7 @@ members = [
     "crates/call",
     "crates/channel",
     "crates/claude_native",
+    "crates/codex_native",
     "crates/cli",
     "crates/client",
     "crates/clock",
@@ -306,6 +307,7 @@ buffer_diff = { path = "crates/buffer_diff" }
 call = { path = "crates/call" }
 channel = { path = "crates/channel" }
 claude_native = { path = "crates/claude_native" }
+codex_native = { path = "crates/codex_native" }
 cli = { path = "crates/cli" }
 client = { path = "crates/client" }
 clock = { path = "crates/clock" }

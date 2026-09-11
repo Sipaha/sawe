@@ -3460,6 +3460,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex_native"
+version = "0.1.0"
+dependencies = [
+ "acp_thread",
+ "action_log",
+ "agent-client-protocol",
+ "agent_servers",
+ "anyhow",
+ "futures 0.3.32",
+ "gpui",
+ "log",
+ "project",
+ "serde_json",
+ "smol",
+ "ui",
+ "util",
+ "watch",
+]
+
+[[package]]
 name = "collab"
 version = "0.44.0"
 dependencies = [
