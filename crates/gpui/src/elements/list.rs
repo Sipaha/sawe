@@ -87,6 +87,9 @@ struct StateInner {
 /// which is useful when the whole list is being resized and each item scales similarly.
 #[derive(Clone)]
 enum PendingScroll {
+    /// Resolve an upward wheel movement from the previously visible row.
+    /// Preceding rows must be measured before consuming the distance into them.
+    FromBelow(ListOffset),
     /// Preserve the same pixel offset into the item after it is remeasured.
     Absolute { item_ix: usize, offset: Pixels },
     /// Preserve the same fractional offset into the item after it is remeasured.
@@ -491,6 +494,7 @@ impl ListState {
             state.reset = true;
             state.measuring_behavior.reset();
             state.logical_scroll_top = None;
+            state.pending_scroll = None;
             state.scrollbar_drag_start_height = None;
             state.items.summary().count
         };
@@ -522,7 +526,9 @@ impl ListState {
         let state = &mut *self.0.borrow_mut();
 
         if let Some(scroll_top) = state.logical_scroll_top {
-            if range.contains(&scroll_top.item_ix) {
+            if range.contains(&scroll_top.item_ix)
+                && !matches!(state.pending_scroll, Some(PendingScroll::FromBelow(_)))
+            {
                 state.pending_scroll = match scroll_anchor {
                     ScrollAnchor::Absolute => Some(PendingScroll::Absolute {
                         item_ix: scroll_top.item_ix,
@@ -639,6 +645,14 @@ impl ListState {
         drop(old_items);
         state.items = new_items;
 
+        if let Some(PendingScroll::FromBelow(anchor)) = state.pending_scroll.as_mut() {
+            if old_range.contains(&anchor.item_ix) {
+                state.pending_scroll = None;
+            } else if old_range.end <= anchor.item_ix {
+                anchor.item_ix = anchor.item_ix - old_range.len() + spliced_count;
+            }
+        }
+
         if let Some(ListOffset {
             item_ix,
             offset_in_item,
@@ -674,6 +688,7 @@ impl ListState {
 
         let current_offset = self.logical_scroll_top();
         let state = &mut *self.0.borrow_mut();
+        state.pending_scroll = None;
 
         if distance < px(0.) {
             state.follow_state.stop_following();
@@ -704,6 +719,7 @@ impl ListState {
     /// growing (e.g. during streaming).
     pub fn scroll_to_end(&self) {
         let state = &mut *self.0.borrow_mut();
+        state.pending_scroll = None;
         let item_count = state.items.summary().count;
         state.logical_scroll_top = Some(ListOffset {
             item_ix: item_count,
@@ -717,6 +733,7 @@ impl ListState {
     /// following occurs.
     pub fn set_follow_mode(&self, mode: FollowMode) {
         let state = &mut *self.0.borrow_mut();
+        state.pending_scroll = None;
 
         match mode {
             FollowMode::Normal => {
@@ -747,6 +764,7 @@ impl ListState {
     /// Scroll the list to the given offset
     pub fn scroll_to(&self, mut scroll_top: ListOffset) {
         let state = &mut *self.0.borrow_mut();
+        state.pending_scroll = None;
         let item_count = state.items.summary().count;
         if scroll_top.item_ix >= item_count {
             scroll_top.item_ix = item_count;
@@ -763,6 +781,7 @@ impl ListState {
     /// Scroll the list to the given item, such that the item is fully visible.
     pub fn scroll_to_reveal_item(&self, ix: usize) {
         let state = &mut *self.0.borrow_mut();
+        state.pending_scroll = None;
 
         let mut scroll_top = state.logical_scroll_top();
         let height = state
@@ -970,6 +989,16 @@ impl StateInner {
             .max(px(0.))
             .min(scroll_max);
 
+        self.pending_scroll =
+            if delta.y > scroll_top.offset_in_item.max(px(0.)) && scroll_top.item_ix > 0 {
+                Some(PendingScroll::FromBelow(ListOffset {
+                    item_ix: scroll_top.item_ix,
+                    offset_in_item: scroll_top.offset_in_item - delta.y,
+                }))
+            } else {
+                None
+            };
+
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.logical_scroll_top = None;
         } else {
@@ -1045,11 +1074,14 @@ impl StateInner {
         // `MeasureLast` consults the current scroll target so the
         // watermark can chase the user's scroll position. Captured
         // here before we re-borrow `self.measuring_behavior` mutably.
-        let scroll_top_ix = self
-            .logical_scroll_top
-            .as_ref()
-            .map(|s| s.item_ix)
-            .unwrap_or(total);
+        let scroll_top_ix = match &self.pending_scroll {
+            Some(PendingScroll::FromBelow(anchor)) => anchor.item_ix,
+            _ => self
+                .logical_scroll_top
+                .as_ref()
+                .map(|s| s.item_ix)
+                .unwrap_or(total),
+        };
         // Decide what range to measure on this pass and whether to
         // request another frame to keep going. `Measure(_)` does the
         // whole list once; `MeasureLast` advances `measured_start`
@@ -1166,6 +1198,46 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) -> LayoutItemsResponse {
+        // A wheel movement into an unmeasured/stale preceding row is anchored
+        // to the row the reader was already viewing, not to an estimated offset
+        // from the new row's top. Measure backwards until the requested pixels
+        // are consumed; a tall row therefore grows above the viewport.
+        if let Some(PendingScroll::FromBelow(mut anchor)) = self.pending_scroll.clone() {
+            self.pending_scroll = None;
+            let mut cursor = self.items.cursor::<Count>(());
+            cursor.seek(&Count(anchor.item_ix), Bias::Right);
+            let end = anchor.item_ix;
+            let mut measured = VecDeque::new();
+            while anchor.offset_in_item < px(0.) && anchor.item_ix > 0 {
+                cursor.prev();
+                let Some(item) = cursor.item() else { break };
+                anchor.item_ix -= 1;
+                let mut element = render_item(anchor.item_ix, window, cx);
+                let size = element.layout_as_root(
+                    size(
+                        available_width
+                            .map_or(AvailableSpace::MinContent, AvailableSpace::Definite),
+                        AvailableSpace::MinContent,
+                    ),
+                    window,
+                    cx,
+                );
+                anchor.offset_in_item += size.height;
+                measured.push_front(ListItem::Measured {
+                    size,
+                    focus_handle: item.focus_handle(),
+                });
+            }
+            anchor.offset_in_item = anchor.offset_in_item.max(px(0.));
+            let mut cursor = self.items.cursor::<Count>(());
+            let mut items = cursor.slice(&Count(anchor.item_ix), Bias::Right);
+            items.extend(measured, ());
+            cursor.seek(&Count(end), Bias::Right);
+            items.append(cursor.suffix(), ());
+            self.items = items;
+            self.logical_scroll_top = Some(anchor);
+        }
+
         let old_items = self.items.clone();
         let mut measured_items = VecDeque::new();
         let mut item_layouts = VecDeque::new();
@@ -1492,6 +1564,7 @@ impl StateInner {
     // Scrollbar support
 
     fn set_offset_from_scrollbar(&mut self, point: Point<Pixels>) {
+        self.pending_scroll = None;
         let Some(bounds) = self.last_layout_bounds else {
             return;
         };
@@ -2223,6 +2296,111 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 5);
         assert_eq!(offset.offset_in_item, px(40.));
+    }
+
+    #[gpui::test]
+    fn test_upward_scroll_anchors_expanding_row_after_coalesced_events(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        let expanded = Rc::new(Cell::new(false));
+        struct View(ListState, Rc<Cell<bool>>);
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let expanded = self.1.get();
+                list(self.0.clone(), move |ix, _, _| {
+                    div()
+                        .h(px(if ix == 2 && expanded { 300. } else { 100. }))
+                        .w_full()
+                        .into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+        let view = cx.update(|_, cx| cx.new(|_| View(state.clone(), expanded.clone())));
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: px(0.),
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 3,
+            offset_in_item: px(0.),
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        expanded.set(true);
+        // The paint handler coalesces wheel deltas against the same painted
+        // anchor. A reversed event before repaint must subtract from that move,
+        // not accumulate again against the estimated intermediate row.
+        for delta in [70., -20.] {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(50.), px(100.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+                ..Default::default()
+            });
+        }
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 2);
+        assert_eq!(offset.offset_in_item, px(250.));
+        assert_eq!(state.bounds_for_item(3).unwrap().top(), px(50.));
+    }
+
+    #[gpui::test]
+    fn test_upward_scroll_measures_only_crossed_cold_rows(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(1000, crate::ListAlignment::Top, px(0.));
+        let renders = Rc::new(Cell::new(0usize));
+        struct View(ListState, Rc<Cell<usize>>);
+        impl Render for View {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let renders = self.1.clone();
+                list(self.0.clone(), move |ix, _, _| {
+                    renders.set(renders.get() + 1);
+                    div()
+                        .h(px(if ix == 899 { 300. } else { 100. }))
+                        .w_full()
+                        .into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+        let view = cx.update(|_, cx| cx.new(|_| View(state.clone(), renders.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 900,
+            offset_in_item: px(0.),
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        renders.set(0);
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(100.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(50.))),
+            ..Default::default()
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(state.logical_scroll_top().item_ix, 899);
+        assert_eq!(state.logical_scroll_top().offset_in_item, px(250.));
+        assert_eq!(state.bounds_for_item(900).unwrap().top(), px(50.));
+        assert!(renders.get() < 10, "must not measure the whole cold prefix");
+        assert!(!state.is_following_tail());
+        state.set_follow_mode(FollowMode::Tail);
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+        assert!(state.is_following_tail());
+        assert_eq!(state.logical_scroll_top().item_ix, 998);
     }
 
     #[gpui::test]
