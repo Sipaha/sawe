@@ -10,8 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    Overflow, Pixels, Point, ScrollWheelEvent, Size, Style, StyleRefinement, Styled, Window, point,
+    px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -1793,15 +1793,18 @@ impl Element for List {
         let height = bounds.size.height;
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
-        let mut accumulated_scroll_delta = ScrollDelta::default();
+        // Every event is applied to the same painted anchor until repaint.
+        // Preserve signed travel on reversals: ScrollDelta::coalesce discards
+        // earlier movement when the sign changes and would move that anchor
+        // in the wrong direction for e.g. +70px followed by -20px.
+        let mut accumulated_scroll_delta = point(px(0.), px(0.));
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
+                accumulated_scroll_delta += event.delta.pixel_delta(px(20.));
                 list_state.0.borrow_mut().scroll(
                     &scroll_top,
                     height,
-                    pixel_delta,
+                    accumulated_scroll_delta,
                     current_view,
                     window,
                     cx,
@@ -2308,10 +2311,14 @@ mod test {
         struct View(ListState, Rc<Cell<bool>>);
         impl Render for View {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                let expanded = self.1.get();
+                let expanded = self.1.clone();
                 list(self.0.clone(), move |ix, _, _| {
                     div()
-                        .h(px(if ix == 2 && expanded { 300. } else { 100. }))
+                        .h(px(if ix == 2 && expanded.get() {
+                            300.
+                        } else {
+                            100.
+                        }))
                         .w_full()
                         .into_any()
                 })
@@ -2338,13 +2345,20 @@ mod test {
         // The paint handler coalesces wheel deltas against the same painted
         // anchor. A reversed event before repaint must subtract from that move,
         // not accumulate again against the estimated intermediate row.
-        for delta in [70., -20.] {
-            cx.simulate_event(ScrollWheelEvent {
-                position: point(px(50.), px(100.)),
-                delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
-                ..Default::default()
-            });
-        }
+        cx.update(|window, cx| {
+            use crate::InputEvent as _;
+            for delta in [70., -20.] {
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position: point(px(50.), px(100.)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            }
+        });
         cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
             view.into_any_element()
         });
