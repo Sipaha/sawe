@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+"""Preview synthetic cases, or explicitly run a bounded provider evaluation."""
+from prompt_checks.evaluate import main
+raise SystemExit(main())

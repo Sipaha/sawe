@@ -1,0 +1,373 @@
+{
+  "version": 1,
+  "audit": "docs/findings/2026-09-11-model-neutral-prompt-audit.md",
+  "template_globs": [
+    "assets/prompts/*.hbs",
+    "crates/agent/src/templates/*.hbs",
+    "crates/solution_agent/resources/*.md",
+    "crates/agent_settings/src/prompts/*.txt",
+    "crates/edit_prediction_cli/src/prompts/*.md",
+    ".factory/prompts/crash/*.md"
+  ],
+  "surfaces": [
+    {
+      "path": "assets/prompts/content_prompt.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{#each diagnostic_errors}}",
+        "{{#if diagnostic_errors}}",
+        "{{#if is_insert}}",
+        "{{#if is_truncated}}",
+        "{{#if language_name}}",
+        "{{#if rewrite_section}}",
+        "{{/each}}",
+        "{{/if}}",
+        "{{INSERTED_CODE}}",
+        "{{REWRITTEN_CODE}}",
+        "{{code_content}}",
+        "{{content_type}}",
+        "{{else}}",
+        "{{error_message}}",
+        "{{language_name}}",
+        "{{line_number}}",
+        "{{{document_content}}}",
+        "{{{rewrite_section}}}",
+        "{{{user_prompt}}}"
+      ]
+    },
+    {
+      "path": "assets/prompts/content_prompt_v2.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{#each diagnostic_errors}}",
+        "{{#if diagnostic_errors}}",
+        "{{#if is_truncated}}",
+        "{{#if language_name}}",
+        "{{/each}}",
+        "{{/if}}",
+        "{{code_content}}",
+        "{{content_type}}",
+        "{{else}}",
+        "{{error_message}}",
+        "{{language_name}}",
+        "{{line_number}}",
+        "{{{document_content}}}",
+        "{{{rewrite_section}}}"
+      ]
+    },
+    {
+      "path": "assets/prompts/terminal_assistant_prompt.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{#each latest_output as |line|}}",
+        "{{#if latest_output}}",
+        "{{#if shell}}",
+        "{{#if working_directory}}",
+        "{{/each}}",
+        "{{/if}}",
+        "{{arch}}",
+        "{{line}}",
+        "{{os}}",
+        "{{shell}}",
+        "{{working_directory}}",
+        "{{{user_prompt}}}"
+      ]
+    },
+    {
+      "path": "crates/agent/src/templates/create_file_prompt.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{edit_description}}",
+        "{{path}}"
+      ]
+    },
+    {
+      "path": "crates/agent/src/templates/diff_judge.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{assertions}}",
+        "{{diff}}"
+      ]
+    },
+    {
+      "path": "crates/agent/src/templates/edit_file_prompt_diff_fenced.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{edit_description}}",
+        "{{path}}"
+      ]
+    },
+    {
+      "path": "crates/agent/src/templates/edit_file_prompt_xml.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{edit_description}}",
+        "{{path}}"
+      ]
+    },
+    {
+      "path": "crates/agent/src/templates/experimental_system_prompt.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{#each worktrees}}",
+        "{{#if (contains available_tools 'grep') }}",
+        "{{#if (contains available_tools 'spawn_agent') }}",
+        "{{#if (gt (len available_tools) 0)}}",
+        "{{#if has_rules}}",
+        "{{#if model_name}}",
+        "{{#if rules_file}}",
+        "{{/each}}",
+        "{{/if}}",
+        "{{abs_path}}",
+        "{{date}}",
+        "{{else}}",
+        "{{model_name}}",
+        "{{os}}",
+        "{{root_name}}",
+        "{{rules_file.path_in_worktree}}",
+        "{{shell}}",
+        "{{{rules_file.text}}}"
+      ]
+    },
+    {
+      "path": "crates/agent/src/templates/system_prompt.hbs",
+      "kind": "handlebars",
+      "placeholders": [
+        "{{#each skills}}",
+        "{{#each worktrees}}",
+        "{{#if (contains available_tools 'grep') }}",
+        "{{#if (contains available_tools 'spawn_agent') }}",
+        "{{#if (gt (len available_tools) 0)}}",
+        "{{#if (or user_agents_md has_rules)}}",
+        "{{#if has_rules}}",
+        "{{#if has_skills}}",
+        "{{#if model_name}}",
+        "{{#if rules_file}}",
+        "{{#if sandboxing}}",
+        "{{#if user_agents_md}}",
+        "{{#if worktrees}}",
+        "{{/each}}",
+        "{{/if}}",
+        "{{abs_path}}",
+        "{{date}}",
+        "{{description}}",
+        "{{else}}",
+        "{{model_name}}",
+        "{{name}}",
+        "{{os}}",
+        "{{root_name}}",
+        "{{rules_file.path_in_worktree}}",
+        "{{shell}}",
+        "{{{location}}}",
+        "{{{rules_file.text}}}",
+        "{{{user_agents_md}}}"
+      ]
+    },
+    {
+      "path": "crates/solution_agent/resources/compact_context_instructions.md",
+      "kind": "substitution",
+      "placeholders": [
+        "{{agent_id}}",
+        "{{compact_dir}}",
+        "{{compact_request_shell}}",
+        "{{session_id}}",
+        "{{solution_id}}",
+        "{{solution_socket_shell}}",
+        "{{solution_socket}}",
+        "{{started_at_iso}}",
+        "{{tokens_max}}",
+        "{{tokens_used}}"
+      ],
+      "consumer": "crates/solution_agent/src/compact.rs"
+    },
+    {
+      "path": "crates/solution_agent/resources/supervisor_audit_instructions.md",
+      "kind": "substitution",
+      "placeholders": [
+        "{BRIDGE_BIN_SHELL}",
+        "{CUSTOM_PROMPT_SECTION}",
+        "{DIARY_PATH}",
+        "{INTENT_PATH}",
+        "{SOCKET_PATH_SHELL}",
+        "{SUPERVISED_SESSION_ID}",
+        "{VERDICTS_PATH}",
+        "{VERDICT_NONCE}"
+      ],
+      "consumer": "crates/solution_agent/src/supervisor/briefing.rs"
+    },
+    {
+      "path": "crates/solution_agent/resources/supervisor_judge_instructions.md",
+      "kind": "substitution",
+      "placeholders": [
+        "{BRIDGE_BIN_SHELL}",
+        "{COMPACT_DIR}",
+        "{CONTEXT_USAGE_SECTION}",
+        "{CUSTOM_PROMPT_SECTION}",
+        "{DIARY_PATH}",
+        "{INTENT_PATH}",
+        "{SOCKET_PATH_SHELL}",
+        "{SUPERVISED_SESSION_ID}",
+        "{VERDICT_NONCE}"
+      ],
+      "consumer": "crates/solution_agent/src/supervisor/briefing.rs"
+    },
+    {
+      "path": "crates/agent_settings/src/prompts/compaction_prompt.txt",
+      "kind": "instruction"
+    },
+    {
+      "path": "crates/agent_settings/src/prompts/summarize_thread_detailed_prompt.txt",
+      "kind": "instruction"
+    },
+    {
+      "path": "crates/agent_settings/src/prompts/summarize_thread_prompt.txt",
+      "kind": "instruction"
+    },
+    {
+      "path": "crates/edit_prediction_cli/src/prompts/qa.md",
+      "kind": "instruction"
+    },
+    {
+      "path": "crates/edit_prediction_cli/src/prompts/repair.md",
+      "kind": "instruction"
+    },
+    {
+      "path": "crates/edit_prediction_cli/src/prompts/teacher.md",
+      "kind": "instruction"
+    },
+    {
+      "path": "crates/edit_prediction_cli/src/prompts/teacher_multi_region.md",
+      "kind": "instruction"
+    },
+    {
+      "path": ".factory/prompts/crash/fix.md",
+      "kind": "instruction"
+    },
+    {
+      "path": ".factory/prompts/crash/investigate.md",
+      "kind": "instruction"
+    },
+    {
+      "path": ".factory/prompts/crash/link-issues.md",
+      "kind": "instruction"
+    },
+    {
+      "path": "crates/solution_agent/src/claude_adapter.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/solution_agent/src/supervisor/briefing.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/solution_agent/src/store.rs",
+      "kind": "inline-owner",
+      "constants": [
+        "RECONNECT_CONTINUATION_PROMPT",
+        "RESTART_CONTINUATION_PROMPT",
+        "RECONNECT_UNANSWERED_USER_PROMPT"
+      ]
+    },
+    {
+      "path": "crates/solution_agent/src/message_generator.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/solution_agent/src/store/queue.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/solution_agent/src/store/acp_event.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/solution_agent/src/upload.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/agent/src/thread.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/git_ui/src/commit_message_prompt.txt",
+      "kind": "instruction"
+    },
+    {
+      "path": "crates/git_conflict_ui/src/ai_suggest.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/solution_git/src/ai_cherry_pick_suggest.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/edit_prediction_cli/src/format_prompt.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/edit_prediction_cli/src/repair.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/edit_prediction_cli/src/qa.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/zeta_prompt/src/zeta_prompt.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "crates/zeta_prompt/src/multi_region.rs",
+      "kind": "inline-owner"
+    },
+    {
+      "path": "script/docs-suggest",
+      "kind": "instruction"
+    },
+    {
+      "path": "script/docs-suggest-publish",
+      "kind": "instruction"
+    },
+    {
+      "path": "script/run-background-agent-mvp-local",
+      "kind": "instruction"
+    },
+    {
+      "path": "script/github-check-new-issue-for-duplicates.py",
+      "kind": "instruction"
+    }
+  ],
+  "output_contracts": [
+    {
+      "id": "diff-judge-score",
+      "consumer": "crates/agent/src/tools/evals/edit_file.rs",
+      "regex": "<score>(\\d+)</score>",
+      "cases": [
+        {
+          "output": "<analysis>Partial</analysis><score>75</score>",
+          "parsed": 75
+        },
+        {
+          "output": "<score>0</score>",
+          "parsed": 0
+        },
+        {
+          "output": "<score>100</score>",
+          "parsed": 100
+        },
+        {
+          "output": "score: 75",
+          "parsed": null
+        },
+        {
+          "output": "<score>bad</score>",
+          "parsed": null
+        },
+        {
+          "output": "<score>-1</score>",
+          "parsed": null
+        }
+      ]
+    }
+  ]
+}

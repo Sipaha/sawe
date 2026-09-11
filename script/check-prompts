@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+"""Check prompt contracts without Rust builds, network access or model calls."""
+from prompt_checks.contracts import main
+raise SystemExit(main())
