@@ -22,6 +22,7 @@ How sessions are run.
 
 - [`workflow/supervisor-mode.md`](workflow/supervisor-mode.md) — the supervisor's playbook (READ → DECIDE → DISPATCH → VERIFY → FINALIZE).
 - [`workflow/doc-discipline.md`](workflow/doc-discipline.md) — when to create / update which doc.
+- [`workflow/solution-agent-communication.md`](workflow/solution-agent-communication.md) — find, address and reply to agents through the Solution socket.
 - [`workflow/prompt-checks.md`](workflow/prompt-checks.md) — versioned prompt contracts and opt-in synthetic provider evaluations.
 - [`workflow/adr-template.md`](workflow/adr-template.md) — template for new ADRs.
 
@@ -53,7 +54,7 @@ can read them.
 
 | Date | Status | Plan |
 |---|---|---|
-| 2026-09-11 | implementation | [`plans/2026-09-11-solution-agent-messaging.md`](plans/2026-09-11-solution-agent-messaging.md) — scoped, attributed peer messages without human-origin side effects. |
+| 2026-09-11 | complete | [`plans/2026-09-11-solution-agent-messaging.md`](plans/2026-09-11-solution-agent-messaging.md) — scoped, attributed peer messages without human-origin side effects. |
 | 2026-09-11 | complete | [`plans/2026-09-11-live-compaction-and-observer-triggers.md`](plans/2026-09-11-live-compaction-and-observer-triggers.md) — cooperative compaction, active observer checks and native follow-up delivery. |
 | 2026-09-11 | complete | [`plans/2026-09-11-prompt-audit-improvements.md`](plans/2026-09-11-prompt-audit-improvements.md) — bounded generation tasks, grounded suggestions and prompt checks. |
 | 2026-09-11 | complete | [`plans/2026-09-11-prompt-audit-and-error-compaction.md`](plans/2026-09-11-prompt-audit-and-error-compaction.md) — English model-neutral prompt audit and Error-state context recovery. |

@@ -476,7 +476,12 @@ mod tests {
     /// Uses a stub binary that ignores the claude CLI args and sleeps, so the
     /// test exercises the real spawn → drop → reap path without needing claude.
     #[gpui::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "A real subprocess must be reaped by the OS in wall time, not virtual GPUI time"
+    )]
     async fn dropping_the_process_kills_the_child(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
         use std::io::Write as _;
 
         let dir = tempfile::tempdir().expect("tempdir");
