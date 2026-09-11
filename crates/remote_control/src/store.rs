@@ -492,6 +492,7 @@ async fn bootstrap_listener(
         cert,
         clients_rx,
         dispatcher,
+        idle_timeout: listener::DEFAULT_IDLE_READ_TIMEOUT,
     };
 
     // `start_listener` calls `TcpListener::bind` which needs to be on a

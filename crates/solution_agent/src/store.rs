@@ -391,6 +391,15 @@ pub struct SolutionAgentStore {
     /// breach — a continuously-streaming entry mustn't be able to starve
     /// the trailing-edge emit indefinitely.
     entry_update_throttles: HashMap<(SolutionSessionId, usize), EntryUpdateThrottle>,
+    /// Recently-accepted `spk_client_send_id`s per session, so a client that
+    /// lost the socket mid-send can safely replay the identical bundle
+    /// instead of bouncing the text back to its draft (audit N-05).
+    ///
+    /// In-memory ONLY: a desktop restart forgets it, which is exactly why
+    /// `editor.capabilities` also carries `server_instance_id` — a client that
+    /// sees a new instance id must not rely on dedupe for a send it dispatched
+    /// to the old one.
+    client_send_dedupe: HashMap<SolutionSessionId, CsidWindow>,
     /// One per-session chain that SERIALIZES the entry-row persist writes
     /// (`persist_main_stream` / `persist_all_rows`). Each helper captures its
     /// plan synchronously (in event order) then chains its detached DB work
@@ -604,6 +613,139 @@ struct SessionTeardown {
     /// Hidden supervisor judge/auditor session — suppress all close
     /// notifications (mirrors the create-side suppression).
     was_ephemeral: bool,
+}
+
+/// Outcome of [`SolutionAgentStore::claim_client_send_ids`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsidClaim {
+    /// At least one id in the bundle had not been seen inside the window;
+    /// every id is now claimed and the caller must go on to enqueue.
+    Accepted,
+    /// EVERY id in the bundle was already claimed and is still inside the
+    /// window — this is a replay of a send the store already accepted, so the
+    /// caller must do nothing at all.
+    Duplicate,
+}
+
+/// A claim plus the receipt needed to undo it.
+///
+/// The caller MUST release the claim on every path that does not reach the
+/// enqueue. A claim that outlives a failed send is strictly worse than no
+/// dedupe at all: the client's replay is answered `duplicate`, the client
+/// takes its SUCCESS path (marker removed, bubble kept, no toast, no bounce),
+/// and the user's message is gone for the whole 24 h window with no
+/// diagnostic. Before dedupe existed the replay simply failed again, loudly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsidReceipt {
+    pub claim: CsidClaim,
+    /// The ids THIS call inserted, which is exactly what may be released.
+    ///
+    /// Not the whole bundle: on a partial overlap the ids that were already
+    /// claimed belong to an EARLIER, successful send, and releasing those
+    /// would let that earlier message be re-sent as a duplicate — the very
+    /// thing the window exists to stop.
+    newly_claimed: Vec<i64>,
+}
+
+impl CsidReceipt {
+    fn accepted(newly_claimed: Vec<i64>) -> Self {
+        Self {
+            claim: CsidClaim::Accepted,
+            newly_claimed,
+        }
+    }
+
+    pub fn is_duplicate(&self) -> bool {
+        self.claim == CsidClaim::Duplicate
+    }
+}
+
+/// How long a `spk_client_send_id` stays deduplicated. Re-exported from
+/// `editor_mcp`, where the single literal lives because that is the crate
+/// which puts the value on the wire as `csid_dedupe_window_ms`; the two MUST
+/// stay equal, and a re-export is the only way to make that structural.
+pub const CSID_DEDUPE_WINDOW: std::time::Duration = editor_mcp::CSID_DEDUPE_WINDOW;
+
+/// 512 csids/session ≈ 12 KB/session. A session that produced 512 sends
+/// inside 24 h is far past anything the mobile composer can generate, so the
+/// cap only ever bounds a pathological or hostile client.
+pub const CSID_DEDUPE_MAX_PER_SESSION: usize = 512;
+
+/// Per-session ring of recently-claimed `spk_client_send_id`s.
+#[derive(Default)]
+struct CsidWindow {
+    /// csid -> claim instant. Bounded by [`CSID_DEDUPE_MAX_PER_SESSION`].
+    seen: HashMap<i64, std::time::Instant>,
+    /// Claim order, so eviction is O(evicted) instead of a full scan.
+    order: std::collections::VecDeque<i64>,
+}
+
+impl CsidWindow {
+    /// Drop everything claimed longer ago than `window`. The deque is in
+    /// claim order, so the sweep stops at the first live entry.
+    fn sweep(&mut self, now: std::time::Instant, window: std::time::Duration) {
+        while let Some(oldest) = self.order.front().copied() {
+            let expired = self
+                .seen
+                .get(&oldest)
+                .is_none_or(|claimed_at| now.duration_since(*claimed_at) >= window);
+            if !expired {
+                break;
+            }
+            self.order.pop_front();
+            self.seen.remove(&oldest);
+        }
+    }
+
+    fn claim(&mut self, csids: &[i64], now: std::time::Instant) -> CsidReceipt {
+        self.sweep(now, CSID_DEDUPE_WINDOW);
+        // All-or-nothing: a genuine retry always replays the IDENTICAL
+        // bundle, so a full overlap is the only shape a duplicate can take.
+        // A partial overlap means the client merged a re-send with a new
+        // message and must go through — the transcript-level csid echo pops
+        // the right optimistic bubbles either way.
+        let all_seen = csids.iter().all(|csid| self.seen.contains_key(csid));
+        if all_seen {
+            return CsidReceipt {
+                claim: CsidClaim::Duplicate,
+                newly_claimed: Vec::new(),
+            };
+        }
+        let mut newly_claimed = Vec::new();
+        for csid in csids {
+            if self.seen.insert(*csid, now).is_none() {
+                self.order.push_back(*csid);
+                newly_claimed.push(*csid);
+            }
+        }
+        while self.order.len() > CSID_DEDUPE_MAX_PER_SESSION {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        CsidReceipt::accepted(newly_claimed)
+    }
+
+    /// [`Self::release`] keyed off a receipt — the shape the store's public
+    /// `release_client_send_ids` uses, exposed so the window's own unit tests
+    /// exercise the same path production does rather than a parallel one.
+    #[cfg(test)]
+    fn release_for_test(&mut self, receipt: &CsidReceipt) {
+        self.release(&receipt.newly_claimed);
+    }
+
+    /// Undo the ids a claim inserted, so a send that never reached the
+    /// enqueue can be retried instead of being answered `duplicate` forever.
+    /// Ids already dropped by TTL or capacity eviction are simply skipped.
+    fn release(&mut self, csids: &[i64]) {
+        for csid in csids {
+            if self.seen.remove(csid).is_some()
+                && let Some(position) = self.order.iter().position(|queued| queued == csid)
+            {
+                self.order.remove(position);
+            }
+        }
+    }
 }
 
 struct EntryUpdateThrottle {
@@ -964,6 +1106,7 @@ impl SolutionAgentStore {
             model_catalog: ModelCatalog::new(),
             focus_resolver: None,
             entry_update_throttles: HashMap::new(),
+            client_send_dedupe: HashMap::new(),
             entries_persist_chain: PersistChains::default(),
             entry_write_failed: HashMap::new(),
             last_auto_reconnect_ms: HashMap::new(),
@@ -3334,6 +3477,10 @@ impl SolutionAgentStore {
                         session_id,
                     ));
                 }
+                // The epoch bump invalidates every cursor the clients held, so
+                // nothing dispatched before the rotation can be a meaningful
+                // duplicate of anything sent after it.
+                store.forget_client_send_ids(session_id);
                 // Re-subscribe to the new AcpThread's event stream.
                 // Dropping the old subscription unhooks us from the
                 // dead thread automatically.
@@ -3553,6 +3700,9 @@ impl SolutionAgentStore {
                         session_id,
                     ));
                 }
+                // A `/clear` means nothing that preceded it can be a
+                // meaningful duplicate; see `rotate_context`.
+                store.forget_client_send_ids(session_id);
                 let new_sub = store.subscribe_to_session(session_id, new_thread, cx);
                 session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
                 store.persist_session_row(session_id, cx);

@@ -19,10 +19,9 @@ pub mod workspace_seq;
 
 pub use handoff::{HandoffOutcome, try_handoff_to_existing_instance};
 pub use lifecycle::{
-    cleanup_legacy_runtime_dir, close_solution_socket, is_global_tool,
-    is_solution_scoped_tool, lock_path, open_solution_socket, runtime_dir,
-    set_runtime_dir_for_test, socket_path, solution_scope_for_path, solution_socket_for_path,
-    solution_socket_path, start_server,
+    cleanup_legacy_runtime_dir, close_solution_socket, is_global_tool, is_solution_scoped_tool,
+    lock_path, open_solution_socket, runtime_dir, set_runtime_dir_for_test, socket_path,
+    solution_scope_for_path, solution_socket_for_path, solution_socket_path, start_server,
 };
 pub use notifications::emit as emit_notification;
 pub use registry::{
@@ -34,6 +33,10 @@ pub use tier_guard::{
     BranchProtectionChecker, BranchProtectionDecision, BranchProtectionHint,
     BranchProtectionTarget, RepoPathResolver, TierGuardTool, current_caps,
     set_branch_protection_checker, set_repo_path_resolver,
+};
+pub use tools::capabilities::{
+    CSID_DEDUPE_WINDOW, FEATURE_CSID_DEDUPE, FEATURE_ENTRY_BODY_DELTA, FEATURE_OMIT_PREVIEW,
+    FEATURE_QUIET_MESSAGE_APPENDED, WIRE_SCHEMA_VERSION, server_instance_id, wire_features,
 };
 pub use tools::is_confirmed;
 pub use window_ids::format as format_window_id;

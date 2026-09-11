@@ -14,12 +14,17 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine as _;
 use chrono::Utc;
+use futures::future::BoxFuture;
 use futures::{SinkExt as _, StreamExt as _};
 use hmac::{Hmac, Mac};
 use remote_control::auth::HMAC_DOMAIN_TAG;
 use remote_control::cert::ServerCert;
-use remote_control::dispatch::MinimalDispatcher;
+use remote_control::dispatch::{
+    ConnectionDispatcher, JsonRpcRequest, JsonRpcResponse, MinimalDispatcher, PendingResponse,
+    RemoteDispatcher,
+};
 use remote_control::listener::{self, ListenerConfig};
+use remote_control::proxy::{NotificationReceiver, notification_channel};
 use remote_control::{AuthorizedClient, RemoteControlSettings};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -186,6 +191,7 @@ async fn full_handshake_and_minimal_dispatcher_round_trip() -> Result<()> {
         cert,
         clients_rx,
         dispatcher,
+        idle_timeout: listener::DEFAULT_IDLE_READ_TIMEOUT,
     };
     let handle = listener::start_listener(cfg).await?;
     let addr = handle.bound_addr();
@@ -336,6 +342,7 @@ async fn handshake_rejects_unauthorized_client() -> Result<()> {
         cert,
         clients_rx,
         dispatcher,
+        idle_timeout: listener::DEFAULT_IDLE_READ_TIMEOUT,
     };
     let handle = listener::start_listener(cfg).await?;
     let addr = handle.bound_addr();
@@ -395,6 +402,520 @@ async fn handshake_rejects_unauthorized_client() -> Result<()> {
         }
         other => panic!("expected Close(1008), got {other:?}"),
     }
+
+    drop(handle);
+    Ok(())
+}
+
+/// Order in which requests were committed upstream, as recorded by
+/// [`TestConnection::begin_dispatch`].
+type CommitOrder = Arc<std::sync::Mutex<Vec<i64>>>;
+
+/// Dispatcher stub with the knobs the concurrency / ordering / liveness
+/// tests need: a method that takes a configurable while to answer, replies
+/// that deliberately complete out of order, and an optional notification
+/// stream that keeps producing outbound traffic.
+struct TestDispatcher {
+    slow_delay: Duration,
+    /// Size of the payload `remote.editor.bulk` answers with. Big enough
+    /// and the writer blocks inside `sink.send` until the client drains.
+    bulk_bytes: usize,
+    /// Make replies complete in REVERSE request-id order, so a test that
+    /// asserts commit order can't pass just because the responses happened
+    /// to come back in order.
+    reverse_replies: bool,
+    notify_every: Option<Duration>,
+    commit_order: CommitOrder,
+}
+
+impl TestDispatcher {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            slow_delay: Duration::from_secs(2),
+            bulk_bytes: 0,
+            reverse_replies: false,
+            notify_every: None,
+            commit_order: CommitOrder::default(),
+        })
+    }
+
+    fn notifying(interval: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            slow_delay: Duration::ZERO,
+            bulk_bytes: 0,
+            reverse_replies: false,
+            notify_every: Some(interval),
+            commit_order: CommitOrder::default(),
+        })
+    }
+
+    fn recording_order() -> Arc<Self> {
+        Arc::new(Self {
+            slow_delay: Duration::ZERO,
+            bulk_bytes: 0,
+            reverse_replies: true,
+            notify_every: None,
+            commit_order: CommitOrder::default(),
+        })
+    }
+
+    fn bulky(bulk_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            slow_delay: Duration::ZERO,
+            bulk_bytes,
+            reverse_replies: false,
+            notify_every: None,
+            commit_order: CommitOrder::default(),
+        })
+    }
+}
+
+impl RemoteDispatcher for TestDispatcher {
+    fn open_connection(&self) -> BoxFuture<'static, Result<Box<dyn ConnectionDispatcher>>> {
+        let slow_delay = self.slow_delay;
+        let bulk_bytes = self.bulk_bytes;
+        let reverse_replies = self.reverse_replies;
+        let notify_every = self.notify_every;
+        let commit_order = self.commit_order.clone();
+        Box::pin(async move {
+            let notifications = notify_every.map(|interval| {
+                let (sender, receiver) = notification_channel();
+                tokio::spawn(async move {
+                    // Bounded so a finished test can't leave a task
+                    // spinning for the rest of the binary's life.
+                    for _ in 0..500 {
+                        tokio::time::sleep(interval).await;
+                        sender.send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "editor/notification",
+                            "params": {
+                                "kind": "agent_session_title_changed",
+                                "payload": { "session_id": "s" },
+                            },
+                        }));
+                    }
+                });
+                receiver
+            });
+            let connection: Box<dyn ConnectionDispatcher> = Box::new(TestConnection {
+                slow_delay,
+                bulk_bytes,
+                reverse_replies,
+                notifications,
+                commit_order,
+                upstream: tokio::sync::Mutex::new(()),
+            });
+            Ok(connection)
+        })
+    }
+}
+
+struct TestConnection {
+    slow_delay: Duration,
+    bulk_bytes: usize,
+    reverse_replies: bool,
+    notifications: Option<NotificationReceiver>,
+    commit_order: CommitOrder,
+    /// Stand-in for `UnixMcpProxy`'s `write_half` mutex — the thing that
+    /// actually decides which request the editor sees first.
+    upstream: tokio::sync::Mutex<()>,
+}
+
+impl ConnectionDispatcher for TestConnection {
+    // `async_yields_async` is exactly the shape this method is for: the
+    // outer future is the commit (awaited by the reader in wire order) and
+    // the value it yields is the reply-wait (spawned). Collapsing them is
+    // the bug the split exists to prevent.
+    #[allow(clippy::async_yields_async)]
+    fn begin_dispatch<'a>(
+        &'a self,
+        _client_name: &'a str,
+        request: JsonRpcRequest,
+    ) -> BoxFuture<'a, PendingResponse> {
+        Box::pin(async move {
+            // Model the real `begin_call`: take the shared upstream lock and
+            // yield once (a `write_all` on a Unix socket does). Whatever
+            // order this runs in IS the order the editor would have seen the
+            // requests, which is why the recording lives here and not in the
+            // reply phase.
+            {
+                let _upstream = self.upstream.lock().await;
+                tokio::task::yield_now().await;
+                if let Some(id) = request.id.as_i64() {
+                    self.commit_order
+                        .lock()
+                        .expect("commit-order mutex")
+                        .push(id);
+                }
+            }
+
+            let bulk =
+                (request.method == "remote.editor.bulk").then(|| "x".repeat(self.bulk_bytes));
+            let mut reply_delay = Duration::ZERO;
+            if request.method == "remote.editor.slow" {
+                reply_delay += self.slow_delay;
+            }
+            if self.reverse_replies {
+                let id = request.id.as_i64().unwrap_or(0).clamp(0, 64);
+                reply_delay += Duration::from_millis((64 - id) as u64 * 10);
+            }
+            Box::pin(async move {
+                if !reply_delay.is_zero() {
+                    tokio::time::sleep(reply_delay).await;
+                }
+                match bulk {
+                    Some(payload) => JsonRpcResponse::ok(
+                        request.id,
+                        serde_json::json!({ "method": request.method, "bulk": payload }),
+                    ),
+                    None => JsonRpcResponse::ok(
+                        request.id,
+                        serde_json::json!({ "method": request.method, "ok": true }),
+                    ),
+                }
+            }) as PendingResponse
+        })
+    }
+
+    fn take_notifications(&mut self) -> Option<NotificationReceiver> {
+        self.notifications.take()
+    }
+}
+
+type TestWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Bring up a listener on an ephemeral port and complete the full client
+/// handshake against it, returning the authenticated socket alongside the
+/// pieces a test needs to drive revocation / shutdown.
+async fn start_and_authenticate(
+    dispatcher: Arc<dyn RemoteDispatcher>,
+    idle_timeout: Duration,
+) -> Result<(
+    listener::ListenerHandle,
+    tokio::sync::watch::Sender<Vec<AuthorizedClient>>,
+    TestWebSocket,
+)> {
+    let client = make_authorized_client("Phone");
+    let cert = make_server_cert();
+    let fingerprint = cert.fingerprint_sha256;
+    let (clients_tx, clients_rx) = tokio::sync::watch::channel(vec![client.clone()]);
+
+    let cfg = ListenerConfig {
+        bind_addr: ([127, 0, 0, 1], 0).into(),
+        cert,
+        clients_rx,
+        dispatcher,
+        idle_timeout,
+    };
+    let handle = listener::start_listener(cfg).await?;
+    let addr = handle.bound_addr();
+
+    let tls_config = build_client_tls_config(fingerprint);
+    let tls_connector = tokio_tungstenite::Connector::Rustls(tls_config);
+    let url = format!("wss://127.0.0.1:{}/", addr.port());
+    let request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        url.as_str(),
+    )?;
+    let (mut ws, _resp) =
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(tls_connector))
+            .await?;
+
+    let challenge_frame = ws.next().await.expect("challenge")?;
+    let challenge_text = match challenge_frame {
+        Message::Text(text) => text,
+        other => panic!("expected text challenge, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(challenge_text.as_ref())?;
+    let challenge_bytes = hex::decode(parsed["challenge"].as_str().expect("challenge hex"))?;
+    let mut challenge = [0u8; 16];
+    challenge.copy_from_slice(&challenge_bytes);
+    let response = compute_response(&client.secret_base64, &challenge);
+    ws.send(Message::Text(
+        serde_json::json!({ "type": "response", "response": hex::encode(response) })
+            .to_string()
+            .into(),
+    ))
+    .await?;
+    let welcome = ws.next().await.expect("welcome")?;
+    match welcome {
+        Message::Text(text) => {
+            let value: serde_json::Value = serde_json::from_str(text.as_ref())?;
+            assert_eq!(value["type"], "welcome");
+        }
+        other => panic!("expected welcome, got {other:?}"),
+    }
+    Ok((handle, clients_tx, ws))
+}
+
+/// Read frames until one carries a JSON-RPC `id`, and return it.
+/// Notifications (which have no `id`) are skipped.
+async fn next_response(ws: &mut TestWebSocket) -> Result<serde_json::Value> {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for a response frame"))?
+            .ok_or_else(|| anyhow::anyhow!("socket closed while waiting for a response"))??;
+        let Message::Text(text) = frame else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(text.as_ref())?;
+        if value.get("id").is_some_and(|id| !id.is_null()) {
+            return Ok(value);
+        }
+    }
+}
+
+/// Read frames until a Close arrives, returning `(code, reason)`.
+async fn next_close(ws: &mut TestWebSocket, within: Duration) -> Result<(u16, String)> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for a close frame"))?;
+        match frame {
+            Some(Ok(Message::Close(Some(close)))) => {
+                return Ok((u16::from(close.code), close.reason.to_string()));
+            }
+            Some(Ok(Message::Close(None))) => return Ok((1005, String::new())),
+            Some(Ok(_)) => continue,
+            Some(Err(err)) => return Err(err.into()),
+            None => anyhow::bail!("socket ended without a close frame"),
+        }
+    }
+}
+
+/// N-50: the request loop used to dispatch inline, so one slow RPC held
+/// the whole connection — no pongs, no notifications, no other RPCs —
+/// for as long as it ran (up to the 30 s proxy call timeout). A phone
+/// could not tell "the server is busy with my own big response" from a
+/// dead socket. Requests now run on their own tasks and answer out of
+/// order, which JSON-RPC allows (the client matches on `id`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_rpc_does_not_block_a_concurrent_one() -> Result<()> {
+    let (handle, _clients_tx, mut ws) =
+        start_and_authenticate(TestDispatcher::new(), listener::DEFAULT_IDLE_READ_TIMEOUT).await?;
+
+    let started = std::time::Instant::now();
+    ws.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"remote.editor.slow"}"#.into(),
+    ))
+    .await?;
+    ws.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":2,"method":"remote.editor.ping"}"#.into(),
+    ))
+    .await?;
+
+    let first = next_response(&mut ws).await?;
+    assert_eq!(
+        first["id"], 2,
+        "the fast RPC must answer while the slow one is still running"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "fast reply took {:?} — it was queued behind the 2 s call",
+        started.elapsed(),
+    );
+
+    let second = next_response(&mut ws).await?;
+    assert_eq!(second["id"], 1);
+
+    drop(handle);
+    Ok(())
+}
+
+/// H1: requests must reach the editor in the order they arrived on the
+/// wire. The reader dispatches concurrently now, so the ONLY thing keeping
+/// that true is that the commit half of a dispatch runs inline on the
+/// reader; spawning the whole call instead lets the tasks race for the
+/// upstream write mutex — and tokio's LIFO slot makes the *newest* task
+/// win, so two frames delivered in one TCP segment invert essentially
+/// every time.
+///
+/// The client depends on this: `QueueController` releases each queued send
+/// as soon as the previous frame reaches the transport, so flushing an
+/// offline backlog puts every message in flight at once. Inverting them
+/// reorders the transcript permanently, and nothing heals it.
+///
+/// The stub records arrival inside `begin_dispatch` (under a shared lock,
+/// with a yield, exactly like the real `write_all`) and answers in reverse
+/// id order, so this cannot pass by accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_reach_the_dispatcher_in_wire_order() -> Result<()> {
+    let dispatcher = TestDispatcher::recording_order();
+    let commit_order = dispatcher.commit_order.clone();
+    let (handle, _clients_tx, mut ws) =
+        start_and_authenticate(dispatcher, listener::DEFAULT_IDLE_READ_TIMEOUT).await?;
+
+    const REQUESTS: i64 = 12;
+    // One `send` per frame, no reads in between: the frames land in the
+    // server's receive buffer back-to-back, which is the shape that
+    // reproduces the inversion.
+    for id in 1..=REQUESTS {
+        ws.send(Message::Text(
+            format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"remote.editor.ping"}}"#).into(),
+        ))
+        .await?;
+    }
+
+    let mut answered = Vec::new();
+    for _ in 0..REQUESTS {
+        answered.push(next_response(&mut ws).await?["id"].as_i64().expect("id"));
+    }
+    answered.sort_unstable();
+    assert_eq!(
+        answered,
+        (1..=REQUESTS).collect::<Vec<_>>(),
+        "every request must be answered exactly once"
+    );
+
+    let committed = commit_order.lock().expect("commit-order mutex").clone();
+    assert_eq!(
+        committed,
+        (1..=REQUESTS).collect::<Vec<_>>(),
+        "requests must be committed upstream in wire order, got {committed:?}"
+    );
+
+    drop(handle);
+    Ok(())
+}
+
+/// N-08: an inbound frame over the 1 MiB cap makes tungstenite abort the
+/// read. The socket used to be torn down with no close frame at all, so
+/// the phone read it as a network blip and retried the same poison frame
+/// on a ~1 s loop. 1009 lets it classify the failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversize_frame_is_closed_with_1009() -> Result<()> {
+    let (handle, _clients_tx, mut ws) =
+        start_and_authenticate(TestDispatcher::new(), listener::DEFAULT_IDLE_READ_TIMEOUT).await?;
+
+    let padding = "x".repeat(1024 * 1024 + 4096);
+    let oversize =
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"remote.editor.ping","params":"{padding}"}}"#);
+    ws.send(Message::Text(oversize.into())).await?;
+
+    let (code, reason) = next_close(&mut ws, Duration::from_secs(10)).await?;
+    assert_eq!(
+        code, 1009,
+        "expected WS 1009 (message too big), reason={reason:?}"
+    );
+    assert!(reason.contains("too big"), "reason: {reason:?}");
+
+    drop(handle);
+    Ok(())
+}
+
+/// N-51: turning Remote Control off only dropped the accept loop. Live
+/// connections kept working — a paired phone could still send messages
+/// and authorise tool calls against a server that considered itself off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_listener_closes_live_connections() -> Result<()> {
+    let (handle, _clients_tx, mut ws) =
+        start_and_authenticate(TestDispatcher::new(), listener::DEFAULT_IDLE_READ_TIMEOUT).await?;
+
+    ws.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"remote.editor.ping"}"#.into(),
+    ))
+    .await?;
+    assert_eq!(next_response(&mut ws).await?["id"], 1);
+
+    drop(handle);
+
+    let (code, reason) = next_close(&mut ws, Duration::from_secs(10)).await?;
+    assert_eq!(code, 1001);
+    assert_eq!(reason, "server shutting down");
+    Ok(())
+}
+
+/// N-54: a revoked client was kicked with "evicted by new connection",
+/// which reads as "you connected twice" — the opposite of what happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoked_client_is_closed_with_its_own_reason() -> Result<()> {
+    let (handle, clients_tx, mut ws) =
+        start_and_authenticate(TestDispatcher::new(), listener::DEFAULT_IDLE_READ_TIMEOUT).await?;
+
+    clients_tx
+        .send(Vec::new())
+        .expect("listener holds a receiver");
+
+    let (code, reason) = next_close(&mut ws, Duration::from_secs(10)).await?;
+    assert_eq!(code, 1001);
+    assert_eq!(reason, "authorization revoked");
+
+    drop(handle);
+    Ok(())
+}
+
+/// M1: a close must reach the client even when the writer is already
+/// blocked pushing a large frame — which, on a slow link, is most of the
+/// time.
+///
+/// Before, `close_rx` was only polled between queue items, so a close was
+/// invisible to the writer for the whole duration of the frame in flight;
+/// the reader gave up after its grace and aborted the writer, and the
+/// phone got a bare TCP reset instead of "authorization revoked". The
+/// close reasons the rest of this work added (1009, "server shutting
+/// down", "idle timeout") were unreachable in exactly the situation they
+/// were most needed.
+///
+/// The client stops reading so the 8 MB response wedges the writer, the
+/// server revokes it, and only then does the client drain — later than the
+/// old grace, sooner than the current close-write budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_preempts_a_frame_already_in_flight() -> Result<()> {
+    let (handle, clients_tx, mut ws) = start_and_authenticate(
+        TestDispatcher::bulky(8 * 1024 * 1024),
+        listener::DEFAULT_IDLE_READ_TIMEOUT,
+    )
+    .await?;
+
+    ws.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"remote.editor.bulk"}"#.into(),
+    ))
+    .await?;
+    // Let the response reach the writer and fill the socket buffers.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    clients_tx
+        .send(Vec::new())
+        .expect("listener holds a receiver");
+
+    // Stay silent past the point where the reader used to abort the writer,
+    // then start draining.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    let (code, reason) = next_close(&mut ws, Duration::from_secs(20)).await?;
+    assert_eq!(code, 1001);
+    assert_eq!(reason, "authorization revoked");
+
+    drop(handle);
+    Ok(())
+}
+
+/// N-53: the idle timer was re-armed by every loop iteration, and
+/// delivering a notification is a loop iteration — so a phone that had
+/// stopped receiving was never detected as long as the editor kept
+/// streaming at it. The timer now measures INBOUND silence only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_timeout_is_not_rearmed_by_outbound_notifications() -> Result<()> {
+    let (handle, _clients_tx, mut ws) = start_and_authenticate(
+        TestDispatcher::notifying(Duration::from_millis(100)),
+        Duration::from_secs(1),
+    )
+    .await?;
+
+    // One request opens the dispatcher connection, which is what starts
+    // the notification pump.
+    ws.send(Message::Text(
+        r#"{"jsonrpc":"2.0","id":1,"method":"remote.editor.ping"}"#.into(),
+    ))
+    .await?;
+    assert_eq!(next_response(&mut ws).await?["id"], 1);
+
+    // Keep draining (so the socket never backs up) but send nothing.
+    let (code, reason) = next_close(&mut ws, Duration::from_secs(10)).await?;
+    assert_eq!(code, 1001);
+    assert_eq!(reason, "idle timeout");
 
     drop(handle);
     Ok(())

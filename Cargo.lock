@@ -6006,6 +6006,7 @@ dependencies = [
  "solutions",
  "tempfile",
  "util",
+ "uuid",
  "workspace",
 ]
 

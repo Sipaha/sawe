@@ -19,6 +19,21 @@ pub struct SubscribeParams {
     /// Optional filter object (kind-specific).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<serde_json::Value>,
+    /// Kinds the caller wants delivery suppressed for on THIS connection,
+    /// even though they stay in `kinds`. Gated on the
+    /// `quiet_message_appended` feature token.
+    ///
+    /// Accepted and echoed here, but deliberately NOT consulted by
+    /// `editor_mcp::emit_notification`: the registry is process-global and
+    /// never pruned on disconnect, so honouring a suppression list at the
+    /// emit layer would apply one client's preferences to every other client.
+    /// Enforcement lives in `remote_control`'s per-connection proxy, which is
+    /// the only layer that knows which socket asked. The field exists on this
+    /// tool solely so the parameter survives `deny_unknown_fields` when the
+    /// proxy forwards the frame verbatim — without it a client that asked for
+    /// suppression would get `-32602` and a failed subscribe.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppress_kinds: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for SubscribeParams {
@@ -29,12 +44,14 @@ impl<'de> Deserialize<'de> for SubscribeParams {
             solution_id: Option<i64>,
             kinds: Vec<String>,
             filter: Option<serde_json::Value>,
+            suppress_kinds: Vec<String>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             solution_id: inner.solution_id,
             kinds: inner.kinds,
             filter: inner.filter,
+            suppress_kinds: inner.suppress_kinds,
         })
     }
 }
@@ -194,5 +211,44 @@ impl McpServerTool for ListSubscriptionsTool {
                 subscriptions: infos,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SubscribeParams` is `deny_unknown_fields`, so the parameter has to be
+    /// declared here even though only `remote_control`'s per-connection proxy
+    /// may act on it — otherwise the proxy's verbatim forward of a
+    /// `remote.editor.subscribe` carrying `suppress_kinds` would come back
+    /// `-32602` and the client would see a failed subscribe.
+    #[test]
+    fn subscribe_accepts_suppress_kinds() {
+        let params: SubscribeParams = serde_json::from_value(serde_json::json!({
+            "kinds": ["agent_session_dirty", "agent_session_message_appended"],
+            "suppress_kinds": ["agent_session_message_appended"],
+        }))
+        .expect("suppress_kinds must not be an unknown field");
+        assert_eq!(params.kinds.len(), 2);
+        assert_eq!(
+            params.suppress_kinds,
+            vec!["agent_session_message_appended"]
+        );
+
+        let old_client: SubscribeParams = serde_json::from_value(serde_json::json!({
+            "kinds": ["agent_session_dirty"],
+        }))
+        .expect("old clients omit the key");
+        assert!(old_client.suppress_kinds.is_empty());
+
+        let unknown: Result<SubscribeParams, _> = serde_json::from_value(serde_json::json!({
+            "kinds": ["agent_session_dirty"],
+            "no_such_param": true,
+        }));
+        assert!(
+            unknown.is_err(),
+            "deny_unknown_fields must survive the addition"
+        );
     }
 }

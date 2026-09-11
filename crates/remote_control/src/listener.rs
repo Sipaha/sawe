@@ -16,11 +16,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
+use futures::stream::SplitSink;
 use futures::{SinkExt as _, StreamExt as _};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ServerConfig;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
@@ -32,15 +33,74 @@ use crate::auth;
 use crate::cert::ServerCert;
 use crate::dispatch::{ConnectionDispatcher, JsonRpcResponse, RemoteDispatcher, parse_request};
 use crate::model::AuthorizedClient;
+use crate::proxy::NotificationReceiver;
 
 /// Max time (seconds) the client has to reply to the challenge frame
 /// before we drop the connection.
 const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
-/// Idle-read timeout once authenticated. A connection that doesn't send
-/// anything for this long is dropped; clients are expected to ping
-/// (`remote.editor.ping`) well below this bound to stay alive.
-const IDLE_READ_TIMEOUT_SECS: u64 = 60;
+/// Idle-read timeout once authenticated. Strictly an INBOUND-silence
+/// timer: the deadline is re-armed when the reader takes a frame off the
+/// socket, never by anything we send. A half-open peer that stopped
+/// receiving (LTE IP change mid-turn) therefore still trips it even
+/// while the editor is streaming notifications at it. Clients are
+/// expected to ping (`remote.editor.ping`) well below this bound.
+///
+/// "When the reader dequeues" is not quite "when the client sends": the
+/// reader also parks while taking an in-flight permit, opening the proxy
+/// or committing a request upstream, and a frame arriving during one of
+/// those does not re-arm the deadline until it is read. Every one of those
+/// parks races the deadline, so the worst case is that a client holding
+/// all [`MAX_INFLIGHT_REQUESTS`] slots for a full minute without any of
+/// them completing gets closed — by which point its own 30 s call timeouts
+/// have long since fired.
+pub const DEFAULT_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many RPCs from ONE connection may be in dispatch at the same
+/// time. Requests are dispatched on their own tasks so a slow call
+/// can't head-of-line-block pongs, notifications, the idle timer or
+/// other RPCs; this bound is what keeps that from turning into
+/// unbounded task growth. The reader takes a permit before reading the
+/// next frame, so exceeding the bound applies backpressure at the
+/// socket instead of in memory.
+const MAX_INFLIGHT_REQUESTS: usize = 16;
+
+/// Depth of the per-connection outbound frame queue that funnels
+/// responses + notifications to the single writer task. Deep enough to
+/// absorb a burst from a busy editor, shallow enough that a client that
+/// stopped reading is noticed rather than buffered indefinitely.
+const OUTBOUND_QUEUE_CAPACITY: usize = 512;
+
+/// Floor of the per-frame write budget. See [`write_budget`].
+const WRITE_TIMEOUT_BASE_SECS: u64 = 30;
+
+/// Throughput the per-frame write budget assumes, on top of
+/// [`WRITE_TIMEOUT_BASE_SECS`]. Deliberately pessimistic: this is a
+/// backstop against a wedged socket, not a liveness detector.
+const MIN_WRITE_THROUGHPUT_BYTES_PER_SEC: u64 = 32 * 1024;
+
+/// Budget for writing a close frame, including flushing whatever is left
+/// of a frame the close preempted. Bounded on purpose: a truncated WS
+/// frame is unparseable, so the close can only go out behind the bytes
+/// already committed — and waiting out a multi-megabyte response on a slow
+/// link would defeat the point of preempting it. A peer that can't drain
+/// within this window gets a reset instead of a reason.
+const CLOSE_WRITE_TIMEOUT_SECS: u64 = 10;
+
+/// How long the reader waits for the writer to deliver the close frame
+/// before abandoning it and tearing the socket down. Must comfortably
+/// exceed [`CLOSE_WRITE_TIMEOUT_SECS`], or the reader would abort the
+/// writer before it could deliver the reason — which is precisely how the
+/// close reasons this work added (1009 "message too big",
+/// "authorization revoked", "server shutting down") went missing whenever
+/// the writer happened to be mid-frame, i.e. most of the time on a slow
+/// link.
+const CLOSE_GRACE_SECS: u64 = 25;
+
+/// Cap on the polite TCP teardown after the close frame is out — see
+/// [`graceful_teardown`]. Short: by this point the client has its reason
+/// and nothing else is owed to it.
+const CLOSE_DRAIN_SECS: u64 = 2;
 
 /// Exponential backoff for repeat auth failures, in seconds. There is a
 /// 1-failure grace period: the FIRST failure from a subnet earns no ban
@@ -88,12 +148,16 @@ pub struct ListenerConfig {
     pub bind_addr: SocketAddr,
     pub cert: ServerCert,
     /// Receiver of the live authorised-client list. The listener reads
-    /// `borrow().clone()` at handshake time, so revoking a client
-    /// (`clients_tx.send(new_list)`) takes effect on the NEXT connection.
-    /// Open connections from a revoked client are NOT kicked — that's a
-    /// future improvement.
+    /// `borrow().clone()` at handshake time, and `watch_revocations`
+    /// additionally kicks any live connection whose client disappears
+    /// from the list, so a revoke takes effect immediately rather than
+    /// on the next connection.
     pub clients_rx: watch::Receiver<Vec<AuthorizedClient>>,
     pub dispatcher: Arc<dyn RemoteDispatcher>,
+    /// Inbound-silence timeout for authenticated connections. Production
+    /// passes [`DEFAULT_IDLE_READ_TIMEOUT`]; tests shorten it so the
+    /// zombie-detection path is exercisable in seconds.
+    pub idle_timeout: Duration,
 }
 
 /// Per-connection registration. We hold one slot per authenticated
@@ -113,11 +177,32 @@ struct ConnectionSlot {
     /// + future observability surfaces.
     last_activity: Arc<AtomicI64>,
     /// Drop-on-eviction signal. The connection task selects against
-    /// `kill_rx`; firing it sends a clean close frame and exits. We
-    /// fire it in three places: (a) a same-client new connection
-    /// replacing this one, (b) a revoke that removes this client from
-    /// `clients_rx`'s list, (c) future ops affordances.
-    kill: Option<oneshot::Sender<()>>,
+    /// `kill_rx`; firing it sends a clean close frame carrying the
+    /// matching reason and exits. We fire it in two places: (a) a
+    /// same-client new connection replacing this one, (b) a revoke that
+    /// removes this client from `clients_rx`'s list.
+    kill: Option<oneshot::Sender<KillReason>>,
+}
+
+/// Why a live connection is being closed from the server side. Each
+/// variant carries its own close-frame reason so the phone's log says
+/// what actually happened instead of guessing at "evicted".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillReason {
+    /// A fresh authenticated connection from the same client name took
+    /// this slot (1-client-1-connection).
+    Evicted,
+    /// The client was removed from the authorised list.
+    Revoked,
+}
+
+impl KillReason {
+    fn close_reason(self) -> &'static str {
+        match self {
+            KillReason::Evicted => "evicted by new connection",
+            KillReason::Revoked => "authorization revoked",
+        }
+    }
 }
 
 /// One row in the ban map. Keyed by [`subnet_key`] (a /24 for IPv4, /64
@@ -226,8 +311,18 @@ impl TokenBucket {
 /// 8 bytes zeroed). Same /24 over residential ISP usually = same
 /// human + same NAT; legit pairs always share their /24 with their
 /// own router.
+///
+/// Exception: carrier-grade NAT. Addresses in 100.64.0.0/10 (RFC 6598)
+/// are shared between *thousands* of unrelated mobile subscribers, so a
+/// /24 there is not "one offender" — it's a slice of a carrier. Banning
+/// it locks the user's own phone out for up to 24 h because some
+/// stranger's stale pairing kept retrying. Those get keyed by the full
+/// address instead; the accept-rate limiter, the TLS-handshake
+/// semaphore and [`BAN_LIST_MAX_ENTRIES`] are what bound a per-address
+/// ladder against a spraying attacker.
 fn subnet_key(ip: IpAddr) -> IpAddr {
     match ip {
+        IpAddr::V4(v4) if is_carrier_grade_nat(v4) => IpAddr::V4(v4),
         IpAddr::V4(v4) => {
             let o = v4.octets();
             IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], 0))
@@ -237,6 +332,12 @@ fn subnet_key(ip: IpAddr) -> IpAddr {
             IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
         }
     }
+}
+
+/// RFC 6598 shared address space: 100.64.0.0/10.
+fn is_carrier_grade_nat(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (64..128).contains(&o[1])
 }
 
 fn now_millis() -> i64 {
@@ -254,11 +355,24 @@ fn now_millis() -> i64 {
     dur.as_millis().min(i64::MAX as u128) as i64
 }
 
-/// Handle returned by `start_listener`. Dropping it triggers shutdown.
+/// Handle returned by `start_listener`. Dropping it triggers shutdown of
+/// the accept loop AND of every live connection.
 pub struct ListenerHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Broadcast to every per-connection task. Turning Remote Control off
+    /// (or a bind failure rolling the listener back) has to actually
+    /// disconnect the phones that are already paired and streaming —
+    /// dropping the accept loop alone left them fully functional against
+    /// a server that considered itself off, able to send messages and
+    /// authorise tool calls until they happened to reconnect.
+    conn_shutdown_tx: watch::Sender<bool>,
     bound_addr: SocketAddr,
     task: Option<JoinHandle<()>>,
+    /// The revoke watcher. It otherwise only exits when the caller drops
+    /// its `clients_tx`, which production does but nothing guarantees —
+    /// a caller that keeps the sender would leak a task holding an
+    /// `Arc<ListenerState>` for the life of the process.
+    revocation_task: Option<JoinHandle<()>>,
 }
 
 impl ListenerHandle {
@@ -269,6 +383,19 @@ impl ListenerHandle {
 
 impl Drop for ListenerHandle {
     fn drop(&mut self) {
+        // Order matters: signal the live connections first so they get a
+        // clean close frame out before the process (or the tokio runtime
+        // behind it) has any chance to go away.
+        //
+        // The accept loop and every live connection hold a receiver, so a
+        // send error here means all of them are already gone — there is
+        // nothing left to close.
+        if self.conn_shutdown_tx.send(true).is_err() {
+            log::debug!(
+                target: "remote_control",
+                "listener shutdown: accept loop and all connections already gone",
+            );
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             // Receiver may already be dropped if the task exited on its own
             // (e.g. accept errored out). Ignoring the send error is correct.
@@ -277,12 +404,15 @@ impl Drop for ListenerHandle {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        if let Some(task) = self.revocation_task.take() {
+            task.abort();
+        }
     }
 }
 
 /// Bind a TCP listener, build a TLS acceptor, and start the accept loop.
 /// The returned handle owns the loop; dropping it shuts down the
-/// listener and any in-flight connections.
+/// listener AND closes every live connection (see [`ListenerHandle`]).
 pub async fn start_listener(cfg: ListenerConfig) -> Result<ListenerHandle> {
     let listener = TcpListener::bind(cfg.bind_addr)
         .await
@@ -293,6 +423,7 @@ pub async fn start_listener(cfg: ListenerConfig) -> Result<ListenerHandle> {
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (conn_shutdown_tx, conn_shutdown_rx) = watch::channel(false);
 
     let state = Arc::new(ListenerState::default());
 
@@ -303,7 +434,7 @@ pub async fn start_listener(cfg: ListenerConfig) -> Result<ListenerHandle> {
     // hammer the ban-list on every retry attempt with the freshly-
     // invalidated secret (catching collateral devices on the same
     // /24 in the cooldown).
-    tokio::spawn(watch_revocations(cfg.clients_rx.clone(), state.clone()));
+    let revocation_task = tokio::spawn(watch_revocations(cfg.clients_rx.clone(), state.clone()));
 
     let task = tokio::spawn(accept_loop(
         listener,
@@ -312,12 +443,16 @@ pub async fn start_listener(cfg: ListenerConfig) -> Result<ListenerHandle> {
         cfg.dispatcher,
         state,
         shutdown_rx,
+        conn_shutdown_rx,
+        cfg.idle_timeout,
     ));
 
     Ok(ListenerHandle {
         shutdown_tx: Some(shutdown_tx),
+        conn_shutdown_tx,
         bound_addr,
         task: Some(task),
+        revocation_task: Some(revocation_task),
     })
 }
 
@@ -340,6 +475,8 @@ async fn accept_loop(
     dispatcher: Arc<dyn RemoteDispatcher>,
     state: Arc<ListenerState>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    conn_shutdown_rx: watch::Receiver<bool>,
+    idle_timeout: Duration,
 ) {
     loop {
         tokio::select! {
@@ -392,6 +529,7 @@ async fn accept_loop(
                         let clients_rx = clients_rx.clone();
                         let dispatcher = dispatcher.clone();
                         let state = state.clone();
+                        let conn_shutdown_rx = conn_shutdown_rx.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_conn(
                                 stream,
@@ -400,6 +538,8 @@ async fn accept_loop(
                                 clients_rx,
                                 dispatcher,
                                 state,
+                                conn_shutdown_rx,
+                                idle_timeout,
                             )
                             .await
                             {
@@ -545,7 +685,7 @@ async fn kick_existing_for_client(state: &ListenerState, name: &str) {
             let mut victim = conns.swap_remove(i);
             let victim_peer = victim.peer;
             if let Some(kill) = victim.kill.take() {
-                let _ = kill.send(());
+                let _ = kill.send(KillReason::Evicted);
             }
             log::info!(
                 target: "remote_control",
@@ -580,7 +720,7 @@ async fn watch_revocations(
         // minimises the window where a concurrent
         // `kick_existing_for_client` or accept-side slot push would
         // contend with us.
-        let to_kill: Vec<(oneshot::Sender<()>, String, SocketAddr)> = {
+        let to_kill: Vec<(oneshot::Sender<KillReason>, String, SocketAddr)> = {
             let mut conns = state.active_conns.lock().await;
             let mut kills = Vec::new();
             let mut i = 0;
@@ -597,7 +737,7 @@ async fn watch_revocations(
             kills
         };
         for (kill, name, peer) in to_kill {
-            let _ = kill.send(());
+            let _ = kill.send(KillReason::Revoked);
             log::info!(
                 target: "remote_control",
                 "kicking revoked client {name:?} ({peer})",
@@ -613,6 +753,8 @@ async fn handle_conn(
     clients_rx: watch::Receiver<Vec<AuthorizedClient>>,
     dispatcher: Arc<dyn RemoteDispatcher>,
     state: Arc<ListenerState>,
+    conn_shutdown_rx: watch::Receiver<bool>,
+    idle_timeout: Duration,
 ) -> Result<()> {
     // Disable Nagle: WS frames are small and latency-sensitive. Rare
     // platforms refuse this (already-closed sockets, exotic kernels);
@@ -809,7 +951,7 @@ async fn handle_conn(
     //    socket.
     kick_existing_for_client(&state, &client_name).await;
     let last_activity = Arc::new(AtomicI64::new(now_millis()));
-    let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    let (kill_tx, kill_rx) = oneshot::channel::<KillReason>();
     {
         let mut conns = state.active_conns.lock().await;
         conns.push(ConnectionSlot {
@@ -883,13 +1025,18 @@ async fn handle_conn(
         .await
         .context("sending welcome")?;
 
-    // 6. Request loop.
+    // 6. Request loop. `ws` moves in: everything up to here is strictly
+    //    sequential (challenge → response → welcome, one frame at a
+    //    time), and only now is it safe to split the socket into
+    //    independent reader and writer halves.
     run_request_loop(
-        &mut ws,
+        ws,
         &client_name,
         dispatcher.as_ref(),
         last_activity,
         kill_rx,
+        conn_shutdown_rx,
+        idle_timeout,
         parsed.compress_dict,
     )
     .await?;
@@ -952,348 +1099,823 @@ fn parse_handshake_response(text: &str) -> Result<ParsedHandshake> {
     })
 }
 
+/// One outbound WS frame, queued by the reader / dispatch / notification
+/// tasks and written by the connection's single writer task.
+enum Outbound {
+    /// A JSON payload — compressed into a binary frame when the client
+    /// negotiated compression and the payload is big enough to benefit.
+    ///
+    /// A response carries its dispatch's in-flight permit, which the
+    /// writer drops only once the frame is on the wire. That is what makes
+    /// [`MAX_INFLIGHT_REQUESTS`] a bound on queued RESPONSE BYTES and not
+    /// merely on concurrent dispatch: without it a client that stops
+    /// reading could pipeline requests, let each dispatch serialise a
+    /// multi-megabyte response into the queue, release its permit and
+    /// start another — pinning hundreds of megabytes of editor memory.
+    /// Frames with no permit (pongs, protocol-error replies, and
+    /// notifications, which are all small) pass `None`.
+    Json(String, Option<tokio::sync::OwnedSemaphorePermit>),
+    /// A frame that must go out verbatim (pong echoes).
+    Raw(Message),
+}
+
+/// Why the reader loop stopped. Each variant maps to the close frame (if
+/// any) the client should see, so a phone can tell "the desktop turned
+/// Remote Control off" apart from "my frame was too big" apart from "the
+/// network died".
+enum LoopExit {
+    /// Client sent a Close frame — echo one back.
+    ClientClose,
+    /// Stream ended without a Close frame; nothing to send.
+    StreamEnded,
+    Idle,
+    Killed(KillReason),
+    ServerShutdown,
+    /// Inbound frame exceeded the negotiated 1 MiB cap. tungstenite
+    /// aborts the read, so no JSON-RPC error is possible — but the client
+    /// can still be told *why* instead of seeing a bare socket reset.
+    Oversize,
+    Failed(anyhow::Error),
+}
+
 async fn run_request_loop<S>(
-    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    ws: tokio_tungstenite::WebSocketStream<S>,
     client_name: &str,
     dispatcher: &dyn RemoteDispatcher,
     last_activity: Arc<AtomicI64>,
-    mut kill_rx: oneshot::Receiver<()>,
+    mut kill_rx: oneshot::Receiver<KillReason>,
+    mut conn_shutdown_rx: watch::Receiver<bool>,
+    idle_window: Duration,
     compress_dict: Option<u8>,
 ) -> Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Per-connection dispatcher state (lazy: opened on first request). On
-    // open, immediately `take_notifications()` so the select! arm sees
-    // the receiver. If opening fails (e.g. local MCP socket missing) we
-    // surface -32603 per-request and keep the WS alive — the client may
-    // retry, and a flapping editor restart shouldn't kick paired phones.
-    let mut conn: Option<Box<dyn ConnectionDispatcher>> = None;
-    let mut notifications_rx: Option<tokio::sync::mpsc::Receiver<serde_json::Value>> = None;
+    // Reader / writer split. The reader (this function) never writes to
+    // the socket and never awaits a dispatch: requests are spawned, their
+    // responses funnel back through `outbound_tx`, and one writer task
+    // owns the sink. That's what keeps a 25 MB `get_session` reply — or a
+    // 30 s `dispatch` — from also stalling pongs, notifications, the idle
+    // timer and every other RPC from the same phone.
+    //
+    // Responses therefore come back in completion order, not request
+    // order. That is fine by JSON-RPC (the client matches on `id`) and it
+    // is what makes a cancelled-then-replaced poll stop blocking its
+    // replacement. Notifications keep their relative order because a
+    // single pump task forwards them.
+    let (sink, mut stream) = ws.split();
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE_CAPACITY);
+    let (close_tx, close_rx) = oneshot::channel::<Option<CloseFrame>>();
+    let mut writer = tokio::spawn(writer_task(
+        sink,
+        outbound_rx,
+        close_rx,
+        compress_dict,
+        client_name.to_string(),
+    ));
 
-    loop {
-        // Tokio `select!` here arbitrates between WS-read, notification
-        // pump, idle timeout, and the eviction-kill signal. The kill
-        // arm fires when the accept loop picked this slot as LRU
-        // victim to make room for a new connection.
-        let select_outcome = if let Some(rx) = notifications_rx.as_mut() {
-            tokio::select! {
-                biased;
-                _ = &mut kill_rx => SelectOutcome::Evicted,
-                next = ws.next() => SelectOutcome::Frame(next),
-                notification = rx.recv() => SelectOutcome::Notification(notification),
-                _ = tokio::time::sleep(Duration::from_secs(IDLE_READ_TIMEOUT_SECS)) => {
-                    SelectOutcome::Idle
-                }
+    // Per-connection dispatcher state (lazy: opened on first request). On
+    // open, immediately `take_notifications()` and start the pump. If
+    // opening fails (e.g. local MCP socket missing) we surface -32603
+    // per-request and keep the WS alive — the client may retry, and a
+    // flapping editor restart shouldn't kick paired phones.
+    let mut conn: Option<Arc<dyn ConnectionDispatcher>> = None;
+    let mut notification_pump: Option<JoinHandle<()>> = None;
+    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS));
+    // Owns every spawned response-wait so teardown can cancel them instead
+    // of leaving them (and the upstream MCP connection they answer on)
+    // alive for up to the proxy's 30 s call timeout after the socket is
+    // gone.
+    let mut dispatch_tasks = tokio::task::JoinSet::new();
+    // Re-armed ONLY on an inbound frame — see DEFAULT_IDLE_READ_TIMEOUT.
+    let mut idle_deadline = tokio::time::Instant::now() + idle_window;
+
+    let exit = loop {
+        // Reap finished dispatch tasks so the JoinSet doesn't accumulate
+        // completed entries over a long-lived connection.
+        while dispatch_tasks.try_join_next().is_some() {}
+
+        let next = tokio::select! {
+            biased;
+            reason = &mut kill_rx => {
+                break LoopExit::Killed(reason.unwrap_or(KillReason::Evicted));
             }
-        } else {
-            tokio::select! {
-                biased;
-                _ = &mut kill_rx => SelectOutcome::Evicted,
-                next = ws.next() => SelectOutcome::Frame(next),
-                _ = tokio::time::sleep(Duration::from_secs(IDLE_READ_TIMEOUT_SECS)) => {
-                    SelectOutcome::Idle
+            _ = wait_for_shutdown(&mut conn_shutdown_rx) => break LoopExit::ServerShutdown,
+            next = stream.next() => next,
+            _ = tokio::time::sleep_until(idle_deadline) => break LoopExit::Idle,
+        };
+
+        let frame = match next {
+            None => break LoopExit::StreamEnded,
+            Some(Err(tokio_tungstenite::tungstenite::Error::Capacity(err))) => {
+                log::info!(
+                    target: "remote_control",
+                    "client {client_name:?} sent an oversize frame: {err}",
+                );
+                break LoopExit::Oversize;
+            }
+            Some(Err(err)) => break LoopExit::Failed(anyhow!("ws read error: {err}")),
+            Some(Ok(frame)) => frame,
+        };
+
+        // Any inbound frame counts as activity — both for LRU eviction
+        // (a client mid-conversation shouldn't lose its slot to a fresh
+        // connection) and for the inbound-silence timer.
+        last_activity.store(now_millis(), Ordering::Relaxed);
+        idle_deadline = tokio::time::Instant::now() + idle_window;
+
+        // A JSON-RPC request arrives either as a TEXT frame or, when
+        // compression was negotiated, as a compressed BINARY frame.
+        // Extract its text here; non-request frames (ping/upload/close)
+        // are handled inline and leave `request_text` as None.
+        let request_text: Option<String> = match frame {
+            Message::Text(text) => Some(text.to_string()),
+            Message::Ping(payload) => {
+                // tungstenite also queues its own automatic pong, which
+                // the writer flushes with the next frame; this explicit
+                // one just makes the reply prompt on an otherwise silent
+                // connection. Best-effort: if the outbound queue is full
+                // the client is already not draining, and a dropped pong
+                // is not what will save it.
+                if outbound_tx
+                    .try_send(Outbound::Raw(Message::Pong(payload)))
+                    .is_err()
+                {
+                    log::debug!(
+                        target: "remote_control",
+                        "outbound queue full; skipping explicit pong to {client_name:?}",
+                    );
                 }
+                None
+            }
+            Message::Pong(_) => None,
+            Message::Close(frame) => {
+                log::debug!(
+                    target: "remote_control",
+                    "client {client_name:?} sent close frame: {frame:?}",
+                );
+                break LoopExit::ClientClose;
+            }
+            Message::Frame(_) => None,
+            Message::Binary(bytes) => handle_binary_frame(bytes, client_name),
+        };
+
+        // A JSON-RPC request extracted from a text or compressed-binary
+        // frame — dispatch it on its own task and reply from there.
+        let Some(text) = request_text else {
+            continue;
+        };
+        let request = match parse_request(&text) {
+            Ok(request) => request,
+            Err(parse_err_response) => {
+                queue_response(&outbound_tx, &parse_err_response, client_name);
+                continue;
             }
         };
 
-        match select_outcome {
-            SelectOutcome::Frame(None) => {
-                log::debug!(
-                    target: "remote_control",
-                    "client {client_name:?} closed connection",
-                );
-                return Ok(());
+        // Only NOW take an in-flight slot: it gates RPC concurrency, and
+        // taking it before the frame was classified would make upload
+        // chunks and pings queue behind slow RPCs (recreating the stall
+        // N-52 was about) and would stop the idle deadline being re-armed
+        // by a client that is very much alive.
+        let permit = tokio::select! {
+            biased;
+            reason = &mut kill_rx => {
+                break LoopExit::Killed(reason.unwrap_or(KillReason::Evicted));
             }
-            SelectOutcome::Frame(Some(Err(err))) => {
-                return Err(anyhow!("ws read error: {err}"));
-            }
-            SelectOutcome::Frame(Some(Ok(frame))) => {
-                // Any inbound frame counts as activity for LRU
-                // eviction purposes — a client mid-conversation
-                // shouldn't lose its slot to a fresh connection.
-                last_activity.store(now_millis(), Ordering::Relaxed);
-                // A JSON-RPC request arrives either as a TEXT frame or, when
-                // compression was negotiated, as a compressed BINARY frame.
-                // Extract its text here; non-request frames (ping/upload/close)
-                // are handled inline and leave `request_text` as None.
-                let request_text: Option<String> = match frame {
-                    Message::Text(text) => Some(text.to_string()),
-                    Message::Ping(payload) => {
-                        ws.send(Message::Pong(payload))
-                            .await
-                            .context("sending pong")?;
-                        None
-                    }
-                    Message::Pong(_) => None,
-                    Message::Close(frame) => {
-                        log::debug!(
-                            target: "remote_control",
-                            "client {client_name:?} sent close frame: {frame:?}",
-                        );
-                        let _ = ws.send(Message::Close(None)).await;
-                        return Ok(());
-                    }
-                    Message::Frame(_) => None,
-                    Message::Binary(bytes) => {
-                        // Compressed JSON-RPC request (negotiated)? Decode and
-                        // route it through the same dispatch path as text.
-                        if crate::wire_codec::is_compressed(&bytes) {
-                            match crate::wire_codec::decompress(&bytes) {
-                                Ok(raw) => match String::from_utf8(raw) {
-                                    Ok(text) => Some(text),
-                                    Err(err) => {
-                                        log::warn!(
-                                            target: "remote_control",
-                                            "client {client_name:?} sent a compressed frame that wasn't UTF-8: {err}; dropping",
-                                        );
-                                        None
-                                    }
-                                },
-                                Err(err) => {
-                                    log::warn!(
-                                        target: "remote_control",
-                                        "client {client_name:?} sent an undecodable compressed frame: {err}; dropping",
-                                    );
-                                    None
-                                }
-                            }
-                        } else {
-                            // Chunked-upload frame: 16-byte header
-                            // (u64 upload_id BE | u64 offset BE) + raw payload.
-                            // See `docs/plans/2026-05-19-chunked-upload-binary-frames.md`.
-                            // Anything < 16 bytes is malformed — log and
-                            // drop rather than erroring on the WS, since a
-                            // legit client never sends shorter frames and
-                            // an attacker shouldn't get useful feedback.
-                            if bytes.len() < 16 {
-                                log::warn!(
-                                    target: "remote_control",
-                                    "client {client_name:?} sent {n}-byte binary frame (< 16); dropping",
-                                    n = bytes.len(),
-                                );
-                                continue;
-                            }
-                            // Diagnostic — debug-level breadcrumb so a live
-                            // log tail can confirm chunks ARE reaching the
-                            // server. Per-chunk, so it stays at debug to
-                            // avoid flooding info on large uploads. The
-                            // header parse below is duplicated by the
-                            // handler; that's fine, this is a debug aid not
-                            // a hot path.
-                            let upload_id_log =
-                                u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
-                            let offset_log =
-                                u64::from_be_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
-                            log::debug!(
-                                target: "remote_control::upload",
-                                "binary frame from {client_name:?}: upload_id={upload_id_log} offset={offset_log} payload_bytes={}",
-                                bytes.len() - 16,
-                            );
-                            // Delegate parsing + dispatch to the upper-layer
-                            // handler registered via
-                            // `remote_control::set_binary_frame_handler`.
-                            // Keeps `remote_control` free of the
-                            // `solution_agent` dep (which would pull a
-                            // second rustls CryptoProvider via its
-                            // transitive `agent_servers` / `claude-acp`
-                            // graph and break the post-auth handshake).
-                            match crate::binary_frame_handler() {
-                                Some(handler) => {
-                                    if let Err(err) = handler(&bytes) {
-                                        log::warn!(
-                                            target: "remote_control::upload",
-                                            "binary frame handler rejected upload_id={upload_id_log} offset={offset_log} (client={client_name:?}): {err}",
-                                        );
-                                    } else {
-                                        log::debug!(
-                                            target: "remote_control::upload",
-                                            "binary frame written: upload_id={upload_id_log} offset={offset_log}",
-                                        );
-                                    }
-                                }
-                                None => {
-                                    log::warn!(
-                                        target: "remote_control::upload",
-                                        "NO binary frame handler installed; dropping {n}-byte frame (client={client_name:?})",
-                                        n = bytes.len(),
-                                    );
-                                }
-                            }
-                            None
-                        }
-                    }
-                };
+            _ = wait_for_shutdown(&mut conn_shutdown_rx) => break LoopExit::ServerShutdown,
+            permit = inflight.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(err) => break LoopExit::Failed(anyhow!("inflight semaphore closed: {err}")),
+            },
+            _ = tokio::time::sleep_until(idle_deadline) => break LoopExit::Idle,
+        };
 
-                // A JSON-RPC request extracted from a text or compressed-binary
-                // frame — dispatch it and reply (compressing the reply when
-                // negotiated).
-                if let Some(text) = request_text {
-                    let response = match parse_request(&text) {
-                        Ok(req) => {
-                            // Lazily open the proxy. On first call we
-                            // also grab the notifications receiver.
-                            if conn.is_none() {
-                                match dispatcher.open_connection().await {
-                                    Ok(mut c) => {
-                                        notifications_rx = c.take_notifications();
-                                        conn = Some(c);
-                                    }
-                                    Err(err) => {
-                                        let response = JsonRpcResponse::error(
-                                            req.id.clone(),
-                                            -32603,
-                                            format!("opening local MCP proxy: {err}"),
-                                        );
-                                        write_response(ws, &response, compress_dict).await?;
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Safe: `conn` is Some here.
-                            let dispatcher_ref = conn
-                                .as_mut()
-                                .ok_or_else(|| anyhow!("connection dispatcher disappeared"))?;
-                            dispatcher_ref.dispatch(client_name, req).await
-                        }
-                        Err(parse_err_response) => *parse_err_response,
-                    };
-                    write_response(ws, &response, compress_dict).await?;
+        if conn.is_none() {
+            // Bounded by the proxy's own 5 s connect timeout and happens at
+            // most once per connection, but raced against the exits anyway
+            // so a revoke landing during it isn't ignored for 5 s.
+            let opened = tokio::select! {
+                biased;
+                reason = &mut kill_rx => {
+                    break LoopExit::Killed(reason.unwrap_or(KillReason::Evicted));
                 }
-            }
-            SelectOutcome::Notification(None) => {
-                // Notifications channel closed (proxy reader dropped).
-                // Stop pumping; keep the WS alive so the client can
-                // still issue RPC calls (each call opens its own
-                // upstream frame; the dispatcher will re-fail cleanly).
-                notifications_rx = None;
-            }
-            SelectOutcome::Notification(Some(payload)) => {
-                let kind = payload
-                    .pointer("/params/kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if kind.starts_with("upload_") {
-                    log::info!(
-                        target: "remote_control::upload",
-                        "forwarding {kind} notification to {client_name:?}",
-                    );
-                }
-                if !allow_list::should_forward_event(kind) {
-                    if kind.starts_with("upload_") {
-                        log::warn!(
-                            target: "remote_control::upload",
-                            "DROPPING {kind} notification — allow_list rejected (BUG?)",
-                        );
+                _ = wait_for_shutdown(&mut conn_shutdown_rx) => break LoopExit::ServerShutdown,
+                opened = dispatcher.open_connection() => opened,
+                _ = tokio::time::sleep_until(idle_deadline) => break LoopExit::Idle,
+            };
+            match opened {
+                Ok(mut opened) => {
+                    if let Some(notifications) = opened.take_notifications() {
+                        notification_pump = Some(tokio::spawn(pump_notifications(
+                            notifications,
+                            outbound_tx.clone(),
+                            client_name.to_string(),
+                        )));
                     }
+                    conn = Some(Arc::from(opened));
+                }
+                Err(err) => {
+                    let response = JsonRpcResponse::error(
+                        request.id.clone(),
+                        -32603,
+                        format!("opening local MCP proxy: {err}"),
+                    );
+                    queue_response(&outbound_tx, &response, client_name);
                     continue;
                 }
-                let envelope = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "remote/notification",
-                    "params": payload
-                        .get("params")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                });
-                let serialized = match serde_json::to_string(&envelope) {
-                    Ok(text) => text,
-                    Err(err) => {
-                        log::warn!(
-                            target: "remote_control",
-                            "serialising notification: {err:#}; dropping",
-                        );
-                        continue;
-                    }
-                };
-                if let Err(err) = send_text_frame(ws, serialized, compress_dict).await {
-                    return Err(anyhow!(
-                        "sending notification to client {client_name:?}: {err}"
-                    ));
-                }
             }
-            SelectOutcome::Idle => {
-                log::info!(
-                    target: "remote_control",
-                    "client {client_name:?} idle for {IDLE_READ_TIMEOUT_SECS}s, closing",
-                );
-                let close = CloseFrame {
+        }
+        let Some(connection) = conn.clone() else {
+            break LoopExit::Failed(anyhow!("connection dispatcher disappeared"));
+        };
+
+        // THE ORDERING POINT. `begin_dispatch` commits the request upstream
+        // and is awaited here, on the reader, in wire order — it is an id
+        // mint plus a `write_all` on a local Unix socket. Only the wait for
+        // the reply is spawned. Dispatching the whole call on a task would
+        // let two requests race for the upstream write mutex, and the mobile
+        // client's offline queue depends on the opposite: it releases each
+        // send as soon as the previous frame reaches the transport, so a
+        // flush of N queued messages puts N sends in flight at once and
+        // relies on us executing them in arrival order. Reversing them
+        // reverses the transcript, permanently.
+        let pending = tokio::select! {
+            biased;
+            reason = &mut kill_rx => {
+                break LoopExit::Killed(reason.unwrap_or(KillReason::Evicted));
+            }
+            _ = wait_for_shutdown(&mut conn_shutdown_rx) => break LoopExit::ServerShutdown,
+            pending = connection.begin_dispatch(client_name, request) => pending,
+            _ = tokio::time::sleep_until(idle_deadline) => break LoopExit::Idle,
+        };
+
+        let outbound = outbound_tx.clone();
+        let name = client_name.to_string();
+        dispatch_tasks.spawn(async move {
+            let response = pending.await;
+            queue_response_owned(outbound, response, permit, &name).await;
+        });
+    };
+
+    let (close_frame, result) = match exit {
+        LoopExit::ClientClose => (Some(None), Ok(())),
+        LoopExit::StreamEnded => {
+            log::debug!(
+                target: "remote_control",
+                "client {client_name:?} closed connection",
+            );
+            (None, Ok(()))
+        }
+        LoopExit::Idle => {
+            log::info!(
+                target: "remote_control",
+                "client {client_name:?} sent nothing for {idle_window:?}, closing",
+            );
+            (
+                Some(Some(CloseFrame {
                     code: CloseCode::Away,
                     reason: "idle timeout".into(),
-                };
-                let _ = ws.send(Message::Close(Some(close))).await;
-                return Ok(());
+                })),
+                Ok(()),
+            )
+        }
+        LoopExit::Killed(reason) => {
+            log::info!(
+                target: "remote_control",
+                "closing client {client_name:?}: {}",
+                reason.close_reason(),
+            );
+            (
+                Some(Some(CloseFrame {
+                    code: CloseCode::Away,
+                    reason: reason.close_reason().into(),
+                })),
+                Ok(()),
+            )
+        }
+        LoopExit::ServerShutdown => {
+            log::info!(
+                target: "remote_control",
+                "closing client {client_name:?}: remote control disabled",
+            );
+            (
+                Some(Some(CloseFrame {
+                    code: CloseCode::Away,
+                    reason: "server shutting down".into(),
+                })),
+                Ok(()),
+            )
+        }
+        LoopExit::Oversize => (
+            Some(Some(CloseFrame {
+                code: CloseCode::Size,
+                reason: "message too big".into(),
+            })),
+            Ok(()),
+        ),
+        LoopExit::Failed(err) => (None, Err(err)),
+    };
+
+    // Teardown. The pump holds an `outbound_tx` clone, so it has to go
+    // first or the writer would never see the channel close. In-flight
+    // dispatch tasks hold clones too, but they're bounded by the proxy's
+    // 30 s call timeout and the grace wait below caps how long we care.
+    if let Some(pump) = notification_pump {
+        pump.abort();
+    }
+    if let Some(frame) = close_frame {
+        // Priority path: the writer prefers this over the queue and will
+        // even preempt a frame already in flight, so the close goes out
+        // ahead of any backlog.
+        let _ = close_tx.send(frame);
+    } else {
+        drop(close_tx);
+    }
+    // Cancel the response-waits only after the close is queued: any
+    // response they had already handed to the writer still goes out, but
+    // nothing keeps waiting on an editor call whose socket is gone.
+    dispatch_tasks.abort_all();
+    drop(outbound_tx);
+    let sink = match tokio::time::timeout(Duration::from_secs(CLOSE_GRACE_SECS), &mut writer).await
+    {
+        Ok(Ok(sink)) => Some(sink),
+        Ok(Err(err)) => {
+            log::debug!(
+                target: "remote_control",
+                "writer task for {client_name:?} ended abnormally: {err}",
+            );
+            None
+        }
+        Err(_) => {
+            log::debug!(
+                target: "remote_control",
+                "writer for {client_name:?} didn't finish within {CLOSE_GRACE_SECS}s; aborting",
+            );
+            writer.abort();
+            None
+        }
+    };
+    if let Some(sink) = sink {
+        match sink.reunite(stream) {
+            Ok(mut ws) => graceful_teardown(&mut ws).await,
+            Err(_) => log::debug!(
+                target: "remote_control",
+                "could not reunite socket halves for {client_name:?}; skipping graceful teardown",
+            ),
+        }
+    }
+    result
+}
+
+/// Finish the TCP conversation politely once the close frame is out.
+///
+/// Dropping a socket that still has unread bytes in its receive queue
+/// makes the kernel answer with RST, and an RST wipes the *peer's*
+/// receive buffer — including the close frame we just sent. That turns a
+/// deliberate, reasoned close (1009 "message too big", "authorization
+/// revoked", "server shutting down") back into the bare connection reset
+/// the client can only read as a network blip, which is exactly the
+/// failure we set out to fix. So: half-close (rustls emits close_notify,
+/// TCP sends FIN) and read whatever is still in flight until EOF.
+/// Bounded by [`CLOSE_DRAIN_SECS`] — a peer that keeps talking gets cut
+/// off anyway.
+async fn graceful_teardown<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let inner = ws.get_mut();
+    let drain = async {
+        if let Err(err) = inner.shutdown().await {
+            log::debug!(target: "remote_control", "socket shutdown: {err}");
+            return;
+        }
+        let mut scratch = [0u8; 4096];
+        loop {
+            match inner.read(&mut scratch).await {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(err) => {
+                    log::debug!(target: "remote_control", "drain read: {err}");
+                    return;
+                }
             }
-            SelectOutcome::Evicted => {
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(CLOSE_DRAIN_SECS), drain).await;
+}
+
+/// Resolve once `conn_shutdown_rx` reports shutdown, or once its sender
+/// is gone (which only happens when the `ListenerHandle` is dropped, i.e.
+/// the same thing).
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The connection's only writer. Owns the sink so nothing else can block
+/// on it.
+///
+/// Two properties matter here.
+///
+/// *A close is never stuck behind a frame.* `close_rx` is raced against
+/// both "wait for the next item" and the write of the item in flight, so
+/// a revoke / shutdown / idle / 1009 close reaches the phone even while a
+/// multi-megabyte response is draining over LTE. Preempting truncates
+/// that frame, which is fine — we are closing — but a truncated WS frame
+/// is unparseable, so the close is written only after the partial frame
+/// gets [`CLOSE_WRITE_TIMEOUT_SECS`] to drain. If it can't, the peer gets
+/// a reset instead of a reason; that is the honest outcome for a link
+/// that cannot finish the frame it is on.
+///
+/// *A slow link is not a dead link.* The per-frame budget scales with the
+/// payload (see [`write_budget`]) instead of being a flat deadline: a flat
+/// 30 s would cut off any `get_session` bigger than ~25 MB on anything
+/// under ~7 Mbit/s and loop the client on the retry forever — the exact
+/// user this work exists for.
+async fn writer_task<S>(
+    mut sink: SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+    mut outbound_rx: mpsc::Receiver<Outbound>,
+    mut close_rx: oneshot::Receiver<Option<CloseFrame>>,
+    compress_dict: Option<u8>,
+    client_name: String,
+) -> SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Cleared once the reader drops `close_tx` without asking for a close
+    // (it exited on a path with nothing to say, or it panicked). After
+    // that the oneshot must not be polled again.
+    let mut close_armed = true;
+    loop {
+        let item = if close_armed {
+            tokio::select! {
+                biased;
+                closing = &mut close_rx => match closing {
+                    Ok(frame) => {
+                        write_close_frame(&mut sink, frame, &client_name).await;
+                        return sink;
+                    }
+                    Err(_) => {
+                        close_armed = false;
+                        continue;
+                    }
+                },
+                item = outbound_rx.recv() => item,
+            }
+        } else {
+            outbound_rx.recv().await
+        };
+        let Some(item) = item else {
+            return sink;
+        };
+
+        // The permit (if any) is released by this binding going out of
+        // scope at the end of the iteration — i.e. once the frame is on
+        // the wire, not when the response was serialised.
+        let (message, _permit) = match item {
+            Outbound::Raw(message) => (message, None),
+            Outbound::Json(text, permit) => (encode_json_frame(text, compress_dict), permit),
+        };
+        let budget = write_budget(message.len());
+
+        let step = {
+            let write = tokio::time::timeout(budget, sink.send(message));
+            let mut write = std::pin::pin!(write);
+            if close_armed {
+                tokio::select! {
+                    biased;
+                    closing = &mut close_rx => match closing {
+                        Ok(frame) => WriteStep::Preempted(frame),
+                        Err(_) => {
+                            close_armed = false;
+                            WriteStep::from_result(write.as_mut().await)
+                        }
+                    },
+                    result = write.as_mut() => WriteStep::from_result(result),
+                }
+            } else {
+                WriteStep::from_result(write.as_mut().await)
+            }
+        };
+
+        match step {
+            WriteStep::Continue => {}
+            WriteStep::Failed(err) => {
+                log::debug!(
+                    target: "remote_control",
+                    "write to {client_name:?} failed: {err}",
+                );
+                return sink;
+            }
+            WriteStep::TimedOut => {
                 log::info!(
                     target: "remote_control",
-                    "client {client_name:?} evicted by accept loop to free a slot",
+                    "write to {client_name:?} did not finish within its {budget:?} budget; dropping connection",
                 );
-                let close = CloseFrame {
-                    code: CloseCode::Away,
-                    reason: "evicted by new connection".into(),
-                };
-                let _ = ws.send(Message::Close(Some(close))).await;
-                return Ok(());
+                return sink;
+            }
+            WriteStep::Preempted(frame) => {
+                // The abandoned frame's bytes are still in tungstenite's
+                // write buffer; `write_close_frame` flushes them ahead of
+                // the close, which is what keeps the close parseable.
+                write_close_frame(&mut sink, frame, &client_name).await;
+                return sink;
             }
         }
     }
 }
 
-enum SelectOutcome {
-    Frame(
-        Option<
-            Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+/// Outcome of one pass through the writer's per-frame step.
+enum WriteStep {
+    Continue,
+    Failed(tokio_tungstenite::tungstenite::Error),
+    TimedOut,
+    Preempted(Option<CloseFrame>),
+}
+
+impl WriteStep {
+    fn from_result(
+        result: Result<
+            Result<(), tokio_tungstenite::tungstenite::Error>,
+            tokio::time::error::Elapsed,
         >,
-    ),
-    Notification(Option<serde_json::Value>),
-    Idle,
-    Evicted,
+    ) -> Self {
+        match result {
+            Ok(Ok(())) => WriteStep::Continue,
+            Ok(Err(err)) => WriteStep::Failed(err),
+            Err(_) => WriteStep::TimedOut,
+        }
+    }
 }
 
-async fn write_response<S>(
-    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+/// Per-frame write budget: a floor plus an allowance proportional to the
+/// payload.
+///
+/// `SinkExt::send` doesn't resolve until the whole frame has been accepted
+/// by the kernel, and outbound frames are unbounded — tungstenite's size
+/// caps are read-side only, and the payloads this server sends (a session
+/// with inline images can be tens of megabytes) are exactly the ones that
+/// take minutes on a mobile link. So the allowance assumes nothing better
+/// than [`MIN_WRITE_THROUGHPUT_BYTES_PER_SEC`]. This is a backstop against
+/// a socket that is truly wedged, not a liveness detector: the reader's
+/// inbound idle timer is what notices a dead peer, and a close request
+/// preempts a frame in flight regardless of its budget.
+fn write_budget(bytes: usize) -> Duration {
+    Duration::from_secs(WRITE_TIMEOUT_BASE_SECS)
+        + Duration::from_secs(bytes as u64 / MIN_WRITE_THROUGHPUT_BYTES_PER_SEC)
+}
+
+/// Write the close frame under [`CLOSE_WRITE_TIMEOUT_SECS`]. Any bytes
+/// still buffered from a preempted frame are flushed first (tungstenite
+/// does that as part of the send), which is why the budget has to cover
+/// both.
+async fn write_close_frame<S>(
+    sink: &mut SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+    frame: Option<CloseFrame>,
+    client_name: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let sent = tokio::time::timeout(
+        Duration::from_secs(CLOSE_WRITE_TIMEOUT_SECS),
+        sink.send(Message::Close(frame)),
+    )
+    .await;
+    match sent {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => log::debug!(
+            target: "remote_control",
+            "close frame to {client_name:?} failed: {err}",
+        ),
+        Err(_) => log::info!(
+            target: "remote_control",
+            "close frame to {client_name:?} stalled for {CLOSE_WRITE_TIMEOUT_SECS}s; \
+             the client will see a reset instead of a reason",
+        ),
+    }
+}
+
+/// Forward this connection's notifications to the writer, in order.
+/// Runs as its own task so a slow client backs pressure onto
+/// notifications alone, never onto the reader's RPC / ping / idle path.
+async fn pump_notifications(
+    mut notifications: NotificationReceiver,
+    outbound: mpsc::Sender<Outbound>,
+    client_name: String,
+) {
+    while let Some(payload) = notifications.recv().await {
+        let kind = payload
+            .pointer("/params/kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if kind.starts_with("upload_") {
+            log::info!(
+                target: "remote_control::upload",
+                "forwarding {kind} notification to {client_name:?}",
+            );
+        }
+        if !allow_list::should_forward_event(kind) {
+            if kind.starts_with("upload_") {
+                log::warn!(
+                    target: "remote_control::upload",
+                    "DROPPING {kind} notification — allow_list rejected (BUG?)",
+                );
+            }
+            continue;
+        }
+        let envelope = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "remote/notification",
+            "params": payload
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        });
+        let serialized = match serde_json::to_string(&envelope) {
+            Ok(text) => text,
+            Err(err) => {
+                log::warn!(
+                    target: "remote_control",
+                    "serialising notification: {err:#}; dropping",
+                );
+                continue;
+            }
+        };
+        if outbound
+            .send(Outbound::Json(serialized, None))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Decode an inbound binary frame: either a compressed JSON-RPC request
+/// (returned as text for the caller to dispatch) or a chunked-upload
+/// payload, which is handled here and yields `None`.
+fn handle_binary_frame(
+    bytes: tokio_tungstenite::tungstenite::Bytes,
+    client_name: &str,
+) -> Option<String> {
+    if crate::wire_codec::is_compressed(&bytes) {
+        return match crate::wire_codec::decompress(&bytes) {
+            Ok(raw) => match String::from_utf8(raw) {
+                Ok(text) => Some(text),
+                Err(err) => {
+                    log::warn!(
+                        target: "remote_control",
+                        "client {client_name:?} sent a compressed frame that wasn't UTF-8: {err}; dropping",
+                    );
+                    None
+                }
+            },
+            Err(err) => {
+                log::warn!(
+                    target: "remote_control",
+                    "client {client_name:?} sent an undecodable compressed frame: {err}; dropping",
+                );
+                None
+            }
+        };
+    }
+    // Chunked-upload frame: 16-byte header
+    // (u64 upload_id BE | u64 offset BE) + raw payload.
+    // See `docs/plans/2026-05-19-chunked-upload-binary-frames.md`.
+    // Anything < 16 bytes is malformed — log and drop rather than
+    // erroring on the WS, since a legit client never sends shorter
+    // frames and an attacker shouldn't get useful feedback.
+    if bytes.len() < 16 {
+        log::warn!(
+            target: "remote_control",
+            "client {client_name:?} sent {n}-byte binary frame (< 16); dropping",
+            n = bytes.len(),
+        );
+        return None;
+    }
+    // Diagnostic — debug-level breadcrumb so a live log tail can confirm
+    // chunks ARE reaching the server. Per-chunk, so it stays at debug to
+    // avoid flooding info on large uploads. The header parse below is
+    // duplicated by the handler; that's fine, this is a debug aid not a
+    // hot path.
+    let upload_id_log = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+    let offset_log = u64::from_be_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
+    log::debug!(
+        target: "remote_control::upload",
+        "binary frame from {client_name:?}: upload_id={upload_id_log} offset={offset_log} payload_bytes={}",
+        bytes.len() - 16,
+    );
+    // Delegate parsing + dispatch to the upper-layer handler registered
+    // via `remote_control::set_binary_frame_handler`. Keeps
+    // `remote_control` free of the `solution_agent` dep (which would pull
+    // a second rustls CryptoProvider via its transitive `agent_servers` /
+    // `claude-acp` graph and break the post-auth handshake). A rejection
+    // is reported to the client out-of-band by the handler itself (an
+    // `upload_chunk_rejected` notification) — there is no JSON-RPC id to
+    // answer on a raw binary frame.
+    match crate::binary_frame_handler() {
+        Some(handler) => match handler(&bytes) {
+            Ok(()) => {
+                log::debug!(
+                    target: "remote_control::upload",
+                    "binary frame written: upload_id={upload_id_log} offset={offset_log}",
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    target: "remote_control::upload",
+                    "binary frame handler rejected upload_id={upload_id_log} offset={offset_log} (client={client_name:?}): {err}",
+                );
+            }
+        },
+        None => {
+            log::warn!(
+                target: "remote_control::upload",
+                "NO binary frame handler installed; dropping {n}-byte frame (client={client_name:?})",
+                n = bytes.len(),
+            );
+        }
+    }
+    None
+}
+
+/// Serialise a small protocol-level response (parse error, proxy-open
+/// error) and hand it to the writer without blocking the reader.
+///
+/// A full outbound queue means the client has stopped draining the socket;
+/// dropping the frame leaves that client's call to hit its own timeout,
+/// which is the same outcome it was already heading for. Logged at error
+/// because it is never expected on a healthy connection.
+fn queue_response(
+    outbound: &mpsc::Sender<Outbound>,
     response: &JsonRpcResponse,
-    compress_dict: Option<u8>,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let payload =
-        serde_json::to_string(response).map_err(|err| anyhow!("serialising response: {err}"))?;
-    send_text_frame(ws, payload, compress_dict)
-        .await
-        .context("sending response")
+    client_name: &str,
+) {
+    let payload = match serde_json::to_string(response) {
+        Ok(payload) => payload,
+        Err(err) => {
+            log::warn!(
+                target: "remote_control",
+                "serialising response for {client_name:?}: {err:#}; dropping",
+            );
+            return;
+        }
+    };
+    if outbound.try_send(Outbound::Json(payload, None)).is_err() {
+        log::error!(
+            target: "remote_control",
+            "outbound queue full; dropping protocol-error response to {client_name:?}",
+        );
+    }
 }
 
-/// Send one JSON text frame, compressing it to a binary frame when the client
-/// negotiated compression (`compress_dict`) and the payload is large enough to
-/// benefit. A frame is never inflated, and a client that didn't negotiate
-/// compression only ever receives text.
-async fn send_text_frame<S>(
-    ws: &mut tokio_tungstenite::WebSocketStream<S>,
-    text: String,
-    compress_dict: Option<u8>,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+/// Same as [`queue_response`], but from a dispatch task, where waiting for
+/// queue space is the right backpressure (the caller has nothing else to
+/// do). Hands the in-flight permit to the writer so it is only released
+/// once the response is actually on the wire.
+async fn queue_response_owned(
+    outbound: mpsc::Sender<Outbound>,
+    response: JsonRpcResponse,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    client_name: &str,
+) {
+    let payload = match serde_json::to_string(&response) {
+        Ok(payload) => payload,
+        Err(err) => {
+            log::warn!(
+                target: "remote_control",
+                "serialising response for {client_name:?}: {err:#}; dropping",
+            );
+            return;
+        }
+    };
+    let _ = outbound.send(Outbound::Json(payload, Some(permit))).await;
+}
+
+/// Turn a JSON payload into the frame that goes on the wire: a compressed
+/// binary frame when the client negotiated compression and the payload is
+/// large enough to benefit, a text frame otherwise. A frame is never
+/// inflated, and a client that didn't negotiate compression only ever
+/// receives text.
+fn encode_json_frame(text: String, compress_dict: Option<u8>) -> Message {
     if let Some(dict) = compress_dict {
         if let Some(frame) = crate::wire_codec::compress_if_worthwhile(
             text.as_bytes(),
             dict,
             crate::wire_codec::DEFAULT_COMPRESS_THRESHOLD_BYTES,
         ) {
-            ws.send(Message::Binary(frame.into()))
-                .await
-                .context("sending compressed frame")?;
-            return Ok(());
+            return Message::Binary(frame.into());
         }
     }
-    ws.send(Message::Text(text.into()))
-        .await
-        .context("sending text frame")?;
-    Ok(())
+    Message::Text(text.into())
 }
 
 #[cfg(test)]
@@ -1509,5 +2131,98 @@ mod tests {
         // ladder at #4 (1 h) rather than restarting at the grace tier.
         record_auth_failure(&state, peer).await;
         assert_eq!(ban_tier_secs(&state, peer).await, Some(3_600));
+    }
+
+    /// Carrier-grade NAT (RFC 6598, 100.64.0.0/10) puts thousands of
+    /// unrelated mobile subscribers behind one prefix. Keying the ban ladder
+    /// by /24 there means a stranger's stale pairing can lock the user's own
+    /// phone out for up to 24 h, and the phone only ever sees a TCP reset.
+    #[tokio::test]
+    async fn cgnat_peers_get_independent_ban_records() {
+        let state = ListenerState::default();
+        let attacker = IpAddr::V4(Ipv4Addr::new(100, 100, 5, 9));
+        let victim = IpAddr::V4(Ipv4Addr::new(100, 100, 5, 10));
+
+        record_auth_failure(&state, attacker).await;
+        record_auth_failure(&state, attacker).await;
+        assert_eq!(ban_tier_secs(&state, attacker).await, Some(30));
+        assert!(is_banned(&state, attacker).await);
+        assert!(
+            !is_banned(&state, victim).await,
+            "a different subscriber on the same CGNAT /24 must not inherit the ban"
+        );
+    }
+
+    #[test]
+    fn subnet_key_masks_public_ipv4_to_slash_24_but_keeps_cgnat_whole() {
+        assert_eq!(
+            subnet_key(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77))),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)),
+        );
+        assert_eq!(
+            subnet_key(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+        );
+        assert_eq!(
+            subnet_key(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))),
+            IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254)),
+        );
+        // 100.128.x is outside the /10 — ordinary public space, /24 again.
+        assert_eq!(
+            subnet_key(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 5))),
+            IpAddr::V4(Ipv4Addr::new(100, 128, 0, 0)),
+        );
+    }
+
+    /// The close reason is the only thing telling a phone why it was cut off.
+    /// Revocation used to reuse the eviction string, which reads as "you
+    /// connected twice" — the opposite of the truth.
+    #[test]
+    fn kill_reasons_are_distinct_and_honest() {
+        assert_eq!(
+            KillReason::Evicted.close_reason(),
+            "evicted by new connection"
+        );
+        assert_eq!(KillReason::Revoked.close_reason(), "authorization revoked");
+        assert_ne!(
+            KillReason::Evicted.close_reason(),
+            KillReason::Revoked.close_reason(),
+        );
+    }
+
+    /// H2: the per-frame write budget must scale with the payload. A flat
+    /// 30 s deadline cuts off any session response bigger than about 25 MB
+    /// on anything under ~7 Mbit/s — and the client just retries the same
+    /// request, forever. That is the slow-link user this work exists for,
+    /// not a peer worth disconnecting.
+    #[test]
+    fn write_budget_scales_with_payload_so_a_slow_link_is_not_cut_off() {
+        assert_eq!(
+            write_budget(0),
+            Duration::from_secs(WRITE_TIMEOUT_BASE_SECS),
+            "an empty frame gets exactly the floor"
+        );
+        // The audit's worked example: a session with four photos, ~25 MB.
+        let big = write_budget(25 * 1024 * 1024);
+        assert!(
+            big >= Duration::from_secs(800),
+            "a 25 MB frame must be allowed minutes, got {big:?}"
+        );
+        assert!(
+            write_budget(1024) < write_budget(64 * 1024 * 1024),
+            "the budget must be monotonic in payload size"
+        );
+    }
+
+    /// The reader gives the writer more time to deliver a close than the
+    /// writer is allowed to spend delivering one. Inverting these is how
+    /// close reasons silently stopped arriving whenever the writer was
+    /// mid-frame.
+    #[test]
+    fn close_grace_exceeds_the_close_write_budget() {
+        assert!(
+            CLOSE_GRACE_SECS > CLOSE_WRITE_TIMEOUT_SECS,
+            "reader grace {CLOSE_GRACE_SECS}s must exceed writer budget {CLOSE_WRITE_TIMEOUT_SECS}s",
+        );
     }
 }

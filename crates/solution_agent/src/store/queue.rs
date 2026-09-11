@@ -25,7 +25,7 @@ use gpui::{AsyncApp, Context, Entity, SharedString, Task};
 use acp_thread::{AcpThread, AgentThreadEntry, SelectedPermissionOutcome, ToolCallStatus};
 use agent_client_protocol::schema as acp;
 
-use super::{SolutionAgentStore, SolutionAgentStoreEvent};
+use super::{CsidReceipt, SolutionAgentStore, SolutionAgentStoreEvent};
 use crate::model::{
     PendingBundle, QueueTarget, SessionState, SolutionSessionId, SolutionSessionMetadata,
 };
@@ -473,6 +473,59 @@ impl SolutionAgentStore {
         }
         session.update(cx, |s, _| s.flush_after_cancel = true);
         self.cancel_turn(session_id, cx)
+    }
+
+    /// Atomically claim `csids` for `session_id` (audit N-05).
+    ///
+    /// Returns [`CsidClaim::Duplicate`] iff EVERY id in `csids` was already
+    /// claimed and is still inside [`CSID_DEDUPE_WINDOW`]; the caller must
+    /// then do nothing at all — not even resolve upload handles, which are
+    /// consumed destructively and would fail the second time round. A partial
+    /// overlap is `Accepted` and the unseen ids are claimed: a bundle that
+    /// merges a re-send with a new message must go through.
+    ///
+    /// An EMPTY `csids` is `Accepted` without touching the table — a
+    /// desktop-originated or unstamped send has no idempotency key and can
+    /// never be recognised as a replay.
+    pub fn claim_client_send_ids(
+        &mut self,
+        session_id: SolutionSessionId,
+        csids: &[i64],
+    ) -> CsidReceipt {
+        if csids.is_empty() {
+            return CsidReceipt::accepted(Vec::new());
+        }
+        self.client_send_dedupe
+            .entry(session_id)
+            .or_default()
+            .claim(csids, std::time::Instant::now())
+    }
+
+    /// Undo a claim whose send never reached the enqueue.
+    ///
+    /// MUST be called on every failure path between
+    /// [`claim_client_send_ids`](Self::claim_client_send_ids) and the actual
+    /// `send_message_blocks` — see [`CsidReceipt`] for what a leaked claim
+    /// costs the user. Releases only the ids the matching claim inserted, so
+    /// a partial-overlap bundle cannot un-claim an earlier successful send.
+    pub fn release_client_send_ids(
+        &mut self,
+        session_id: SolutionSessionId,
+        receipt: &CsidReceipt,
+    ) {
+        if receipt.newly_claimed.is_empty() {
+            return;
+        }
+        if let Some(window) = self.client_send_dedupe.get_mut(&session_id) {
+            window.release(&receipt.newly_claimed);
+        }
+    }
+
+    /// Forget every claimed csid for `session_id`. Called from session
+    /// teardown and from the epoch-bumping context wipes: after a `/clear`
+    /// nothing that preceded it can be a meaningful duplicate.
+    pub(crate) fn forget_client_send_ids(&mut self, session_id: SolutionSessionId) {
+        self.client_send_dedupe.remove(&session_id);
     }
 
     /// Send a plain-text user message. Convenience wrapper around

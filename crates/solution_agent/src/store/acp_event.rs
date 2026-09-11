@@ -769,14 +769,19 @@ impl SolutionAgentStore {
                 // for a tool call or the first preview snapshot of a
                 // streaming assistant reply.
                 //
-                // Coalesced via a trailing-edge debounce: a 500 ms quiet
-                // window collapses a token-by-token streaming burst
-                // into roughly 2 emits/sec, and a 2 s max-stale guard
-                // forces an emit when an entry is continuously dirty so
-                // the consumer doesn't starve. Replacing an entry in
+                // Coalesced via a trailing-edge debounce that RE-ARMS on
+                // every update: replacing an entry in
                 // `entry_update_throttles` drops the previous `Task`,
-                // which cancels its inflight timer → only the latest
-                // debounce window's task survives to fire.
+                // cancelling its inflight timer, so only the latest
+                // 500 ms window is ever pending. Consequence: during a
+                // continuous token-by-token stream (updates arriving
+                // faster than every 500 ms) the quiet window NEVER
+                // elapses and the emit cadence is set entirely by the
+                // 2 s max-stale guard — roughly one emit every 2 s. The
+                // 500 ms window only fires as the trailing edge, once
+                // the stream goes quiet. Consumers that size their own
+                // polling against this (the mobile client's tail-resync)
+                // must budget for the ~2 s cadence, not for 500 ms.
                 // Key + emit on the GLOBAL entry index (`live_base + local`),
                 // not the thread-local one the event carries. The consumer
                 // (`build_message_appended_payload`) resolves it against

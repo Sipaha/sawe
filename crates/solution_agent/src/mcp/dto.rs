@@ -364,7 +364,33 @@ pub struct EntrySummary {
     /// caller requested a slice — lets the client reassemble a sparse
     /// map from multiple paginated responses.
     pub index: usize,
-    /// Markdown rendering of the entry, truncated to roughly 200 chars.
+    /// Markdown rendering of the entry, truncated to roughly 200 scalar
+    /// values.
+    ///
+    /// `skip_serializing_if` on EMPTINESS rather than an `Option` so the
+    /// field's Rust type, its `JsonSchema` and every internal consumer stay
+    /// unchanged.
+    ///
+    /// THAT IS ONLY SAFE BECAUSE A RENDERING CAN NEVER BE EMPTY. A shipped
+    /// client declares `preview` non-null with no default, so an omitted key
+    /// does not render as empty — it throws, and since the entry is a member
+    /// of `changed_entries` it fails the decode of the WHOLE response, which
+    /// freezes the transcript until the user force-quits. Every arm of
+    /// `session_entry_to_markdown` prefixes a literal heading or appends a
+    /// literal `\n\n`, so the truncation below is non-empty even for an entry
+    /// with no content of its own. `every_entry_kind_renders_a_non_empty_preview`
+    /// pins that for every variant and fails to COMPILE when a new one is
+    /// added. Do not weaken either half without making this field an `Option`
+    /// first.
+    ///
+    /// So the key is omitted in exactly one situation: a caller that asked for
+    /// `omit_preview_when_markdown` on an entry this response also carries a
+    /// body for. Never omitted for `role == "user"` entries —
+    /// the mobile client keys csid-less optimistic bubbles off the user
+    /// preview, and reconstructing that key from `markdown` would force it to
+    /// re-implement `truncate_preview`'s Unicode-scalar truncation against
+    /// UTF-16 string lengths.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub preview: String,
     /// Full untruncated markdown rendering. Populated only when the
     /// caller passes `include_full_content: true`, or when the entry
@@ -379,6 +405,28 @@ pub struct EntrySummary {
     /// image content blocks".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<EntryImage>>,
+    /// How many inlineable images this entry holds — i.e. the length
+    /// `images` would have had if the caller had asked for it.
+    ///
+    /// Deliberately NOT `skip_serializing_if`: `0` has to go on the wire.
+    /// The client treats an absent field as "this server is too old to
+    /// know" and falls back to probing the entry with a
+    /// `get_session_entry` round trip, so omitting zeros would send it
+    /// probing exactly the text-only entries this field exists to let it
+    /// skip — the optimisation would look wired up and do nothing. A
+    /// 200-message session with two photos pays ~198 useless round trips
+    /// per open without it.
+    ///
+    /// Also independent of the request's `include_images`: the mobile
+    /// client polls with `include_images: false`, which is precisely when
+    /// it needs the count.
+    ///
+    /// Counts only EXTRACTABLE images, matching `count_images_in_entry` —
+    /// so it is 0 for assistant / tool-call / plan entries, whose image
+    /// blocks are flattened to `spk-image://N` links with the raw blocks
+    /// discarded. That matches the client, whose lazy backfill only
+    /// targets user entries.
+    pub image_count: usize,
     /// Present only for `role == "tool_call"` entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<ToolCallSummary>,
@@ -445,6 +493,119 @@ pub struct EntrySummary {
     /// `user_intent.md`). Always `false` for non-user entries.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub editor_recovery: bool,
+    /// Total UTF-8 BYTE length of this entry's full body — the length of
+    /// `markdown`, or of the body the client will hold once it has appended
+    /// `markdown_tail`. Emitted whenever the server built a body at all, in
+    /// BOTH the whole and the delta forms. Absent means "old server, or no
+    /// body was built for this entry" — never "length zero".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_len: Option<u64>,
+    /// Present exactly when the server verified the caller's `known_entries`
+    /// digest for this index and is therefore sending only the tail. Its value
+    /// is the caller's own `markdown_len`, echoed back.
+    ///
+    /// MUST NOT be emitted when the request carried no `known_entries`: an old
+    /// client that received it would decode `markdown = null` and render an
+    /// empty bubble.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_prefix_len: Option<u64>,
+    /// The bytes to append after the caller's first `markdown_prefix_len`
+    /// bytes of held body. Present iff `markdown_prefix_len` is present.
+    ///
+    /// `""` is legal, and it is neither "empty body" nor "absent": it means
+    /// the prefix the caller offered already reached the end of the body this
+    /// server holds.
+    ///
+    /// EMPTINESS IS NOT THE "UNCHANGED" SIGNAL — never branch on it. A client
+    /// offers the digest over its held body MINUS the trailing whitespace run
+    /// (the rendering wraps every body in a role heading and a trailing
+    /// `\n\n`, so that run moves as the body grows), which means an unchanged
+    /// entry comes back with that whitespace as its tail, not with `""`. A
+    /// caller that offered the exact current body sees `""` instead. Both are
+    /// ordinary tails and both splice identically. The honest test for "did
+    /// this entry actually change" is `markdown_len` against the held length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_tail: Option<String>,
+}
+
+/// One entry's body digest as the caller already holds it, so the server can
+/// answer with a tail instead of the whole body (audit N-29).
+///
+/// The digest agreement with the mobile client is byte-for-byte load-bearing:
+/// a divergence splices a tail onto a body the client does not actually hold,
+/// which corrupts the transcript SILENTLY rather than failing to decode. See
+/// [`sha256_16_hex`].
+///
+/// `deny_unknown_fields` makes this struct UNEXTENDABLE without a new feature
+/// token, exactly like `GetSessionChangesParams` itself: a newer client that
+/// adds a field here does not get it politely ignored by an older desktop —
+/// serde rejects the element, which fails the whole `get_session_changes`
+/// call, i.e. a failed poll rather than a degraded one. A future field must
+/// therefore be gated on a NEW `wire_features` token that the client checks
+/// before sending, never added on the assumption that old servers will skip
+/// it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KnownEntryDto {
+    /// STREAM-LOCAL index, the same space as `EntrySummary.index`.
+    pub index: usize,
+    /// UTF-8 BYTE length of the body the client holds for `index`. Never a
+    /// UTF-16 unit count and never a `char` count.
+    pub markdown_len: u64,
+    /// Lowercase hex of the first 16 bytes of SHA-256 over those bytes.
+    pub markdown_hash: String,
+}
+
+/// Hard cap on how many `known_entries` digests one poll may carry. The
+/// response page itself is capped at `CHANGED_ENTRIES_PAGE`, so a caller
+/// offering more digests than that is either confused or hostile; 32 leaves
+/// generous headroom above the client's own cap of 8.
+pub(crate) const KNOWN_ENTRIES_MAX: usize = 32;
+
+/// Validate a caller's `known_entries` and index it by stream-local index.
+///
+/// Every failure is an `invalid_params:` tool error, never a panic — a
+/// malformed digest is a client bug, and answering it with a whole body would
+/// hide that bug rather than surface it.
+pub(crate) fn index_known_entries(
+    known: &[KnownEntryDto],
+) -> anyhow::Result<HashMap<usize, &KnownEntryDto>> {
+    anyhow::ensure!(
+        known.len() <= KNOWN_ENTRIES_MAX,
+        "invalid_params: known_entries capped at {KNOWN_ENTRIES_MAX}"
+    );
+    let mut by_index: HashMap<usize, &KnownEntryDto> = HashMap::with_capacity(known.len());
+    for entry in known {
+        anyhow::ensure!(
+            entry.markdown_hash.len() == 32
+                && entry
+                    .markdown_hash
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "invalid_params: markdown_hash must be 32 lowercase hex chars"
+        );
+        anyhow::ensure!(
+            by_index.insert(entry.index, entry).is_none(),
+            "invalid_params: duplicate index in known_entries"
+        );
+    }
+    Ok(by_index)
+}
+
+/// Lowercase hex of the FIRST 16 BYTES of SHA-256(`bytes`) — exactly 32
+/// characters, `[0-9a-f]`, no prefix and no separators.
+///
+/// Byte-for-byte identical to the mobile client's `Digests.bodyDigest`; the
+/// shared reference vectors in `mcp::tests` are what prove it. Truncation is
+/// fixed at 16 bytes, not "half the digest".
+pub(crate) fn sha256_16_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let full = Sha256::digest(bytes);
+    let mut out = String::with_capacity(32);
+    for byte in &full[..16] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -799,6 +960,18 @@ const FIELD_PREVIEW_MAX_CHARS: usize = 500;
 /// caller threads it through `summarize_entry` calls in oldest-first
 /// order so each `EntryImage.index` is stable across the session even
 /// when an entry holds multiple images.
+///
+/// `body_delta` is the digest the caller claims to already hold for this
+/// entry (audit N-29). `Some` ONLY on the `get_session_changes` path and
+/// ONLY when that request carried a matching `known_entries` element —
+/// every other caller passes `None`, which is what keeps
+/// `markdown_prefix_len` / `markdown_tail` off the wire for a client that
+/// would decode their presence as `markdown = null` and render an empty
+/// bubble.
+///
+/// `omit_preview_when_markdown` drops `preview` for entries this response
+/// also carries a body for (audit N-37). Honoured only for `role != "user"`
+/// entries; see the field's doc on [`EntrySummary::preview`].
 pub(crate) fn summarize_entry(
     entry: &crate::session_entry::SessionEntry,
     index: usize,
@@ -806,6 +979,8 @@ pub(crate) fn summarize_entry(
     include_images: bool,
     image_cursor: &mut usize,
     live_auth_options: &HashMap<String, Vec<ToolCallAuthOption>>,
+    body_delta: Option<&KnownEntryDto>,
+    omit_preview_when_markdown: bool,
 ) -> EntrySummary {
     use crate::session_entry::SessionEntryKind;
     let kind = &entry.kind;
@@ -835,18 +1010,51 @@ pub(crate) fn summarize_entry(
         raw_markdown
     };
     let preview = truncate_preview(&markdown_source, 200);
-    let markdown = if include_full_content {
-        Some(markdown_source)
+    let markdown_len = markdown_source.len() as u64;
+    // Exactly one row of the §2.4 invariant table per entry: whole body,
+    // delta body, or no body. `is_char_boundary` is not optional — without it
+    // `&bytes[..len]` could hash a partial code point and the tail slice
+    // would panic. A non-boundary length is simply a mismatch, so the caller
+    // gets the whole body.
+    let (markdown, markdown_prefix_len, markdown_tail, markdown_len) = if !include_full_content {
+        (None, None, None, None)
+    } else if let Some(known) = body_delta {
+        let held = known.markdown_len as usize;
+        let matches = held <= markdown_source.len()
+            && markdown_source.is_char_boundary(held)
+            && sha256_16_hex(&markdown_source.as_bytes()[..held]) == known.markdown_hash;
+        if matches {
+            let tail = markdown_source[held..].to_string();
+            (
+                None,
+                Some(known.markdown_len),
+                Some(tail),
+                Some(markdown_len),
+            )
+        } else {
+            (Some(markdown_source), None, None, Some(markdown_len))
+        }
     } else {
-        None
+        (Some(markdown_source), None, None, Some(markdown_len))
     };
+    let has_body = markdown.is_some() || markdown_tail.is_some();
+    let preview = if omit_preview_when_markdown && has_body && !matches!(role, EntryRoleDto::User) {
+        String::new()
+    } else {
+        preview
+    };
+    // Computed unconditionally — see the field's doc on `EntrySummary`.
+    // It is the client's only way to tell a photo-bearing user entry from
+    // a text-only one without asking, and it polls with
+    // `include_images: false`.
+    let image_count = count_images_in_entry(kind);
     let images = if include_images {
         Some(extract_images_for_entry(kind, image_cursor))
     } else {
         // Advance the cursor even when the caller didn't opt in, so
         // toggling `include_images` between calls preserves the same
         // stable indices.
-        *image_cursor += count_images_in_entry(kind);
+        *image_cursor += image_count;
         None
     };
     let tool_call = if let SessionEntryKind::ToolCall { .. } = kind {
@@ -893,6 +1101,7 @@ pub(crate) fn summarize_entry(
         preview,
         markdown,
         images,
+        image_count,
         tool_call,
         plan,
         system_level,
@@ -902,6 +1111,9 @@ pub(crate) fn summarize_entry(
         subagent_id,
         observer_nudge,
         editor_recovery,
+        markdown_len,
+        markdown_prefix_len,
+        markdown_tail,
     }
 }
 

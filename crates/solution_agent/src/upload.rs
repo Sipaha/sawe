@@ -50,7 +50,18 @@ const MAX_CONCURRENT_PER_SESSION: usize = 4;
 /// check then holds the actual bytes to the declared size).
 pub const MAX_UPLOAD_SIZE: u64 = 5 * 1024 * 1024;
 
-/// 1 hour TTL — uploads that aren't finished within this window get GCed.
+/// Cap on the pending-rejection buffer. Rejections coalesce per upload, so
+/// this is only reachable with more than this many distinct uploads in
+/// flight at once — far above the per-session cap. It exists so a stalled
+/// GPUI drainer can never turn a chunk flood into unbounded growth.
+const MAX_QUEUED_REJECTIONS: usize = 64;
+
+/// 1 hour TTL — uploads that see no activity within this window get GCed.
+/// The clock is `last_activity_at`, not `created_at`: a slow or repeatedly
+/// interrupted upload that keeps making progress is a live upload, and
+/// reaping it mid-flight would fail the client with `upload expired` while
+/// its bytes are sitting on disk. Only genuinely abandoned uploads (no
+/// chunk for an hour) get reaped.
 pub const UPLOAD_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// State for a single in-flight upload. `received_bytes` is sequential — see
@@ -64,8 +75,35 @@ pub struct UploadState {
     pub tmp_path: PathBuf,
     pub received_bytes: u64,
     pub created_at: Instant,
+    /// Last time a chunk landed (seeded to `created_at` at `init`). Drives
+    /// the [`UPLOAD_TTL`] reap so a long-but-progressing upload is never
+    /// collected out from under a client.
+    pub last_activity_at: Instant,
     pub sha256: Option<String>,
     file: File,
+}
+
+impl UploadState {
+    /// Compare `data` against the bytes already written at `offset`. The
+    /// caller has established that the range lies wholly inside
+    /// `received_bytes`.
+    fn range_matches(&mut self, offset: u64, data: &[u8]) -> Result<bool> {
+        use std::io::Read as _;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|err| anyhow!("seek({offset}) verifying upload {}: {err}", self.id))?;
+        let mut existing = vec![0u8; data.len()];
+        self.file
+            .read_exact(&mut existing)
+            .map_err(|err| anyhow!("read verifying upload {}: {err}", self.id))?;
+        // Restore the append position — `write_chunk` seeks before every
+        // write, but leaving the handle where the caller expects it keeps
+        // this method side-effect-free from the outside.
+        self.file
+            .seek(SeekFrom::Start(self.received_bytes))
+            .map_err(|err| anyhow!("restoring position on upload {}: {err}", self.id))?;
+        Ok(existing == data)
+    }
 }
 
 /// Successful `finish` result. The tmp file lives until the caller either
@@ -88,6 +126,20 @@ pub struct ChunkAck {
     pub received_bytes: u64,
 }
 
+/// Negative counterpart of [`ChunkAck`]: a chunk the manager refused. Drained
+/// by the same GPUI-side pump and emitted as an `upload_chunk_rejected`
+/// notification so the client can re-seek immediately instead of waiting out
+/// its 30 s ack timeout. `expected_offset` is the offset the next chunk must
+/// carry (i.e. current `received_bytes`), or `None` when the upload id is
+/// unknown — in which case the client should abandon the transfer.
+#[derive(Clone, Debug)]
+pub struct ChunkRejection {
+    pub upload_id: UploadId,
+    pub offset: u64,
+    pub expected_offset: Option<u64>,
+    pub reason: String,
+}
+
 pub struct UploadManager {
     state: HashMap<UploadId, UploadState>,
     next_id: AtomicU64,
@@ -96,6 +148,12 @@ pub struct UploadManager {
     /// `editor_mcp::emit_notification` calls. Bounded by the rate of
     /// inbound chunks; the drainer empties it on every tick.
     ack_queue: Vec<ChunkAck>,
+    /// Same hand-off as `ack_queue`, for chunks we refused. Drained by the
+    /// same pump and emitted as `upload_chunk_rejected`. Coalesced per
+    /// upload and capped at [`MAX_QUEUED_REJECTIONS`] — only the latest
+    /// `expected_offset` for an upload is useful, and the drainer runs on
+    /// the GPUI thread, which can stall.
+    rejection_queue: Vec<ChunkRejection>,
 }
 
 impl UploadManager {
@@ -115,6 +173,7 @@ impl UploadManager {
             next_id: AtomicU64::new(seed.max(1)),
             tmp_root,
             ack_queue: Vec::new(),
+            rejection_queue: Vec::new(),
         })
     }
 
@@ -166,6 +225,7 @@ impl UploadManager {
                 tmp_path,
                 received_bytes: 0,
                 created_at: Instant::now(),
+                last_activity_at: Instant::now(),
                 sha256,
                 file,
             },
@@ -176,22 +236,97 @@ impl UploadManager {
     /// Append `data` at `offset`. Refuses non-sequential writes (offset must
     /// equal current `received_bytes`) — V1 wire protocol is in-order to
     /// avoid sparse-file handling. Returns the new cumulative `received_bytes`.
+    ///
+    /// A chunk that lands entirely inside the already-received prefix is a
+    /// duplicate, not an error: a half-open link makes the client resend the
+    /// chunk whose ack it never saw. Re-acking it (without rewriting the
+    /// bytes) lets the transfer continue instead of stalling for the client's
+    /// 30 s ack timeout.
+    ///
+    /// Every refusal is queued as a [`ChunkRejection`] so the GPUI-side pump
+    /// can tell the client *now* which offset to resume from; the `Err` is
+    /// still returned for the caller's log.
     pub fn write_chunk(&mut self, id: UploadId, offset: u64, data: &[u8]) -> Result<u64> {
-        let entry = self
-            .state
-            .get_mut(&id)
-            .ok_or_else(|| anyhow!("write_chunk: unknown upload_id {id}"))?;
+        if !self.state.contains_key(&id) {
+            self.push_rejection(ChunkRejection {
+                upload_id: id,
+                offset,
+                expected_offset: None,
+                reason: "unknown_upload_id".into(),
+            });
+            bail!("write_chunk: unknown upload_id {id}");
+        }
+        // Safe: presence was just checked, and `self` is exclusively
+        // borrowed throughout.
+        let entry = self.state.get_mut(&id).expect("entry present");
         if offset != entry.received_bytes {
+            let len = data.len() as u64;
+            // Re-send of a range we already hold → idempotent re-ack, but
+            // only if the bytes actually match. The design's other integrity
+            // net — the sha256 in `finish` — is optional on the wire and the
+            // mobile client never populates it, so accepting a duplicate
+            // range sight-unseen would let a buggy client silently swap part
+            // of its own upload. Comparing costs one read of an already-hot
+            // page on a path that only fires after a link glitch.
+            if offset < entry.received_bytes && offset.saturating_add(len) <= entry.received_bytes {
+                match entry.range_matches(offset, data) {
+                    Ok(true) => {
+                        let received = entry.received_bytes;
+                        entry.last_activity_at = Instant::now();
+                        self.ack_queue.push(ChunkAck {
+                            upload_id: id,
+                            received_bytes: received,
+                        });
+                        return Ok(received);
+                    }
+                    Ok(false) => {
+                        let expected = entry.received_bytes;
+                        self.push_rejection(ChunkRejection {
+                            upload_id: id,
+                            offset,
+                            expected_offset: Some(expected),
+                            reason: "duplicate_mismatch".into(),
+                        });
+                        bail!(
+                            "write_chunk: upload {id} resent offset {offset} with different bytes",
+                        );
+                    }
+                    Err(err) => {
+                        let expected = entry.received_bytes;
+                        self.push_rejection(ChunkRejection {
+                            upload_id: id,
+                            offset,
+                            expected_offset: Some(expected),
+                            reason: "duplicate_unverifiable".into(),
+                        });
+                        return Err(err);
+                    }
+                }
+            }
+            let expected = entry.received_bytes;
+            self.push_rejection(ChunkRejection {
+                upload_id: id,
+                offset,
+                expected_offset: Some(expected),
+                reason: "out_of_order".into(),
+            });
             bail!(
-                "write_chunk: out-of-order chunk for upload {id} — got offset {offset}, expected {}",
-                entry.received_bytes
+                "write_chunk: out-of-order chunk for upload {id} — got offset {offset}, expected {expected}",
             );
         }
         let new_total = entry.received_bytes.saturating_add(data.len() as u64);
         if new_total > entry.expected_size {
+            let expected_offset = entry.received_bytes;
+            let expected_size = entry.expected_size;
+            self.push_rejection(ChunkRejection {
+                upload_id: id,
+                offset,
+                expected_offset: Some(expected_offset),
+                reason: "overrun".into(),
+            });
             bail!(
                 "write_chunk: upload {id} overrun — total {new_total} > expected {expected}",
-                expected = entry.expected_size,
+                expected = expected_size,
             );
         }
         entry
@@ -208,6 +343,7 @@ impl UploadManager {
         // editor restarts (we don't — TTL drops dangling uploads anyway),
         // promote this to `sync_all()`.
         entry.received_bytes = new_total;
+        entry.last_activity_at = Instant::now();
         self.ack_queue.push(ChunkAck {
             upload_id: id,
             received_bytes: new_total,
@@ -275,12 +411,16 @@ impl UploadManager {
         Ok(())
     }
 
-    /// Prune entries older than `ttl`. Returns the number reaped. Caller
-    /// passes `Instant::now()` so tests can shift the clock.
+    /// Prune entries that have seen no chunk for `ttl`. Returns the number
+    /// reaped. Caller passes `Instant::now()` so tests can shift the clock.
+    ///
+    /// The clock is `last_activity_at`, so an upload that is slowly but
+    /// steadily progressing across a long outage-riddled session is never
+    /// reaped out from under its client; only an abandoned one is.
     pub fn gc(&mut self, now: Instant, ttl: Duration) -> usize {
         let mut expired = Vec::new();
         for (id, entry) in self.state.iter() {
-            if now.saturating_duration_since(entry.created_at) > ttl {
+            if now.saturating_duration_since(entry.last_activity_at) > ttl {
                 expired.push((*id, entry.tmp_path.clone()));
             }
         }
@@ -307,6 +447,30 @@ impl UploadManager {
     /// drainer can release the mutex before emitting.
     pub fn drain_acks(&mut self) -> Vec<ChunkAck> {
         std::mem::take(&mut self.ack_queue)
+    }
+
+    /// Queue a rejection, replacing any earlier one for the same upload —
+    /// the client only ever acts on the most recent `expected_offset`.
+    fn push_rejection(&mut self, rejection: ChunkRejection) {
+        if let Some(slot) = self
+            .rejection_queue
+            .iter_mut()
+            .find(|queued| queued.upload_id == rejection.upload_id)
+        {
+            *slot = rejection;
+            return;
+        }
+        if self.rejection_queue.len() >= MAX_QUEUED_REJECTIONS {
+            self.rejection_queue.remove(0);
+        }
+        self.rejection_queue.push(rejection);
+    }
+
+    /// Drain queued chunk rejections. Same hand-off contract as
+    /// [`UploadManager::drain_acks`]; the drainer fans each one out as an
+    /// `upload_chunk_rejected` notification.
+    pub fn drain_rejections(&mut self) -> Vec<ChunkRejection> {
+        std::mem::take(&mut self.rejection_queue)
     }
 }
 
@@ -1011,5 +1175,160 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid upload handle"), "got: {err}");
+    }
+
+    /// N-55: the TTL used to run from `created_at`, so an upload that
+    /// survived a long outage-riddled session got reaped mid-flight and the
+    /// client saw `upload expired` with its bytes still on disk. The clock
+    /// is now last-chunk activity.
+    #[test]
+    fn gc_measures_the_ttl_from_the_last_chunk_not_from_creation() {
+        let (mut m, _dir) = mgr();
+        let id = m
+            .init("s".into(), "image/png".into(), "a".into(), 8, None)
+            .expect("init");
+        // Simulate a long-lived upload: created a while ago, but still
+        // making progress right now.
+        sleep(Duration::from_millis(20));
+        m.write_chunk(id, 0, &[1, 2, 3, 4]).expect("c1");
+
+        let reaped = m.gc(Instant::now(), Duration::from_millis(10));
+        assert_eq!(reaped, 0, "an upload that just wrote a chunk is not stale");
+        assert!(m.resolve(id).is_some());
+
+        // Once it really does go quiet for longer than the TTL, it goes.
+        sleep(Duration::from_millis(20));
+        assert_eq!(m.gc(Instant::now(), Duration::from_millis(10)), 1);
+    }
+
+    /// N-55: a refused chunk used to be logged and nothing else, so the
+    /// client sat out its 30 s ack timeout and went Paused on a working
+    /// link. Every refusal now queues a rejection the drainer turns into an
+    /// `upload_chunk_rejected` notification carrying the resume offset.
+    #[test]
+    fn an_out_of_order_chunk_queues_a_rejection_with_the_expected_offset() {
+        let (mut m, _dir) = mgr();
+        let id = m
+            .init("s".into(), "image/png".into(), "a".into(), 10, None)
+            .expect("init");
+        m.write_chunk(id, 0, &[1, 2, 3, 4]).expect("c1");
+        let _ = m.drain_acks();
+
+        m.write_chunk(id, 9, &[9])
+            .expect_err("offset 9 is not next");
+        let rejections = m.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].upload_id, id);
+        assert_eq!(rejections[0].offset, 9);
+        assert_eq!(rejections[0].expected_offset, Some(4));
+        assert_eq!(rejections[0].reason, "out_of_order");
+    }
+
+    #[test]
+    fn a_chunk_for_an_unknown_upload_queues_a_rejection_without_an_offset() {
+        let (mut m, _dir) = mgr();
+        m.write_chunk(4242, 0, &[1]).expect_err("unknown id");
+        let rejections = m.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].upload_id, 4242);
+        assert_eq!(rejections[0].expected_offset, None);
+        assert_eq!(rejections[0].reason, "unknown_upload_id");
+    }
+
+    /// N-55: a half-open link makes the client resend the chunk whose ack it
+    /// never saw. Treating that as an error stalled the transfer; re-acking
+    /// the range we already hold lets it continue, and writes nothing.
+    #[test]
+    fn a_resent_chunk_is_re_acked_instead_of_rejected() {
+        let (mut m, _dir) = mgr();
+        let id = m
+            .init("s".into(), "image/png".into(), "a".into(), 8, None)
+            .expect("init");
+        m.write_chunk(id, 0, &[1, 2, 3, 4]).expect("c1");
+        let _ = m.drain_acks();
+
+        let received = m
+            .write_chunk(id, 0, &[1, 2, 3, 4])
+            .expect("duplicate re-ack");
+        assert_eq!(received, 4);
+        assert_eq!(
+            m.status(id),
+            Some((4, 8)),
+            "the duplicate must not advance the offset"
+        );
+        let acks = m.drain_acks();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].received_bytes, 4);
+        assert!(
+            m.drain_rejections().is_empty(),
+            "a duplicate is not a rejection"
+        );
+    }
+
+    #[test]
+    fn an_overrun_chunk_queues_a_rejection() {
+        let (mut m, _dir) = mgr();
+        let id = m
+            .init("s".into(), "image/png".into(), "a".into(), 4, None)
+            .expect("init");
+        m.write_chunk(id, 0, &[1, 2, 3, 4, 5]).expect_err("overrun");
+        let rejections = m.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].reason, "overrun");
+        assert_eq!(rejections[0].expected_offset, Some(0));
+    }
+
+    /// The idempotent re-ack must verify the bytes, not just the range. The
+    /// only other integrity net (`finish`'s sha256) is optional on the wire
+    /// and the mobile client never sends it, so an unverified re-ack would
+    /// let a buggy client swap part of its own upload unnoticed.
+    #[test]
+    fn a_resent_chunk_with_different_bytes_is_rejected() {
+        let (mut m, _dir) = mgr();
+        let id = m
+            .init("s".into(), "image/png".into(), "a".into(), 8, None)
+            .expect("init");
+        m.write_chunk(id, 0, &[1, 2, 3, 4]).expect("c1");
+        let _ = m.drain_acks();
+
+        m.write_chunk(id, 0, &[9, 9, 9, 9])
+            .expect_err("mismatched duplicate must not be re-acked");
+        let rejections = m.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].reason, "duplicate_mismatch");
+        assert_eq!(rejections[0].expected_offset, Some(4));
+        assert!(m.drain_acks().is_empty());
+        assert_eq!(
+            m.status(id),
+            Some((4, 8)),
+            "a rejected duplicate must not touch the offset"
+        );
+    }
+
+    /// Rejections coalesce per upload — only the newest `expected_offset` is
+    /// actionable — and the buffer is capped so a stalled GPUI drainer can't
+    /// let a chunk flood grow it without bound.
+    #[test]
+    fn rejections_coalesce_per_upload_and_stay_bounded() {
+        let (mut m, _dir) = mgr();
+        let id = m
+            .init("s".into(), "image/png".into(), "a".into(), 10, None)
+            .expect("init");
+        m.write_chunk(id, 0, &[1, 2, 3, 4]).expect("c1");
+        let _ = m.drain_acks();
+
+        for offset in [7, 8, 9] {
+            m.write_chunk(id, offset, &[0]).expect_err("out of order");
+        }
+        let rejections = m.drain_rejections();
+        assert_eq!(rejections.len(), 1, "one upload → one pending rejection");
+        assert_eq!(rejections[0].offset, 9, "the newest rejection wins");
+        assert_eq!(rejections[0].expected_offset, Some(4));
+
+        for unknown in 0..(MAX_QUEUED_REJECTIONS as u64 * 2) {
+            m.write_chunk(900_000 + unknown, 0, &[1])
+                .expect_err("unknown id");
+        }
+        assert_eq!(m.drain_rejections().len(), MAX_QUEUED_REJECTIONS);
     }
 }

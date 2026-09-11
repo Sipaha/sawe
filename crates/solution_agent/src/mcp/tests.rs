@@ -2939,6 +2939,8 @@ async fn get_session_changes_returns_only_entries_past_since_seq(cx: &mut gpui::
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -2964,6 +2966,8 @@ async fn get_session_changes_returns_only_entries_past_since_seq(cx: &mut gpui::
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3006,6 +3010,8 @@ async fn get_session_changes_delivers_coalesce_merge_update(cx: &mut gpui::TestA
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3064,6 +3070,8 @@ async fn get_session_changes_paginates_changed_entries(cx: &mut gpui::TestAppCon
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3085,6 +3093,8 @@ async fn get_session_changes_paginates_changed_entries(cx: &mut gpui::TestAppCon
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3121,6 +3131,8 @@ async fn get_session_changes_sections_always_present(cx: &mut gpui::TestAppConte
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3158,6 +3170,8 @@ async fn get_session_changes_sections_always_present(cx: &mut gpui::TestAppConte
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3189,6 +3203,8 @@ async fn get_session_changes_reset_on_epoch_mismatch(cx: &mut gpui::TestAppConte
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3252,6 +3268,8 @@ async fn get_session_changes_stream_selection_narrows_entries_and_total(
                 toolu: "sub1".to_string(),
             }),
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3284,6 +3302,8 @@ async fn get_session_changes_stream_selection_narrows_entries_and_total(
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3331,6 +3351,8 @@ async fn get_session_changes_image_indices_match_get_session(cx: &mut gpui::Test
             known_epoch: 0,
             stream_id: None,
             include_images: true,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3394,6 +3416,8 @@ async fn get_session_changes_tail_truncate_shrinks_total(cx: &mut gpui::TestAppC
             known_epoch: 0,
             stream_id: None,
             include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -3417,6 +3441,7 @@ fn anchored_entry(index: usize, role: EntryRoleDto) -> EntrySummary {
         preview: String::new(),
         markdown: None,
         images: None,
+        image_count: 0,
         tool_call: None,
         plan: None,
         system_level: None,
@@ -3426,6 +3451,9 @@ fn anchored_entry(index: usize, role: EntryRoleDto) -> EntrySummary {
         subagent_id: None,
         observer_nudge: false,
         editor_recovery: false,
+        markdown_len: None,
+        markdown_prefix_len: None,
+        markdown_tail: None,
     }
 }
 
@@ -3980,6 +4008,8 @@ async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::Test
                 known_epoch: full.epoch,
                 stream_id: None,
                 include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
             },
             &mut cx.to_async(),
         )
@@ -4018,6 +4048,8 @@ async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::Test
                 known_epoch: full.epoch,
                 stream_id: None,
                 include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
             },
             &mut cx.to_async(),
         )
@@ -4066,6 +4098,8 @@ async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::Test
                 known_epoch: full.epoch,
                 stream_id: None,
                 include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
             },
             &mut cx.to_async(),
         )
@@ -4091,6 +4125,8 @@ async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::Test
                 known_epoch: full.epoch + 1,
                 stream_id: None,
                 include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
             },
             &mut cx.to_async(),
         )
@@ -4118,6 +4154,8 @@ async fn get_session_changes_closed_row_native_serves_deltas(cx: &mut gpui::Test
                 known_epoch: 0,
                 stream_id: None,
                 include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
             },
             &mut cx.to_async(),
         )
@@ -4236,6 +4274,8 @@ async fn get_session_legacy_blob_closed_session_serves_bumped_epoch(cx: &mut gpu
                 known_epoch: sc.epoch,
                 stream_id: None,
                 include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
             },
             &mut cx.to_async(),
         )
@@ -4375,6 +4415,8 @@ async fn get_session_refuses_to_serve_an_undecodable_blob_as_empty(cx: &mut gpui
                 known_epoch: 0,
                 stream_id: None,
                 include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
             },
             &mut cx.to_async(),
         )
@@ -4601,6 +4643,8 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
                     known_epoch: 0,
                     stream_id: None,
                     include_images: false,
+                    known_entries: None,
+                    omit_preview_when_markdown: false,
                 },
                 &mut cx.to_async(),
             )
@@ -5219,6 +5263,8 @@ async fn drain_cold_delta(
                     known_epoch: epoch,
                     stream_id: None,
                     include_images: false,
+                    known_entries: None,
+                    omit_preview_when_markdown: false,
                 },
                 &mut cx.to_async(),
             )
@@ -6654,6 +6700,8 @@ async fn get_session_changes_pages_by_mod_seq_across_index_order(cx: &mut gpui::
             known_epoch: 0,
             stream_id: None,
             include_images: true,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -6697,6 +6745,8 @@ async fn get_session_changes_pages_by_mod_seq_across_index_order(cx: &mut gpui::
             known_epoch: 0,
             stream_id: None,
             include_images: true,
+            known_entries: None,
+            omit_preview_when_markdown: false,
         },
         cx,
     )
@@ -6760,4 +6810,1371 @@ async fn read_session_history_live_renders_only_the_requested_page(cx: &mut gpui
         all.entries[1..3].to_vec(),
         "the page is byte-identical to the same slice of the full render"
     );
+}
+
+/// `EntrySummary.image_count` lets a client tell a photo-bearing user entry
+/// from a text-only one without a `get_session_entry` round trip. Its whole
+/// value rests on two properties that are easy to break and silent when
+/// broken, so both are pinned here.
+///
+/// 1. **Zero is serialized.** The client reads an absent field as "this
+///    server is too old to know" and falls back to probing. Adding
+///    `skip_serializing_if` would therefore send it probing exactly the
+///    text-only entries the field exists to let it skip: the optimisation
+///    would look wired up and do nothing.
+/// 2. **It does not depend on `include_images`.** The mobile client polls
+///    with `include_images: false`, which is precisely when it needs the
+///    count.
+#[test]
+fn entry_summary_reports_image_count_independently_of_include_images() {
+    use std::collections::HashMap;
+
+    fn summarize(
+        entry: &crate::session_entry::SessionEntry,
+        include_images: bool,
+    ) -> (EntrySummary, serde_json::Value) {
+        let auth_options = HashMap::new();
+        let mut image_cursor = 0usize;
+        let summary = super::dto::summarize_entry(
+            entry,
+            0,
+            false,
+            include_images,
+            &mut image_cursor,
+            &auth_options,
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&summary).expect("EntrySummary serializes");
+        (summary, json)
+    }
+
+    // A user entry with photos, WITHOUT asking for the payloads — the
+    // polling shape.
+    let with_images = parity_user(1, "look at these", 2);
+    let (summary, json) = summarize(&with_images, false);
+    assert_eq!(summary.image_count, 2);
+    assert!(
+        summary.images.is_none(),
+        "the caller didn't opt in, so no payloads"
+    );
+    assert_eq!(
+        json.get("image_count"),
+        Some(&serde_json::json!(2)),
+        "the count must survive include_images = false; got {json}"
+    );
+
+    // Same entry WITH payloads: the count is exactly what `images` holds.
+    let (opted_in, _) = summarize(&with_images, true);
+    assert_eq!(opted_in.image_count, 2);
+    assert_eq!(
+        opted_in.images.as_ref().map(Vec::len),
+        Some(opted_in.image_count),
+        "image_count must equal the length `images` would have had"
+    );
+
+    // A text-only user entry: 0, and PRESENT in the JSON.
+    let text_only = parity_user(2, "just text", 0);
+    let (summary, json) = summarize(&text_only, false);
+    assert_eq!(summary.image_count, 0);
+    let object = json.as_object().expect("EntrySummary is a JSON object");
+    assert!(
+        object.contains_key("image_count"),
+        "a text-only entry must still carry image_count: 0, or the client \
+         falls back to probing every entry; got {json}"
+    );
+    assert_eq!(object.get("image_count"), Some(&serde_json::json!(0)));
+
+    // An assistant entry: 0. Its images (if any) are flattened to
+    // `spk-image://N` links with the raw blocks discarded, so there is
+    // nothing extractable — matching the client, whose backfill only
+    // targets user entries.
+    let assistant = parity_assistant(3, "here you go");
+    let (summary, json) = summarize(&assistant, false);
+    assert_eq!(summary.image_count, 0);
+    assert_eq!(json.get("image_count"), Some(&serde_json::json!(0)));
+}
+
+// -----------------------------------------------------------------
+// WIRE-V7 N-29 / N-37 / N-05: append-delta bodies, preview suppression,
+// and `spk_client_send_id` idempotency.
+// -----------------------------------------------------------------
+
+/// The digest MUST agree byte-for-byte with the mobile client's
+/// `Digests.bodyDigest`; a divergence splices a tail onto a body the client
+/// does not hold, which corrupts the transcript SILENTLY rather than failing
+/// to decode. These three literals are the shared vectors from WIRE-V7 §2.2 —
+/// they are COPIED from the spec (and from the Kotlin suite), never
+/// recomputed, so a divergence between the two implementations shows up here
+/// instead of in the field.
+#[test]
+fn sha256_16_hex_reference_vectors() {
+    assert_eq!(
+        super::dto::sha256_16_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb924"
+    );
+    assert_eq!(
+        super::dto::sha256_16_hex("hello".as_bytes()),
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e"
+    );
+    // "héllo" exists purely to catch a UTF-16 length bug: Kotlin's
+    // `"héllo".length` is 5, but the digested prefix is 6 BYTES.
+    let hello_accented = "héllo";
+    assert_eq!(hello_accented.len(), 6, "markdown_len counts UTF-8 bytes");
+    assert_eq!(
+        super::dto::sha256_16_hex(hello_accented.as_bytes()),
+        "3c48591d8d098a4538f5e013dfcf406e"
+    );
+    for digest in [
+        super::dto::sha256_16_hex(b""),
+        super::dto::sha256_16_hex(b"anything"),
+    ] {
+        assert_eq!(digest.len(), 32, "32 hex chars, never the full 64");
+        assert!(
+            digest
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+    }
+}
+
+/// Poll shaped exactly like an old client's: none of the new parameters.
+///
+/// The response must be byte-identical to what this server produced before
+/// N-29/N-37 existed, with the single documented exception of the additive
+/// `markdown_len` key (which an `ignoreUnknownKeys` decoder drops). In
+/// particular `markdown_prefix_len` / `markdown_tail` MUST NOT appear: an old
+/// client that received them would decode `markdown = null` and render an
+/// empty bubble. This is the most dangerous line in the whole feature.
+#[gpui::test]
+async fn delta_bodies_absent_without_known_entries(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let result = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 0,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    assert_eq!(result.changed_entries.len(), 4);
+
+    // Every key this server emitted for a `changed_entries` element BEFORE
+    // N-29/N-37. Listed explicitly so an accidental additive field on the
+    // hot path has to be justified here rather than sliding onto the wire.
+    let pre_change_keys: std::collections::BTreeSet<&str> = [
+        "role",
+        "index",
+        "preview",
+        "markdown",
+        "image_count",
+        "created_ms",
+    ]
+    .into_iter()
+    .collect();
+
+    for entry in &result.changed_entries {
+        let json = serde_json::to_value(entry).expect("EntrySummary serialises");
+        let object = json.as_object().expect("entry is an object");
+        assert!(
+            object.contains_key("markdown"),
+            "an old client must still get the WHOLE body: {json}"
+        );
+        assert!(
+            !object.contains_key("markdown_prefix_len"),
+            "delta fields must never reach a client that sent no known_entries: {json}"
+        );
+        assert!(
+            !object.contains_key("markdown_tail"),
+            "delta fields must never reach a client that sent no known_entries: {json}"
+        );
+        assert!(
+            object.contains_key("preview"),
+            "preview stays on the wire unless the caller opted out: {json}"
+        );
+        let mut keys: std::collections::BTreeSet<&str> =
+            object.keys().map(String::as_str).collect();
+        assert!(
+            keys.remove("markdown_len"),
+            "markdown_len is emitted whenever a body was built: {json}"
+        );
+        assert_eq!(
+            keys, pre_change_keys,
+            "an old client's response must be today's response plus markdown_len \
+             and nothing else: {json}"
+        );
+        assert_eq!(
+            entry.markdown_len,
+            entry.markdown.as_ref().map(|md| md.len() as u64),
+            "markdown_len counts UTF-8 bytes of the body actually sent"
+        );
+    }
+}
+
+/// Digest of the body index 1 currently holds, plus that body's byte length.
+async fn held_body(
+    session_id: crate::model::SolutionSessionId,
+    index: usize,
+    cx: &mut gpui::TestAppContext,
+) -> (String, u64, String) {
+    let result = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 0,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    let entry = result
+        .changed_entries
+        .iter()
+        .find(|e| e.index == index)
+        .expect("entry present");
+    let body = entry.markdown.clone().expect("whole body");
+    let digest = super::dto::sha256_16_hex(body.as_bytes());
+    (body.clone(), body.len() as u64, digest)
+}
+
+/// Replace the Main assistant entry's text and bump its `mod_seq` so the next
+/// poll picks it up, the way a streaming reply grows between two polls.
+fn regrow_assistant(
+    session_id: crate::model::SolutionSessionId,
+    text: &str,
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::session_entry::{AssistantChunk, SessionEntryKind};
+    let text = text.to_string();
+    mutate_session(session_id, cx, move |s| {
+        let entry = s.entries.get_mut(1).expect("assistant entry at index 1");
+        let entry = std::sync::Arc::make_mut(entry);
+        entry.mod_seq = 5;
+        entry.kind = SessionEntryKind::AssistantMessage {
+            chunks: vec![AssistantChunk::Message(text)],
+        };
+        s.change_seq = 5;
+    });
+}
+
+#[gpui::test]
+async fn delta_body_tail_on_matching_digest(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let (base_body, _base_len, _digest) = held_body(session_id, 1, cx).await;
+    // An entry's rendering is `## Assistant\n\n{body}\n\n`, so a growing
+    // assistant reply does NOT append to the END of the previous rendering —
+    // the trailing newline run moves with the body. The stable prefix is
+    // therefore the held body minus that trailing run, and that is the length
+    // a client offers.
+    let base_len = base_body.trim_end_matches('\n').len() as u64;
+    let digest = super::dto::sha256_16_hex(&base_body.as_bytes()[..base_len as usize]);
+    // The suffix is multi-byte on purpose: the tail is sliced at a BYTE
+    // offset, so a UTF-16 length bug on either side shows up here.
+    regrow_assistant(session_id, "a1-main…and a multi-byte tail", cx);
+    // Take the whole grown body from the server itself, so the expected tail
+    // is derived from the server's own rendering rather than a hand-written
+    // copy of it.
+    let full = {
+        let result = run_changes(
+            GetSessionChangesParams {
+                session_id: session_id.to_string(),
+                since_seq: 4,
+                known_epoch: 0,
+                stream_id: None,
+                include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
+            },
+            cx,
+        )
+        .await;
+        result.changed_entries[0].markdown.clone().expect("body")
+    };
+    assert!(
+        full.starts_with(&base_body[..base_len as usize]),
+        "the offered prefix must still be an exact prefix: {full:?}"
+    );
+    assert!(full.len() > base_body.len(), "the body actually grew");
+
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 4,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: Some(vec![KnownEntryDto {
+                index: 1,
+                markdown_len: base_len,
+                markdown_hash: digest,
+            }]),
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    let entry = &delta.changed_entries[0];
+    assert_eq!(entry.index, 1);
+    assert!(entry.markdown.is_none(), "the whole body must not be sent");
+    assert_eq!(entry.markdown_prefix_len, Some(base_len));
+    assert_eq!(
+        entry.markdown_tail.as_deref(),
+        Some(&full[base_len as usize..])
+    );
+    assert_eq!(entry.markdown_len, Some(full.len() as u64));
+    assert!(
+        entry
+            .markdown_tail
+            .as_deref()
+            .is_some_and(|tail| tail.len() < full.len()),
+        "the tail must be strictly cheaper than the whole body"
+    );
+}
+
+/// The entry rendering wraps the body in `## Assistant\n\n…\n\n`, so a client
+/// that offers a digest over its ENTIRE held body stops matching the moment
+/// the body grows: the trailing newline run has moved. The server correctly
+/// falls back to the whole body — it can only verify the exact prefix the
+/// caller claims, never guess a shorter one.
+///
+/// This case is what decides whether N-29 pays for itself on the traffic it
+/// targets (a streaming assistant reply), and the choice lives entirely on
+/// the client: offer the digest over the held body minus its trailing
+/// whitespace run, as `delta_body_tail_on_matching_digest` does. Pinned as a
+/// test so the server's half of that contract cannot drift silently.
+#[gpui::test]
+async fn delta_body_whole_held_body_stops_matching_once_the_body_grows(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let (_body, whole_len, whole_digest) = held_body(session_id, 1, cx).await;
+    regrow_assistant(session_id, "a1-main plus more", cx);
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 4,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: Some(vec![KnownEntryDto {
+                index: 1,
+                markdown_len: whole_len,
+                markdown_hash: whole_digest,
+            }]),
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    let entry = &delta.changed_entries[0];
+    assert!(
+        entry.markdown.is_some(),
+        "no match ⇒ whole body; correct, but it saves nothing"
+    );
+    assert_eq!(entry.markdown_prefix_len, None);
+    assert_eq!(entry.markdown_tail, None);
+}
+
+/// An offer that already reaches the end of the body yields `""`.
+///
+/// The old name for this test said "unchanged yields an empty tail", which
+/// asserts the right bytes but names a semantic that does NOT hold: a client
+/// trims the trailing whitespace run off its offer, so an unchanged entry
+/// normally comes back with that whitespace as its tail (see
+/// `delta_body_unchanged_offer_yields_the_trailing_whitespace_as_the_tail`).
+/// `""` is simply what a caller offering the exact current body sees. Nothing
+/// may treat an empty tail as the "unchanged" signal.
+#[gpui::test]
+async fn delta_body_empty_tail_when_the_offer_reaches_the_end(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let (_body, len, digest) = held_body(session_id, 1, cx).await;
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 1,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: Some(vec![KnownEntryDto {
+                index: 1,
+                markdown_len: len,
+                markdown_hash: digest,
+            }]),
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    let entry = delta
+        .changed_entries
+        .iter()
+        .find(|e| e.index == 1)
+        .expect("entry 1 in the page");
+    assert!(entry.markdown.is_none());
+    assert_eq!(entry.markdown_tail.as_deref(), Some(""));
+    assert_eq!(entry.markdown_prefix_len, Some(len));
+    assert_eq!(entry.markdown_len, Some(len));
+    assert_eq!(
+        entry.markdown_prefix_len, entry.markdown_len,
+        "prefix == total is what actually says \"nothing was added\"; the empty \
+         tail is a consequence of the offer, not the signal"
+    );
+}
+
+/// The tail a REAL client sees for an unchanged entry.
+///
+/// `buildKnownEntries` offers the held body minus its trailing whitespace run
+/// (the rendering wraps every body in `## Assistant\n\n…\n\n`, so that run
+/// moves as the body grows). So the common "nothing happened, just a
+/// state-only poke" response carries `"\n\n"` as its tail, NOT `""` — and it
+/// splices back to exactly the held body either way. Pinned alongside
+/// `delta_body_empty_tail_when_the_offer_reaches_the_end` so both branches
+/// stay covered and neither can be mistaken for an "unchanged" signal.
+#[gpui::test]
+async fn delta_body_unchanged_offer_yields_the_trailing_whitespace_as_the_tail(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let (body, _len, _digest) = held_body(session_id, 1, cx).await;
+    let offered = body.trim_end_matches('\n').len() as u64;
+    assert!(
+        offered < body.len() as u64,
+        "the rendering has a trailing run"
+    );
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 1,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: Some(vec![KnownEntryDto {
+                index: 1,
+                markdown_len: offered,
+                markdown_hash: super::dto::sha256_16_hex(&body.as_bytes()[..offered as usize]),
+            }]),
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    let entry = delta
+        .changed_entries
+        .iter()
+        .find(|e| e.index == 1)
+        .expect("entry 1 in the page");
+    assert!(entry.markdown.is_none());
+    assert_eq!(
+        entry.markdown_tail.as_deref(),
+        Some("\n\n"),
+        "an UNCHANGED entry does not come back with an empty tail"
+    );
+    assert_eq!(entry.markdown_prefix_len, Some(offered));
+    assert_eq!(entry.markdown_len, Some(body.len() as u64));
+    // The whole point: splicing the tail onto the offered prefix reproduces
+    // the held body byte-for-byte.
+    let spliced = format!(
+        "{}{}",
+        &body[..offered as usize],
+        entry.markdown_tail.as_deref().expect("tail")
+    );
+    assert_eq!(spliced, body, "the rehydrated body must equal what we held");
+}
+
+/// The executable form of the rule `EntrySummary::markdown_tail`'s doc
+/// promises: an unchanged entry is identified by `markdown_len`, NEVER by an
+/// empty tail.
+///
+/// Both halves use the trimmed offer a real client sends, so both come back
+/// with a NON-empty tail — emptiness demonstrably distinguishes nothing on
+/// this path, while `markdown_len` against the held length separates them
+/// cleanly. Without this, the promise lives only in a comment, and a comment
+/// loses to whoever writes `if tail.is_empty() { skip }` next.
+#[gpui::test]
+async fn delta_body_unchanged_is_identified_by_markdown_len_not_by_an_empty_tail(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let (body, held_len, _digest) = held_body(session_id, 1, cx).await;
+    // Exactly what `buildKnownEntries` offers: the held body minus its
+    // trailing whitespace run.
+    let offered = body.trim_end_matches('\n').len() as u64;
+    let offer = || {
+        Some(vec![KnownEntryDto {
+            index: 1,
+            markdown_len: offered,
+            markdown_hash: super::dto::sha256_16_hex(&body.as_bytes()[..offered as usize]),
+        }])
+    };
+    let poll = |since_seq: u64| GetSessionChangesParams {
+        session_id: session_id.to_string(),
+        since_seq,
+        known_epoch: 0,
+        stream_id: None,
+        include_images: false,
+        known_entries: offer(),
+        omit_preview_when_markdown: false,
+    };
+
+    let unchanged = run_changes(poll(1), cx).await;
+    let unchanged = unchanged
+        .changed_entries
+        .iter()
+        .find(|e| e.index == 1)
+        .expect("entry 1 in the page")
+        .clone();
+
+    regrow_assistant(session_id, "a1-main plus more", cx);
+    let grown = run_changes(poll(4), cx).await;
+    let grown = grown
+        .changed_entries
+        .iter()
+        .find(|e| e.index == 1)
+        .expect("entry 1 in the page")
+        .clone();
+
+    // The signal: length, not emptiness.
+    assert_eq!(
+        unchanged.markdown_len,
+        Some(held_len),
+        "an unchanged entry's total length still equals what the client holds"
+    );
+    assert!(
+        grown.markdown_len.expect("grown length") > held_len,
+        "a grown entry's total length exceeds what the client holds"
+    );
+    assert_ne!(
+        unchanged.markdown_len, grown.markdown_len,
+        "markdown_len is what separates the two cases"
+    );
+
+    // The non-signal: BOTH tails are non-empty, so branching on emptiness
+    // would classify the unchanged entry and the grown one identically.
+    for (label, entry) in [("unchanged", &unchanged), ("grown", &grown)] {
+        let tail = entry.markdown_tail.as_deref().expect("delta tail");
+        assert!(
+            !tail.is_empty(),
+            "{label}: a trimmed offer never yields an empty tail, so emptiness \
+             distinguishes nothing — do not branch on it"
+        );
+    }
+    assert_eq!(unchanged.markdown_prefix_len, Some(offered));
+    assert_eq!(grown.markdown_prefix_len, Some(offered));
+}
+
+#[gpui::test]
+async fn delta_body_falls_back_on_mismatched_digest(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let (body, len, _digest) = held_body(session_id, 1, cx).await;
+    // Same LENGTH, one byte different mid-body — exactly the tool-call
+    // mutate-in-place shape a length-only match would corrupt.
+    let mut altered = body.into_bytes();
+    let mid = altered.len() / 2;
+    altered[mid] = if altered[mid] == b'x' { b'y' } else { b'x' };
+    let altered = String::from_utf8_lossy(&altered).into_owned();
+    assert_eq!(altered.len() as u64, len);
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 1,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: Some(vec![KnownEntryDto {
+                index: 1,
+                markdown_len: len,
+                markdown_hash: super::dto::sha256_16_hex(altered.as_bytes()),
+            }]),
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    let entry = delta
+        .changed_entries
+        .iter()
+        .find(|e| e.index == 1)
+        .expect("entry 1 in the page");
+    assert!(
+        entry.markdown.is_some(),
+        "a mismatch must send the whole body"
+    );
+    assert_eq!(entry.markdown_prefix_len, None);
+    assert_eq!(entry.markdown_tail, None);
+    assert_eq!(entry.markdown_len, Some(len));
+}
+
+/// A `markdown_len` that lands inside a multi-byte code point must be treated
+/// as a plain mismatch — no panic, whole body. Without the
+/// `is_char_boundary` guard the hash would run over a partial code point and
+/// the tail slice would panic on a live poll.
+#[gpui::test]
+async fn delta_body_falls_back_on_non_char_boundary(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    regrow_assistant(session_id, "héllo wörld", cx);
+    let (body, len, _digest) = held_body(session_id, 1, cx).await;
+    // "## Assistant\n\n" is 14 ASCII bytes and byte 14 is the `h`, so byte 16
+    // lands in the middle of the two-byte `é` that follows it.
+    let inside = 16u64;
+    assert!(!body.is_char_boundary(inside as usize), "body: {body:?}");
+    assert!(inside < len);
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 4,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: Some(vec![KnownEntryDto {
+                index: 1,
+                markdown_len: inside,
+                // Digest of the truncated-at-a-boundary prefix, so ONLY the
+                // boundary check can reject it.
+                markdown_hash: super::dto::sha256_16_hex(&body.as_bytes()[..inside as usize]),
+            }]),
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    let entry = &delta.changed_entries[0];
+    assert!(entry.markdown.is_some(), "whole body, no panic");
+    assert_eq!(entry.markdown_prefix_len, None);
+    assert_eq!(entry.markdown_tail, None);
+}
+
+/// A `markdown_len` past the end of the body is a mismatch, not a slice
+/// panic.
+#[gpui::test]
+async fn delta_body_falls_back_on_overlong_prefix(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let (_body, len, digest) = held_body(session_id, 1, cx).await;
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 1,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: Some(vec![KnownEntryDto {
+                index: 1,
+                markdown_len: len + 4096,
+                markdown_hash: digest,
+            }]),
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    let entry = delta
+        .changed_entries
+        .iter()
+        .find(|e| e.index == 1)
+        .expect("entry 1 in the page");
+    assert!(entry.markdown.is_some());
+    assert_eq!(entry.markdown_prefix_len, None);
+}
+
+#[gpui::test]
+async fn known_entries_validation(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let good_hash = || "0123456789abcdef0123456789abcdef".to_string();
+    let poll = |known: Vec<KnownEntryDto>| GetSessionChangesParams {
+        session_id: session_id.to_string(),
+        since_seq: 0,
+        known_epoch: 0,
+        stream_id: None,
+        include_images: false,
+        known_entries: Some(known),
+        omit_preview_when_markdown: false,
+    };
+    let fail = |params: GetSessionChangesParams, cx: &mut gpui::TestAppContext| {
+        let mut async_cx = cx.to_async();
+        async move {
+            format!(
+                "{:#}",
+                GetSessionChangesTool
+                    .run(params, &mut async_cx)
+                    .await
+                    .expect_err("must be rejected")
+            )
+        }
+    };
+
+    let too_many: Vec<KnownEntryDto> = (0..33)
+        .map(|index| KnownEntryDto {
+            index,
+            markdown_len: 0,
+            markdown_hash: good_hash(),
+        })
+        .collect();
+    let message = fail(poll(too_many), cx).await;
+    assert!(
+        message.contains("invalid_params: known_entries capped at 32"),
+        "got {message}"
+    );
+
+    let duplicated = vec![
+        KnownEntryDto {
+            index: 1,
+            markdown_len: 0,
+            markdown_hash: good_hash(),
+        },
+        KnownEntryDto {
+            index: 1,
+            markdown_len: 1,
+            markdown_hash: good_hash(),
+        },
+    ];
+    let message = fail(poll(duplicated), cx).await;
+    assert!(
+        message.contains("invalid_params: duplicate index in known_entries"),
+        "got {message}"
+    );
+
+    let short_hash = vec![KnownEntryDto {
+        index: 1,
+        markdown_len: 0,
+        markdown_hash: "abc".to_string(),
+    }];
+    let message = fail(poll(short_hash), cx).await;
+    assert!(
+        message.contains("invalid_params: markdown_hash must be 32 lowercase hex chars"),
+        "got {message}"
+    );
+
+    let upper_hash = vec![KnownEntryDto {
+        index: 1,
+        markdown_len: 0,
+        markdown_hash: "0123456789ABCDEF0123456789abcdef".to_string(),
+    }];
+    let message = fail(poll(upper_hash), cx).await;
+    assert!(
+        message.contains("invalid_params: markdown_hash must be 32 lowercase hex chars"),
+        "uppercase hex is a divergence risk with the client, got {message}"
+    );
+}
+
+/// `deny_unknown_fields` must survive the two additive parameters — a probe
+/// for a feature this build does not have has to keep failing loudly rather
+/// than being silently ignored.
+#[test]
+fn unknown_param_still_rejected() {
+    let ok: Result<GetSessionChangesParams, _> = serde_json::from_value(serde_json::json!({
+        "session_id": "s",
+        "since_seq": 1,
+        "known_epoch": 0,
+        "known_entries": [{"index": 3, "markdown_len": 9, "markdown_hash": "0123456789abcdef0123456789abcdef"}],
+        "omit_preview_when_markdown": true,
+    }));
+    let ok = ok.expect("the two new params deserialize");
+    assert_eq!(ok.known_entries.as_ref().map(Vec::len), Some(1));
+    assert!(ok.omit_preview_when_markdown);
+    assert!(ok.include_images, "include_images still defaults TRUE");
+
+    let err: Result<GetSessionChangesParams, _> = serde_json::from_value(serde_json::json!({
+        "session_id": "s",
+        "since_seq": 1,
+        "known_epoch": 0,
+        "no_such_param": true,
+    }));
+    assert!(
+        err.is_err(),
+        "an unknown key must still be a deserialize error"
+    );
+
+    let err: Result<KnownEntryDto, _> = serde_json::from_value(serde_json::json!({
+        "index": 1,
+        "markdown_len": 2,
+        "markdown_hash": "0123456789abcdef0123456789abcdef",
+        "extra": 1,
+    }));
+    assert!(err.is_err(), "KnownEntryDto is deny_unknown_fields too");
+
+    // Absent means absent, never "delta everything".
+    let bare: GetSessionChangesParams = serde_json::from_value(serde_json::json!({
+        "session_id": "s",
+        "since_seq": 1,
+        "known_epoch": 0,
+    }))
+    .expect("old-client params");
+    assert!(bare.known_entries.is_none());
+    assert!(!bare.omit_preview_when_markdown);
+}
+
+#[gpui::test]
+async fn omit_preview_suppresses_only_non_user_bodies(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 0,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: true,
+        },
+        cx,
+    )
+    .await;
+    for entry in &delta.changed_entries {
+        let json = serde_json::to_value(entry).expect("serialises");
+        let has_preview = json.get("preview").is_some();
+        match entry.role {
+            EntryRoleDto::User => assert!(
+                has_preview,
+                "user previews are the optimistic-bubble reconcile key and stay \
+                 on the wire unconditionally: {json}"
+            ),
+            _ => assert!(
+                !has_preview,
+                "a non-user entry carrying a body must drop its preview: {json}"
+            ),
+        }
+        assert!(
+            json.get("markdown").is_some(),
+            "the body is still there: {json}"
+        );
+    }
+
+    // An entry with NO body keeps its preview even with the flag on.
+    let full = GetSessionTool
+        .run(
+            GetSessionParams {
+                session_id: session_id.to_string(),
+                include_full_content: false,
+                omit_preview_when_markdown: true,
+                ..Default::default()
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_session")
+        .structured_content;
+    for entry in &full.entries {
+        let json = serde_json::to_value(entry).expect("serialises");
+        assert!(json.get("markdown").is_none());
+        assert!(
+            json.get("preview").is_some(),
+            "no body ⇒ preview is the only rendering the client has: {json}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn omit_preview_off_by_default(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    let delta = run_changes(
+        GetSessionChangesParams {
+            session_id: session_id.to_string(),
+            since_seq: 0,
+            known_epoch: 0,
+            stream_id: None,
+            include_images: false,
+            known_entries: None,
+            omit_preview_when_markdown: false,
+        },
+        cx,
+    )
+    .await;
+    for entry in &delta.changed_entries {
+        let json = serde_json::to_value(entry).expect("serialises");
+        assert!(
+            json.get("preview").is_some(),
+            "an old client must still see every preview: {json}"
+        );
+        assert!(!entry.preview.is_empty());
+    }
+}
+
+/// Text block carrying an `spk_client_send_id` on its `_meta`, mirroring what
+/// the mobile client sends.
+fn stamped_text_block(text: &str, csid: i64) -> acp::ContentBlock {
+    let mut block = acp::TextContent::new(text.to_string());
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        acp_thread::SPK_CLIENT_SEND_ID_META_KEY.to_string(),
+        serde_json::json!(csid),
+    );
+    block.meta = Some(meta);
+    acp::ContentBlock::Text(block)
+}
+
+async fn send_blocks(
+    session_id: crate::model::SolutionSessionId,
+    blocks: Vec<acp::ContentBlock>,
+    cx: &mut gpui::TestAppContext,
+) -> SendMessageBlocksResult {
+    // `resolve_upload_handles` needs the process-wide manager installed even
+    // for a text-only bundle; the install is a `OnceLock`, so this is a
+    // no-op after the first caller.
+    ensure_test_upload_manager();
+    SendMessageBlocksTool
+        .run(
+            SendMessageBlocksParams {
+                session_id: session_id.to_string(),
+                blocks,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("send_message_blocks")
+        .structured_content
+}
+
+/// Park the session in `Running` so a send lands in `pending_messages`, where
+/// the test can count bundles deterministically without driving a turn.
+fn force_running(session_id: crate::model::SolutionSessionId, cx: &mut gpui::TestAppContext) {
+    mutate_session(session_id, cx, |s| {
+        s.state = crate::model::SessionState::Running {
+            started_at: std::time::Instant::now(),
+            notified: false,
+        };
+    });
+}
+
+fn queued_text(
+    session_id: crate::model::SolutionSessionId,
+    cx: &mut gpui::TestAppContext,
+) -> String {
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let session = session.read(cx);
+        session
+            .pending_messages
+            .iter()
+            .flat_map(|bundle| bundle.blocks.iter())
+            .filter_map(|block| match block {
+                acp::ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    })
+}
+
+#[gpui::test]
+async fn csid_duplicate_is_not_enqueued(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    force_running(session_id, cx);
+    let bundle = || vec![stamped_text_block("run the tests", 1_757_232_041_123)];
+
+    let first = send_blocks(session_id, bundle(), cx).await;
+    assert_eq!(first.delivery, Some(SendDeliveryDto::Accepted));
+    assert_eq!(first.client_send_ids, vec![1_757_232_041_123]);
+    let after_first = queued_text(session_id, cx);
+    assert_eq!(after_first.matches("run the tests").count(), 1);
+
+    // Byte-identical replay: the socket died before the first response
+    // arrived, so the client resent the same QueuedMessage.
+    let second = send_blocks(session_id, bundle(), cx).await;
+    assert_eq!(second.delivery, Some(SendDeliveryDto::Duplicate));
+    assert_eq!(second.client_send_ids, vec![1_757_232_041_123]);
+    assert_eq!(
+        queued_text(session_id, cx),
+        after_first,
+        "a duplicate must enqueue nothing at all"
+    );
+}
+
+/// The dedupe check runs BEFORE `resolve_upload_handles`, which consumes and
+/// ABORTS every handle it sees. A duplicate that reached it would die with
+/// `unknown_upload_id` — i.e. the retry this feature exists to make safe
+/// would fail with a confusing upload error.
+#[gpui::test]
+async fn csid_duplicate_does_not_consume_uploads(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    ensure_test_upload_manager();
+    force_running(session_id, cx);
+
+    let init = UploadInitTool
+        .run(
+            UploadInitParams {
+                session_id: session_id.to_string(),
+                mime: "image/png".to_string(),
+                display_name: "pic.png".to_string(),
+                total_size: 4,
+                sha256: None,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("upload_init")
+        .structured_content;
+    crate::upload::with_manager(|m| m.write_chunk(init.upload_id, 0, &[1, 2, 3, 4]))
+        .expect("manager installed")
+        .expect("write_chunk");
+    let handle = UploadFinishTool
+        .run(
+            UploadFinishParams {
+                upload_id: init.upload_id,
+                sha256: None,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("upload_finish")
+        .structured_content
+        .handle;
+
+    let bundle = || {
+        vec![
+            stamped_text_block("here is a photo", 42),
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                "pic.png".to_string(),
+                handle.clone(),
+            )),
+        ]
+    };
+    let first = send_blocks(session_id, bundle(), cx).await;
+    assert_eq!(first.delivery, Some(SendDeliveryDto::Accepted));
+
+    // The handle is gone now — a replay that reached `resolve_upload_handles`
+    // would error. It must return `duplicate` instead.
+    let second = send_blocks(session_id, bundle(), cx).await;
+    assert_eq!(
+        second.delivery,
+        Some(SendDeliveryDto::Duplicate),
+        "the dedupe check must short-circuit before the upload handles are touched"
+    );
+    assert_eq!(second.client_send_ids, vec![42]);
+}
+
+/// A bundle that merges a re-send with a NEW message is a different message
+/// and must go through. Only a FULL overlap is a duplicate.
+#[gpui::test]
+async fn csid_partial_overlap_is_accepted(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    force_running(session_id, cx);
+    let first = send_blocks(session_id, vec![stamped_text_block("a", 1)], cx).await;
+    assert_eq!(first.delivery, Some(SendDeliveryDto::Accepted));
+    let merged = send_blocks(
+        session_id,
+        vec![stamped_text_block("a", 1), stamped_text_block("b", 2)],
+        cx,
+    )
+    .await;
+    assert_eq!(merged.delivery, Some(SendDeliveryDto::Accepted));
+    assert_eq!(merged.client_send_ids, vec![1, 2]);
+    // …and now BOTH ids are claimed, so the merged bundle itself dedupes.
+    let replay = send_blocks(
+        session_id,
+        vec![stamped_text_block("a", 1), stamped_text_block("b", 2)],
+        cx,
+    )
+    .await;
+    assert_eq!(replay.delivery, Some(SendDeliveryDto::Duplicate));
+}
+
+/// A desktop-originated (unstamped) send has no idempotency key and can never
+/// be recognised as a replay.
+#[gpui::test]
+async fn unstamped_send_is_always_accepted(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    force_running(session_id, cx);
+    for _ in 0..3 {
+        let result = send_blocks(
+            session_id,
+            vec![acp::ContentBlock::Text(acp::TextContent::new(
+                "no stamp".to_string(),
+            ))],
+            cx,
+        )
+        .await;
+        assert_eq!(result.delivery, Some(SendDeliveryDto::Accepted));
+        assert!(result.client_send_ids.is_empty());
+    }
+    assert_eq!(
+        queued_text(session_id, cx).matches("no stamp").count(),
+        3,
+        "every unstamped send is a distinct message"
+    );
+}
+
+/// A `/clear` (or a `/compact` rotation) bumps the epoch, so nothing that
+/// preceded it can be a meaningful duplicate of anything sent after it.
+#[gpui::test]
+async fn csid_window_dropped_on_context_reset(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    force_running(session_id, cx);
+    let bundle = || vec![stamped_text_block("same text", 7)];
+    assert_eq!(
+        send_blocks(session_id, bundle(), cx).await.delivery,
+        Some(SendDeliveryDto::Accepted)
+    );
+    assert_eq!(
+        send_blocks(session_id, bundle(), cx).await.delivery,
+        Some(SendDeliveryDto::Duplicate)
+    );
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| store.forget_client_send_ids(session_id));
+    });
+    force_running(session_id, cx);
+    assert_eq!(
+        send_blocks(session_id, bundle(), cx).await.delivery,
+        Some(SendDeliveryDto::Accepted),
+        "after the window is dropped the same csid is a fresh message"
+    );
+}
+
+/// WIRE-V7 §9.4: the two `delivery` values go on the wire as EXACTLY
+/// `"accepted"` and `"duplicate"`.
+///
+/// A rename on either side is silent — the client's decoder would see an
+/// unknown variant and fall back to `null`, i.e. "this server has no csid
+/// dedupe", which quietly disables the retry the feature exists to enable
+/// rather than failing loudly. Pinned as literals, not as
+/// `rename_all = "snake_case"` behaviour, because the literals are the
+/// contract.
+#[test]
+fn send_delivery_wire_values_are_frozen() {
+    assert_eq!(
+        serde_json::to_value(SendDeliveryDto::Accepted).expect("serialises"),
+        serde_json::json!("accepted")
+    );
+    assert_eq!(
+        serde_json::to_value(SendDeliveryDto::Duplicate).expect("serialises"),
+        serde_json::json!("duplicate")
+    );
+}
+
+/// §9.5: absent means "old peer" for both new fields on the send result.
+///
+/// A server without csid dedupe emits neither key, and the client must read
+/// that as "unknown", never as `accepted`. The `Default` here stands in for
+/// exactly that build.
+#[test]
+fn send_result_omits_both_new_fields_when_it_has_nothing_to_say() {
+    let old_shape = SendMessageBlocksResult::default();
+    assert_eq!(
+        serde_json::to_value(&old_shape).expect("serialises"),
+        serde_json::json!({}),
+        "an unstamped/undeduped send must be byte-identical to today's `{{}}`"
+    );
+
+    // …and the fully-populated shape is the one from WIRE-V7 §4.8.
+    let duplicate = SendMessageBlocksResult {
+        delivery: Some(SendDeliveryDto::Duplicate),
+        client_send_ids: vec![1_757_232_041_123],
+    };
+    assert_eq!(
+        serde_json::to_value(&duplicate).expect("serialises"),
+        serde_json::json!({
+            "delivery": "duplicate",
+            "client_send_ids": [1_757_232_041_123_i64],
+        }),
+    );
+}
+
+/// A send that fails BETWEEN the claim and the enqueue must leave its csid
+/// claimable again.
+///
+/// The loss this prevents, end to end: the phone sends a bundle whose upload
+/// aged out of its offline queue, `resolve_upload_handles` errors, the socket
+/// dies before the tool error arrives, the client's four replay conditions
+/// all hold so it replays the identical bundle — and a leaked claim would
+/// answer `duplicate`. The client reads `duplicate` as SUCCESS (marker
+/// removed, optimistic bubble kept, no toast, no bounce), so the user's
+/// message is gone for the full 24 h window with no diagnostic anywhere.
+/// Before dedupe existed the replay simply failed again, loudly.
+#[gpui::test]
+async fn csid_is_released_when_the_send_fails_before_enqueue(cx: &mut gpui::TestAppContext) {
+    let (session_id, _tmp) = seed_delta_session(cx).await;
+    ensure_test_upload_manager();
+    force_running(session_id, cx);
+
+    // A handle that resolves to nothing — the aged-out / already-consumed
+    // upload the interleaving above turns on.
+    let bundle = || {
+        vec![
+            stamped_text_block("here is a photo", 4242),
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                "gone.png".to_string(),
+                format!("{}999999", crate::upload::HANDLE_SCHEME),
+            )),
+        ]
+    };
+
+    let failure = SendMessageBlocksTool
+        .run(
+            SendMessageBlocksParams {
+                session_id: session_id.to_string(),
+                blocks: bundle(),
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("an unresolvable upload handle must fail the send");
+    let message = format!("{failure:#}");
+    assert!(
+        message.contains("unknown_upload_id"),
+        "expected the resolve to be what failed, got {message}"
+    );
+    assert_eq!(
+        queued_text(session_id, cx)
+            .matches("here is a photo")
+            .count(),
+        0,
+        "nothing was enqueued"
+    );
+
+    // The replay must be treated as a FRESH send, not answered `duplicate`.
+    let replay = SendMessageBlocksTool
+        .run(
+            SendMessageBlocksParams {
+                session_id: session_id.to_string(),
+                blocks: bundle(),
+            },
+            &mut cx.to_async(),
+        )
+        .await;
+    match replay {
+        Err(err) => {
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("unknown_upload_id"),
+                "the replay must fail the SAME loud way, not silently succeed: {message}"
+            );
+        }
+        Ok(response) => panic!(
+            "a leaked claim answered the replay as {:?} — the user's message is now \
+             silently lost",
+            response.structured_content.delivery
+        ),
+    }
+
+    // And once the underlying cause is gone, the same csid still sends.
+    let recovered = send_blocks(
+        session_id,
+        vec![stamped_text_block("here is a photo", 4242)],
+        cx,
+    )
+    .await;
+    assert_eq!(
+        recovered.delivery,
+        Some(SendDeliveryDto::Accepted),
+        "the csid was never consumed by a send that did not happen"
+    );
+    assert_eq!(
+        queued_text(session_id, cx)
+            .matches("here is a photo")
+            .count(),
+        1,
+    );
+}
+
+/// `preview` is `skip_serializing_if = "String::is_empty"`, so an entry whose
+/// rendering came out empty would OMIT the key — and a shipped mobile client
+/// declares `preview` non-null with no default, so it throws. Because the
+/// entry is a member of `changed_entries`, one such entry fails the decode of
+/// the ENTIRE response, and the transcript stops advancing until the user
+/// force-quits.
+///
+/// That is unreachable only because every arm of `session_entry_to_markdown`
+/// prefixes a literal heading or appends a literal `\n\n`, so no rendering
+/// can be empty even when the entry's own content is. Nothing enforced that.
+/// This does: every variant is built with EMPTY content — the adversarial
+/// case — and asserted to still produce a non-empty preview and to serialise
+/// the key.
+///
+/// The `match` at the bottom is the real guard: adding a `SessionEntryKind`
+/// variant makes this test fail to COMPILE, forcing whoever adds it to prove
+/// their rendering is non-empty rather than discovering it as a frozen
+/// transcript in the field.
+#[gpui::test]
+async fn every_entry_kind_renders_a_non_empty_preview(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{
+        CompactionStatus, PlanItem, SessionEntry, SessionEntryKind, SystemEntryLevel, ToolStatus,
+    };
+    let _ = cx;
+
+    let kinds = vec![
+        SessionEntryKind::UserMessage {
+            id: None,
+            content_md: String::new(),
+            chunks: Vec::new(),
+        },
+        SessionEntryKind::AssistantMessage { chunks: Vec::new() },
+        SessionEntryKind::ToolCall {
+            id: String::new(),
+            label_md: String::new(),
+            kind: acp::ToolKind::Execute,
+            status: ToolStatus::Pending,
+            content_md: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            tool_name: None,
+            locations: Vec::new(),
+            status_started_at: None,
+        },
+        SessionEntryKind::Plan(Vec::<PlanItem>::new()),
+        SessionEntryKind::ContextCompaction {
+            id: String::new(),
+            status: CompactionStatus::Completed,
+            summary_md: None,
+        },
+        SessionEntryKind::System {
+            level: SystemEntryLevel::Info,
+            text_md: String::new(),
+        },
+    ];
+
+    let auth_options = std::collections::HashMap::new();
+    for kind in &kinds {
+        let entry = SessionEntry {
+            created_ms: 1_700_000_000_000,
+            mod_seq: 1,
+            subagent_id: None,
+            kind: kind.clone(),
+        };
+        let mut image_cursor = 0usize;
+        let summary = super::dto::summarize_entry(
+            &entry,
+            0,
+            true,
+            false,
+            &mut image_cursor,
+            &auth_options,
+            None,
+            // Suppression OFF — this is about the rendering itself, not the
+            // N-37 opt-out, which is only ever honoured for non-user entries
+            // the caller explicitly asked to suppress.
+            false,
+        );
+        assert!(
+            !summary.preview.is_empty(),
+            "{kind:?} rendered an EMPTY preview; `skip_serializing_if` would omit the \
+             key and a shipped client would fail to decode the whole response"
+        );
+        let json = serde_json::to_value(&summary).expect("serialises");
+        assert!(
+            json.get("preview").is_some(),
+            "{kind:?} omitted the preview key: {json}"
+        );
+    }
+
+    // Exhaustiveness guard — see the doc above. A new variant belongs in
+    // `kinds` too; this match only forces the compile error that says so.
+    for kind in &kinds {
+        match kind {
+            SessionEntryKind::UserMessage { .. }
+            | SessionEntryKind::AssistantMessage { .. }
+            | SessionEntryKind::ToolCall { .. }
+            | SessionEntryKind::Plan(_)
+            | SessionEntryKind::ContextCompaction { .. }
+            | SessionEntryKind::System { .. } => {}
+        }
+    }
 }

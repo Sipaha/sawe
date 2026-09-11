@@ -3813,6 +3813,67 @@ commit into the incoming project's panel.
 How to apply: `Background` means "the same thing I was already showing moved"; it is never an open,
 never an activation, and never a repoint.
 
+### 156. The remote-control listener may spawn the reply wait, never the upstream write
+
+`run_request_loop` splits the WebSocket into a reader and a single writer task, so a slow RPC or a
+large frame can no longer block pong replies, notification forwarding, the idle timer or any other
+request from that phone. But the *upstream commit* stays on the reader, in wire order:
+`UnixMcpProxy::call_tool` is split into `begin_call` (mint id → insert pending → `write_all`) and
+`PendingCall::finish` (a pure oneshot wait), and only the latter is spawned.
+
+Why: the first version spawned a task per request, and that inverts order almost deterministically
+rather than rarely — tokio's LIFO slot polls the most recently spawned task first, and two frames
+arriving in one TCP segment are spawned back to back. A standalone model of the shape inverted
+500/500 trials. The invariant is invisible from inside this crate: it is stated in the *mobile
+client's* offline queue, whose gate chain opens when a frame is handed to the transport rather than
+when its response arrives, so a flush deliberately puts N sends in flight at once. Two messages typed
+offline in order could therefore land in the transcript reversed, permanently, with nothing to detect
+or heal it.
+
+How to apply: keep the commit inline and keep its test, and make that test drive the **real** proxy
+path — a stub dispatcher that merely sleeps inside `dispatch` never contends the shared write mutex
+and cannot observe this class of bug, which is exactly why the broken version looked tested.
+Related: a per-frame write timeout is not a liveness check (`SinkExt::send` resolves only when the
+whole frame is accepted by the kernel, and outbound frames are unbounded), so it must scale with
+payload size or it cuts a large response on any slow link.
+
+### 157. The mobile wire negotiates by capability list, because its version gate is an equality check
+
+`wire_schema_version` stays 6 and new wire fields are gated on tokens in
+`Capabilities::wire_features` (always serialised, empty vector included, so a client can distinguish
+"no features" from "no negotiation"), alongside `server_instance_id` and `csid_dedupe_window_ms`.
+
+Why: the mobile client rejects a server that is **too new** as well as too old, and either verdict
+tears the connection down onto a terminal screen with no retry. A bump is therefore a hard cutover by
+construction — every phone already in the field breaks the moment the desktop updates, before its APK
+can be replaced. Negotiation also cannot be done by probing: the params structs are
+`deny_unknown_fields`, so an unknown key returns `-32602` and the client sees a failed poll rather
+than a graceful fallback.
+
+How to apply: every new field is optional, and **absent means "old peer, behave as today"** — never a
+value that silently disables a feature. Two structs carry silent traps recorded at their definitions:
+`SendDeliveryDto`'s wire literals are a cross-repo agreement point (a third variant can fail a
+*strict* decoder on an accepted send), and `KnownEntryDto` is `deny_unknown_fields`, so it is
+unextendable — a newer client adding a field there fails the whole call rather than being ignored.
+When a real break finally arrives, widen the client's `MIN_SUPPORTED_WIRE_SCHEMA_VERSION` first; the
+constant exists so the next break does not repeat the equality trap.
+
+### 158. An idempotency claim must be released by whatever fails after it
+
+`claim_client_send_ids` returns a `CsidReceipt` whose `newly_claimed` list is private, and
+`release_client_send_ids` takes that receipt; everything between the claim and the enqueue runs inside
+one block whose `Err` releases.
+
+Why: the claim is taken before `resolve_upload_handles` on purpose, but nothing released it when that
+step failed, so the id sat in the dedupe window for 24 h with nothing enqueued. A replay of that send
+was then answered `duplicate`, the client read `duplicate` as success, and the user's message vanished
+with no diagnostic — where before dedupe existed the same path failed loudly. The receipt is private
+and typed because a partial overlap must release only the *newly* claimed ids: the rest belong to an
+earlier successful send, and releasing those would let that message be re-sent as a duplicate.
+
+How to apply: bracket the whole claim-to-enqueue span rather than wrapping the one call that fails
+today, so a fallible step added later cannot skip the release.
+
 ### 159. `catalog.list` is shared onto per-solution sockets, because the Solution Agent's prompt promises it
 
 `catalog.list` is in `SHARED_TOOLS` alongside `solutions.add_member`; the mutating `catalog.*` tools

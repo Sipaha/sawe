@@ -3626,6 +3626,8 @@ async fn final_streamed_message_is_visible_to_delta_poll_after_stop(cx: &mut Tes
                 known_epoch: 0,
                 stream_id: None,
                 include_images: false,
+                known_entries: None,
+                omit_preview_when_markdown: false,
             },
             &mut cx.to_async(),
         )
@@ -7177,4 +7179,142 @@ async fn toggle_dialog_session_drops_a_stale_remembered_id(cx: &mut TestAppConte
             );
         });
     });
+}
+
+// -----------------------------------------------------------------
+// WIRE-V7 N-05: the `spk_client_send_id` dedupe window.
+// -----------------------------------------------------------------
+
+#[test]
+fn csid_window_evicts_by_capacity() {
+    let mut window = CsidWindow::default();
+    let now = std::time::Instant::now();
+    for csid in 0..(CSID_DEDUPE_MAX_PER_SESSION as i64 + 1) {
+        assert_eq!(window.claim(&[csid], now).claim, CsidClaim::Accepted);
+    }
+    assert_eq!(
+        window
+            .claim(&[CSID_DEDUPE_MAX_PER_SESSION as i64], now)
+            .claim,
+        CsidClaim::Duplicate,
+        "the newest claim is still remembered"
+    );
+    assert_eq!(
+        window.claim(&[0], now).claim,
+        CsidClaim::Accepted,
+        "the OLDEST claim is the one evicted once the cap is exceeded"
+    );
+}
+
+#[test]
+fn csid_window_evicts_by_ttl() {
+    let mut window = CsidWindow::default();
+    let now = std::time::Instant::now();
+    let long_ago = now
+        .checked_sub(CSID_DEDUPE_WINDOW + std::time::Duration::from_secs(1))
+        .expect("test clock is far enough from the epoch");
+    assert_eq!(window.claim(&[11], long_ago).claim, CsidClaim::Accepted);
+    assert_eq!(
+        window.claim(&[11], long_ago).claim,
+        CsidClaim::Duplicate,
+        "still inside the window relative to its own claim instant"
+    );
+    assert_eq!(
+        window.claim(&[11], now).claim,
+        CsidClaim::Accepted,
+        "a claim older than CSID_DEDUPE_WINDOW is forgotten, so the phone's \
+         24 h offline queue can never be silently swallowed by a stale entry"
+    );
+}
+
+#[test]
+fn csid_window_requires_a_full_overlap_to_be_a_duplicate() {
+    let mut window = CsidWindow::default();
+    let now = std::time::Instant::now();
+    assert_eq!(window.claim(&[1, 2], now).claim, CsidClaim::Accepted);
+    assert_eq!(window.claim(&[1, 2], now).claim, CsidClaim::Duplicate);
+    assert_eq!(
+        window.claim(&[2, 3], now).claim,
+        CsidClaim::Accepted,
+        "a bundle merging a re-send with a new message must go through"
+    );
+    assert_eq!(window.claim(&[2, 3], now).claim, CsidClaim::Duplicate);
+}
+
+/// Session teardown must drop the window with everything else keyed by
+/// session id — otherwise the map grows one dead entry per closed session for
+/// the editor's whole lifetime.
+#[gpui::test]
+async fn csid_window_dropped_on_session_delete(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            assert_eq!(
+                store.claim_client_send_ids(session_id, &[5150]).claim,
+                CsidClaim::Accepted
+            );
+            assert_eq!(
+                store.claim_client_send_ids(session_id, &[5150]).claim,
+                CsidClaim::Duplicate
+            );
+            store.close_session(session_id, cx).expect("close_session");
+            assert_eq!(
+                store.claim_client_send_ids(session_id, &[5150]).claim,
+                CsidClaim::Accepted,
+                "teardown forgets the window"
+            );
+        });
+    });
+}
+
+/// Releasing a claim must undo ONLY what that claim inserted.
+///
+/// On a partial overlap the already-claimed ids belong to an EARLIER,
+/// successful send. Releasing those too would let that earlier message be
+/// re-sent and land in the transcript twice — the exact duplicate the window
+/// exists to stop.
+#[test]
+fn csid_release_undoes_only_the_ids_that_claim_inserted() {
+    let mut window = CsidWindow::default();
+    let now = std::time::Instant::now();
+
+    // An earlier send claims `1`.
+    let first = window.claim(&[1], now);
+    assert_eq!(first.claim, CsidClaim::Accepted);
+    // A later bundle merges the re-send of `1` with a new `2`.
+    let merged = window.claim(&[1, 2], now);
+    assert_eq!(merged.claim, CsidClaim::Accepted);
+
+    // That later bundle fails before enqueue and releases its claim.
+    window.release_for_test(&merged);
+
+    assert_eq!(
+        window.claim(&[2], now).claim,
+        CsidClaim::Accepted,
+        "the id the failed call inserted is claimable again"
+    );
+    assert_eq!(
+        window.claim(&[1], now).claim,
+        CsidClaim::Duplicate,
+        "the id belonging to the EARLIER successful send must stay claimed"
+    );
+}
+
+/// A released id is claimable again, and releasing twice is harmless.
+#[test]
+fn csid_release_is_idempotent_and_restores_claimability() {
+    let mut window = CsidWindow::default();
+    let now = std::time::Instant::now();
+    let receipt = window.claim(&[7, 8], now);
+    assert_eq!(window.claim(&[7, 8], now).claim, CsidClaim::Duplicate);
+
+    window.release_for_test(&receipt);
+    window.release_for_test(&receipt);
+
+    assert_eq!(
+        window.claim(&[7, 8], now).claim,
+        CsidClaim::Accepted,
+        "a send that never enqueued must be retryable"
+    );
 }

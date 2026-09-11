@@ -434,6 +434,12 @@ pub struct GetSessionParams {
     /// unless `user_anchored_lead` is also set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_anchored_since_ms: Option<i64>,
+    /// Default false. When true, `EntrySummary.preview` is omitted for any
+    /// non-user entry this response carries a body for — i.e. only when
+    /// `include_full_content` is also set (audit N-37). Entries with no body,
+    /// and every `role == "user"` entry, keep their preview unconditionally.
+    #[serde(default)]
+    pub omit_preview_when_markdown: bool,
 }
 
 impl<'de> Deserialize<'de> for GetSessionParams {
@@ -450,6 +456,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
             stream_id: Option<StreamIdDto>,
             user_anchored_lead: Option<usize>,
             user_anchored_since_ms: Option<i64>,
+            omit_preview_when_markdown: bool,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -462,6 +469,7 @@ impl<'de> Deserialize<'de> for GetSessionParams {
             stream_id: inner.stream_id,
             user_anchored_lead: inner.user_anchored_lead,
             user_anchored_since_ms: inner.user_anchored_since_ms,
+            omit_preview_when_markdown: inner.omit_preview_when_markdown,
         })
     }
 }
@@ -727,6 +735,10 @@ fn build_get_session_result(
                 input.include_images,
                 &mut image_cursor,
                 &live_auth_options,
+                // `get_session` is a full load: the caller holds nothing to
+                // diff against, so it never takes the N-29 delta path.
+                None,
+                input.omit_preview_when_markdown,
             ));
         }
         // Judge-frugal slice (user messages + lead context + the
@@ -952,8 +964,32 @@ pub struct GetSessionChangesParams {
     pub stream_id: Option<StreamIdDto>,
     /// Whether to inline base64 image payloads on changed entries. Defaults
     /// true — the delta is the live render source.
+    ///
+    /// The default stays `true` DELIBERATELY, even though `get_session`'s
+    /// same-named param defaults `false`. Flipping it would silently strip
+    /// images from every consumer that relies on the documented default — a
+    /// pre-2026-09-06 mobile build (photos vanish with no error) and any
+    /// third-party MCP consumer — while buying nothing from the mobile client,
+    /// which serialises an explicit value at every call site. A future
+    /// consumer that wants the cheap default should pass `false`, not change
+    /// the meaning of a shipped one. See WIRE-V7 §5 (audit N-30).
     #[serde(default = "default_true")]
     pub include_images: bool,
+    /// Per-entry digests of the bodies the caller already holds, so the
+    /// server can answer with a tail instead of the whole body (audit N-29).
+    ///
+    /// Absent (`None`) means "old client, or a client that chose not to":
+    /// every entry's body is sent whole, exactly as before this field
+    /// existed. An EMPTY vec is NOT "delta everything" — it means "I hold
+    /// nothing worth diffing", which is the same as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_entries: Option<Vec<KnownEntryDto>>,
+    /// Default false. When true, `EntrySummary.preview` is omitted for any
+    /// non-user entry this response carries a body for (audit N-37). Entries
+    /// with no body, and every `role == "user"` entry, keep their preview
+    /// unconditionally.
+    #[serde(default)]
+    pub omit_preview_when_markdown: bool,
 }
 
 impl<'de> Deserialize<'de> for GetSessionChangesParams {
@@ -968,6 +1004,10 @@ impl<'de> Deserialize<'de> for GetSessionChangesParams {
             stream_id: Option<StreamIdDto>,
             #[serde(default = "default_true")]
             include_images: bool,
+            #[serde(default)]
+            known_entries: Option<Vec<KnownEntryDto>>,
+            #[serde(default)]
+            omit_preview_when_markdown: bool,
         }
         let inner = Inner::deserialize(de)?;
         Ok(Self {
@@ -976,6 +1016,8 @@ impl<'de> Deserialize<'de> for GetSessionChangesParams {
             known_epoch: inner.known_epoch,
             stream_id: inner.stream_id,
             include_images: inner.include_images,
+            known_entries: inner.known_entries,
+            omit_preview_when_markdown: inner.omit_preview_when_markdown,
         })
     }
 }
@@ -1066,6 +1108,11 @@ impl McpServerTool for GetSessionChangesTool {
         );
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
+        // Validate ONCE, up front, so a malformed digest is a tool error
+        // rather than a silently-whole body on one path and an error on the
+        // other. An absent or empty `known_entries` yields an empty map,
+        // which is exactly the pre-N-29 behaviour.
+        let known_by_index = index_known_entries(input.known_entries.as_deref().unwrap_or(&[]))?;
 
         // 1. In-memory path — live or cold-restored, the freshest source.
         let in_memory = cx.update(|cx| {
@@ -1081,7 +1128,9 @@ impl McpServerTool for GetSessionChangesTool {
             // tail-resync only runs while the session is Running/Stopping, which
             // a flagged session never is.
             readable_in_memory_session(session_id, cx).map(|entity| {
-                entity.map(|e| build_get_session_changes_result(e.read(cx), &input, cx))
+                entity.map(|e| {
+                    build_get_session_changes_result(e.read(cx), &input, &known_by_index, cx)
+                })
             })
         });
         let result = match in_memory {
@@ -1091,7 +1140,7 @@ impl McpServerTool for GetSessionChangesTool {
             //    was served a cold full load then polls this RPC with the
             //    cursor it was handed, and a hard error there would strand a
             //    transcript the client has already rendered.
-            None => get_session_changes_from_db(session_id, &input, cx).await?,
+            None => get_session_changes_from_db(session_id, &input, &known_by_index, cx).await?,
         };
 
         let text = format!(
@@ -1117,9 +1166,15 @@ impl McpServerTool for GetSessionChangesTool {
 /// from the same code — in particular the same `(epoch, current_seq)` cursor
 /// arithmetic, which is what lets a client seeded by a cold `get_session` keep
 /// polling without a spurious `reset`.
+///
+/// `known_by_index` is the caller's validated `known_entries`, keyed by
+/// stream-local index. Empty for every client that did not send the N-29
+/// parameter, which is what keeps `markdown_prefix_len` / `markdown_tail` off
+/// the wire for an old peer.
 fn build_get_session_changes_result(
     session: &crate::model::SolutionSession,
     input: &GetSessionChangesParams,
+    known_by_index: &std::collections::HashMap<usize, &KnownEntryDto>,
     cx: &App,
 ) -> GetSessionChangesResult {
     let epoch = session.epoch;
@@ -1248,6 +1303,8 @@ fn build_get_session_changes_result(
                     input.include_images,
                     &mut image_cursor,
                     &live_auth_options,
+                    known_by_index.get(&index).copied(),
+                    input.omit_preview_when_markdown,
                 ),
             );
             if wanted_iter.peek().is_none() {
@@ -1337,10 +1394,12 @@ fn build_get_session_changes_result(
 async fn get_session_changes_from_db(
     session_id: SolutionSessionId,
     input: &GetSessionChangesParams,
+    known_by_index: &std::collections::HashMap<usize, &KnownEntryDto>,
     cx: &mut AsyncApp,
 ) -> Result<GetSessionChangesResult> {
     let session = load_cold_session(session_id, cx).await?;
-    Ok(cx.update(|cx| build_get_session_changes_result(session.read(cx), input, cx)))
+    Ok(cx
+        .update(|cx| build_get_session_changes_result(session.read(cx), input, known_by_index, cx)))
 }
 
 /// Fetch the full content of a single session entry by index. Designed
@@ -1526,6 +1585,11 @@ fn build_get_session_entry_result(
         input.include_images,
         &mut image_cursor,
         &live_auth_options,
+        // `get_session_entry` is deliberately excluded from both N-29 and
+        // N-37: it returns a single entry, so its preview is noise-level and
+        // there is nothing to diff against.
+        None,
+        false,
     );
     Ok(GetSessionEntryResult { entry: summary })
 }

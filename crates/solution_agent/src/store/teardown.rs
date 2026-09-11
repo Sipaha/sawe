@@ -548,6 +548,10 @@ impl SolutionAgentStore {
         self.teammate_watchers.forget_session(id);
         self.backoff_timers.remove(&id);
         self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
+        // The csid dedupe window is keyed by session id and nothing else
+        // prunes it; a closed session's replay protection is also meaningless
+        // (there is nothing left to replay into).
+        self.forget_client_send_ids(id);
         // The persist chain is the one runtime map that does NOT get evicted
         // with the session. A `Drain` leaves it under its key so that it both
         // finishes and keeps ordering a reopen that re-keys the same

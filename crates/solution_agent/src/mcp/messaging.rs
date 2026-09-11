@@ -120,8 +120,47 @@ impl<'de> Deserialize<'de> for SendMessageBlocksParams {
     }
 }
 
+/// What the server did with this `send_message_blocks` call.
+///
+/// The wire values are EXACTLY `"accepted"` and `"duplicate"`, frozen by
+/// `send_delivery_wire_values_are_frozen`. They are a byte-for-byte agreement
+/// point with the mobile client (WIRE-V7 §9.4) — a rename here does not fail
+/// to decode there, it changes what the client believes happened to a message
+/// the user typed.
+///
+/// ADDING A THIRD VARIANT IS A COMPATIBILITY EVENT, not an additive change.
+/// A client decodes this into a closed enum, so a verdict it has never heard
+/// of is at best "unknown, assume accepted" and at worst — for any build whose
+/// decoder is strict — an exception that aborts the WHOLE result object and
+/// turns a send the server ACCEPTED into a failed-send error and a bounced
+/// draft. Before adding one, confirm every client in the field decodes an
+/// unrecognised verdict leniently, and gate the new value behind a new
+/// `wire_features` token so a client opts into being told about it. The same
+/// reasoning as `wire_schema_version`: the cost lands on phones that are
+/// already shipped and cannot be updated in lockstep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SendDeliveryDto {
+    /// This call claimed the bundle's `spk_client_send_id`s and enqueued the
+    /// message.
+    Accepted,
+    /// An identical csid set was already accepted inside the dedupe window;
+    /// this call did nothing.
+    Duplicate,
+}
+
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
-pub struct SendMessageBlocksResult {}
+pub struct SendMessageBlocksResult {
+    /// Absent means "this server has no csid dedupe" (an old build), which a
+    /// client must read as "unknown", never as `accepted`. Present, it is
+    /// authoritative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<SendDeliveryDto>,
+    /// The `spk_client_send_id`s the server recognised on this call, in source
+    /// order. Empty for an unstamped (desktop-originated) send.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_send_ids: Vec<i64>,
+}
 
 #[derive(Clone)]
 pub struct SendMessageBlocksTool;
@@ -146,26 +185,77 @@ impl McpServerTool for SendMessageBlocksTool {
         );
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
-        // Swap any `spk-upload://<id>` ResourceLink for the inline
-        // Image/Text the chunked-upload tmp file contains, BEFORE the
-        // bundle reaches the store. Without this step the handle URI
-        // would travel verbatim to claude-acp, which has no idea what
-        // `spk-upload://` means — the attached image silently vanishes
-        // and the agent sees only the accompanying text.
-        let blocks = crate::upload::resolve_upload_handles(input.blocks)?;
-
-        cx.update(|cx| {
+        // Idempotency check FIRST (audit N-05). `resolve_upload_handles`
+        // below consumes and ABORTS every upload handle it sees, so a
+        // replayed bundle that reached it would die with `unknown_upload_id`
+        // — i.e. the retry this feature exists to make safe would fail with a
+        // confusing upload error. A duplicate must return success having
+        // touched nothing.
+        let client_send_ids = acp_thread::csids_from_blocks(&input.blocks);
+        let receipt = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
-            store.update(cx, |store, cx| {
-                store.send_message_blocks(session_id, blocks, cx).detach();
-            });
+            store.update(cx, |store, _| {
+                store.claim_client_send_ids(session_id, &client_send_ids)
+            })
         });
+        if receipt.is_duplicate() {
+            return Ok(ToolResponse {
+                content: vec![ToolResponseContent::Text {
+                    text: "duplicate".to_string(),
+                }],
+                structured_content: SendMessageBlocksResult {
+                    delivery: Some(SendDeliveryDto::Duplicate),
+                    client_send_ids,
+                },
+            });
+        }
+
+        // EVERY path from here either reaches the enqueue or RELEASES the
+        // claim. The fallible work is inside this block precisely so a step
+        // added later cannot skip the release by returning early: a claim
+        // that outlives a failed send turns the client's replay into a
+        // `duplicate` answer, which the client takes as SUCCESS, and the
+        // user's message disappears for 24 h with no error anywhere. See
+        // `CsidReceipt`.
+        let enqueued = (|| -> Result<()> {
+            // Swap any `spk-upload://<id>` ResourceLink for the inline
+            // Image/Text the chunked-upload tmp file contains, BEFORE the
+            // bundle reaches the store. Without this step the handle URI
+            // would travel verbatim to claude-acp, which has no idea what
+            // `spk-upload://` means — the attached image silently vanishes
+            // and the agent sees only the accompanying text.
+            //
+            // This is the fallible step the release exists for: it errors on
+            // an unknown/aged-out upload id, an unfinished upload, an
+            // unsupported MIME, a malformed handle URI or an IO fault.
+            let blocks = crate::upload::resolve_upload_handles(input.blocks)?;
+            cx.update(|cx| {
+                let store = SolutionAgentStore::global(cx);
+                store.update(cx, |store, cx| {
+                    store.send_message_blocks(session_id, blocks, cx).detach();
+                });
+            });
+            Ok(())
+        })();
+
+        if let Err(err) = enqueued {
+            cx.update(|cx| {
+                let store = SolutionAgentStore::global(cx);
+                store.update(cx, |store, _| {
+                    store.release_client_send_ids(session_id, &receipt);
+                });
+            });
+            return Err(err);
+        }
 
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
                 text: "queued".to_string(),
             }],
-            structured_content: SendMessageBlocksResult {},
+            structured_content: SendMessageBlocksResult {
+                delivery: Some(SendDeliveryDto::Accepted),
+                client_send_ids,
+            },
         })
     }
 }

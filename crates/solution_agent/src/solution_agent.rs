@@ -187,15 +187,22 @@ async fn run_identity_migration(db: &db::SolutionAgentDb, cx: &mut AsyncApp) {
     }
 }
 
-/// Drain queued chunk-ack events from the `UploadManager` and broadcast each
-/// one as an `upload_chunk_acked` MCP notification. The listener (pure tokio)
-/// can't call `editor_mcp::emit_notification` directly because the underlying
-/// `McpServer` uses `RefCell` and must be touched from the GPUI thread, so the
-/// ack queue inside `UploadManager` is the cross-thread hand-off.
+/// Drain queued chunk-ack and chunk-rejection events from the `UploadManager`
+/// and broadcast each one as an `upload_chunk_acked` / `upload_chunk_rejected`
+/// MCP notification. The listener (pure tokio) can't call
+/// `editor_mcp::emit_notification` directly because the underlying `McpServer`
+/// uses `RefCell` and must be touched from the GPUI thread, so the queues
+/// inside `UploadManager` are the cross-thread hand-off.
+///
+/// The rejection half is what keeps a flaky link from stalling: without it a
+/// refused chunk is only logged, and the client sits out its 30 s ack timeout
+/// before pausing. `upload_chunk_rejected` carries the `expected_offset` the
+/// client should resume from, so it can re-seek immediately. Clients that
+/// don't know the kind ignore it and fall back to the timeout as before.
 ///
 /// 100ms tick is fast enough that mobile progress bars feel live but slow
 /// enough that an idle editor isn't waking up for nothing. The drainer only
-/// emits when the queue has acks — empty drains are a single Vec::take + early
+/// emits when a queue has entries — empty drains are a single Vec::take + early
 /// continue.
 fn spawn_upload_ack_drainer(cx: &mut App) {
     cx.spawn(async move |cx: &mut AsyncApp| {
@@ -220,6 +227,25 @@ fn spawn_upload_ack_drainer(cx: &mut App) {
                         "received_bytes": ack.received_bytes,
                     });
                     editor_mcp::emit_notification(cx, "upload_chunk_acked", payload);
+                }
+                let rejections =
+                    upload::with_manager(|m| m.drain_rejections()).unwrap_or_default();
+                for rejection in rejections {
+                    log::info!(
+                        target: "solution_agent::upload",
+                        "drainer emit upload_chunk_rejected: upload_id={} offset={} expected={:?} reason={}",
+                        rejection.upload_id,
+                        rejection.offset,
+                        rejection.expected_offset,
+                        rejection.reason,
+                    );
+                    let payload = serde_json::json!({
+                        "upload_id": rejection.upload_id,
+                        "offset": rejection.offset,
+                        "expected_offset": rejection.expected_offset,
+                        "reason": rejection.reason,
+                    });
+                    editor_mcp::emit_notification(cx, "upload_chunk_rejected", payload);
                 }
             });
         }

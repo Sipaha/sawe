@@ -9,6 +9,18 @@
 //!  - tools can check whether interested clients exist before doing
 //!    expensive notification-formatting work,
 //!  - clients can poll `editor.get_operation` for op-progress updates.
+//!
+//! FOLLOW-UP (WIRE-V7 §6.4, audit N-34): this registry is process-GLOBAL, not
+//! per-connection — ids come from one counter, entries are never removed on
+//! disconnect, and every client reconnect appends another one. That is why no
+//! emit-path filtering may consult it: one client's subscription set would be
+//! applied to every client. Making it per-connection is a real refactor across
+//! `editor_mcp` <-> `context_server` <-> `remote_control`, and its whole payoff
+//! today is ONE kind (`agent_session_notification_sent`, which is forwarded by
+//! the `agent_session_` prefix rule but never subscribed to and never handled).
+//! The duplicate-poke half of N-34 is instead handled per connection in
+//! `remote_control::proxy::SuppressedKinds`. Revisit the refactor only when
+//! something needs the registry for more than that one kind.
 
 use chrono::{DateTime, Utc};
 use collections::HashMap;
