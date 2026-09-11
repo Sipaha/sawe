@@ -16,14 +16,14 @@ mod actions;
 mod panel;
 mod terminal_provider;
 
-use gpui::{Context, Focusable as _, SharedString, TaskExt as _, Window};
+use gpui::{Context, Focusable as _, SharedString, Window};
 use solution_agent::SolutionSessionId;
 use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
 use solution_agent::solution_band::SolutionBand;
 use solution_agent::store::SolutionAgentStore;
 use workspace::{UtilityKind, Workspace};
 
-pub use actions::{NewChat, NewTerminal, ShowSession, ToggleDialog, ToggleFocus};
+pub use actions::{NewChat, NewCodexChat, NewTerminal, ShowSession, ToggleDialog, ToggleFocus};
 pub use panel::{ConsolePanel, ConsoleTab, console_panel_for_workspace};
 pub use terminal_provider::TerminalProvider;
 
@@ -41,6 +41,7 @@ pub fn init(cx: &mut gpui::App) {
             }
         });
         workspace.register_action(handle_new_chat);
+        workspace.register_action(handle_new_codex_chat);
         workspace.register_action(handle_toggle_focus);
         workspace.register_action(handle_show_session);
         workspace.register_action(handle_toggle_dialog);
@@ -110,21 +111,31 @@ fn handle_new_chat(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    create_chat(workspace, CLAUDE_ACP_AGENT_ID, cx);
+}
+
+fn handle_new_codex_chat(
+    workspace: &mut Workspace,
+    _: &NewCodexChat,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    create_chat(workspace, "codex-native", cx);
+}
+
+fn create_chat(workspace: &mut Workspace, agent_id: &'static str, cx: &mut Context<Workspace>) {
     let Some(solution_id) = panel::active_solution_id_for_workspace(workspace, cx) else {
         return;
     };
     let project = workspace.project().clone();
     let store = SolutionAgentStore::global(cx);
     // A chat is always solution-scoped and rooted at `solution.root`
-    // (`cwd: None`) — never the active member's folder. This used to be a
-    // shared `new_chat_cwd` helper both creation entry points routed
-    // through (Critical 1, 2026-08-26 final review); now there is only one
-    // entry point (this action; the "+" popover dispatches it too), so
-    // there is no second call site left to diverge.
+    // (`cwd: None`) — never the active member's folder. Both agent actions
+    // and the "+" popover use this helper to preserve the same scope.
     let task = store.update(cx, |store, cx| {
         store.create_session_with_cwd(
             solution_id,
-            SharedString::from(CLAUDE_ACP_AGENT_ID),
+            SharedString::from(agent_id),
             project,
             None,
             None,
@@ -132,16 +143,20 @@ fn handle_new_chat(
             cx,
         )
     });
-    cx.spawn(async move |_workspace, cx| {
-        let session_id = task.await?;
-        cx.update(|cx| {
+    cx.spawn(async move |workspace, cx| match task.await {
+        Ok(session_id) => cx.update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
                 store.set_active_dialog_session(solution_id, Some(session_id), cx);
             });
-        });
-        anyhow::Ok(())
+        }),
+        Err(error) => {
+            log::error!("console panel: failed to create {agent_id} chat: {error:#}");
+            workspace
+                .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                .ok();
+        }
     })
-    .detach_and_log_err(cx);
+    .detach();
 }
 
 /// `ShowSession` handler: selects `action.session_id` as its own solution's

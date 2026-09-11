@@ -9,8 +9,10 @@ gpui::actions!(
         ToggleFocus,
         /// Opens a new terminal tab in the console panel.
         NewTerminal,
-        /// Creates a new AI-chat session and shows it in the Solution band.
+        /// Creates a new Claude chat and shows it in the Solution band.
         NewChat,
+        /// Creates a new Codex chat and shows it in the Solution band.
+        NewCodexChat,
         /// Toggles the Solution band's dialog half (`ctrl-shift-a`).
         /// Collapses it if a session is currently showing
         /// (`SolutionAgentStore::set_active_dialog_session(solution_id, None,

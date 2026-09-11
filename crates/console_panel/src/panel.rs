@@ -2005,6 +2005,7 @@ mod tests {
     #[test]
     fn new_chat_action_matches_the_status_bar_strips_dispatch_string() {
         assert_eq!(NewChat.name(), "console_panel::NewChat");
+        assert_eq!(crate::NewCodexChat.name(), "console_panel::NewCodexChat");
     }
 
     /// Same pinning for the band's utility button group (phase 2b task 6),
@@ -2123,6 +2124,7 @@ mod tests {
         init_test(cx);
 
         let connect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let codex_connect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         cx.update(|cx| {
             let registry = std::sync::Arc::new(solution_agent::adapter::AdapterRegistry::new());
             SolutionAgentStore::init_global(cx, registry);
@@ -2131,7 +2133,13 @@ mod tests {
                 s.register_agent_server(
                     gpui::SharedString::from(solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID),
                     std::rc::Rc::new(solution_agent::test_support::MockAgentServer::new(
-                        connect_count,
+                        connect_count.clone(),
+                    )),
+                );
+                s.register_agent_server(
+                    gpui::SharedString::from("codex-native"),
+                    std::rc::Rc::new(solution_agent::test_support::MockAgentServer::new(
+                        codex_connect_count.clone(),
                     )),
                 );
             });
@@ -2166,13 +2174,24 @@ mod tests {
                 crate::handle_new_chat(workspace, &NewChat, window, cx);
             })
             .unwrap();
-        // The async `create_session_with_cwd` task settles (successfully or
-        // not) after this call returns — either way is fine. What this test
-        // guards is that the synchronous part of `handle_new_chat` (reading
-        // the active solution + project off `&mut Workspace`, then calling
-        // into `SolutionAgentStore`) does not panic while the `Workspace` is
-        // leased.
         cx.run_until_parked();
+        assert_eq!(connect_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            codex_connect_count.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        window_handle
+            .update(cx, |workspace, window, cx| {
+                crate::handle_new_codex_chat(workspace, &crate::NewCodexChat, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(connect_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            codex_connect_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     /// Bootstrap a `Workspace` with BOTH Solution-band slots filled — the
