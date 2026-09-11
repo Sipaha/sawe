@@ -223,7 +223,7 @@ impl CodexConnection {
         let Some(directory) = paths.ordered_paths().next().cloned() else {
             return Task::ready(Err(anyhow!("Working directory cannot be empty")));
         };
-        let config = mcp_config(&mcp_servers_for_project(&project, cx));
+        let config = session_config(&mcp_servers_for_project(&project, cx));
         cx.spawn(async move |cx| {
             let mut process = cx.update(|cx| Process::spawn(&directory, cx))?;
             process.initialize().await?;
@@ -479,8 +479,14 @@ async fn models(process: &Process) -> Result<Vec<CodexModelInfo>> {
     }
     Ok(models)
 }
-fn mcp_config(servers: &[acp::McpServer]) -> Value {
+fn session_config(servers: &[acp::McpServer]) -> Value {
     let mut config = serde_json::Map::new();
+    // Request the large window for editor-owned threads. Codex clamps this
+    // to the selected model's maximum, including after a model switch, and
+    // reports its effective usable capacity through tokenUsage updates.
+    // This override applies to thread/start and thread/resume only; it does
+    // not modify the user's global Codex configuration.
+    config.insert("model_context_window".into(), json!(872_000));
     for server in servers {
         match server {
             acp::McpServer::Stdio(server) => {
@@ -560,7 +566,7 @@ mod tests {
     use super::*;
     #[test]
     fn forwards_stdio_and_http_mcp_configuration() {
-        let config = mcp_config(&[
+        let config = session_config(&[
             acp::McpServer::Stdio(
                 acp::McpServerStdio::new("sawe", "/bin/sawe")
                     .args(vec!["--nc".into(), "/tmp/solution/mcp.sock".into()])
@@ -571,6 +577,7 @@ mod tests {
                     .headers(vec![acp::HttpHeader::new("Authorization", "Bearer test")]),
             ),
         ]);
+        assert_eq!(config["model_context_window"], 872_000);
         assert_eq!(config["mcp_servers.sawe"]["command"], "/bin/sawe");
         assert_eq!(config["mcp_servers.sawe"]["env"]["SCOPE"], "test");
         assert_eq!(
@@ -585,7 +592,7 @@ mod tests {
             2
         );
         assert!(config["mcp_servers.remote"].get("tools").is_none());
-        let external = mcp_config(&[acp::McpServer::Stdio(acp::McpServerStdio::new(
+        let external = session_config(&[acp::McpServer::Stdio(acp::McpServerStdio::new(
             "sawe",
             "/bin/external",
         ))]);

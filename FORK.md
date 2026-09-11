@@ -4052,3 +4052,13 @@ cold sessions restored after restart require user participation before peer wake
 Acceptance reports queued/submitted input, not completed work. See
 [the communication guide](docs/workflow/solution-agent-communication.md) and
 [ADR-0005](docs/architecture/decisions/0005-solution-peer-messaging.md).
+
+### 169. Editor-owned Codex threads request a large context window
+
+Codex thread start and resume pass `model_context_window = 872000` in their
+session configuration. The native runtime clamps the request to the selected
+model's maximum; Sawe continues to display reported effective capacity rather
+than the requested size. GPT-6-Astra currently reports 828400 usable tokens,
+while switching the same thread to GPT-5.5 reports 258400. Global Codex settings
+are unchanged. Observer thresholds continue to use the reported capacity.
+See [the verification finding](docs/findings/2026-09-11-codex-large-context.md).

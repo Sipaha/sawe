@@ -133,6 +133,7 @@ Short, dated, single-fact notes from sessions: "ran a benchmark and got X",
 
 | Date | Status | Topic |
 |---|---|---|
+| 2026-09-11 | verified | [`findings/2026-09-11-codex-large-context.md`](findings/2026-09-11-codex-large-context.md) — editor-scoped large window and native model-switch clamping. |
 | 2026-09-11 | verified | [`findings/2026-09-11-claude-native-streaming-input.md`](findings/2026-09-11-claude-native-streaming-input.md) — active stdin works, but queued input survives interrupt; retain the editor-owned hook queue. |
 | 2026-09-11 | audited | [`findings/2026-09-11-model-neutral-prompt-audit.md`](findings/2026-09-11-model-neutral-prompt-audit.md) — prompt inventory, English defaults, protocol boundaries and prioritized improvements. |
 | 2026-09-11 | fixed | [`findings/2026-09-11-chat-scroll-anchoring.md`](findings/2026-09-11-chat-scroll-anchoring.md) — preserve visible content when upward scrolling discovers taller wrapped rows. |
