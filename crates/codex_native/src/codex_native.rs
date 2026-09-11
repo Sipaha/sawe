@@ -427,16 +427,30 @@ async fn models(process: &Process) -> Result<Vec<CodexModelInfo>> {
 fn mcp_config(servers: &[acp::McpServer]) -> Value {
     let mut config = serde_json::Map::new();
     for server in servers {
-        if let acp::McpServer::Stdio(server) = server {
-            let env: serde_json::Map<String, Value> = server
-                .env
-                .iter()
-                .map(|e| (e.name.clone(), json!(e.value)))
-                .collect();
-            config.insert(
-                format!("mcp_servers.{}", server.name),
-                json!({"command":server.command,"args":server.args,"env":env}),
-            );
+        match server {
+            acp::McpServer::Stdio(server) => {
+                let env: serde_json::Map<String, Value> = server
+                    .env
+                    .iter()
+                    .map(|entry| (entry.name.clone(), json!(entry.value)))
+                    .collect();
+                config.insert(
+                    format!("mcp_servers.{}", server.name),
+                    json!({"command":server.command,"args":server.args,"env":env}),
+                );
+            }
+            acp::McpServer::Http(server) => {
+                let headers: serde_json::Map<String, Value> = server
+                    .headers
+                    .iter()
+                    .map(|entry| (entry.name.clone(), json!(entry.value)))
+                    .collect();
+                config.insert(
+                    format!("mcp_servers.{}", server.name),
+                    json!({"url":server.url,"http_headers":headers}),
+                );
+            }
+            _ => log::warn!("Codex does not support this MCP transport"),
         }
     }
     Value::Object(config)
@@ -478,6 +492,30 @@ fn belongs_to_thread(params: &Value, id: &acp::SessionId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwards_stdio_and_http_mcp_configuration() {
+        let config = mcp_config(&[
+            acp::McpServer::Stdio(
+                acp::McpServerStdio::new("sawe", "/bin/sawe")
+                    .args(vec!["--mcp-bridge".into()])
+                    .env(vec![acp::EnvVariable::new("SCOPE", "test")]),
+            ),
+            acp::McpServer::Http(
+                acp::McpServerHttp::new("remote", "https://example.com/mcp")
+                    .headers(vec![acp::HttpHeader::new("Authorization", "Bearer test")]),
+            ),
+        ]);
+        assert_eq!(config["mcp_servers.sawe"]["command"], "/bin/sawe");
+        assert_eq!(config["mcp_servers.sawe"]["env"]["SCOPE"], "test");
+        assert_eq!(
+            config["mcp_servers.remote"]["url"],
+            "https://example.com/mcp"
+        );
+        assert_eq!(
+            config["mcp_servers.remote"]["http_headers"]["Authorization"],
+            "Bearer test"
+        );
+    }
     #[test]
     fn child_and_unscoped_events_cannot_complete_parent_turn() {
         let id = acp::SessionId::new("parent");
