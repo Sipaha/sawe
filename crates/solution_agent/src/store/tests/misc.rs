@@ -6011,7 +6011,8 @@ fn thread_has_continuation(
                     _ => None,
                 })
                 .collect();
-            text.contains("продолжай работу с того места")
+            text.contains("Continue the user's current task from the last confirmed state")
+                && text.contains("Check any interrupted operation before repeating it")
         } else {
             false
         }
@@ -6204,9 +6205,23 @@ async fn reconnect_on_unanswered_user_message_points_at_it(cx: &mut TestAppConte
     let (has_unanswered_prompt, has_generic) = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.read_with(cx, |store, cx| {
-            let unanswered = last_user_text_contains(store, session_id, "НЕ считай его уже", cx);
-            let generic =
-                last_user_text_contains(store, session_id, "продолжай работу с того места", cx);
+            let unanswered = last_user_text_contains(
+                store,
+                session_id,
+                "before you answered the latest human message above",
+                cx,
+            ) && last_user_text_contains(
+                store,
+                session_id,
+                "Read and address that message now; do not treat it as already handled",
+                cx,
+            ) && last_user_text_contains(
+                store,
+                session_id,
+                "Check any interrupted operation before repeating it",
+                cx,
+            );
+            let generic = thread_has_continuation(store, session_id, cx);
             (unanswered, generic)
         })
     });
