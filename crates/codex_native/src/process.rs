@@ -19,6 +19,18 @@ use std::{
 use util::{ResultExt as _, process::Child};
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+#[derive(Debug)]
+pub(crate) struct RpcError {
+    pub code: i64,
+    pub message: String,
+}
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Codex: {}", self.message)
+    }
+}
+impl std::error::Error for RpcError {}
+
 pub struct Process {
     child: Mutex<Child>,
     executor: gpui::BackgroundExecutor,
@@ -101,33 +113,17 @@ impl Process {
         })
     }
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(id, sender);
-        if self
-            .outgoing
-            .unbounded_send(json!({"id":id,"method":method,"params":params}))
-            .is_err()
-        {
-            self.pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&id);
-            bail!("Codex input closed. Reopen this chat to reconnect.");
-        }
-        let result = futures::select_biased! {
-            response = receiver.fuse() => response.context("Codex process disconnected. Reopen this chat to reconnect.")?,
-            _ = futures::FutureExt::fuse(self.executor.timer(Duration::from_secs(45))) => Err(anyhow!("Codex {method} timed out. Reopen this chat to reconnect.")),
-        };
-        self.pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&id);
-        result
+        request_on_wire(
+            &self.outgoing,
+            &self.pending,
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            method,
+            params,
+            self.executor.timer(Duration::from_secs(45)).map(|_| ()),
+        )
+        .await
     }
+
     pub async fn initialize(&self) -> Result<()> {
         self.request("initialize", json!({"clientInfo":{"name":"sawe","title":"Sawe","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}})).await?;
         self.outgoing
@@ -146,6 +142,81 @@ impl Drop for Process {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+async fn request_on_wire(
+    outgoing: &mpsc::UnboundedSender<Value>,
+    pending: &Pending,
+    id: u64,
+    method: &str,
+    params: Value,
+    timeout: impl std::future::Future<Output = ()>,
+) -> Result<Value> {
+    let (sender, receiver) = oneshot::channel();
+    pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id, sender);
+    if outgoing
+        .unbounded_send(json!({"id":id,"method":method,"params":params}))
+        .is_err()
+    {
+        pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+        bail!("Codex input closed. Reopen this chat to reconnect.");
+    }
+    let timeout = timeout.fuse();
+    futures::pin_mut!(timeout);
+    let result = futures::select_biased! {
+        response = receiver.fuse() => response.context("Codex process disconnected. Reopen this chat to reconnect.")?,
+        _ = timeout => Err(anyhow!("Codex {method} timed out. Reopen this chat to reconnect.")),
+    };
+    pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+    result
+}
+
+#[cfg(test)]
+pub(crate) async fn mock_steer_exchange(
+    params: Value,
+    mut response: Value,
+    before_response: Vec<Value>,
+) -> Result<Value> {
+    let pending: Pending = Default::default();
+    let (outgoing, mut requests) = mpsc::unbounded();
+    let expected = params.clone();
+    let request = request_on_wire(
+        &outgoing,
+        &pending,
+        41,
+        "turn/steer",
+        params,
+        futures::future::pending(),
+    );
+    let server = async {
+        let message = requests.next().await.unwrap();
+        assert_eq!(
+            message,
+            json!({"id":41,"method":"turn/steer","params":expected})
+        );
+        response["id"] = json!(41);
+        let bytes = before_response
+            .iter()
+            .chain(std::iter::once(&response))
+            .map(|v| format!("{v}\n"))
+            .collect::<String>();
+        let (events, mut incoming) = mpsc::unbounded();
+        read_messages(futures::io::Cursor::new(bytes), pending.clone(), events).await;
+        for event in before_response {
+            assert_eq!(incoming.next().await.unwrap(), event);
+        }
+    };
+    let (result, _) = futures::join!(request, server);
+    result
 }
 
 async fn read_messages(
@@ -173,10 +244,14 @@ async fn read_messages(
                     .remove(&id)
             {
                 let result = if let Some(error) = value.get("error") {
-                    Err(anyhow!(
-                        "Codex: {}",
-                        error["message"].as_str().unwrap_or("request failed")
-                    ))
+                    Err(RpcError {
+                        code: error["code"].as_i64().unwrap_or(0),
+                        message: error["message"]
+                            .as_str()
+                            .unwrap_or("request failed")
+                            .to_owned(),
+                    }
+                    .into())
                 } else {
                     Ok(value["result"].clone())
                 };

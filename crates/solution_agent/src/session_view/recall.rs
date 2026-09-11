@@ -108,6 +108,13 @@ impl SolutionSessionView {
             return;
         };
         let bundle = self.session.read(cx).pending_messages[idx].clone();
+        if SolutionAgentStore::global(cx)
+            .read(cx)
+            .bundle_is_steering(session_id, bundle.id)
+        {
+            return;
+        }
+
         let (text, images) = unpack_recalled_bundle(bundle.blocks.clone());
         if text.is_empty() && images.is_empty() {
             return;

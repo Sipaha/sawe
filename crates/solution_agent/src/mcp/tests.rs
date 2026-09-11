@@ -3157,6 +3157,7 @@ async fn get_session_changes_sections_always_present(cx: &mut gpui::TestAppConte
     // A non-empty queue surfaces in the same always-present section.
     mutate_session(session_id, cx, |s| {
         s.pending_messages.push_back(crate::model::PendingBundle {
+            id: uuid::Uuid::new_v4(),
             target: crate::model::QueueTarget::Main,
             blocks: vec![fake_user_text_chunk("queued")],
         });

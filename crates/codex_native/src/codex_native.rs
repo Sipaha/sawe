@@ -1,5 +1,7 @@
 mod process;
+mod steering;
 mod translate;
+pub use steering::SteerOutcome;
 
 use acp_thread::{AcpThread, AgentConnection, AuthorizationKind, PermissionOptions, UserMessageId};
 use action_log::ActionLog;
@@ -107,6 +109,58 @@ pub struct CodexConnection {
     desired_efforts: RefCell<HashMap<acp::SessionId, String>>,
 }
 impl CodexConnection {
+    /// Add input to the currently active turn. Acceptance is not completion:
+    /// the original prompt future remains owned by turn/completed.
+    pub fn steer(
+        &self,
+        id: &acp::SessionId,
+        blocks: Vec<acp::ContentBlock>,
+        client_message_id: String,
+        cx: &mut App,
+    ) -> Task<SteerOutcome> {
+        let sessions = self.sessions.borrow();
+        let Some(session) = sessions.get(id) else {
+            return Task::ready(SteerOutcome::Rejected(anyhow!("Codex session is closed")));
+        };
+        let input = match translate::input(&blocks) {
+            Ok(input) => input,
+            Err(error) => return Task::ready(SteerOutcome::Rejected(error)),
+        };
+        let state = session.state.clone();
+        let process = session.process.clone();
+        let generation = state.borrow().generation;
+        let id = id.clone();
+        cx.spawn(async move |cx| {
+            // A follow-up may precede the turn/start acknowledgement. Wait for
+            // this generation's id, never pick up a subsequent turn's id.
+            for _ in 0..100 {
+                let unavailable = {
+                    let state = state.borrow();
+                    state.generation != generation
+                        || state.sender.is_none()
+                        || state.cancel_requested
+                        || state.disconnected
+                };
+                if unavailable {
+                    return SteerOutcome::Rejected(anyhow!(
+                        "The original Codex turn is no longer active"
+                    ));
+                }
+                let turn_id = state.borrow().turn_id.clone();
+                if let Some(turn_id) = turn_id {
+                    return steering::request(&id, &turn_id, input, client_message_id, |params| {
+                        process.request("turn/steer", params)
+                    })
+                    .await;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+            }
+            SteerOutcome::Rejected(anyhow!("Codex has not acknowledged the active turn yet"))
+        })
+    }
+
     pub fn available_models(&self, id: &acp::SessionId) -> Vec<CodexModelInfo> {
         self.sessions
             .borrow()

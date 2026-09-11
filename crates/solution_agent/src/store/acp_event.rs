@@ -346,6 +346,12 @@ impl SolutionAgentStore {
                         .unwrap_or(false);
                     let cancelled =
                         matches!(reason, agent_client_protocol::schema::StopReason::Cancelled);
+                    if cancelled && let Some(session) = self.session(session_id) {
+                        if session.update(cx, |session, _| session.clear_compaction_request()) {
+                            self.mark_queue_changed(session_id, cx);
+                            cx.notify();
+                        }
+                    }
                     if cancelled && !flush_after_cancel {
                         // Silent-drop path: user pressed Stop, queue
                         // gets discarded without surfacing what was in
@@ -384,77 +390,7 @@ impl SolutionAgentStore {
                             self.mark_queue_changed(session_id, cx);
                         }
                     } else {
-                        // Idle / flush-after-cancel. Deliver the MAIN-targeted
-                        // bundles as a new turn. Any Subagent-targeted leftover
-                        // belongs to a teammate that the now-ending parent turn
-                        // has finished — per design it is LOST (a follow-up for
-                        // teammate X is meaningless to the parent), so drop it
-                        // with a WARN rather than mis-route it to the main
-                        // thread. Partition the queue in one update.
-                        let (main_blocks, dropped_subagent) = self
-                            .sessions
-                            .get(&session_id)
-                            .cloned()
-                            .map(|s| {
-                                s.update(cx, |s, _| {
-                                    let mut main: Vec<acp::ContentBlock> = Vec::new();
-                                    let mut dropped: Vec<crate::model::PendingBundle> = Vec::new();
-                                    for bundle in s.pending_messages.drain(..) {
-                                        match bundle.target {
-                                            crate::model::QueueTarget::Main => {
-                                                main.extend(bundle.blocks)
-                                            }
-                                            crate::model::QueueTarget::Subagent(_) => {
-                                                dropped.push(bundle)
-                                            }
-                                        }
-                                    }
-                                    (main, dropped)
-                                })
-                            })
-                            .unwrap_or_default();
-                        if !dropped_subagent.is_empty() {
-                            let previews: Vec<String> = dropped_subagent
-                                .iter()
-                                .map(|b| {
-                                    let to = match &b.target {
-                                        crate::model::QueueTarget::Subagent(id) => id.as_ref(),
-                                        crate::model::QueueTarget::Main => "main",
-                                    };
-                                    format!("→{to}: {}", queue::summarize_blocks_for_log(&b.blocks))
-                                })
-                                .collect();
-                            log::warn!(
-                                target: "solution_agent::queue",
-                                "session={session_id} dropped {} subagent-targeted bundle(s) on turn end \
-                                 (addressee teammate finished without draining; no fallback to main) — content: [{}]",
-                                dropped_subagent.len(),
-                                previews.join(" | "),
-                            );
-                        }
-                        let had_pending = !main_blocks.is_empty() || !dropped_subagent.is_empty();
-                        if had_pending {
-                            self.mark_queue_changed(session_id, cx);
-                        }
-                        if !main_blocks.is_empty() {
-                            log::info!(
-                                target: "solution_agent::queue",
-                                "session={session_id} flushing {} Main block(s) \
-                                 (flush_after_cancel={flush_after_cancel}) preview={}",
-                                main_blocks.len(),
-                                queue::summarize_blocks_for_log(&main_blocks),
-                            );
-                            // Idle-flush is always end-of-turn: the agent
-                            // already produced a complete message, so prepend
-                            // the "not a reply" hint (stripped on render, like
-                            // the per-message timestamps already in the blocks).
-                            let mut with_hint = Vec::with_capacity(main_blocks.len() + 1);
-                            with_hint.push(acp::ContentBlock::Text(acp::TextContent::new(
-                                format!("{}\n\n", queue::QUEUE_HINT_LINE),
-                            )));
-                            with_hint.extend(main_blocks);
-                            self.send_message_blocks(session_id, with_hint, cx).detach();
-                        }
+                        self.flush_stopped_queue(session_id, flush_after_cancel, cx);
                     }
                 }
             }

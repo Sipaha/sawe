@@ -991,6 +991,7 @@ mod tests {
             let session = store.read(cx).session(session_id).expect("session");
             session.update(cx, |s, _| {
                 s.pending_messages.push_back(crate::model::PendingBundle {
+                    id: uuid::Uuid::new_v4(),
                     target: crate::model::QueueTarget::Main,
                     blocks: vec![
                         stamped_text("hello world", 111),

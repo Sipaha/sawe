@@ -417,6 +417,7 @@ impl SolutionAgentStore {
                 // promised — this is the same settle the `Stopped` branch does,
                 // minus the Cancelled-drop path (a flag-less force-flip keeps the
                 // queue for the normal idle-flush, exactly as before).
+                if store.active_steers.contains_key(&session_id) { return; }
                 let flush_after_cancel = session.update(cx, |s, _| {
                     let was = s.flush_after_cancel;
                     s.flush_after_cancel = false;
@@ -527,6 +528,7 @@ impl SolutionAgentStore {
     /// nothing that preceded it can be a meaningful duplicate.
     pub(crate) fn forget_client_send_ids(&mut self, session_id: SolutionSessionId) {
         self.client_send_dedupe.remove(&session_id);
+        self.active_steers.remove(&session_id);
     }
 
     /// Send a plain-text user message. Convenience wrapper around
@@ -641,6 +643,35 @@ impl SolutionAgentStore {
             return self.send_after_transcript_retry(session_id, blocks, target, from_user, cx);
         }
 
+        // A cooperative compaction request must never answer a permission
+        // prompt as a side effect, including one that appeared during retry.
+        let is_compaction = crate::compact::is_compaction_blocks(&blocks);
+        if is_compaction
+            && !crate::compact::compaction_matches_pending(session_entity.read(cx), &blocks)
+        {
+            return Task::ready(Err(SendFailure::not_consumed(anyhow!(
+                "This compaction request is no longer current"
+            ))));
+        }
+        if is_compaction
+            && (matches!(
+                session_entity.read(cx).state,
+                SessionState::AwaitingInput | SessionState::Stopping
+            ) || session_entity
+                .read(cx)
+                .acp_thread()
+                .is_some_and(|thread| pending_authorization_reject(thread, cx).is_some()))
+        {
+            return Task::ready(Err(SendFailure::not_consumed(anyhow!(
+                "Cannot request compaction while waiting for permission or stopping"
+            ))));
+        }
+        if from_user && !is_compaction {
+            session_entity.update(cx, |session, _| {
+                session.compact_reset_observer_memory = false
+            });
+        }
+
         // A genuine USER message into a supervised session both (a) resets the
         // continue-cap / audit-cadence counter and (b) RESUMES supervision when
         // it was paused in `WaitingUser` (the human answered the supervisor's
@@ -714,7 +745,8 @@ impl SolutionAgentStore {
         // Already running → merge into `pending_messages`; flushed on `Stopped`.
         // In-turn delivery for the native backend will be restored via a
         // pull-closure in a later task; for now all mid-turn sends queue.
-        let already_running = matches!(session_entity.read(cx).state, SessionState::Running { .. });
+        let already_running = matches!(session_entity.read(cx).state, SessionState::Running { .. })
+            || self.active_steers.contains_key(&session_id);
         if already_running {
             // Audit log: queueing is a frequent source of "where did
             // my message go?" bug reports — having every enqueue +
@@ -730,16 +762,23 @@ impl SolutionAgentStore {
                 ))
                 .chain(blocks)
                 .collect();
+            let reserved = self
+                .active_steers
+                .get(&session_id)
+                .map(|s| s.bundles.clone())
+                .unwrap_or_default();
             let merged = session_entity.update(cx, |s, _| {
                 // Merge into the trailing bundle only when it's addressed to
                 // the SAME target — consecutive same-tab follow-ups coalesce
                 // into one prompt, but a differently-targeted follow-up (e.g.
                 // a teammate message after a main-agent one) starts its own
                 // bundle so each addressee's hook drains only its own.
-                let merge = s
-                    .pending_messages
-                    .back()
-                    .is_some_and(|last| last.target == target);
+                let merge = s.pending_messages.back().is_some_and(|last| {
+                    last.target == target
+                        && !reserved.contains(&last.id)
+                        && !is_compaction
+                        && !crate::compact::is_compaction_blocks(&last.blocks)
+                });
                 if merge {
                     let last = s
                         .pending_messages
@@ -752,6 +791,7 @@ impl SolutionAgentStore {
                     last.blocks.extend(stamped);
                 } else {
                     s.pending_messages.push_back(PendingBundle {
+                        id: uuid::Uuid::new_v4(),
                         target: target.clone(),
                         blocks: stamped,
                     });
@@ -775,6 +815,7 @@ impl SolutionAgentStore {
             // would stay invisible on a paired mobile until the
             // eventual flush.
             self.mark_queue_changed(session_id, cx);
+            self.try_steer_pending(session_id, cx);
             cx.notify();
             return Task::ready(Ok(()));
         }

@@ -33,6 +33,7 @@ mod acp_event;
 mod connection_pool;
 mod hydration;
 mod queue;
+mod steering;
 mod supervisor_engine;
 mod teammate_reconciler;
 mod teardown;
@@ -357,6 +358,7 @@ impl PersistChains {
 }
 
 pub struct SolutionAgentStore {
+    active_steers: HashMap<SolutionSessionId, steering::PendingSteer>,
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
     pool: parking_lot::Mutex<SubprocessPool>,
@@ -1105,6 +1107,7 @@ impl SolutionAgentStore {
             }
         });
         Self {
+            active_steers: HashMap::new(),
             sessions: HashMap::new(),
             by_solution: HashMap::new(),
             pool: parking_lot::Mutex::new(SubprocessPool::new()),
@@ -4160,6 +4163,7 @@ impl SolutionAgentStore {
             }
             if let Some(text) = pending_message {
                 s.pending_messages.push_back(crate::model::PendingBundle {
+                        id: uuid::Uuid::new_v4(),
                     target: crate::model::QueueTarget::Main,
                     blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
                 });

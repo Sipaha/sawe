@@ -311,6 +311,7 @@ impl QueueTarget {
 /// hold e.g. one `Main` bundle and one `Subagent` bundle simultaneously.
 #[derive(Clone, Debug)]
 pub struct PendingBundle {
+    pub id: uuid::Uuid,
     pub target: QueueTarget,
     pub blocks: Vec<acp::ContentBlock>,
 }
