@@ -4062,3 +4062,9 @@ than the requested size. GPT-6-Astra currently reports 828400 usable tokens,
 while switching the same thread to GPT-5.5 reports 258400. Global Codex settings
 are unchanged. Observer thresholds continue to use the reported capacity.
 See [the verification finding](docs/findings/2026-09-11-codex-large-context.md).
+
+### 170. The session-strip plus opens provider selection
+
+The session strip uses one plus button to open the Claude/Codex new-chat menu.
+The separate chevron and immediate-Claude left-click path were removed. The
+existing provider actions and the separate reopen-closed-session button remain.

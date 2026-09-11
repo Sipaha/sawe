@@ -627,41 +627,15 @@ impl SessionTabStrip {
             })
     }
 
-    /// The strip's trailing `+`: one plain left click creates a session, and
-    /// that is all it does. It briefly also carried "Reopen Closed Chat…" on
-    /// a right click (10120c6a27); the maintainer ruled that undiscoverable
-    /// on 2026-09-04, so the reopen flow became
-    /// [`Self::render_reopen_button`] and the gesture was removed rather than
-    /// kept alongside it — two paths to one action is how the tooltip, the
-    /// menu entry and the close prompt started disagreeing in the first
-    /// place.
-    ///
-    /// Same `IconButton` at the same `IconSize::Small` it has always been, so
-    /// the strip's row height (`ButtonSize::Default.rems()`, shared with the
-    /// tab pills) — and with it the status bar's height — is unchanged.
-    fn render_plus_button(&self, _cx: &Context<Self>) -> impl IntoElement {
-        IconButton::new("session-tab-strip-plus", IconName::Plus)
-            .icon_size(IconSize::Small)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text(PLUS_TOOLTIP))
-            .on_click(|_, window, cx| {
-                // Dispatched by name (not imported) — see the module doc for why.
-                match cx.build_action("console_panel::NewChat", None) {
-                    Ok(action) => window.dispatch_action(action, cx),
-                    Err(err) => {
-                        log::error!("session_tab_strip: console_panel::NewChat unavailable: {err}")
-                    }
-                }
-            })
-    }
-
-    fn render_agent_menu(&self) -> impl IntoElement {
+    /// The trailing plus opens provider selection before creating a chat.
+    /// Keep the existing small button size so the status bar height is stable.
+    fn render_plus_button(&self) -> impl IntoElement {
         PopoverMenu::new("session-tab-strip-agent-menu")
             .trigger(
-                IconButton::new("session-tab-strip-agent-trigger", IconName::ChevronDown)
+                IconButton::new("session-tab-strip-plus", IconName::Plus)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Choose an agent for a new chat")),
+                    .tooltip(Tooltip::text(PLUS_TOOLTIP)),
             )
             .menu(|window, cx| {
                 Some(ContextMenu::build(window, cx, |menu, _, _| {
@@ -877,8 +851,7 @@ impl Render for SessionTabStrip {
             .overflow_x_scroll()
             .children(tabs)
             .when_some(overflow_popover, |this, popover| this.child(popover))
-            .child(self.render_plus_button(cx))
-            .child(self.render_agent_menu())
+            .child(self.render_plus_button())
             .child(self.render_reopen_button(solution_id, weak_workspace.clone(), cx));
 
         // The rule is a sibling of the scrolling group, not its last child:
