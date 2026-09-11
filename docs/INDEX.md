@@ -50,6 +50,7 @@ can read them.
 
 | Date | Status | Plan |
 |---|---|---|
+| 2026-09-11 | implementation | [`plans/2026-09-11-prompt-audit-improvements.md`](plans/2026-09-11-prompt-audit-improvements.md) — bounded generation tasks, grounded suggestions and prompt checks. |
 | 2026-09-11 | complete | [`plans/2026-09-11-prompt-audit-and-error-compaction.md`](plans/2026-09-11-prompt-audit-and-error-compaction.md) — English model-neutral prompt audit and Error-state context recovery. |
 | 2026-09-11 | complete | [`plans/2026-09-11-chat-scroll-anchoring.md`](plans/2026-09-11-chat-scroll-anchoring.md) — preserve the visual anchor when wrapped history rows are measured. |
 | 2026-09-11 | complete | [`plans/2026-09-11-codex-native.md`](plans/2026-09-11-codex-native.md) — native Codex app-server integration, runtime model controls, session lifecycle and Desktop feature candidates. |
