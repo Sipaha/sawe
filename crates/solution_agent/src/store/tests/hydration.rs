@@ -71,7 +71,6 @@ async fn hydrate_all_hydrates_cold_sessions(cx: &mut TestAppContext) {
         available_models: vec![],
         desired_model: None,
         desired_effort: None,
-        permission_mode: Default::default(),
     })
     .unwrap();
     db.save_blob(id_a, blob_a).await.expect("blob a");
@@ -245,7 +244,6 @@ async fn cold_entries_from_persisted_v2_reconstructs_per_entry(cx: &mut TestAppC
         available_models: vec![],
         desired_model: None,
         desired_effort: None,
-        permission_mode: Default::default(),
     };
     let (cold_entries, created_ms) =
         cx.update(|cx| crate::store::cold_entries_from_persisted(Some(persisted), cx));
@@ -291,7 +289,6 @@ fn persisted_session_roundtrips_with_structured_entries() {
         available_models: vec![],
         desired_model: None,
         desired_effort: None,
-        permission_mode: Default::default(),
     };
     let bytes = serde_json::to_vec(&original).unwrap();
     let decoded: PersistedSession = serde_json::from_slice(&bytes).unwrap();
@@ -366,7 +363,6 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
         available_models: vec![],
         desired_model: None,
         desired_effort: None,
-        permission_mode: Default::default(),
     })
     .unwrap();
     db.save_blob(id_a, blob_a).await.expect("blob a");
@@ -984,7 +980,6 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         available_models: vec![],
         desired_model: None,
         desired_effort: None,
-        permission_mode: Default::default(),
     })
     .unwrap();
     db.save_blob(id_a, blob_a).await.expect("blob a");
@@ -1369,7 +1364,6 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         available_models: vec![],
         desired_model: Some("some-model".into()),
         desired_effort: None,
-        permission_mode: Default::default(),
     })
     .unwrap();
     db.save_blob(id_a, blob_a).await.expect("blob a");
@@ -1511,7 +1505,6 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         available_models: vec![],
         desired_model: None,
         desired_effort: None,
-        permission_mode: Default::default(),
     })
     .unwrap();
     db.save_blob(id_a, blob_a).await.expect("blob a");
@@ -1798,7 +1791,6 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
                 available_models: vec![],
                 desired_model: None,
                 desired_effort: None,
-                permission_mode: Default::default(),
             }),
             cx,
         )

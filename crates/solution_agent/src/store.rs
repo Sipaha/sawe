@@ -3802,8 +3802,8 @@ impl SolutionAgentStore {
                     context_count: new_count,
                 });
                 cx.notify();
-                new_count
-            })?;
+                Ok(new_count)
+            })??;
 
             Ok(new_count)
         })

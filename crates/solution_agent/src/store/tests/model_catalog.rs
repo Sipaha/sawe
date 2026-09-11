@@ -26,7 +26,6 @@ fn persisted_session_round_trips_models() {
         }],
         desired_model: Some("opus".into()),
         desired_effort: Some("high".into()),
-        permission_mode: Default::default(),
     };
     let bytes = serde_json::to_vec(&p).unwrap();
     let back: PersistedSession = serde_json::from_slice(&bytes).unwrap();
