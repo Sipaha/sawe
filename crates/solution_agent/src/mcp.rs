@@ -13,6 +13,7 @@ mod context;
 mod dto;
 mod lifecycle;
 mod messaging;
+mod peer;
 mod read;
 mod supervisor;
 mod uploads;
@@ -28,8 +29,8 @@ mod tests;
 // (`crate::mcp::GetSessionChangesTool`), and `event_sources` — do not drop them.
 #[allow(unused_imports)]
 pub(crate) use {
-    authorization::*, context::*, dto::*, lifecycle::*, messaging::*, read::*, supervisor::*,
-    uploads::*,
+    authorization::*, context::*, dto::*, lifecycle::*, messaging::*, peer::*, read::*,
+    supervisor::*, uploads::*,
 };
 
 #[cfg(debug_assertions)]
@@ -44,6 +45,7 @@ pub fn register(cx: &mut App) {
     read::register_read(cx);
     lifecycle::register_lifecycle(cx);
     messaging::register_messaging(cx);
+    peer::register_peer(cx);
     authorization::register_authorization(cx);
     context::register_context(cx);
     uploads::register_uploads(cx);
