@@ -464,13 +464,15 @@ mod tests {
         let path = "/tmp/project's \"quoted\" $HOME `name`\\dir/continue.md";
         let request = serde_json::json!({"prompt_file": path}).to_string();
         for value in [path, request.as_str()] {
-            let output = std::process::Command::new("sh")
-                .args([
-                    "-c",
-                    &format!("printf '%s' {}", quote_shell_argument(value)),
-                ])
-                .output()
-                .expect("run shell");
+            let output = smol::block_on(
+                smol::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        &format!("printf '%s' {}", quote_shell_argument(value)),
+                    ])
+                    .output(),
+            )
+            .expect("run shell");
             assert!(output.status.success());
             assert_eq!(output.stdout, value.as_bytes());
         }

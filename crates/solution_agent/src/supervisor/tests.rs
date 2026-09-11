@@ -291,10 +291,12 @@ fn briefing_shell_arguments_roundtrip_without_executing_paths() {
             .map(|(arguments, _)| arguments)
             .expect("bridge command");
         // Only printf is executed; the generated binary/socket paths are data.
-        let output = std::process::Command::new("sh")
-            .args(["-c", &format!("printf '%s\\0' {arguments}")])
-            .output()
-            .unwrap();
+        let output = smol::block_on(
+            smol::process::Command::new("sh")
+                .args(["-c", &format!("printf '%s\\0' {arguments}")])
+                .output(),
+        )
+        .unwrap();
         assert!(output.status.success());
         let expected = format!("{}\0--nc\0{}\0", ctx.bridge_bin, ctx.socket_path);
         assert_eq!(output.stdout, expected.as_bytes());
