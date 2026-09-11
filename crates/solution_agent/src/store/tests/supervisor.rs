@@ -2700,7 +2700,7 @@ async fn agent_completion_clears_parked_wait(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
+async fn done_verdict_preserves_question_until_supervision_resumes(cx: &mut gpui::TestAppContext) {
     let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
 
     // Enable supervision and escalate a question — the banner should be set.
@@ -2721,12 +2721,40 @@ async fn done_verdict_clears_pending_question(cx: &mut gpui::TestAppContext) {
     assert_eq!(status, crate::supervisor::SupervisorStatus::WaitingUser);
     assert!(q.is_some(), "question must be set after escalate_to_user");
 
-    // A Done verdict fires before the user replies — banner must be cleared.
+    // A stale Done verdict cannot resolve an unanswered human question.
     store.update(cx, |store, cx| {
         store.apply_verdict(
             id,
             crate::supervisor::VerdictAction::Done,
             "all done".into(),
+            None,
+            None,
+            None,
+            None,
+            cx,
+        );
+    });
+    store.read_with(cx, |store, cx| {
+        assert_eq!(
+            store.supervisor_state(id).unwrap().status,
+            crate::supervisor::SupervisorStatus::WaitingUser
+        );
+        assert_eq!(
+            store.session(id).unwrap().read(cx).supervisor_question,
+            q,
+            "a stale verdict must preserve the exact outstanding question"
+        );
+    });
+
+    // A fresh review after explicit resume may complete the task and clear
+    // its old question. Seed Watching to test the accepted Done branch itself.
+    store.update(cx, |store, cx| {
+        store.supervisor_states.get_mut(&id).unwrap().status =
+            crate::supervisor::SupervisorStatus::Watching;
+        store.apply_verdict(
+            id,
+            crate::supervisor::VerdictAction::Done,
+            "completed after resume".into(),
             None,
             None,
             None,
