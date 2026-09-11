@@ -18,7 +18,7 @@ Default instructions use English and do not assume a particular model. Responses
 
 ## Follow-up implementation
 
-The uncontroversial recommendations are implemented and under final verification in
+The uncontroversial recommendations are implemented and verified in
 [`../plans/2026-09-11-prompt-audit-improvements.md`](../plans/2026-09-11-prompt-audit-improvements.md):
 
 1. Versioned synthetic behavior cases and opt-in installed-provider probes distinguish heuristic grading from human review of the model's reasoning.
@@ -92,3 +92,7 @@ The user's follow-up clarified that routine task ordering must not be escalated,
 The affected debug suites passed: `claude_native` 92, `codex_native` 11, `console_panel` 39, `solution_agent` 856, `solution_git` 55 (1,053 total). The existing `bench_rebuild_streams` timing probe remains ignored. Prompt inventory checks and 21 Python tests passed. Scoped debug `script/clippy` passed with warnings denied.
 
 A fresh headless editor with an isolated temporary Solution verified real Codex active input using GPT-5.6-Luna/low: the follow-up was sent 4.92 seconds after the test began, while the shell command ran; the command completed, the final answer was exactly the newer marker, and the queue was empty. The check completed in 17.94 seconds. Running-session UI allowed Compact and disabled Clear. This also exposed and fixed the status meter ignoring a cold session's persisted context capacity.
+
+The final rebuilt debug UI displayed `102.4k / 128.0k · 80.0%`; Compact was enabled and Clear disabled for the seeded Running session. Screenshots and synthetic runtime state remain outside Git. The temporary headless editor was closed after verification.
+
+Both final editor profiles built successfully; release-fast includes the corrected persisted context capacity.

@@ -1,6 +1,6 @@
 # Cooperative live compaction and proactive observer checks
 
-Status: implementation
+Status: complete
 
 ## Goal
 Allow context compaction during active work, and make an enabled observer sustain autonomous progress with periodic/context-driven checks.
@@ -28,3 +28,8 @@ The user additionally requested verification of both native runtimes. Codex uses
 
 ## Clarified autonomy boundary
 Routine ordering between approved tasks is an agent decision unless the user explicitly reserves it. Consequential architecture/product choices that are unresolved and undelegated remain human decisions. A visible question alone is not a blocker; preserve real blockers and continue independent TODOs. Added three synthetic regression cases and checked both installed providers.
+
+## Final verification
+The affected debug suites passed 1,053 tests (856 solution_agent, 55 solution_git, 39 console_panel, 92 claude_native, 11 codex_native); the existing non-assertion timing probe remains ignored. Prompt contracts and 21 Python tests passed. Scoped debug script/clippy passed with warnings denied. Both debug and release-fast binaries were rebuilt after the final UI correction.
+
+Real Codex active-input smoke passed in an isolated temporary Solution: one final response reflected the follow-up sent during a running command, with no duplicate or pending queue. Rendered UI at 102.4k/128k (80%) enabled Compact and disabled Clear. Claude native-stream cancellation evidence is documented separately; its existing hook remains. Temporary worktrees were removed; screenshots and model reports were excluded from Git.
