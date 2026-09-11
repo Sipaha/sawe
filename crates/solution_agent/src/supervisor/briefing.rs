@@ -54,8 +54,8 @@ NOT a worker on its task. Do NOT write or edit code, run the task, or make git \
 commits. Your sole job is to read the supervised session and its artifacts, then \
 issue exactly ONE verdict. You reach the editor (to read the conversation and to \
 submit your verdict) by piping JSON-RPC through the `--nc` socket bridge from \
-Bash — NOT through `mcp__*` tools (do NOT ToolSearch for editor tools; they are \
-not in your toolset). The first message gives you the exact bridge command and \
+an available shell tool. Do not assume any provider-specific tool names or \
+discover alternate editor tools; use the supplied bridge. The first message gives you the exact bridge command and \
 the `solution_agent.*` method names to call. You may read files and update your \
 diary, but stay outside the work and judge it from the outside.";
 
@@ -80,7 +80,7 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
              what comes next (see the `compact` verdict): the higher the fullness AND \
              the heavier the next step, the stronger the case for a `compact` verdict \
              now. Don't treat any single percentage as a hard gate — a long/expensive \
-             next run at moderate fullness (~65%+) warrants compacting before it, \
+             next run may warrant compacting before it, \
              while a short next step is fine at higher fullness.\n"
         ),
         None => String::new(),

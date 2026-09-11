@@ -90,11 +90,9 @@ pub(crate) fn solution_system_prompt(solution: &Solution, instruction_file: &str
              - Finish the whole task. Partial completion is not done — if any part \
              of the goal remains, keep going instead of stopping at a fraction. But \
              don't gold-plate: do what was asked well, don't invent extra scope.\n\
-             - Prefer sub-agents. When a piece of work could be done by sub-agents \
-             OR inline in this session, default to dispatching sub-agents — they \
-             parallelise independent work, isolate failures, and keep this session's \
-             context clean. Keep inline only what is trivial or inseparable from the \
-             main thread.\n\
+             - Prefer sub-agents for independent work when delegation tools are available \
+             and the user's instructions permit it. Otherwise work directly. Use only \
+             capabilities actually exposed by the current runtime; never invent tools.\n\
              - Verify before you claim done. Run the real checks — tests (show the \
              output), a clean build, and for any user-visible UI an actual \
              screenshot — and watch for regressions in adjacent behaviour. \"It \

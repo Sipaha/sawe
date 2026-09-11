@@ -162,14 +162,18 @@ const JUDGE_SPAWN_RETRY_MS: i64 = 15_000;
 /// Idle. Deliberately a fresh "carry on" instruction, NOT a replay of the
 /// interrupted turn (replaying could re-run tool calls whose side effects already
 /// landed).
-const RECONNECT_CONTINUATION_PROMPT: &str = "Твой процесс завис, поэтому редактор перезапустил его. \
-     История и контекст сохранены — продолжай работу с того места, на котором остановился.";
+const RECONNECT_CONTINUATION_PROMPT: &str = "The editor restarted your process after it stopped responding. \
+     The conversation has been restored. Continue the user's current task from the last confirmed \
+     state. Check any interrupted operation before repeating it; its effects may already have landed. \
+     Keep the user's language, constraints, and outstanding approval requirements.";
 
 /// Continuation sent after a user-initiated Restart. Same instruction, without
 /// the claim that the process hung — nothing was wrong, the user asked for a
 /// fresh subprocess.
-const RESTART_CONTINUATION_PROMPT: &str = "Редактор перезапустил твой процесс по команде пользователя. \
-     История и контекст сохранены — продолжай работу с того места, на котором остановился.";
+const RESTART_CONTINUATION_PROMPT: &str = "The editor restarted your process at the user's request. \
+     The conversation has been restored. Continue the user's current task from the last confirmed \
+     state. Check any interrupted operation before repeating it; its effects may already have landed. \
+     Keep the user's language, constraints, and outstanding approval requirements.";
 
 /// Continuation sent after [`SolutionAgentStore::reconnect_agent`] when the
 /// wedge happened on an UNANSWERED user message — the transcript tail is a human
@@ -179,9 +183,10 @@ const RESTART_CONTINUATION_PROMPT: &str = "Редактор перезапуст
 /// subprocess to "continue" makes it treat the replayed user message as
 /// already-handled history and skip it — the reported "my message never reached
 /// you" bug. So point it explicitly at the user's message instead.
-const RECONNECT_UNANSWERED_USER_PROMPT: &str = "Твой процесс завис, не успев ответить на \
-     ПОСЛЕДНЕЕ сообщение пользователя (оно выше в истории). История и контекст сохранены. \
-     Перечитай это сообщение и выполни его сейчас — НЕ считай его уже обработанным.";
+const RECONNECT_UNANSWERED_USER_PROMPT: &str = "The editor restarted your process before you answered \
+     the latest human message above. The conversation has been restored. Read and address that \
+     message now; do not treat it as already handled. Check any interrupted operation before \
+     repeating it, and keep the user's language, constraints, and approval requirements.";
 
 /// Classify a `done` verdict's `reasoning`. `done` has two modes (see
 /// `supervisor_judge_instructions.md`): a genuine completion, or a PARK awaiting

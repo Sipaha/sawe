@@ -2207,8 +2207,9 @@ impl SolutionAgentStore {
                 if idle_or_errored {
                     self.deliver_nudge_now(
                         id,
-                        "The task you were waiting on should be done by now — \
-                         check the result and continue."
+                        "The scheduled wait has elapsed. Check the actual status and result \
+                         of the task you were waiting on, then continue as appropriate. \
+                         Do not assume it succeeded or repeat an operation without checking."
                             .to_string(),
                         cx,
                     )
