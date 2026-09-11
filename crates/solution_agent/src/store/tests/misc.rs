@@ -2650,6 +2650,7 @@ fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
                     cx,
                 )
                 .expect("registered ClaudeAcpAdapter produces a non-empty prompt");
+            assert_eq!(meta["sawePermissionMode"], "full_access");
             let system_prompt = meta
                 .get("systemPrompt")
                 .expect("meta carries `systemPrompt` key (camelCase, not snake_case — claude-agent-acp matches exactly)")

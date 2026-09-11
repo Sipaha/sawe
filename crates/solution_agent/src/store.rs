@@ -1622,10 +1622,16 @@ impl SolutionAgentStore {
             .and_then(|id| self.sessions.get(&id))
             .map(|session| session.read(cx).permission_mode)
             .unwrap_or_default();
-        meta.insert(
-            "sawePermissionMode".into(),
-            serde_json::json!(permission_mode.as_str()),
-        );
+        // This extension is enforced only by the two native runtimes.
+        // Unknown/custom adapters retain their existing metadata contract.
+        if agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID
+            || agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID
+        {
+            meta.insert(
+                "sawePermissionMode".into(),
+                serde_json::json!(permission_mode.as_str()),
+            );
+        }
         // Ephemeral supervisor judge/auditor sessions get a Supervisor system
         // prompt instead of the solution's worker framing, so they judge from
         // the outside rather than drifting into doing the task.
