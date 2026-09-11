@@ -1,6 +1,6 @@
 # Model-neutral prompt audit and error-state compaction
 
-Status: implementation
+Status: complete
 
 ## Goal
 Allow context compaction after an agent error; audit all repository-owned model instructions, translate non-English defaults into English, and recommend improvements that work across models.
@@ -22,3 +22,15 @@ Exercise the actual error-state compaction path with a mock backend and the rend
 
 ## Delivery
 Update FORK.md and docs/INDEX.md, commit and push all relevant changes. Exclude screenshots and temporary reports from Git.
+
+## Implemented
+
+English/capability-based runtime defaults, model-neutral assistant and maintenance templates, precise user-language preservation, safe single-pass path substitution, and documented protocol exceptions. Context controls accept Errored; cold `/clear` is intercepted locally; asynchronous clearing rechecks that the source conversation did not change. Multiline summary chunks are preserved and prompt override management no longer recursively deletes user directories. Full inventory and proposals: `docs/findings/2026-09-11-model-neutral-prompt-audit.md`.
+
+## Merged test results
+
+915 tests passed: GPUI list 24, Codex native 7, console panel 39, Solution agent 835, agent prompt templates 9, multiline summary streaming 1. One existing Solution-agent test remains ignored. Workspace formatting, diff whitespace and scoped debug `script/clippy` checks passed without warnings.
+
+The final UI check confirmed both context actions are enabled for a cold Errored session. Its badge now preserves the error instead of overriding it with Sleeping.
+
+Debug and release-fast builds completed successfully. Final headless UI checks passed for context recovery controls, visible cold-session errors and wrapped-history scrolling. Temporary screenshots/probes were excluded from Git.

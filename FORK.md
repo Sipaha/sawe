@@ -3967,4 +3967,19 @@ shell quoting. Single-pass substitution must never reinterpret inserted values.
 Context cleanup accepts Idle and Errored sessions. Active turns and pending
 approvals are protected in both UI and backend, and an asynchronous reset must
 recheck activity/session identity before replacing history. Compact still needs
-a reachable runtime and enough context headroom to write its handoff.
+a reachable runtime and enough context headroom to write its handoff. Cold
+sessions retain terminal error text instead of hiding it under Sleeping.
+
+### 163. Upward wheel scrolling anchors before discovering row heights
+
+A newly visible wrapped row can be much taller than its cached estimate. GPUI
+ListState records the previous visible row and cumulative wheel displacement,
+then measures backwards only as far as the requested distance crosses rows.
+Additional discovered height extends above the reader's visual anchor instead
+of jumping to an estimate-based offset from the new row's top. Existing resize,
+streaming and follow-tail semantics remain separate. Explicit navigation clears
+the temporary anchor; splices adjust it or discard a removed anchor row.
+
+The wheel handler sums signed pixel deltas relative to one painted anchor;
+the generic direction-resetting coalescer is unsuitable here. Never accumulate
+those deltas a second time in the measurement correction.

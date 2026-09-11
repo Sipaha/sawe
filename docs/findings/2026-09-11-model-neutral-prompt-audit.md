@@ -1,6 +1,6 @@
 # Model-neutral prompt audit
 
-Status: implementation verified by static audit; merged runtime checks in progress.
+Status: audit complete; affected runtime tests and scoped clippy passed.
 
 ## Scope and language policy
 
@@ -26,9 +26,7 @@ Default instructions use English and do not assume a particular model. Responses
 
 ## Solution runtime inventory
 
-
-
-Audited repository-owned model-facing text in `crates/solution_agent`: shared solution system prompt (`claude_adapter.rs`, Codex adapter call site); supervisor system/context/custom briefing (`supervisor/briefing.rs`); judge and audit resources; compaction resource and renderer (renderer edits delegated to error_compaction); all three reconnect/restart constants (`store.rs`); scheduled supervisor nudge; commit-message prompt (`message_generator.rs`); queue timing hint and delivery wrappers (`store/queue.rs`, `store/acp_event.rs`); attachment wrapper (`upload.rs`); session compose and generic MCP forwarding. Search covered all source/resources with Cyrillic, prompt/instruction identifiers, TextContent construction, and imperative string literals. Shared team/background files were inspected: they parse runtime output rather than supply model instructions.
+Audited repository-owned model-facing text in `crates/solution_agent`: shared solution system prompt (`claude_adapter.rs`, Codex adapter call site); supervisor system/context/custom briefing (`supervisor/briefing.rs`); judge and audit resources; compaction resource and renderer (including its renderer); all three reconnect/restart constants (`store.rs`); scheduled supervisor nudge; commit-message prompt (`message_generator.rs`); queue timing hint and delivery wrappers (`store/queue.rs`, `store/acp_event.rs`); attachment wrapper (`upload.rs`); session compose and generic MCP forwarding. Search covered all source/resources with Cyrillic, prompt/instruction identifiers, TextContent construction, and imperative string literals. Shared team/background files were inspected: they parse runtime output rather than supply model instructions.
 
 User-entered supervisor instructions, user messages, uploaded file contents, provider output, multilingual parsing test fixtures, UI labels, logging, comments, and protocol identifiers were intentionally preserved. The remaining Cyrillic production strings are UI/system notifications, not model instructions. Provider-specific parsing keys/paths remain runtime contracts, not portable instructions.
 
@@ -41,21 +39,9 @@ User-entered supervisor instructions, user messages, uploaded file contents, pro
 - Compaction no longer assumes its trigger implies near-full context, invents user dislike of updates, dictates internal reasoning language, or blocks rotation to select an ambiguous future goal. Preserve ambiguity, pending approvals, uncertain operation effects, and actual user communication preferences. Do not store credentials. Do not reference absent next.md.
 - Commit-message prompt treats diff as data; disallows unrequested mutations and unsupported test claims.
 - Scheduled wait nudge asks to inspect actual status, rather than assume completion.
-- Coordinated shell-safe compact request/socket placeholders with error_compaction (JSON escaping + shell quoting must be implemented together).
-
-## Recommendations
-
-1. Add cross-provider behavioral evaluations for recovery after a partial tool operation, ambiguous compaction, permission pending at compaction, tool-less delegation, and malicious instructions in source diffs. Text assertions alone cannot establish behavior across all models.
-2. Give ephemeral generation tasks a dedicated read-only system role: current shared worker system prompt still requests full task/build/docs workflow while the commit task should only produce text. Permission/tool restrictions should enforce this, beyond prompt wording.
-3. Make supervisor runtime/provider selection explicit and capability based. Prompt portability does not itself replace the existing Claude-specific ephemeral-session launcher.
-4. Shorten the judge template (currently ~350 lines) by moving stable mechanics into host logic and injecting only action-specific context. Preserve verdict nonce, dropped-nudge handling, user-intent preservation, and wait/continue loop limits.
-5. Implemented follow-up: supervisor bridge paths now use dedicated shell-quoted placeholders and single-pass substitution, so placeholder-looking text in paths or custom instructions is not recursively rewritten. Added a shell printf-only roundtrip regression for both judge/audit templates with spaces, apostrophes, command substitutions, backticks, backslashes, and newlines. No user-provided path is executed.
-6. Centralize prompt inventory and placeholder validation; version templates and evaluate them across installed providers before changes. Avoid claiming universal behavior merely because wording is English/provider-neutral.
-
+- Implemented shell-safe compact request/socket placeholders (JSON escaping + shell quoting must be implemented together).
 
 ## Other editor and maintenance inventory
-
-
 
 | Owner / source | Purpose | Disposition |
 | --- | --- | --- |
@@ -83,3 +69,9 @@ User-entered supervisor instructions, user messages, uploaded file contents, pro
 
 Explicit non-prompt exclusions: `open_path_prompt`, `ui_prompt`, GPUI prompts and `git_ui/picker_prompt.rs` are user dialogs; `task_template` and license templates are unrelated template data. `edit_prediction_cli/split_commit.rs` generates eval cases without a model prompt. Historical docs, fixtures, tests containing foreign text, provider names, API roles and protocol fields are not English-default migration targets. Root separately audits `.rules`, AGENTS and skill/workflow instructions.
 
+
+## Verification
+
+Affected suites passed: 915 tests, one existing ignored test. Debug build, workspace formatting and scoped debug clippy passed without code warnings. Native Codex smoke covered streaming, command approval, cancellation and restart recovery. The final rendered debug editor showed both context actions enabled in Errored, with the error text visible even when its process is unloaded.
+
+The final release-fast build also completed successfully.

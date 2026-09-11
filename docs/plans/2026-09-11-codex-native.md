@@ -1,6 +1,6 @@
 # Native Codex support in Solutions
 
-Status: implementation
+Status: complete
 
 ## Goal
 Choose Codex when creating a Solution chat and use the existing conversation UI with the official Codex app-server runtime.
@@ -44,3 +44,9 @@ Lifecycle review fixed child-thread event contamination, abandoned processes on 
 Live checks with the installed CLI confirmed a streamed reply, context after agent restart, command approval and output, interruption followed by another successful turn, and the new-chat menu/model controls in a rendered headless editor. Screenshots and probe data are temporary artifacts outside the repository.
 
 Restarting a never-used Codex chat exposed its `no rollout found for thread id` response. The existing missing-session recovery now recognizes that specific response and creates a new thread with the saved model/effort. Failed cold wakes also transition to Errored instead of leaving an endless Running indicator; a turn-identity guard protects any newer session activity.
+
+## Merged test results
+
+915 tests passed: GPUI list 24, Codex native 7, console panel 39, Solution agent 835, agent prompt templates 9, multiline summary streaming 1. One existing Solution-agent test remains ignored. Workspace formatting, diff whitespace and scoped debug `script/clippy` checks passed without warnings.
+
+Debug and release-fast builds completed successfully. Final headless UI checks passed for context recovery controls, visible cold-session errors and wrapped-history scrolling. Temporary screenshots/probes were excluded from Git.
