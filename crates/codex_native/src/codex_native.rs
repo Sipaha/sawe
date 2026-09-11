@@ -41,6 +41,15 @@ impl CodexAgentServer {
         cx.spawn(async move |cx| {
             let process = cx.update(|cx| Process::spawn(&directory, cx))?;
             process.initialize().await?;
+            if read_only {
+                let effective = process
+                    .request(
+                        "config/read",
+                        json!({"includeLayers":false,"cwd":directory}),
+                    )
+                    .await?;
+                disable_mcp_servers(&mut config, &effective["config"]);
+            }
             models(&process).await
         })
     }
@@ -224,14 +233,19 @@ impl CodexConnection {
         let Some(directory) = paths.ordered_paths().next().cloned() else {
             return Task::ready(Err(anyhow!("Working directory cannot be empty")));
         };
-        let config = session_config(&mcp_servers_for_project(&project, cx));
+        let read_only = meta
+            .as_ref()
+            .and_then(|m| m.get("sawePermissionMode"))
+            .and_then(Value::as_str)
+            == Some("read_only");
+        let mut config = session_config(&mcp_servers_for_project(&project, cx));
         cx.spawn(async move |cx| {
             let mut process = cx.update(|cx| Process::spawn(&directory, cx))?;
             process.initialize().await?;
             let account = process.request("account/read", json!({"refreshToken":false})).await?;
             if account["requiresOpenaiAuth"].as_bool() == Some(true) && account["account"].is_null() { bail!("Codex is not signed in. Run `codex login` in a terminal, complete sign-in, then reopen this chat."); }
             let available_models = models(&process).await?;
-            let mut params = json!({"cwd":directory,"config":config,"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"});
+            let mut params = json!({"cwd":directory,"config":config,"approvalPolicy":"never","approvalsReviewer":"user","sandbox":if read_only {"read-only"} else {"danger-full-access"}});
             if let Some(meta) = &meta {
                 if let Some(prompt) = meta.get("systemPrompt").and_then(|prompt| prompt.as_str().or_else(|| prompt.get("append").and_then(Value::as_str))) { params["developerInstructions"] = json!(prompt); }
                 if let Some(model) = meta.get("modelId").and_then(Value::as_str) { params["model"] = json!(model); }
@@ -260,7 +274,7 @@ impl CodexConnection {
                 let mut translator = translate::Translator::default();
                 while let Some(message) = incoming.next().await {
                     if message.get("id").is_some() {
-                        if let Some(process) = weak_process.upgrade() { handle_approval(message, &pump_id, weak_thread.clone(), process, cx); }
+                        if let Some(process) = weak_process.upgrade() { handle_approval(message, &pump_id, weak_thread.clone(), process, read_only, cx); }
                         continue;
                     }
                     let method = message["method"].as_str().unwrap_or("");
@@ -316,6 +330,17 @@ impl AgentConnection for CodexConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
         self.open(Some(id), project, paths, title, None, cx)
+    }
+    fn resume_session_with_meta(
+        self: Rc<Self>,
+        id: acp::SessionId,
+        project: Entity<Project>,
+        paths: PathList,
+        title: Option<SharedString>,
+        meta: Option<acp::Meta>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.open(Some(id), project, paths, title, meta, cx)
     }
     fn supports_close_session(&self) -> bool {
         true
@@ -480,6 +505,34 @@ async fn models(process: &Process) -> Result<Vec<CodexModelInfo>> {
     }
     Ok(models)
 }
+// Empty tables merge with inherited configuration. Explicitly disable both
+// inherited servers and editor-injected servers so read-only cannot call MCP.
+fn disable_mcp_servers(config: &mut Value, effective: &Value) {
+    let inherited = effective["mcp_servers"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys())
+        .cloned();
+    let injected: Vec<String> = config
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys())
+        .filter_map(|key| key.strip_prefix("mcp_servers.").map(str::to_owned))
+        .collect();
+    for name in inherited.chain(injected) {
+        config[format!("mcp_servers.{name}.enabled")] = json!(false);
+    }
+    // Plugins may contribute additional MCP servers not in mcp_servers.
+    for name in effective["plugins"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys())
+    {
+        let quoted = serde_json::to_string(name).expect("string serialization");
+        config[format!("plugins.{quoted}.enabled")] = json!(false);
+    }
+    config["features.apps"] = json!(false);
+}
 fn session_config(servers: &[acp::McpServer]) -> Value {
     let mut config = serde_json::Map::new();
     // Request the large window for editor-owned threads. Codex clamps this
@@ -496,10 +549,10 @@ fn session_config(servers: &[acp::McpServer]) -> Value {
                     .iter()
                     .map(|entry| (entry.name.clone(), json!(entry.value)))
                     .collect();
-                let mut entry = json!({"command":server.command,"args":server.args,"env":env});
+                let mut entry = json!({"command":server.command,"args":server.args,"env":env,"default_tools_approval_mode":"approve"});
                 // Solution collaboration is an editor capability: peer delivery
                 // enforces scope and user-input gates in the host. Approve only
-                // discovery and peer send on the built-in bridge, not arbitrary
+                // session reads and peer send on the built-in bridge, not arbitrary
                 // MCP writes or the separate human-input endpoint.
                 if server.name == "sawe"
                     && server.args.first().is_some_and(|arg| arg == "--nc")
@@ -507,6 +560,11 @@ fn session_config(servers: &[acp::McpServer]) -> Value {
                 {
                     entry["tools"] = json!({
                         "solution_agent.list_sessions": {"approval_mode":"approve"},
+                        "solution_agent.get_session": {"approval_mode":"approve"},
+                        "solution_agent.get_session_entry": {"approval_mode":"approve"},
+                        "solution_agent.get_session_changes": {"approval_mode":"approve"},
+                        "solution_agent.get_session_children": {"approval_mode":"approve"},
+                        "solution_agent.read_session_history": {"approval_mode":"approve"},
                         "solution_agent.send_agent_message": {"approval_mode":"approve"}
                     });
                 }
@@ -520,7 +578,7 @@ fn session_config(servers: &[acp::McpServer]) -> Value {
                     .collect();
                 config.insert(
                     format!("mcp_servers.{}", server.name),
-                    json!({"url":server.url,"http_headers":headers}),
+                    json!({"url":server.url,"http_headers":headers,"default_tools_approval_mode":"approve"}),
                 );
             }
             _ => log::warn!("Codex does not support this MCP transport"),
@@ -533,6 +591,7 @@ fn handle_approval(
     session_id: &acp::SessionId,
     thread: gpui::WeakEntity<AcpThread>,
     process: Rc<Process>,
+    read_only: bool,
     cx: &mut AsyncApp,
 ) {
     let permitted_thread = belongs_to_thread(&message["params"], session_id);
@@ -541,7 +600,7 @@ fn handle_approval(
     cx.spawn(async move |cx| {
         let method = message["method"].as_str().unwrap_or_default(); let params = &message["params"];
         let result = if matches!(method,"item/commandExecution/requestApproval"|"item/fileChange/requestApproval") {
-            if !permitted_thread {
+            if !permitted_thread || read_only {
                 outgoing.unbounded_send(json!({"id":message["id"],"result":{"decision":"decline"}})).log_err();
                 return;
             }
@@ -599,7 +658,7 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .len(),
-            2
+            7
         );
         assert!(config["mcp_servers.remote"].get("tools").is_none());
         let external = session_config(&[acp::McpServer::Stdio(acp::McpServerStdio::new(
@@ -615,6 +674,28 @@ mod tests {
             config["mcp_servers.remote"]["http_headers"]["Authorization"],
             "Bearer test"
         );
+    }
+    #[test]
+    fn read_only_disables_inherited_and_editor_mcp_without_changing_context_window() {
+        let mut config = session_config(&[acp::McpServer::Stdio(acp::McpServerStdio::new(
+            "sawe", "/sawe",
+        ))]);
+        disable_mcp_servers(
+            &mut config,
+            &json!({"mcp_servers":{"global":{"url":"https://example.com"},"sawe":{"command":"old"}}}),
+        );
+        assert_eq!(config["mcp_servers.global.enabled"], false);
+        assert_eq!(config["mcp_servers.sawe.enabled"], false);
+        assert_eq!(config["model_context_window"], 872_000);
+        disable_mcp_servers(
+            &mut config,
+            &json!({"plugins":{"sample@test":{"enabled":true}}}),
+        );
+        assert_eq!(config["plugins.\"sample@test\".enabled"], false);
+        assert_eq!(config["features.apps"], false);
+        let mut empty = session_config(&[]);
+        disable_mcp_servers(&mut empty, &json!({}));
+        assert_eq!(empty["features.apps"], false);
     }
     #[test]
     fn child_and_unscoped_events_cannot_complete_parent_turn() {

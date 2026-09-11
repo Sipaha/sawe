@@ -299,6 +299,7 @@ impl ClaudeNativeAgentServer {
                 mcp_servers_json: "{\"mcpServers\":{}}".to_string(),
                 append_system_prompt: None,
                 generation_only: false,
+                read_only: false,
                 extra_env,
                 model: None,
                 // A throwaway probe never runs a turn, so it needs no worktree
@@ -383,6 +384,7 @@ impl AgentServer for ClaudeNativeAgentServer {
 /// token meter never regresses (the 200k/1M flicker fix).
 struct SessionShared {
     generation_only: bool,
+    read_only: bool,
     prompt_tx: RefCell<Option<oneshot::Sender<Result<TurnEnd>>>>,
     sticky_window: Cell<Option<u64>>,
     /// Wall time (executor clock) of the last message the pump pulled off
@@ -439,6 +441,7 @@ struct SessionShared {
 #[derive(Clone)]
 struct RespawnBlueprint {
     generation_only: bool,
+    read_only: bool,
     project: Entity<Project>,
     work_dirs: PathList,
     append_system_prompt: Option<String>,
@@ -616,6 +619,29 @@ const UNSUPPORTED_SLASH_COMMANDS: &[&str] = &[
 /// matching what the upstream `getAvailableSlashCommands` in
 /// `acp-agent.js` produces. Unknown / malformed entries are silently
 /// skipped (a single bad entry mustn't blank out the whole command list).
+// Native slash commands can reload MCP or change permission policy before
+// tool authorization. Keep the read-only surface limited to conversation controls.
+fn read_only_command_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "compact" | "clear" | "model" | "context" | "cost" | "status" | "help"
+    )
+}
+
+fn read_only_prompt_allowed(blocks: &[acp::ContentBlock]) -> bool {
+    blocks.iter().all(|block| match block {
+        acp::ContentBlock::Text(text) => {
+            text.text
+                .trim_start()
+                .strip_prefix('/')
+                .is_none_or(|command| {
+                    read_only_command_allowed(command.split_whitespace().next().unwrap_or_default())
+                })
+        }
+        _ => true,
+    })
+}
+
 fn parse_available_commands(payload: &serde_json::Value) -> Vec<acp::AvailableCommand> {
     let Some(commands) = payload.get("commands").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -713,7 +739,7 @@ fn dispatch_initialize(
     cx: &mut gpui::AsyncApp,
 ) {
     let Ok(receiver) = process.send_control(ControlRequestOut::Initialize {
-        hooks: if shared.generation_only {
+        hooks: if shared.generation_only || shared.read_only {
             Default::default()
         } else {
             build_default_hooks()
@@ -740,7 +766,10 @@ fn dispatch_initialize(
         if !models.is_empty() {
             *shared.available_models.borrow_mut() = models;
         }
-        let commands = parse_available_commands(&payload);
+        let mut commands = parse_available_commands(&payload);
+        if shared.read_only {
+            commands.retain(|command| read_only_command_allowed(&command.name));
+        }
         log::debug!(
             target: "claude_native::initialize",
             "initialize response received: {} command(s) after filter",
@@ -999,12 +1028,17 @@ impl ClaudeNativeConnection {
         let Some(work_dir) = work_dirs.ordered_paths().next().cloned() else {
             return Task::ready(Err(anyhow!("Working directory cannot be empty")));
         };
+        let read_only = extra_meta
+            .as_ref()
+            .and_then(|m| m.get("sawePermissionMode"))
+            .and_then(serde_json::Value::as_str)
+            == Some("read_only");
         let generation_only = extra_meta
             .as_ref()
             .and_then(|m| m.get("generationOnly"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let mcp_servers = if generation_only {
+        let mcp_servers = if generation_only || read_only {
             Vec::new()
         } else {
             mcp_servers_for_project(&project, cx)
@@ -1029,7 +1063,7 @@ impl ClaudeNativeConnection {
         let model = Self::model_from_meta(&extra_meta)
             .or_else(|| self.desired_models.borrow().get(&session_id).cloned());
 
-        let settings_path = if generation_only {
+        let settings_path = if generation_only || read_only {
             None
         } else {
             Self::editor_settings_path(&project, &work_dir, cx)
@@ -1037,6 +1071,7 @@ impl ClaudeNativeConnection {
 
         let blueprint = RespawnBlueprint {
             generation_only,
+            read_only,
             project: project.clone(),
             work_dirs: work_dirs.clone(),
             append_system_prompt: append_system_prompt.clone(),
@@ -1051,6 +1086,7 @@ impl ClaudeNativeConnection {
             mcp_servers_json: mcp_config_json(&mcp_servers),
             append_system_prompt,
             generation_only,
+            read_only,
             extra_env: self.extra_env.clone(),
             model,
             settings_path,
@@ -1064,6 +1100,7 @@ impl ClaudeNativeConnection {
         cx.spawn(async move |cx| {
             let shared = Rc::new(SessionShared {
                 generation_only,
+                read_only,
                 prompt_tx: RefCell::new(None),
                 sticky_window: Cell::new(None),
                 last_output: Rc::new(Cell::new(cx.background_executor().now())),
@@ -1287,13 +1324,14 @@ impl ClaudeNativeConnection {
                 binary: self.binary.clone(),
                 work_dir,
                 session: SessionArg::Resume(session_id.0.to_string()),
-                mcp_servers_json: if blueprint.generation_only {
+                mcp_servers_json: if blueprint.generation_only || blueprint.read_only {
                     mcp_config_json(&[])
                 } else {
                     mcp_config_json(&mcp_servers_for_project(&blueprint.project, cx))
                 },
                 append_system_prompt: blueprint.append_system_prompt.clone(),
                 generation_only: blueprint.generation_only,
+                read_only: blueprint.read_only,
                 extra_env: self.extra_env.clone(),
                 model: blueprint.model.clone(),
                 settings_path: blueprint.settings_path.clone(),
@@ -1312,6 +1350,7 @@ impl ClaudeNativeConnection {
 
             let shared = Rc::new(SessionShared {
                 generation_only: blueprint.generation_only,
+                read_only: blueprint.read_only,
                 prompt_tx: RefCell::new(None),
                 sticky_window: Cell::new(None),
                 last_output: Rc::new(Cell::new(cx.background_executor().now())),
@@ -1761,7 +1800,11 @@ async fn run_update_pump(
                         .log_err();
                 }
                 ControlRequestKind::CanUseTool { .. } => {
-                    answer_tool_authorization(envelope, outgoing.clone(), !shared.generation_only);
+                    answer_tool_authorization(
+                        envelope,
+                        outgoing.clone(),
+                        !shared.generation_only && !shared.read_only,
+                    );
                 }
                 ControlRequestKind::Other => {
                     log::debug!(
@@ -2194,6 +2237,19 @@ impl AgentConnection for ClaudeNativeConnection {
         true
     }
 
+    fn resume_session_with_meta(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        meta: Option<acp::Meta>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        let session = SessionArg::Resume(session_id.0.to_string());
+        self.open_session(session, project, work_dirs, title, meta, cx)
+    }
+
     fn resume_session(
         self: Rc<Self>,
         session_id: acp::SessionId,
@@ -2234,6 +2290,12 @@ impl AgentConnection for ClaudeNativeConnection {
                     params.session_id.0
                 )));
             };
+
+            if session.shared.read_only && !read_only_prompt_allowed(&params.prompt) {
+                return Task::ready(Err(anyhow!(
+                    "This slash command is unavailable in read-only mode"
+                )));
+            }
 
             let (sender, prompt_receiver) = oneshot::channel();
             *session.shared.prompt_tx.borrow_mut() = Some(sender);
@@ -2416,6 +2478,26 @@ impl AgentConnection for ClaudeNativeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_blocks_permission_and_configuration_reload_commands() {
+        for command in [
+            "/permissions",
+            "/mcp reconnect",
+            "/reload-plugins",
+            "/hooks",
+            "/unknown",
+        ] {
+            assert!(!read_only_prompt_allowed(&[acp::ContentBlock::Text(
+                acp::TextContent::new(command)
+            )]));
+        }
+        for text in ["Read the source", "/compact", "/context", "/model"] {
+            assert!(read_only_prompt_allowed(&[acp::ContentBlock::Text(
+                acp::TextContent::new(text)
+            )]));
+        }
+    }
 
     #[test]
     fn generation_tool_requests_are_denied_without_changing_interactive_permissions() {
@@ -2734,7 +2816,10 @@ mod tests {
                 {"name": "todos", "description": "filtered"},
             ],
         });
-        let commands = parse_available_commands(&payload);
+        let mut commands = parse_available_commands(&payload);
+        if shared.read_only {
+            commands.retain(|command| read_only_command_allowed(&command.name));
+        }
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["context", "compact", "agents", "skill"]);
         let agents = commands.iter().find(|c| c.name == "agents").unwrap();
@@ -2765,7 +2850,10 @@ mod tests {
         let payload = serde_json::json!({
             "commands": ["garbage", {"name": "context", "description": "ok"}],
         });
-        let commands = parse_available_commands(&payload);
+        let mut commands = parse_available_commands(&payload);
+        if shared.read_only {
+            commands.retain(|command| read_only_command_allowed(&command.name));
+        }
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["context"]);
     }

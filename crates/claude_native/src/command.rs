@@ -44,6 +44,8 @@ pub struct ClaudeCommandSpec {
     pub append_system_prompt: Option<String>,
     /// Text generation only; suppress all tools and customizations.
     pub generation_only: bool,
+    /// Read tools only, without hooks, MCP, or customizations.
+    pub read_only: bool,
     pub extra_env: Vec<(String, String)>,
     /// Model alias or full id passed as `--model`. `None` → claude uses
     /// its default. Used both for the initial spawn and every respawn so
@@ -97,11 +99,20 @@ impl ClaudeCommandSpec {
             "--disallowedTools",
             "AskUserQuestion",
         ]);
-        if self.generation_only {
+        if self.generation_only || self.read_only {
             // Verified against the installed CLI help. Safe mode retains OAuth
             // authentication (unlike --bare) while suppressing project hooks,
             // plugins, skills, rules, and other customizations.
-            cmd.args(["--safe-mode", "--tools", "", "--strict-mcp-config"]);
+            cmd.args([
+                "--safe-mode",
+                "--tools",
+                if self.generation_only {
+                    ""
+                } else {
+                    "Read,Glob,Grep"
+                },
+                "--strict-mcp-config",
+            ]);
             cmd.args(["--mcp-config", r#"{"mcpServers":{}}"#]);
             cmd.args(["--setting-sources", "", "--permission-mode", "default"]);
             cmd.env_remove("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS");
@@ -182,6 +193,7 @@ mod tests {
             mcp_servers_json: r#"{"mcpServers":{}}"#.into(),
             append_system_prompt: Some("SYS".into()),
             generation_only: false,
+            read_only: false,
             extra_env: vec![("K".into(), "V".into())],
             model: None,
             settings_path: None,
@@ -231,6 +243,42 @@ mod tests {
     }
 
     #[test]
+    fn read_only_new_and_resume_restrict_tools_and_ignore_settings_and_mcp() {
+        for session in [
+            SessionArg::New("sid".into()),
+            SessionArg::Resume("sid".into()),
+        ] {
+            let spec = ClaudeCommandSpec {
+                binary: "claude".into(),
+                work_dir: "/w".into(),
+                session,
+                mcp_servers_json: r#"{"mcpServers":{"unsafe":{"command":"touch"}}}"#.into(),
+                append_system_prompt: None,
+                generation_only: false,
+                read_only: true,
+                extra_env: vec![],
+                model: None,
+                settings_path: Some("/hooks.json".into()),
+            };
+            let cmd = spec.to_std_command();
+            let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+            for pair in [
+                ["--tools", "Read,Glob,Grep"],
+                ["--mcp-config", r#"{"mcpServers":{}}"#],
+                ["--setting-sources", ""],
+                ["--permission-mode", "default"],
+            ] {
+                assert!(args.windows(2).any(|w| w == pair));
+            }
+            assert!(args.contains(&"--safe-mode"));
+            assert!(args.contains(&"--strict-mcp-config"));
+            assert!(!args.contains(&"--settings"));
+            assert!(!args.contains(&"bypassPermissions"));
+            assert!(!args.contains(&"--allow-dangerously-skip-permissions"));
+        }
+    }
+
+    #[test]
     fn generation_disables_tools_customizations_and_bypass_on_new_and_resume() {
         for session in [
             SessionArg::New("sid".into()),
@@ -243,6 +291,7 @@ mod tests {
                 mcp_servers_json: r#"{"mcpServers":{"unsafe":{"command":"touch"}}}"#.into(),
                 append_system_prompt: Some("Generate text".into()),
                 generation_only: true,
+                read_only: false,
                 extra_env: vec![],
                 model: None,
                 settings_path: Some("/project/hooks.json".into()),
@@ -280,6 +329,7 @@ mod tests {
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
             generation_only: false,
+            read_only: false,
             extra_env: vec![],
             model: None,
             settings_path: None,
@@ -306,6 +356,7 @@ mod tests {
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
             generation_only: false,
+            read_only: false,
             extra_env: vec![],
             model: Some("opus".into()),
             settings_path: None,
@@ -327,6 +378,7 @@ mod tests {
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
             generation_only: false,
+            read_only: false,
             extra_env: vec![],
             model: None,
             settings_path: None,
@@ -348,6 +400,7 @@ mod tests {
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
             generation_only: false,
+            read_only: false,
             extra_env: vec![],
             model: None,
             settings_path: Some("/state/solutions/7/claude-settings.json".into()),
@@ -378,6 +431,7 @@ mod tests {
             mcp_servers_json: "{}".into(),
             append_system_prompt: None,
             generation_only: false,
+            read_only: false,
             extra_env: vec![],
             model: None,
             settings_path: None,

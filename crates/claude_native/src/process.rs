@@ -505,6 +505,7 @@ mod tests {
             mcp_servers_json: "{}".to_string(),
             append_system_prompt: None,
             generation_only: false,
+            read_only: false,
             extra_env: Vec::new(),
             model: None,
             settings_path: None,
