@@ -4090,3 +4090,16 @@ Approval controls use readable buttons and support Codex's acceptForSession
 choice. Authorization is single-use in the shared thread model and redraws
 immediately; stale UI/MCP answers cannot overwrite an accepted status. Session
 approval remains a provider-scoped grant, not a persistent global permission.
+
+
+### 172. Explicit permission choices become the default for new native chats
+
+The permission menu presents icons, descriptions and a trailing selection mark.
+Full access is visually distinguished and explains its unrestricted file and
+internet access. A successful explicit selection also stores an editor-wide
+default, shared by Claude/Codex across Solutions and surviving restarts. Opening
+or restoring a chat never changes this preference, and existing chats keep
+their own policy. Selecting a chat's current mode still updates the default.
+Fresh creation captures the preference before asynchronous native startup so
+the runtime and the resulting session model agree if another selection occurs
+while connecting. Internal helper capability restrictions remain separate.

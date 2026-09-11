@@ -858,7 +858,12 @@ pub(crate) fn render_status_row(
                 let tooltip = permission_change_error.clone().unwrap_or_else(|| {
                     "Permissions for this session. Changes apply when its agent reconnects.".into()
                 });
+                let icon = match permission_mode {
+                    SessionPermissionMode::FullAccess => IconName::Warning,
+                    SessionPermissionMode::ReadOnly => IconName::Eye,
+                };
                 let trigger = ui::Button::new("solution-status-permissions-trigger", label)
+                    .start_icon(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                     .label_size(LabelSize::Small)
                     .color(Color::Muted)
                     .disabled(!enabled)
@@ -868,13 +873,25 @@ pub(crate) fn render_status_row(
                     .trigger(trigger)
                     .menu(move |window, cx| {
                         Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            for (mode, label) in [
-                                (SessionPermissionMode::FullAccess, "Full access"),
-                                (SessionPermissionMode::ReadOnly, "Read only"),
+                            menu = menu.header("How should this session access your computer?");
+                            for (mode, label, description, icon) in [
+                                (SessionPermissionMode::ReadOnly, "Read only", "Read files without making changes or using external tools", IconName::Eye),
+                                (SessionPermissionMode::FullAccess, "Full access", "Unrestricted access to files and the internet", IconName::Warning),
                             ] {
-                                menu = menu.item(ui::ContextMenuEntry::new(label)
-                                    .when(mode == permission_mode, |entry| entry.icon(IconName::Check).icon_color(Color::Accent))
-                                    .handler(move |window, cx| {
+                                let selected = mode == permission_mode;
+                                let color = if mode == SessionPermissionMode::FullAccess { Color::Warning } else { Color::Default };
+                                menu = menu.custom_entry(
+                                    move |_, _| {
+                                        h_flex().w(px(390.)).gap_2().py_1()
+                                            .debug_selector(move || format!("SESSION-PERMISSION-{}", mode.as_str()))
+                                            .child(Icon::new(icon).size(IconSize::Small).color(color))
+                                            .child(v_flex().flex_1().gap_0p5()
+                                                .child(Label::new(label).color(color))
+                                                .child(Label::new(description).size(LabelSize::Small).color(if mode == SessionPermissionMode::FullAccess { Color::Warning } else { Color::Muted })))
+                                            .child(div().w_4().when(selected, |this| this.child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Muted))))
+                                            .into_any_element()
+                                    },
+                                    move |window, cx| {
                                         let result = SolutionAgentStore::global(cx).update(cx, |store, cx| {
                                             store.set_session_permission_mode(session_id, mode, cx)
                                         });
@@ -882,8 +899,9 @@ pub(crate) fn render_status_row(
                                             let prompt = window.prompt(gpui::PromptLevel::Warning, "Could not change permissions", Some(&error.to_string()), &["OK"], cx);
                                             window.spawn(cx, async move |_| { let _ = prompt.await; }).detach();
                                         }
-                                    }));
+                                    });
                             }
+                            menu = menu.separator().label("Your choice is the default for new sessions");
                             menu
                         }))
                     }))
