@@ -631,7 +631,7 @@ impl SolutionAgentStore {
                     .into_owned()]);
                 let acp_thread_task: Task<Result<Entity<acp_thread::AcpThread>>> = cx
                     .update(|cx| {
-                        if connection.supports_resume_session() {
+                        if connection.supports_resume_session() && !connection.supports_load_session() {
                             Ok(connection.clone().resume_session_with_meta(
                                 acp_session_id.clone(), project.clone(), work_dirs.clone(),
                                 title_for_load.clone(), Some(resume_meta.clone()), cx,
