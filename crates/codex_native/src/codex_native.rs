@@ -489,10 +489,18 @@ fn mcp_config(servers: &[acp::McpServer]) -> Value {
                     .iter()
                     .map(|entry| (entry.name.clone(), json!(entry.value)))
                     .collect();
-                config.insert(
-                    format!("mcp_servers.{}", server.name),
-                    json!({"command":server.command,"args":server.args,"env":env}),
-                );
+                let mut entry = json!({"command":server.command,"args":server.args,"env":env});
+                // Solution collaboration is an editor capability: peer delivery
+                // enforces scope and user-input gates in the host. Approve only
+                // discovery and peer send on the built-in bridge, not arbitrary
+                // MCP writes or the separate human-input endpoint.
+                if server.name == "sawe" && server.args.iter().any(|arg| arg == "--mcp-bridge") {
+                    entry["tools"] = json!({
+                        "solution_agent.list_sessions": {"approval_mode":"approve"},
+                        "solution_agent.send_agent_message": {"approval_mode":"approve"}
+                    });
+                }
+                config.insert(format!("mcp_servers.{}", server.name), entry);
             }
             acp::McpServer::Http(server) => {
                 let headers: serde_json::Map<String, Value> = server
@@ -562,6 +570,23 @@ mod tests {
         ]);
         assert_eq!(config["mcp_servers.sawe"]["command"], "/bin/sawe");
         assert_eq!(config["mcp_servers.sawe"]["env"]["SCOPE"], "test");
+        assert_eq!(
+            config["mcp_servers.sawe"]["tools"]["solution_agent.send_agent_message"]["approval_mode"],
+            "approve"
+        );
+        assert_eq!(
+            config["mcp_servers.sawe"]["tools"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(config["mcp_servers.remote"].get("tools").is_none());
+        let external = mcp_config(&[acp::McpServer::Stdio(acp::McpServerStdio::new(
+            "sawe",
+            "/bin/external",
+        ))]);
+        assert!(external["mcp_servers.sawe"].get("tools").is_none());
         assert_eq!(
             config["mcp_servers.remote"]["url"],
             "https://example.com/mcp"
