@@ -1247,3 +1247,67 @@ async fn an_in_place_rewrite_that_keeps_mod_seq_still_re_renders(cx: &mut gpui::
         })
         .unwrap();
 }
+
+#[gpui::test]
+async fn slash_clear_recovers_cold_error_without_sending_a_prompt(cx: &mut gpui::TestAppContext) {
+    use crate::model::SessionState;
+    use crate::store::SolutionAgentStore;
+    use gpui::VisualTestContext;
+
+    let (session_id, _thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+    let session = cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+    });
+    let project = cx.update(|cx| session.read(cx).project.clone().unwrap());
+    let workspace =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| workspace.root(cx).unwrap().downgrade());
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(session_id, session.clone(), workspace_weak, window, cx)
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.run_until_parked();
+
+    // A failed wake has a transcript identity, but no attached runtime.
+    let old_id = session.update(vcx, |session, cx| {
+        session.set_acp_thread(None, cx);
+        session.state = SessionState::AwaitingInput;
+        session.acp_session_id.clone()
+    });
+    view_window
+        .update(vcx, |view, window, cx| {
+            view.compose_editor
+                .update(cx, |editor, cx| editor.set_text("/clear", window, cx));
+            view.submit_compose_now(window, cx);
+            assert_eq!(
+                view.compose_editor.read(cx).text(cx),
+                "/clear",
+                "busy clear keeps the draft"
+            );
+            assert!(view.pending_send.is_none());
+        })
+        .unwrap();
+    session.update(vcx, |session, _| {
+        session.state = SessionState::Errored("wake failed".into())
+    });
+    view_window
+        .update(vcx, |view, window, cx| {
+            view.submit_compose_now(window, cx);
+            assert!(
+                view.pending_send.is_none(),
+                "/clear must never be forwarded to the model"
+            );
+        })
+        .unwrap();
+    vcx.run_until_parked();
+    session.read_with(vcx, |session, cx| {
+        assert!(matches!(session.state, SessionState::Idle));
+        assert_ne!(session.acp_session_id, old_id);
+        assert!(session.entries.is_empty());
+        assert!(session.acp_thread().unwrap().read(cx).entries().is_empty());
+    });
+}

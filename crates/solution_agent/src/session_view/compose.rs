@@ -131,6 +131,42 @@ impl SolutionSessionView {
                 self.pending_images.len(),
             );
         }
+        // `/clear` is intercepted client-side and translated into a fresh
+        // ACP session under the same SolutionSessionId. Forwarding it to
+        // the agent would clear the SDK's internal context but leave our
+        // local `AcpThread.entries` (and the rendered conversation) as-is;
+        // rotating is agent-agnostic and gives a guaranteed-clean slate
+        // including a reset usage meter. Pending images are dropped — the
+        // user explicitly asked to wipe the conversation.
+        if content.trim() == "/clear" {
+            if self.resuming
+                || !matches!(
+                    self.session.read(cx).state,
+                    SessionState::Idle | SessionState::Errored(_)
+                )
+            {
+                self.show_toast(
+                    "Wait for the current turn to finish before clearing context".into(),
+                    cx,
+                );
+                return;
+            }
+            self.compose_editor.update(cx, |e, cx| e.clear(window, cx));
+            self.pending_images.clear();
+            let session_id = self.session_id;
+            let reset = SolutionAgentStore::global(cx)
+                .update(cx, |store, cx| store.reset_context(session_id, cx));
+            cx.spawn(async move |this, cx| {
+                if let Err(error) = reset.await {
+                    this.update(cx, |view, cx| {
+                        view.show_toast(format!("Could not clear context: {error}").into(), cx);
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+            return;
+        }
         if self.session.read(cx).is_cold() {
             // Cold tab: defer the actual send until the agent
             // subprocess is running. Pre-flight slash-command
@@ -167,22 +203,6 @@ impl SolutionSessionView {
         // pass through as text — claude-acp parses them server-side.
         if let Some(rejection) = self.validate_slash_command(&content, cx) {
             self.show_toast(rejection, cx);
-            return;
-        }
-        // `/clear` is intercepted client-side and translated into a fresh
-        // ACP session under the same SolutionSessionId. Forwarding it to
-        // the agent would clear the SDK's internal context but leave our
-        // local `AcpThread.entries` (and the rendered conversation) as-is;
-        // rotating is agent-agnostic and gives a guaranteed-clean slate
-        // including a reset usage meter. Pending images are dropped — the
-        // user explicitly asked to wipe the conversation.
-        if content.trim() == "/clear" {
-            self.compose_editor.update(cx, |e, cx| e.clear(window, cx));
-            self.pending_images.clear();
-            let session_id = self.session_id;
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.reset_context(session_id, cx).detach_and_log_err(cx);
-            });
             return;
         }
         self.compose_editor.update(cx, |e, cx| e.clear(window, cx));

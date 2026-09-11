@@ -2026,6 +2026,16 @@ async fn clear_wipes_the_legacy_blob_so_a_restore_cannot_replay_it(cx: &mut Test
         "fixture must be row-native before the clear"
     );
 
+    // Finish the seeded turn before asking the editor to clear its context.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                agent_client_protocol::schema::StopReason::EndTurn,
+            ));
+        })
+    });
+    cx.run_until_parked();
+
     cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, cx| store.reset_context(session_id, cx))
     })

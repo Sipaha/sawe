@@ -1703,7 +1703,7 @@ async fn reset_context_kills_the_orphaned_background_agents(cx: &mut TestAppCont
 #[gpui::test]
 async fn late_send_error_is_dropped_when_session_was_reset(cx: &mut TestAppContext) {
     // Race regression guard: `/clear` (reset_context) swapping the
-    // AcpThread mid-turn must not let the OLD turn's late `Err`
+    // AcpThread after an error must not let the OLD turn's late `Err`
     // clobber the freshly-Idle state with `Errored("...")`. Without
     // the `expected_acp_session_id` check in `send_message_blocks`,
     // this test fails — the dropped gate makes the mock prompt return
@@ -1749,6 +1749,22 @@ async fn late_send_error_is_dropped_when_session_was_reset(cx: &mut TestAppConte
 
     // Reset the session while the in-flight prompt is still parked. The
     // new ACP thread takes over; state should land on `Idle`.
+    // A backend error makes human cleanup available without completing the
+    // old prompt future or flushing follow-ups tied to the failed context.
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let thread = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .acp_thread()
+            .unwrap()
+            .clone();
+        thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::Error));
+    });
+    cx.executor().run_until_parked();
+
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| store.reset_context(session_id, cx))
@@ -3187,6 +3203,16 @@ async fn reset_context_clears_entries(cx: &mut TestAppContext) {
             .len()
     });
     assert_eq!(len_before, 1, "one append → one entry before reset");
+
+    // The seeded transcript represents a completed turn before human /clear.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                agent_client_protocol::schema::StopReason::EndTurn,
+            ));
+        })
+    });
+    cx.executor().run_until_parked();
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -5713,6 +5739,16 @@ async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
     );
 
     // Now call reset_context — epoch must advance by exactly 1.
+    // The seeded transcript represents a completed turn before human /clear.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                agent_client_protocol::schema::StopReason::EndTurn,
+            ));
+        })
+    });
+    cx.executor().run_until_parked();
+
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| store.reset_context(session_id, cx))
@@ -5773,6 +5809,22 @@ async fn reset_context_with_queue_bumps_epoch_and_queue_watermark(cx: &mut TestA
             (s.epoch, s.queue_seq)
         })
     });
+
+    // A backend error makes human cleanup available without completing the
+    // old prompt future or flushing follow-ups tied to the failed context.
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let thread = SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .acp_thread()
+            .unwrap()
+            .clone();
+        thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::Error));
+    });
+    cx.executor().run_until_parked();
 
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -5870,6 +5922,16 @@ async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppCont
 
     // Call reset_context — this clears entries, bumps in-memory epoch, then
     // calls persist_all_rows which deletes all rows and saves the new epoch.
+    // The seeded transcript represents a completed turn before human /clear.
+    cx.update(|cx| {
+        acp_thread.update(cx, |_, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                agent_client_protocol::schema::StopReason::EndTurn,
+            ));
+        })
+    });
+    cx.executor().run_until_parked();
+
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| store.reset_context(session_id, cx))
