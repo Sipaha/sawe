@@ -346,8 +346,8 @@ impl<'de> Deserialize<'de> for StartCompactParams {
 pub struct StartCompactResult {
     /// `true` when the compact prompt was enqueued on the agent. A cold
     /// (sleeping) session is woken first, then the prompt is queued.
-    /// `false` when a precondition wasn't met (e.g. session busy,
-    /// context below 20%, or less than 30k tokens of headroom) — `message`
+    /// `false` when a precondition wasn't met (e.g. awaiting approval,
+    /// stopping, compaction already pending, context below 10%, or less than 30k tokens of headroom) — `message`
     /// carries the reason.
     pub queued: bool,
     /// Human-readable explanation when `queued == false`. `None` on

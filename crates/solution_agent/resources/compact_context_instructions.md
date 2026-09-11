@@ -4,6 +4,12 @@ The user or autonomous supervisor requested compaction. This may be for context
 headroom or recovery; do not assume the context is full or that a human is
 watching. Capture the essential state of this conversation in durable files,
 then ask the editor to rotate to a fresh context that can continue the same task.
+If work is already running, finish the current safe step first. Do not cancel
+an in-flight tool or abandon an operation with an uncertain outcome. Respect
+pending approvals and any newer user instructions; record unresolved work and
+operation status in the handoff. Then perform the standard workflow below.
+Do not start unrelated new implementation work before preparing the handoff.
+
 Use the current runtime's available file and shell tools; do not assume a
 particular model, provider, tool name, or context-window size.
 

@@ -32,12 +32,9 @@ pub(crate) struct StartCompactOutcome {
 /// `solution_agent.start_compact` MCP tool so the two surfaces share a
 /// single notion of "is this session compactable right now".
 ///
-/// The cold-session branch is intentionally NOT in here: queueing on a
-/// `SolutionSessionView` requires `&mut Window`, which the MCP path
-/// doesn't have. The desktop entry point handles cold separately via
-/// `start_compact_from_cold` on the navigator.
+/// Cold sessions use the same windowless wake path as MCP.
 /// Who triggered the compaction. A HUMAN-initiated `/compact` wipes the
-/// observer's memory (like `/clear`) so it reasons fresh afterwards; an
+/// observer's memory after successful rotation unless newer user input arrived; an
 /// OBSERVER-issued `compact` verdict must NOT wipe it (that path relies on
 /// `user_intent.md` surviving the transcript loss). See
 /// [`crate::supervisor::wipe_supervisor_memory`].
@@ -53,20 +50,22 @@ fn compact_unavailable_reason(session_id: SolutionSessionId, cx: &App) -> Result
         .read_with(cx, |s, _| s.session(session_id))
         .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
 
-    // Idle and terminal errors can recover by sending the summary request.
-    // A Running/AwaitingInput/Stopping session would
-    // race with the in-flight turn (claude-acp queues prompts in
-    // `pending_messages`, which would deliver the compact instructions
-    // AFTER the active turn — possibly minutes later — and surprise
-    // the user). Cold (sleeping) sessions ARE compactable here: they read
-    // as `Idle`, and the `store.send_message` below wakes them windowless
-    // via `send_message_blocks_with_wake` (the desktop UI's
-    // `start_compact_from_cold` does the same with a `&mut Window`; the MCP
-    // path doesn't need one). This is what lets a paired phone compact a
-    // sleeping session in one tap.
+    // Running sessions accept a cooperative request through native steering
+    // or the existing turn-end queue. Approval waits and stopping remain gated.
     {
         let s = session_entity.read(cx);
-        if !matches!(s.state, SessionState::Idle | SessionState::Errored(_)) {
+        if s.is_compaction_pending() {
+            return Ok(Some("compaction is already requested".into()));
+        }
+        if has_pending_compact_approval(&s, cx) {
+            return Ok(Some(
+                "session is awaiting approval; resolve it before compacting".into(),
+            ));
+        }
+        if !matches!(
+            s.state,
+            SessionState::Idle | SessionState::Errored(_) | SessionState::Running { .. }
+        ) {
             return Ok(Some(format!(
                 "session is busy ({:?}); wait for the current turn to finish",
                 s.state
@@ -113,6 +112,41 @@ fn compact_unavailable_reason(session_id: SolutionSessionId, cx: &App) -> Result
     Ok(None)
 }
 
+pub(crate) fn is_compaction_blocks(blocks: &[agent_client_protocol::schema::ContentBlock]) -> bool {
+    blocks.iter().any(|block| matches!(block, agent_client_protocol::schema::ContentBlock::Text(text) if text.text.starts_with(COMPACT_PROMPT_HEADING)))
+}
+
+/// An old wake/retry must not deliver a cancelled request into a new context.
+pub(crate) fn compaction_matches_pending(
+    session: &crate::model::SolutionSession,
+    blocks: &[agent_client_protocol::schema::ContentBlock],
+) -> bool {
+    let Some(request) = session.pending_compaction else {
+        return false;
+    };
+    let marker = format!("<!-- Sawe compaction request: {request} -->");
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            agent_client_protocol::schema::ContentBlock::Text(text)
+                if text.text.starts_with(COMPACT_PROMPT_HEADING) =>
+            {
+                Some(&text.text)
+            }
+            _ => None,
+        })
+        .all(|text| text.ends_with(&marker))
+}
+
+pub(crate) fn has_pending_compact_approval(
+    session: &crate::model::SolutionSession,
+    cx: &App,
+) -> bool {
+    session.acp_thread().is_some_and(|thread| thread.read(cx).entries().iter().any(|entry| {
+        matches!(entry, acp_thread::AgentThreadEntry::ToolCall(call) if matches!(call.status, acp_thread::ToolCallStatus::WaitingForConfirmation { .. }))
+    }))
+}
+
 pub(crate) fn start_compact_for_session(
     session_id: SolutionSessionId,
     initiator: CompactInitiator,
@@ -129,31 +163,46 @@ pub(crate) fn start_compact_for_session(
     let rendered = render_compact_prompt_inner(session_id, cx)?;
     let is_user = initiator == CompactInitiator::User;
     store.update(cx, |store, cx| {
-        // Human `/compact`: reset the observer to a clean slate (same as
-        // `/clear`), so it doesn't re-litigate settled directives after the
-        // user rotated the context. Observer-issued compaction keeps its memory.
-        if is_user {
-            store.wipe_supervisor_memory(session_id, cx);
-        }
-        // `from_user = is_user`: an OBSERVER-issued compact must NOT go through
-        // the `from_user: true` funnel — that would reset the consecutive-continue
-        // cap / audit cadence (the observer's own action masquerading as a human
-        // reply), defeating the anti-loop guards on a cap-exempt verdict (finding
-        // #9). A genuine user `/compact` keeps the funnel (it IS a human action).
-        // Both still wake a cold session (the wake path is independent of
-        // `from_user`).
+        let session = store.session(session_id).expect("session validated above");
+        let request = session.update(cx, |session, cx| {
+            let request = session.begin_compaction_request();
+            session.compact_reset_observer_memory = is_user;
+            cx.notify();
+            request
+        });
+        let rendered = format!("{rendered}\n\n<!-- Sawe compaction request: {request} -->");
         let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
             agent_client_protocol::schema::TextContent::new(rendered),
         )];
-        store
-            .send_message_blocks_targeted(
-                session_id,
-                blocks,
-                crate::model::QueueTarget::Main,
-                is_user,
-                cx,
-            )
-            .detach_and_log_err(cx);
+        let send = store.send_message_blocks_targeted(
+            session_id,
+            blocks,
+            crate::model::QueueTarget::Main,
+            is_user,
+            cx,
+        );
+        cx.spawn(async move |store, cx| {
+            if let Err(error) = send.await {
+                store.update(cx, |store, cx| {
+                    if let Some(session) = store.session(session_id) {
+                        let queue_changed = session.update(cx, |session, cx| {
+                            if session.pending_compaction != Some(request) {
+                                return false;
+                            }
+                            let changed = session.clear_compaction_request();
+                            cx.notify();
+                            changed
+                        });
+                        if queue_changed {
+                            store.mark_queue_changed(session_id, cx);
+                        }
+                    }
+                })?;
+                return Err(error);
+            }
+            Ok(())
+        })
+        .detach_and_log_err(cx);
     });
     Ok(StartCompactOutcome {
         queued: true,
@@ -355,50 +404,14 @@ impl SolutionSessionView {
         }
     }
 
-    /// Render the compact-instruction template for the active session and
-    /// create the `<root>/.agents/<sid>/c<NN>/` dump directory. Returns the
-    /// rendered prompt body. Surfaces a workspace toast and returns `None`
-    /// on the same failure modes the inline path used to handle (unknown
-    /// solution, mkdir failure).
-    pub(crate) fn render_compact_prompt(&self, cx: &mut Context<Self>) -> Option<String> {
-        let session_id = self.session_id();
-        match render_compact_prompt_inner(session_id, cx) {
-            Ok(rendered) => Some(rendered),
-            Err(err) => {
-                self.toast_compact_error(SharedString::from(err.to_string()), cx);
-                None
-            }
-        }
-    }
-
-    /// Cold-state compact: render the prompt now, queue it as
-    /// `pending_send`, and kick off `start_resume`. The existing wake-flush
-    /// hook (`flush_pending_send_if_ready`) dispatches the queued prompt
-    /// the moment `acp_thread` becomes `Some`. Status badge sequence the
-    /// user sees: `Sleeping → Resuming… → Thinking… → Idle`.
-    ///
-    /// No-ops if there's no rendered prompt (template render + mkdir
-    /// already toasted the failure).
+    /// Use the same windowless wake/send path as MCP, including deduplication
+    /// and failure cleanup, rather than keeping a second view-local queue.
     pub(crate) fn start_compact_from_cold(
         &mut self,
-        window: &mut gpui::Window,
+        _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        match compact_unavailable_reason(self.session_id(), cx) {
-            Ok(None) => {}
-            Ok(Some(reason)) => {
-                self.toast_compact_error(reason.into(), cx);
-                return;
-            }
-            Err(err) => {
-                self.toast_compact_error(err.to_string().into(), cx);
-                return;
-            }
-        }
-        let Some(rendered) = self.render_compact_prompt(cx) else {
-            return;
-        };
-        self.enqueue_text_pending_send_and_resume(rendered, window, cx);
+        self.start_compact(cx);
     }
 
     fn toast_compact_error(&self, message: SharedString, cx: &mut Context<Self>) {
@@ -495,18 +508,7 @@ mod tests {
         );
     }
 
-    /// Cold-compact orchestrator must:
-    ///   1. Render the compact instructions prompt (template variables
-    ///      replaced with cached cold-state values).
-    ///   2. Queue it as a single-block `pending_send` on the view.
-    ///   3. Set `resuming = true` so the badge flips to `Resuming…`.
-    ///
-    /// Assertions are checked synchronously — before `run_until_parked()` —
-    /// so the spawned `resume_session` task never fires and we don't have
-    /// to mock the full ACP handshake. The workspace entity is kept alive
-    /// for the duration of the test so `start_resume`'s synchronous
-    /// `workspace.upgrade()` check returns `Some` and does not clear
-    /// `pending_send` / `resuming` before we can read them.
+    /// Directory retention keeps unrelated sibling files intact.
     #[test]
     fn prune_old_compact_dirs_keeps_recent_window() {
         let tmp = tempfile::tempdir().unwrap();
@@ -563,9 +565,7 @@ mod tests {
 
         let session_id = SolutionSessionId::new();
 
-        // Open a Workspace window so `start_resume` can synchronously
-        // upgrade `self.workspace` — without a valid workspace entity,
-        // `start_resume` immediately clears `pending_send` + `resuming`.
+        // Exercise the desktop entry point against a real workspace view.
         let workspace_window =
             cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
 
@@ -614,25 +614,17 @@ mod tests {
         });
 
         vcx.update(|_window, cx| {
-            view_entity.read_with(cx, |view, _| {
-                let pending = view
-                    .pending_send_for_test()
-                    .expect("pending_send populated after start_compact_from_cold");
-                assert_eq!(pending.len(), 1, "exactly one content block");
-                let agent_client_protocol::schema::ContentBlock::Text(text) = &pending[0] else {
-                    panic!("expected text block, got {:?}", pending[0]);
-                };
-                assert!(
-                    !text.text.contains("{{compact_dir}}"),
-                    "template variable {{{{compact_dir}}}} must be resolved; got: {:?}",
-                    &text.text[..text.text.len().min(200)]
-                );
-                assert!(
-                    text.text.contains(session_id.as_str()),
-                    "rendered prompt must contain session_id={session_id}",
-                );
-                assert!(view.is_resuming(), "resuming flag set after enqueue");
-            });
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).unwrap();
+            assert!(session.read(cx).is_compaction_pending());
+            assert!(
+                !start_compact_for_session(session_id, CompactInitiator::User, cx)
+                    .unwrap()
+                    .queued
+            );
+            let rendered = render_compact_prompt_inner(session_id, cx).unwrap();
+            assert!(!rendered.contains("{{compact_dir}}"));
+            assert!(rendered.contains(session_id.as_str()));
         });
     }
 
@@ -700,7 +692,9 @@ mod tests {
         );
     }
     #[gpui::test]
-    async fn errored_live_session_can_compact_but_busy_sessions_cannot(cx: &mut TestAppContext) {
+    async fn errored_live_session_can_compact_but_approval_and_stopping_cannot(
+        cx: &mut TestAppContext,
+    ) {
         let (session_id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
@@ -716,10 +710,6 @@ mod tests {
         });
         cx.executor().run_until_parked();
         for state in [
-            SessionState::Running {
-                started_at: std::time::Instant::now(),
-                notified: false,
-            },
             SessionState::Stopping {
                 started_at: std::time::Instant::now(),
             },
@@ -758,6 +748,183 @@ mod tests {
             assert!(
                 !thread.read(cx).entries().is_empty(),
                 "compact prompt reaches the live thread"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn running_compact_is_queued_once_without_rotating_and_cleans_up_on_stop(
+        cx: &mut TestAppContext,
+    ) {
+        let (session_id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    Some(acp_thread::TokenUsage {
+                        used_tokens: 250_000,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                )
+            });
+        });
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).unwrap();
+            session.update(cx, |session, _| {
+                session.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                }
+            });
+            let count = session.read(cx).context_count;
+            let acp_id = session.read(cx).acp_session_id.clone();
+            assert!(
+                start_compact_for_session(session_id, CompactInitiator::User, cx)
+                    .unwrap()
+                    .queued
+            );
+            assert!(
+                !start_compact_for_session(session_id, CompactInitiator::Observer, cx)
+                    .unwrap()
+                    .queued
+            );
+            let s = session.read(cx);
+            assert!(s.is_compaction_pending());
+            assert_eq!(s.pending_messages.len(), 1);
+            assert!(is_compaction_blocks(&s.pending_messages[0].blocks));
+            assert!(compaction_matches_pending(s, &s.pending_messages[0].blocks));
+            assert_eq!(s.context_count, count);
+            assert_eq!(s.acp_session_id, acp_id);
+            assert_eq!(s.acp_thread(), Some(&thread));
+            assert!(matches!(s.state, SessionState::Running { .. }));
+            store.update(cx, |store, cx| {
+                store
+                    .send_message(session_id, "Keep my newer instructions".into(), cx)
+                    .detach();
+            });
+            assert_eq!(
+                session.read(cx).pending_messages.len(),
+                2,
+                "compact and user follow-up remain separate"
+            );
+            store.update(cx, |store, cx| {
+                store.mutate_state(
+                    session_id,
+                    |state| {
+                        *state = SessionState::Stopping {
+                            started_at: std::time::Instant::now(),
+                        }
+                    },
+                    cx,
+                )
+            });
+            assert!(!session.read(cx).is_compaction_pending());
+            assert_eq!(session.read(cx).pending_messages.len(), 1);
+            assert!(!is_compaction_blocks(
+                &session.read(cx).pending_messages[0].blocks
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn failed_compact_send_releases_pending_request(cx: &mut TestAppContext) {
+        let (session_id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    Some(acp_thread::TokenUsage {
+                        used_tokens: 250_000,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                )
+            })
+        });
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                start_compact_for_session(session_id, CompactInitiator::User, cx)
+                    .unwrap()
+                    .queued
+            )
+        });
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            let session = SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(session_id)
+                .unwrap();
+            assert!(
+                !session.read(cx).is_compaction_pending(),
+                "mock transport error releases request"
+            );
+            assert_eq!(session.read(cx).context_count, 1);
+            assert!(!session.read(cx).compact_reset_observer_memory);
+        });
+    }
+
+    #[gpui::test]
+    async fn queued_compact_reaches_next_turn_without_early_context_reset(cx: &mut TestAppContext) {
+        let (session_id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    Some(acp_thread::TokenUsage {
+                        used_tokens: 250_000,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                )
+            })
+        });
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            let session = SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(session_id)
+                .unwrap();
+            session.update(cx, |session, _| {
+                session.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                }
+            });
+            assert!(
+                start_compact_for_session(session_id, CompactInitiator::Observer, cx)
+                    .unwrap()
+                    .queued
+            );
+            assert!(
+                thread.read(cx).entries().is_empty(),
+                "enqueue must not send a competing turn"
+            );
+            assert_eq!(session.read(cx).context_count, 1);
+            thread.update(cx, |_thread, cx| {
+                cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                    agent_client_protocol::schema::StopReason::EndTurn,
+                ))
+            });
+        });
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                !thread.read(cx).entries().is_empty(),
+                "turn-end flush sends the handoff request"
+            );
+            let session = SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(session_id)
+                .unwrap();
+            assert!(session.read(cx).pending_messages.is_empty());
+            assert_eq!(
+                session.read(cx).context_count,
+                1,
+                "only compact_session may rotate after handoff writes"
             );
         });
     }

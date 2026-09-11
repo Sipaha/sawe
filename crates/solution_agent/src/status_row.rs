@@ -419,13 +419,19 @@ pub(crate) fn render_status_row(
     let remaining = max.saturating_sub(used);
     let too_full = remaining < COMPACT_HEADROOM_MIN_TOKENS;
     let pct_ok = pct >= COMPACT_BUTTON_MIN_PCT;
-    let compact_enabled = can_clean_context && pct_ok && !too_full;
+    let compact_pending = s.is_compaction_pending();
+    let can_compact_context = (can_clean_context || is_running)
+        && !compact_pending
+        && !crate::compact::has_pending_compact_approval(s, cx);
+    let compact_enabled = can_compact_context && pct_ok && !too_full;
     let clear_enabled = can_clean_context;
     let trigger_enabled = compact_enabled || clear_enabled;
 
     let compact_warning = pct >= COMPACT_BUTTON_WARN_PCT && !too_full;
-    let compact_tooltip: SharedString = if !can_clean_context {
-        "Wait for the current turn to finish before compacting".into()
+    let compact_tooltip: SharedString = if compact_pending {
+        "Compaction requested — waiting for a safe handoff".into()
+    } else if !can_compact_context {
+        "Resolve the pending approval or wait for stopping to finish".into()
     } else if too_full {
         format!(
             "Only {} of headroom left — start a fresh session manually",
@@ -434,6 +440,8 @@ pub(crate) fn render_status_row(
         .into()
     } else if pct < COMPACT_BUTTON_MIN_PCT {
         "Conversation is short — compact later".into()
+    } else if is_running {
+        "Request a handoff at the next safe boundary; the current step keeps running".into()
     } else if compact_warning {
         "Context is filling up — compact recommended".into()
     } else if is_cold {

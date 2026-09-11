@@ -3514,6 +3514,7 @@ impl SolutionAgentStore {
                 // overwrites it — needed to tear down its now-orphaned subprocess.
                 // Only meaningful if the session was actually live (a cold session
                 // never spawned an old child and never held a pool refcount slot).
+                let reset_observer_memory = session_entity.read(cx).compact_reset_observer_memory;
                 let old_acp_session_id = session_entity.read(cx).acp_session_id.clone();
                 let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
                 let new_acp_session_id = new_thread.read(cx).session_id().clone();
@@ -3536,6 +3537,7 @@ impl SolutionAgentStore {
                     s.entries.clear();
                     s.clear_closed_streams();
                     s.rebuild_streams();
+                    s.clear_compaction_request();
                     s.bump_epoch();
                     // `set_acp_thread` emits ThreadReplaced + notify;
                     // last so SessionView re-attaches against a fully
@@ -3544,6 +3546,9 @@ impl SolutionAgentStore {
                     // they were children of is closed a few lines below.
                     s.set_acp_thread(Some(new_thread.clone()), cx)
                 });
+                if reset_observer_memory {
+                    store.wipe_supervisor_memory(session_id, cx);
+                }
                 if background_agents_killed {
                     cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
                         session_id,
@@ -3785,6 +3790,7 @@ impl SolutionAgentStore {
                     s.entries.clear();
                     s.clear_closed_streams();
                     s.rebuild_streams();
+                    s.clear_compaction_request();
                     s.bump_epoch();
                     // Cache the (possibly freshly-built headless) project so
                     // a subsequent reset/restart on this now-live session
@@ -4887,6 +4893,29 @@ impl SolutionAgentStore {
         let previous = session.read(cx).state.clone();
         session.update(cx, |s, _| f(&mut s.state));
         let next = session.read(cx).state.clone();
+        // An active request survives the old turn ending only while its
+        // compact instructions still await delivery. Error/Stop always cancel
+        // it; later ordinary queued messages remain intact.
+        let clear_compact = matches!(
+            next,
+            SessionState::Errored(_) | SessionState::Stopping { .. }
+        ) || (matches!(next, SessionState::Idle)
+            && !session
+                .read(cx)
+                .pending_messages
+                .iter()
+                .any(|bundle| crate::compact::is_compaction_blocks(&bundle.blocks)));
+        if clear_compact && session.read(cx).is_compaction_pending() {
+            let queue_changed = session.update(cx, |session, cx| {
+                let changed = session.clear_compaction_request();
+                cx.notify();
+                changed
+            });
+            if queue_changed {
+                self.mark_queue_changed(session_id, cx);
+            }
+        }
+
         if std::mem::discriminant(&previous) != std::mem::discriminant(&next) {
             self.mark_state_changed(session_id, cx);
         }

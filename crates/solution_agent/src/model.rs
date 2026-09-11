@@ -384,6 +384,10 @@ pub struct SolutionSession {
     /// matches the Claude Code CLI experience where you can keep
     /// typing follow-ups while the agent is still working.
     pub pending_messages: VecDeque<PendingBundle>,
+    /// Transient cooperative compaction request; never restored after a crash.
+    pub(crate) pending_compaction: Option<u64>,
+    pub(crate) compact_reset_observer_memory: bool,
+    compact_request_serial: u64,
     /// One-shot signal set by `interrupt_and_flush_pending`: tells the
     /// next `Stopped(Cancelled)` handler to FLUSH `pending_messages`
     /// instead of clearing them. Without it, `Cancelled` (the user
@@ -681,6 +685,9 @@ impl SolutionSession {
             project: None,
             _acp_subscription: None,
             pending_messages: VecDeque::new(),
+            pending_compaction: None,
+            compact_reset_observer_memory: false,
+            compact_request_serial: 0,
             flush_after_cancel: false,
             live_base: 0,
             entries: Vec::new(),
@@ -746,6 +753,27 @@ impl SolutionSession {
         self.acp_thread.as_ref()
     }
 
+    pub(crate) fn is_compaction_pending(&self) -> bool {
+        self.pending_compaction.is_some()
+    }
+
+    pub(crate) fn begin_compaction_request(&mut self) -> u64 {
+        self.compact_request_serial = self.compact_request_serial.wrapping_add(1);
+        self.pending_compaction = Some(self.compact_request_serial);
+        self.compact_request_serial
+    }
+
+    /// Compact prompts are kept in their own queue bundle. Removing one
+    /// must not discard ordinary follow-ups submitted before or after it.
+    pub(crate) fn clear_compaction_request(&mut self) -> bool {
+        self.pending_compaction = None;
+        self.compact_reset_observer_memory = false;
+        let before = self.pending_messages.len();
+        self.pending_messages
+            .retain(|bundle| !crate::compact::is_compaction_blocks(&bundle.blocks));
+        self.pending_messages.len() != before
+    }
+
     /// Replace the live `AcpThread` on this session. Atomically emits
     /// `SolutionSessionEvent::ThreadReplaced` and `cx.notify()` so
     /// `SolutionSessionView` can re-attach its per-thread subscription
@@ -785,6 +813,9 @@ impl SolutionSession {
             .acp_thread
             .as_ref()
             .is_some_and(|current| thread.as_ref() != Some(current));
+        if replaced_live_thread {
+            self.clear_compaction_request();
+        }
         let killed_background_agents = replaced_live_thread && self.mark_background_agents_killed();
         self.live_base = if thread.is_some() {
             self.entries.len()
