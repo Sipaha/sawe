@@ -638,7 +638,7 @@ async fn collect_evidence(
         _ => return Ok(None),
     };
     let mut evidence = format!(
-        "Source patch (JSON string):\n{:?}\nTarget files at HEAD:\n",
+        "Source patch (quoted string):\n{:?}\nTarget files at HEAD:\n",
         patch
     );
     for path in &commit.paths {
@@ -658,7 +658,7 @@ async fn collect_evidence(
             _ => return Ok(None),
         };
         evidence.push_str(&format!(
-            "Path {path:?}, complete contents (JSON string): {text:?}\n"
+            "Path {path:?}, complete contents (quoted string): {text:?}\n"
         ));
     }
     Ok(Some(evidence))

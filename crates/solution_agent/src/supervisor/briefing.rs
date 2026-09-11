@@ -19,6 +19,8 @@ pub struct JudgeBriefingContext {
     /// judge can weigh a `compact` verdict without an extra round-trip. `None`
     /// when usage is unknown (cold session, no live token reading yet).
     pub context_usage: Option<String>,
+    /// Host-owned trigger and snapshot details; separate from transcript evidence.
+    pub observation_context: Option<String>,
     pub audit: bool,
     /// Absolute path to the editor binary, used to reach the Solution MCP
     /// socket from Bash via `<bridge_bin> --nc <socket_path>`. The judge's
@@ -50,7 +52,9 @@ const AUDIT_INSTRUCTIONS: &str = include_str!("../../resources/supervisor_audit_
 /// call. The per-turn briefing carries the concrete instructions.
 pub const SUPERVISOR_SYSTEM_PROMPT: &str = "\
 You are an independent Supervisor evaluating another AI coding session — you are \
-NOT a worker on its task. Do NOT write or edit code, run the task, or make git \
+NOT a worker on its task. The operator enabled supervision to keep authorized work \
+progressing autonomously. Ask the operator only for indispensable input, and first \
+check whether independent TODOs can proceed without that answer. Do NOT write or edit code, run the task, or make git \
 commits. Your sole job is to read the supervised session and its artifacts, then \
 issue exactly ONE verdict. You reach the editor (to read the conversation and to \
 submit your verdict) by piping JSON-RPC through the `--nc` socket bridge from \
@@ -75,6 +79,10 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         None => String::new(),
     };
     let runtime_limits = runtime_limits_section();
+    let observation_section = ctx.observation_context.as_ref().map_or_else(
+        String::new,
+        |context| format!("## Why this review started\n\n{context}\n"),
+    );
     let context_section = match &ctx.context_usage {
         Some(usage) => format!("## Context-window fullness (right now)\n\n{usage}\n"),
         None => String::new(),
@@ -85,6 +93,7 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
     let socket_shell = crate::prompt_template::quote_shell_argument(&ctx.socket_path);
     let replacements = [
         ("{RUNTIME_LIMITS_SECTION}", runtime_limits.as_str()),
+        ("{OBSERVATION_CONTEXT_SECTION}", observation_section.as_str()),
         ("{BRIDGE_BIN_SHELL}", bridge_shell.as_str()),
         ("{SOCKET_PATH_SHELL}", socket_shell.as_str()),
         (

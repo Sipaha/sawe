@@ -205,6 +205,8 @@
         "{CUSTOM_PROMPT_SECTION}",
         "{DIARY_PATH}",
         "{INTENT_PATH}",
+        "{OBSERVATION_CONTEXT_SECTION}",
+        "{RUNTIME_LIMITS_SECTION}",
         "{SOCKET_PATH_SHELL}",
         "{SUPERVISED_SESSION_ID}",
         "{VERDICT_NONCE}"
@@ -270,7 +272,10 @@
     },
     {
       "path": "crates/solution_agent/src/message_generator.rs",
-      "kind": "inline-owner"
+      "kind": "inline-owner",
+      "constants": [
+        "GENERATION_SYSTEM_PROMPT"
+      ]
     },
     {
       "path": "crates/solution_agent/src/store/queue.rs",

@@ -65,6 +65,7 @@ def make_supervisor_prompt(case):
         'VERDICT_NONCE': 'synthetic-nonce',
         'CONTEXT_USAGE_SECTION': 'Context usage: 10,000 / 200,000 tokens.',
         'CUSTOM_PROMPT_SECTION': '',
+        'OBSERVATION_CONTEXT_SECTION': 'Idle review of the supplied synthetic conversation.',
         'RUNTIME_LIMITS_SECTION': 'Runtime limits: ' + ', '.join(f'{key}={value}' for key, value in limits.items()),
     }
     template = re.sub(r'\{([A-Z_]+)\}', lambda match: values[match[1]], template)

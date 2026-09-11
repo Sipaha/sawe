@@ -221,6 +221,7 @@ fn briefing_substitutes_paths_and_custom_prompt() {
         compact_dir: "/sol/.agents/abcd1234".into(),
         custom_prompt: Some("don't stop before tests pass".into()),
         context_usage: Some("187,000 / 200,000 tokens (94%)".into()),
+        observation_context: Some("Idle review".into()),
         audit: false,
         bridge_bin: "/path/to/sawe".into(),
         socket_path: "/run/sol/mcp.sock".into(),
@@ -228,6 +229,8 @@ fn briefing_substitutes_paths_and_custom_prompt() {
     };
     let out = build_judge_briefing(&ctx);
     assert!(out.contains("abcd1234"));
+    assert!(out.contains("## Why this review started\n\nIdle review"));
+    assert!(!out.contains("{OBSERVATION_CONTEXT_SECTION}"));
     assert!(out.contains("/sol/.agents/abcd1234/supervisor/diary.md"));
     assert!(out.contains("don't stop before tests pass"));
     assert!(out.contains("187,000 / 200,000 tokens (94%)"));
@@ -261,6 +264,7 @@ fn briefing_omits_custom_section_when_absent() {
         compact_dir: "c".into(),
         custom_prompt: None,
         context_usage: None,
+        observation_context: Some("Idle review".into()),
         audit: false,
         bridge_bin: "/path/to/sawe".into(),
         socket_path: "/run/sol/mcp.sock".into(),
@@ -282,6 +286,7 @@ fn briefing_shell_arguments_roundtrip_without_executing_paths() {
         compact_dir: "c".into(),
         custom_prompt: Some("Keep {SOCKET_PATH} literal".into()),
         context_usage: None,
+        observation_context: Some("Idle review".into()),
         audit: false,
         bridge_bin: "/path with space/it's-{SOCKET_PATH}-$(false)-`false`\\sawe".into(),
         socket_path: "/run/it's $(false) `false`\n/socket".into(),
