@@ -2834,6 +2834,12 @@ fn is_session_gone_error_matches_known_markers() {
     ));
     // Non-recoverable transport/auth/allow-list errors stay opaque so we
     // don't pointlessly retry against another cwd.
+    assert!(is_session_gone_error(
+        "Codex: no rollout found for thread id abc"
+    ));
+    assert!(!is_session_gone_error(
+        "Codex: permission denied reading rollout"
+    ));
     assert!(!is_session_gone_error("connection refused"));
     assert!(!is_session_gone_error("authentication required"));
     assert!(!is_session_gone_error("permission denied: /home/spk/.spk"));

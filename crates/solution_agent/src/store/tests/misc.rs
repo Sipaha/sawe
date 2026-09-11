@@ -2768,6 +2768,14 @@ async fn cold_send_unknown_solution_returns_structured_error(cx: &mut TestAppCon
         !msg.contains("has no ACP thread yet"),
         "auto-wake should replace the legacy 'no ACP thread' error, got {msg:?}"
     );
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        assert!(
+            matches!(session.read(cx).state, SessionState::Errored(_)),
+            "failed cold wake must not remain Running"
+        );
+    });
 }
 
 /// Hot-path passthrough: when a session has a live `acp_thread`,

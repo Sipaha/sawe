@@ -3945,3 +3945,8 @@ the runtime so edits cannot continue after the UI reports a failed turn.
 Command and file-change approvals use the existing permission UI; unsupported
 requests fail closed. The plain chat `+` remains Claude; its adjacent visible
 agent menu exposes Codex without changing that gesture.
+
+Codex's missing-rollout response is routed through the existing missing-session
+fallback, because a thread with no first turn has no persisted rollout to resume.
+Cold-wake failures must clear their own Running indicator without overwriting a
+newer turn or an attached thread.

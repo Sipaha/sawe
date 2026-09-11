@@ -965,10 +965,13 @@ pub(crate) use teardown::stale_archive_dirs;
 ///     `new_session` re-mint fallback below) and surfacing a raw
 ///     "No conversation found with session ID: …" snackbar on the user's
 ///     editor restart.
+///   - `Codex: no rollout found for thread id`: Codex does not persist a
+///     newly created thread until its first turn starts.
 fn is_session_gone_error(err_str: &str) -> bool {
     err_str.contains("Resource not found")
         || err_str.contains("-32002")
         || err_str.contains("No conversation found")
+        || err_str.contains("Codex: no rollout found for thread id ")
 }
 
 /// Re-export so the historical `crate::store::EFFORT_LEVELS` path (used by

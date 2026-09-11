@@ -21,6 +21,7 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use gpui::{AsyncApp, Context, Entity, SharedString, Task};
+use util::ResultExt as _;
 
 use acp_thread::{AcpThread, AgentThreadEntry, SelectedPermissionOutcome, ToolCallStatus};
 use agent_client_protocol::schema as acp;
@@ -823,7 +824,25 @@ impl SolutionAgentStore {
             // the Window — MCP-driven sends don't have one). Re-enters
             // `send_message_blocks` once the thread is attached so the
             // normal hot-path code below runs unchanged.
-            return self.send_message_blocks_with_wake(session_id, blocks, cx);
+            let wake = self.send_message_blocks_with_wake(session_id, blocks, cx);
+            return cx.spawn(async move |this, cx| {
+                let result = wake.await;
+                if let Err(failure) = &result {
+                    let message = SharedString::from(format!("{:#}", failure.source));
+                    this.update(cx, |store, cx| {
+                        let still_waking = store.session(session_id).is_some_and(|session| {
+                            let session = session.read(cx);
+                            session.acp_thread().is_none()
+                                && matches!(session.state, SessionState::Running { started_at, .. } if started_at == this_turn_started_at)
+                        });
+                        if still_waking {
+                            store.mutate_state(session_id, |state| *state = SessionState::Errored(message), cx);
+                            cx.notify();
+                        }
+                    }).log_err();
+                }
+                result
+            });
         };
 
         // Route through `AcpThread::send` (not `connection.prompt` directly)
