@@ -2622,8 +2622,9 @@ impl SolutionAgentStore {
             connection
                 .close_session(&provider_id, cx)
                 .detach_and_log_err(cx);
-            self.pool_release_session(pair.clone(), cx);
-            self.pool.lock().remove(&pair);
+            // Other chats may still share the connection. Resume passes the
+            // new policy to a fresh per-session process on that connection.
+            self.pool_release_session(pair, cx);
         }
         session.update(cx, |s, cx| {
             s.permission_mode = mode;
