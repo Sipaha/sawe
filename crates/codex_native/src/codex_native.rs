@@ -41,15 +41,6 @@ impl CodexAgentServer {
         cx.spawn(async move |cx| {
             let process = cx.update(|cx| Process::spawn(&directory, cx))?;
             process.initialize().await?;
-            if read_only {
-                let effective = process
-                    .request(
-                        "config/read",
-                        json!({"includeLayers":false,"cwd":directory}),
-                    )
-                    .await?;
-                disable_mcp_servers(&mut config, &effective["config"]);
-            }
             models(&process).await
         })
     }
@@ -238,14 +229,18 @@ impl CodexConnection {
             .and_then(|m| m.get("sawePermissionMode"))
             .and_then(Value::as_str)
             == Some("read_only");
-        let mut config = session_config(&mcp_servers_for_project(&project, cx));
+        let config = session_config(&mcp_servers_for_project(&project, cx));
         cx.spawn(async move |cx| {
             let mut process = cx.update(|cx| Process::spawn(&directory, cx))?;
             process.initialize().await?;
+            let effective = if read_only {
+                Some(process.request("config/read", json!({"includeLayers":false,"cwd":directory})).await?)
+            } else { None };
+
             let account = process.request("account/read", json!({"refreshToken":false})).await?;
             if account["requiresOpenaiAuth"].as_bool() == Some(true) && account["account"].is_null() { bail!("Codex is not signed in. Run `codex login` in a terminal, complete sign-in, then reopen this chat."); }
             let available_models = models(&process).await?;
-            let mut params = json!({"cwd":directory,"config":config,"approvalPolicy":"never","approvalsReviewer":"user","sandbox":if read_only {"read-only"} else {"danger-full-access"}});
+            let mut params = session_open_params(&directory, config, read_only, effective.as_ref().map(|response| &response["config"]))?;
             if let Some(meta) = &meta {
                 if let Some(prompt) = meta.get("systemPrompt").and_then(|prompt| prompt.as_str().or_else(|| prompt.get("append").and_then(Value::as_str))) { params["developerInstructions"] = json!(prompt); }
                 if let Some(model) = meta.get("modelId").and_then(Value::as_str) { params["model"] = json!(model); }
@@ -505,6 +500,25 @@ async fn models(process: &Process) -> Result<Vec<CodexModelInfo>> {
     }
     Ok(models)
 }
+// Shared by start and resume. Read-only construction requires the resolved
+// configuration so inherited MCP cannot accidentally survive the launch path.
+fn session_open_params(
+    directory: &std::path::Path,
+    mut config: Value,
+    read_only: bool,
+    effective: Option<&Value>,
+) -> Result<Value> {
+    if read_only {
+        let effective = effective
+            .filter(|value| value.is_object())
+            .context("Codex did not return the resolved configuration for read-only mode")?;
+        disable_mcp_servers(&mut config, effective);
+    }
+    Ok(
+        json!({"cwd":directory,"config":config,"approvalPolicy":"never","approvalsReviewer":"user","sandbox":if read_only {"read-only"} else {"danger-full-access"}}),
+    )
+}
+
 // Empty tables merge with inherited configuration. Explicitly disable both
 // inherited servers and editor-injected servers so read-only cannot call MCP.
 fn disable_mcp_servers(config: &mut Value, effective: &Value) {
@@ -675,6 +689,29 @@ mod tests {
             "Bearer test"
         );
     }
+    #[test]
+    fn session_launch_requires_resolved_config_and_disables_mcp_in_read_only() {
+        let directory = std::path::Path::new("/tmp/project");
+        assert!(session_open_params(directory, session_config(&[]), true, None).is_err());
+        assert!(
+            session_open_params(directory, session_config(&[]), true, Some(&Value::Null)).is_err()
+        );
+        let params = session_open_params(
+            directory,
+            session_config(&[]),
+            true,
+            Some(&json!({"mcp_servers":{"global":{"command":"unsafe"}}})),
+        )
+        .unwrap();
+        assert_eq!(params["sandbox"], "read-only");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["config"]["mcp_servers.global.enabled"], false);
+        let full = session_open_params(directory, session_config(&[]), false, None).unwrap();
+        assert_eq!(full["sandbox"], "danger-full-access");
+        assert_eq!(full["approvalPolicy"], "never");
+        assert!(full["config"].get("features.apps").is_none());
+    }
+
     #[test]
     fn read_only_disables_inherited_and_editor_mcp_without_changing_context_window() {
         let mut config = session_config(&[acp::McpServer::Stdio(acp::McpServerStdio::new(

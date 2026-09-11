@@ -40,6 +40,7 @@ fn spec_for(binary: PathBuf, capture: Option<PathBuf>) -> ClaudeCommandSpec {
         mcp_servers_json: r#"{"mcpServers":{}}"#.into(),
         append_system_prompt: None,
         generation_only: false,
+        read_only: false,
         extra_env,
         model: None,
         settings_path: None,
