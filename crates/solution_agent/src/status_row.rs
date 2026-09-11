@@ -169,7 +169,8 @@ pub(crate) fn render_status_row(
     // already leased by GPUI's renderer.
     let (state_text, error_text): (SharedString, Option<SharedString>) = if is_resuming {
         (SharedString::from("Resuming…"), None)
-    } else if is_cold {
+    } else if is_cold && !matches!(&s.state, SessionState::Errored(_)) {
+        // Preserve terminal errors even after the subprocess is unloaded.
         // The session was restored from disk and the subprocess
         // hasn't been spawned yet. Tooltip-less label is fine —
         // the meaning is glanceable (Sleeping = inactive, send
