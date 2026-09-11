@@ -4021,6 +4021,8 @@ cooperatively and deduplicates pending requests. Context resets only after the
 worker completes the handoff. User-requested observer-memory reset is deferred
 until successful rotation and invalidated by newer user instructions. The
 required handoff reserve is 10% of the known window, capped at 30k tokens.
+The status meter uses the persisted session capacity on cold restore, matching
+the backend gate rather than temporarily displaying a fabricated 1M window.
 
 ### 167. Codex follow-ups use acknowledged active-turn steering
 

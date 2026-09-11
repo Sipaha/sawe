@@ -140,6 +140,7 @@ pub(crate) fn render_status_row(
     // Without this split the mutating section would clash with the
     // immutable borrow of `s` through `cx`.
     let s = session.read(cx);
+    let session_cached_max_tokens = s.cached_max_tokens;
     let compact_pending = s.is_compaction_pending();
     let compact_permission_pending = crate::compact::has_pending_compact_approval(s, cx);
     let agent_id = s.agent_id.clone();
@@ -370,7 +371,11 @@ pub(crate) fn render_status_row(
     // we keep it (cached below) so a later 0/missing update never downgrades
     // the meter to the global fallback (the 200k/1M flicker). The Claude
     // Opus 4 window is the fallback only until a real value first arrives.
-    let advertised_max = usage.as_ref().map(|u| u.max_tokens);
+    let advertised_max = usage
+        .as_ref()
+        .map(|u| u.max_tokens)
+        .filter(|max| *max > 0)
+        .or(session_cached_max_tokens);
     let (max, new_cached_max) = resolve_max_tokens(advertised_max, view.status_cached_max_tokens);
     // A Task subagent inherits the parent's model, so its meter borrows the
     // parent's resolved window as the denominator — but it must NOT write back
