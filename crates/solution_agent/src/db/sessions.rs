@@ -33,8 +33,26 @@ impl SolutionAgentDb {
                 meta.permission_mode.as_str().to_owned(),
                 meta.id.to_string(),
             ))?;
+            save_default_permission_mode(&connection, meta.permission_mode)?;
             Ok(())
         })
+    }
+
+    pub fn load_default_permission_mode(&self) -> Result<crate::model::SessionPermissionMode> {
+        let connection = self.connection.lock();
+        let values = connection.select::<String>(
+            "SELECT value FROM solution_agent_preferences WHERE key = 'permission_mode'",
+        )?()?;
+        Ok(crate::model::SessionPermissionMode::from_persisted(
+            values.first().map(String::as_str),
+        ))
+    }
+
+    pub fn save_default_permission_mode(
+        &self,
+        mode: crate::model::SessionPermissionMode,
+    ) -> Result<()> {
+        save_default_permission_mode(&self.connection.lock(), mode)
     }
 
     pub fn list_for_solution(
@@ -847,4 +865,11 @@ pub(crate) fn select_cold_head_by_id(
         max_entry_mod_seq,
         blob_len,
     }))
+}
+
+fn save_default_permission_mode(
+    connection: &Connection,
+    mode: crate::model::SessionPermissionMode,
+) -> Result<()> {
+    connection.exec_bound::<String>("INSERT INTO solution_agent_preferences (key, value) VALUES ('permission_mode', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?(mode.as_str().to_owned())
 }

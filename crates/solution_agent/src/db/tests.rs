@@ -1758,3 +1758,41 @@ async fn permissions_roundtrip_legacy_default_and_stale_metadata(cx: &mut gpui::
         SessionPermissionMode::FullAccess
     );
 }
+
+#[gpui::test]
+async fn permission_default_survives_restart_without_rewriting_existing_chats(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::model::SessionPermissionMode;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("permissions.sqlite");
+    let db = SolutionAgentDb::open_at_path(cx.executor(), &path).unwrap();
+    assert_eq!(
+        db.load_default_permission_mode().unwrap(),
+        SessionPermissionMode::FullAccess
+    );
+    let existing = make_meta(1, 813);
+    db.save_metadata(existing.clone()).await.unwrap();
+    db.save_default_permission_mode(SessionPermissionMode::ReadOnly)
+        .unwrap();
+    drop(db);
+    let reopened = SolutionAgentDb::open_at_path(cx.executor(), &path).unwrap();
+    assert_eq!(
+        reopened.load_default_permission_mode().unwrap(),
+        SessionPermissionMode::ReadOnly
+    );
+    assert_eq!(
+        reopened
+            .list_for_solution(existing.solution_id)
+            .await
+            .unwrap()[0]
+            .permission_mode,
+        SessionPermissionMode::FullAccess
+    );
+    // Ordinary persistence/hydration must never act as an explicit choice.
+    reopened.save_metadata(existing).await.unwrap();
+    assert_eq!(
+        reopened.load_default_permission_mode().unwrap(),
+        SessionPermissionMode::ReadOnly
+    );
+}

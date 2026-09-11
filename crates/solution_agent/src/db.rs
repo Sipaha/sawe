@@ -175,6 +175,8 @@ impl SolutionAgentDb {
             )
         })?;
 
+        connection.exec("CREATE TABLE IF NOT EXISTS solution_agent_preferences (key TEXT PRIMARY KEY, value TEXT NOT NULL)")?()?;
+
         connection.exec(indoc! {"
             CREATE TABLE IF NOT EXISTS solution_sessions (
                 id                TEXT PRIMARY KEY,

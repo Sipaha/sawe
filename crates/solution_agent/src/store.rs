@@ -369,6 +369,8 @@ pub struct SolutionAgentStore {
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
     pool: parking_lot::Mutex<SubprocessPool>,
     persistence: Option<Arc<SolutionAgentDb>>,
+    default_permission_mode: SessionPermissionMode,
+    default_permission_mode_touched: bool,
     pub(crate) adapters: Arc<AdapterRegistry>,
     /// Map of `AgentServerId -> Rc<dyn AgentServer>`. Real `agent_servers`
     /// instances live per-Project (via `Project::agent_server_store`), but
@@ -1119,6 +1121,8 @@ impl SolutionAgentStore {
             by_solution: HashMap::new(),
             pool: parking_lot::Mutex::new(SubprocessPool::new()),
             persistence: None,
+            default_permission_mode: Default::default(),
+            default_permission_mode_touched: false,
             adapters,
             server_registry: HashMap::new(),
             model_catalog: ModelCatalog::new(),
@@ -1166,6 +1170,17 @@ impl SolutionAgentStore {
     }
 
     pub fn set_persistence(&mut self, db: Arc<SolutionAgentDb>, cx: &mut Context<Self>) {
+        if self.default_permission_mode_touched {
+            if let Err(error) = db.save_default_permission_mode(self.default_permission_mode) {
+                log::error!("Could not persist chosen default session permissions: {error}");
+            }
+        } else {
+            self.default_permission_mode =
+                db.load_default_permission_mode().unwrap_or_else(|error| {
+                    log::error!("Could not load default session permissions: {error}");
+                    self.default_permission_mode
+                });
+        }
         self.persistence = Some(db.clone());
         // One-time load: merge persisted band geometry into the in-memory map,
         // FIELD-WISE against `band_state_touched`. A whole-entry `or_insert`
@@ -1370,6 +1385,10 @@ impl SolutionAgentStore {
         // Reserve the stable editor identity before creating the native session
         // so its initial instructions can identify the sender of peer messages.
         let session_id = SolutionSessionId::new();
+        // Capture before any await; another chat changing the preference must
+        // not make the new runtime policy disagree with its eventual UI state.
+        let permission_mode =
+            self.fresh_session_permission_mode(&agent_id, ephemeral || ephemeral_supervisor);
 
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             // 1. Resolve the solution. Cloned out so we don't hold the store
@@ -1401,6 +1420,9 @@ impl SolutionAgentStore {
                 // `claude` launches on it immediately.
                 let mut meta =
                     store.build_session_meta(&pair.1, &solution, Some(session_id), model.clone(), cx);
+                if pair.1.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID || pair.1.as_ref() == crate::codex_adapter::CODEX_AGENT_ID {
+                    meta.get_or_insert_with(acp::Meta::new).insert("sawePermissionMode".into(), serde_json::json!(permission_mode.as_str()));
+                }
                 if ephemeral_supervisor {
                     meta.get_or_insert_with(acp::Meta::new).insert(
                         "systemPrompt".into(),
@@ -1516,6 +1538,7 @@ impl SolutionAgentStore {
                     s.desired_model = model.clone();
                     // Same for the effort level chosen in the new-chat row.
                     s.desired_effort = effort.clone();
+                    s.permission_mode = permission_mode;
                     s.cached_models = live_models.clone();
                     s.set_acp_thread(Some(acp_thread.clone()), cx);
                     s
@@ -1587,6 +1610,21 @@ impl SolutionAgentStore {
 
             Ok(session_id)
         })
+    }
+
+    fn fresh_session_permission_mode(
+        &self,
+        agent_id: &AgentServerId,
+        internal: bool,
+    ) -> SessionPermissionMode {
+        if !internal
+            && (agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID
+                || agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID)
+        {
+            self.default_permission_mode
+        } else {
+            SessionPermissionMode::default()
+        }
     }
 
     /// Build the `_meta` payload for a `NewSessionRequest` so the agent
@@ -2592,6 +2630,11 @@ impl SolutionAgentStore {
         let session = self.session(id).unwrap();
         let s = session.read(cx);
         if s.permission_mode == mode {
+            if let Some(db) = &self.persistence {
+                db.save_default_permission_mode(mode)?;
+            }
+            self.default_permission_mode = mode;
+            self.default_permission_mode_touched = true;
             return Ok(());
         }
         let meta = SolutionSessionMetadata {
@@ -2618,6 +2661,8 @@ impl SolutionAgentStore {
         if let Some(db) = &self.persistence {
             db.save_permission_mode(&meta)?;
         }
+        self.default_permission_mode = mode;
+        self.default_permission_mode_touched = true;
         let pair = (s.solution_id, s.agent_id.clone());
         let live = s.acp_thread().cloned();
         if let Some(thread) = live {
@@ -5786,6 +5831,177 @@ mod permission_tests {
                     )
                     .unwrap()["sawePermissionMode"],
                 "full_access"
+            );
+        });
+    }
+    #[gpui::test]
+    async fn successful_choices_update_default_but_existing_and_internal_sessions_keep_policy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (store, id, _tmp) = test_support::seed_store_with_session(cx).await;
+        store.update(cx, |store, cx| {
+            let claude: AgentServerId = crate::claude_adapter::CLAUDE_ACP_AGENT_ID.into();
+            let codex: AgentServerId = crate::codex_adapter::CODEX_AGENT_ID.into();
+            let session = store.session(id).unwrap();
+            store
+                .set_session_permission_mode(id, SessionPermissionMode::ReadOnly, cx)
+                .unwrap();
+            let captured = store.fresh_session_permission_mode(&claude, false);
+            assert_eq!(captured, SessionPermissionMode::ReadOnly);
+            assert_eq!(store.fresh_session_permission_mode(&codex, false), captured);
+            assert_eq!(
+                store.fresh_session_permission_mode(&claude, true),
+                SessionPermissionMode::FullAccess
+            );
+            assert_eq!(
+                store
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_default_permission_mode()
+                    .unwrap(),
+                captured
+            );
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                }
+            });
+            assert!(
+                store
+                    .set_session_permission_mode(id, SessionPermissionMode::FullAccess, cx)
+                    .is_err()
+            );
+            assert_eq!(store.default_permission_mode, captured);
+            session.update(cx, |s, _| s.state = SessionState::Idle);
+            // Simulate another session's successful explicit selection.
+            store.default_permission_mode = SessionPermissionMode::FullAccess;
+            assert_eq!(
+                session.read(cx).permission_mode,
+                SessionPermissionMode::ReadOnly
+            );
+            // Clicking the already-selected item is still an explicit default.
+            store
+                .set_session_permission_mode(id, SessionPermissionMode::ReadOnly, cx)
+                .unwrap();
+            assert_eq!(
+                store.default_permission_mode,
+                SessionPermissionMode::ReadOnly
+            );
+            let db = store.persistence.as_ref().unwrap().clone();
+            store.default_permission_mode = SessionPermissionMode::FullAccess;
+            store.default_permission_mode_touched = false;
+            store.set_persistence(db, cx);
+            assert_eq!(
+                store.default_permission_mode,
+                SessionPermissionMode::ReadOnly
+            );
+            // The captured launch value remains stable across later changes.
+            store
+                .set_session_permission_mode(id, SessionPermissionMode::FullAccess, cx)
+                .unwrap();
+            assert_eq!(captured, SessionPermissionMode::ReadOnly);
+            assert_eq!(
+                store.fresh_session_permission_mode(&codex, false),
+                SessionPermissionMode::FullAccess
+            );
+        });
+    }
+    #[gpui::test]
+    async fn fresh_launch_keeps_captured_policy_when_default_changes_during_connect(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::{ConnectGate, MockAgentServer, MockConnection};
+        let (solution_id, _tmp, project) = tests::setup_solution_and_project(cx).await;
+        let (gate_tx, gate_rx) = async_channel::bounded(1);
+        let agent_id: AgentServerId = crate::codex_adapter::CODEX_AGENT_ID.into();
+        let existing_id = SolutionSessionId::new();
+        let store = cx.update(|cx| {
+            SolutionAgentStore::init_global(cx, Arc::new(AdapterRegistry::new()));
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.default_permission_mode = SessionPermissionMode::ReadOnly;
+                tests::insert_cold_session(
+                    existing_id,
+                    solution_id,
+                    agent_id.clone(),
+                    None,
+                    None,
+                    store,
+                    cx,
+                );
+                store.register_agent_server(
+                    agent_id.clone(),
+                    Rc::new(MockAgentServer::with_gate(
+                        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        ConnectGate(gate_rx),
+                    )),
+                );
+            });
+            store
+        });
+        let task = store.update(cx, |store, cx| {
+            store.create_session(solution_id, agent_id, project, cx)
+        });
+        cx.executor().run_until_parked();
+        store.update(cx, |store, cx| {
+            store
+                .set_session_permission_mode(existing_id, SessionPermissionMode::FullAccess, cx)
+                .unwrap();
+            assert_eq!(
+                store.default_permission_mode,
+                SessionPermissionMode::FullAccess
+            );
+        });
+        gate_tx.send(()).await.unwrap();
+        gate_tx.close();
+        let id = task.await.unwrap();
+        store.update(cx, |store, cx| {
+            let session = store.session(id).unwrap();
+            assert_eq!(
+                session.read(cx).permission_mode,
+                SessionPermissionMode::ReadOnly
+            );
+            let connection = session
+                .read(cx)
+                .acp_thread()
+                .unwrap()
+                .read(cx)
+                .connection()
+                .clone()
+                .downcast::<MockConnection>()
+                .unwrap();
+            assert_eq!(
+                connection.session_meta.borrow().as_ref().unwrap()["sawePermissionMode"],
+                "read_only"
+            );
+            assert_eq!(
+                store.session(existing_id).unwrap().read(cx).permission_mode,
+                SessionPermissionMode::FullAccess
+            );
+        });
+    }
+    #[gpui::test]
+    async fn explicit_default_before_database_attachment_wins_over_saved_preference(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (store, id, _tmp) = test_support::seed_store_with_session(cx).await;
+        store.update(cx, |store, cx| {
+            let db = store.persistence.take().unwrap();
+            db.save_default_permission_mode(SessionPermissionMode::ReadOnly)
+                .unwrap();
+            store
+                .set_session_permission_mode(id, SessionPermissionMode::FullAccess, cx)
+                .unwrap();
+            store.set_persistence(db.clone(), cx);
+            assert_eq!(
+                store.default_permission_mode,
+                SessionPermissionMode::FullAccess
+            );
+            assert_eq!(
+                db.load_default_permission_mode().unwrap(),
+                SessionPermissionMode::FullAccess
             );
         });
     }
