@@ -116,7 +116,10 @@ Tips, if a worktree branch is ever wanted back: `a5fafb7c24`, `610837611c`,
 
 ## Left standing
 
-- Uncommitted working-tree changes in both members (sawe: untracked `.agents/reports/*`;
-  mobile: the `NewSessionDialog` snapshot-test rework). Out of scope for a branch review.
+- Uncommitted working-tree changes in `spk-editor-mobile` (the `NewSessionDialog`
+  snapshot-test rework). Out of scope for a branch review.
+- `sawe`'s untracked `.agents/reports/*` artefacts were deleted, and the 51 that had
+  been committed there by accident were removed from the repo as well — see the
+  `.gitignore` entry for the commit they stay retrievable at.
 
 Both members now have exactly one local branch: `main`.
