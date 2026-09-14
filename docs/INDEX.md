@@ -135,6 +135,8 @@ Short, dated, single-fact notes from sessions: "ran a benchmark and got X",
 
 | Date | Status | Topic |
 |---|---|---|
+| 2026-09-14 | fixed | [`findings/2026-09-14-review-of-2026-09-11-changes.md`](findings/2026-09-14-review-of-2026-09-11-changes.md) — review of the 70-commit 2026-09-11 day (Codex native, permission modes, peer messaging, listener split): 14 findings, incl. three fail-open permission paths and a 100x cherry-pick budget regression — all fixed the same day. |
+| 2026-09-14 | cleaned | [`findings/2026-09-14-hanging-branch-review.md`](findings/2026-09-14-hanging-branch-review.md) — all 31 hanging local branches in both members were already absorbed by `main` (or archived on the old `Sipaha/spk-editor` remote); deleted, with tips recorded for restore. |
 | 2026-09-11 | verified | [`findings/2026-09-11-codex-large-context.md`](findings/2026-09-11-codex-large-context.md) — editor-scoped large window and native model-switch clamping. |
 | 2026-09-11 | verified | [`findings/2026-09-11-claude-native-streaming-input.md`](findings/2026-09-11-claude-native-streaming-input.md) — active stdin works, but queued input survives interrupt; retain the editor-owned hook queue. |
 | 2026-09-11 | audited | [`findings/2026-09-11-model-neutral-prompt-audit.md`](findings/2026-09-11-model-neutral-prompt-audit.md) — prompt inventory, English defaults, protocol boundaries and prioritized improvements. |
