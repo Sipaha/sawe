@@ -102,11 +102,24 @@ pub fn init(cx: &mut App) {
     // once it's ready. Failure to open the DB is logged but non-fatal — the
     // store falls back to in-memory state.
     let db_task = db::SolutionAgentDb::connect(cx);
+    // The connect + identity migration below are asynchronous, and a chat can be
+    // created before they finish (a fast click, or an MCP/mobile create during
+    // startup). Mark the store as "default permission still unread" so that
+    // window fails closed instead of handing out `FullAccess` over a saved
+    // `ReadOnly`.
+    store::SolutionAgentStore::global(cx).update(cx, |store, _| store.expect_persistence());
     cx.spawn(async move |cx: &mut AsyncApp| {
         let db = match db_task.await {
             Ok(db) => db,
             Err(err) => {
                 log::error!("solution_agent: failed to open persistence DB: {err}");
+                // There is no remembered default to wait for any more. Release
+                // the fail-closed gate, or every chat for the rest of the
+                // process would launch read-only on a DB that will never land.
+                cx.update(|cx| {
+                    store::SolutionAgentStore::global(cx)
+                        .update(cx, |store, _| store.abandon_persistence());
+                });
                 return;
             }
         };

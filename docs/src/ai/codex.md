@@ -24,9 +24,22 @@ advertised for the selected model; choices apply to the next turn.
 ## Tools and permissions
 
 Text, reasoning summaries, commands, file changes and tool results appear
-in the conversation. Codex starts with workspace-write sandboxing and
-on-request approvals. Command and file-change approval requests appear in
-the existing permission UI.
+in the conversation. The chat's permission mode decides what Codex may do,
+and it is the same menu Claude chats use:
+
+- **Full access** launches the thread with `sandbox: danger-full-access` and
+  `approvalPolicy: never` — Codex runs commands and writes files without
+  stopping to ask. A new chat inherits the last mode you chose explicitly.
+- **Read only** launches it with `sandbox: read-only`, and additionally
+  disables every MCP server the launch would otherwise carry — both the ones
+  inherited from your own Codex configuration and the ones Sawe injects — so
+  the thread can read the workspace but cannot act on it.
+
+Changing the mode needs an idle chat and reconnects the Codex runtime.
+
+Codex is not asked for approvals, but if it sends a request anyway, command
+and file-change requests appear in the existing permission UI; in a read-only
+chat they are declined without prompting.
 
 Messages sent while Codex is busy enter Sawe's queue. **Send now** interrupts
 the current turn and sends the queued message. **Stop** cancels the current

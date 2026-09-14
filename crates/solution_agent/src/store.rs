@@ -371,6 +371,17 @@ pub struct SolutionAgentStore {
     persistence: Option<Arc<SolutionAgentDb>>,
     default_permission_mode: SessionPermissionMode,
     default_permission_mode_touched: bool,
+    /// Set once the app has committed to opening a persistence DB, cleared when
+    /// that DB actually lands in [`set_persistence`]. While it is true the store
+    /// does NOT yet know the user's remembered default — the row exists, it just
+    /// has not been read — and `Default::default()` is `FullAccess`, so a chat
+    /// created in that window would silently ignore a saved `ReadOnly` and
+    /// launch with full tools. Unknown must not resolve to the permissive value,
+    /// so [`fresh_session_permission_mode`](Self::fresh_session_permission_mode)
+    /// fails CLOSED until the load completes. Left false for stores that never
+    /// attach a DB at all (tests, the `zed.rs` probe store), where
+    /// "no saved preference → Full access" is the documented behaviour.
+    awaiting_persistence: bool,
     pub(crate) adapters: Arc<AdapterRegistry>,
     /// Map of `AgentServerId -> Rc<dyn AgentServer>`. Real `agent_servers`
     /// instances live per-Project (via `Project::agent_server_store`), but
@@ -1123,6 +1134,7 @@ impl SolutionAgentStore {
             persistence: None,
             default_permission_mode: Default::default(),
             default_permission_mode_touched: false,
+            awaiting_persistence: false,
             adapters,
             server_registry: HashMap::new(),
             model_catalog: ModelCatalog::new(),
@@ -1169,7 +1181,27 @@ impl SolutionAgentStore {
         self.server_registry.get(agent_id).cloned()
     }
 
+    /// Announce that a persistence DB is being opened for this store, before the
+    /// asynchronous connect + identity migration completes. Until
+    /// [`set_persistence`](Self::set_persistence) lands, the remembered default
+    /// session permission is unknown rather than absent — see
+    /// [`awaiting_persistence`](Self::awaiting_persistence).
+    pub fn expect_persistence(&mut self) {
+        if self.persistence.is_none() {
+            self.awaiting_persistence = true;
+        }
+    }
+
+    /// Give up on the DB announced by [`expect_persistence`](Self::expect_persistence)
+    /// (it failed to open). The remembered default is unreadable, not merely
+    /// unread, so the gate must be released — otherwise every chat for the rest
+    /// of the process launches read-only waiting for a DB that will never land.
+    pub fn abandon_persistence(&mut self) {
+        self.awaiting_persistence = false;
+    }
+
     pub fn set_persistence(&mut self, db: Arc<SolutionAgentDb>, cx: &mut Context<Self>) {
+        self.awaiting_persistence = false;
         if self.default_permission_mode_touched {
             if let Err(error) = db.save_default_permission_mode(self.default_permission_mode) {
                 log::error!("Could not persist chosen default session permissions: {error}");
@@ -1621,6 +1653,14 @@ impl SolutionAgentStore {
             && (agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID
                 || agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID)
         {
+            // The remembered default is still on disk and unread: a saved
+            // `ReadOnly` must not be downgraded into `FullAccess` just because
+            // the user was fast enough to open a chat during startup. An
+            // explicit in-session choice made before the DB attached is already
+            // authoritative (`default_permission_mode_touched`), so it wins.
+            if self.awaiting_persistence && !self.default_permission_mode_touched {
+                return SessionPermissionMode::ReadOnly;
+            }
             self.default_permission_mode
         } else {
             SessionPermissionMode::default()
@@ -1737,20 +1777,34 @@ impl SolutionAgentStore {
     /// Persist the row for `session_id` to the DB so the History popover and
     /// "Continue last session" CTA pick it up across editor restarts. No-op
     /// when persistence is disabled (test contexts).
-    /// Ephemeral supervisor judge/auditor sessions must leave NO durable trace
-    /// in the DB. `is_supervisor_ephemeral` is an in-memory-only flag (there is
-    /// no persisted column for it), so a judge row written to `solution_sessions`
-    /// reloads after a restart as an ordinary child session — leaking the
-    /// judge's private supervisor reasoning as a visible session chip on the
-    /// desktop session list and the paired mobile (the live create/close/state
-    /// emits are already suppressed; persistence was the unguarded path). Every
-    /// persist-to-DB helper guards on this, so ephemeral sessions are never
-    /// written — which also stops the DB from accreting one judge transcript per
-    /// supervisor wake-up.
+    /// Ephemeral sessions must leave NO durable trace in the DB. BOTH flags
+    /// qualify, and both are in-memory-only (there is no persisted column for
+    /// either), so a row written to `solution_sessions` reloads as an ordinary
+    /// session that has silently lost the restriction it was created under:
+    ///
+    /// - `is_supervisor_ephemeral` — a judge/auditor row reloads after a restart
+    ///   as an ordinary child session, leaking the judge's private supervisor
+    ///   reasoning as a visible session chip on the desktop session list and the
+    ///   paired mobile (the live create/close/state emits are already
+    ///   suppressed; persistence was the unguarded path).
+    /// - `is_ephemeral` — a `generationOnly` row (commit-message generation)
+    ///   reloads through "Reopen Closed Chat" with NO `generationOnly` and NO
+    ///   restriction: `build_session_meta` has only the persisted metadata to go
+    ///   on, so it emits `sawePermissionMode:"full_access"` and the session
+    ///   respawns with `--tools default --permission-mode bypassPermissions`,
+    ///   resuming a transcript created under a "no tools, ever" contract. That
+    ///   is a fail-OPEN, which is why the flag belongs here and not only in the
+    ///   visibility predicates.
+    ///
+    /// Every persist-to-DB helper guards on this, so ephemeral sessions are
+    /// never written — which also stops the DB from accreting one judge
+    /// transcript per supervisor wake-up and one stray closed chat per generated
+    /// commit message.
     fn is_ephemeral_session(&self, session_id: SolutionSessionId, cx: &App) -> bool {
-        self.sessions
-            .get(&session_id)
-            .is_some_and(|s| s.read(cx).is_supervisor_ephemeral)
+        self.sessions.get(&session_id).is_some_and(|s| {
+            let s = s.read(cx);
+            s.is_supervisor_ephemeral || s.is_ephemeral
+        })
     }
 
     fn persist_session_row(&self, session_id: SolutionSessionId, cx: &mut Context<Self>) {

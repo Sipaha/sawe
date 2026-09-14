@@ -766,7 +766,14 @@ impl SolutionAgentStore {
         // UI, etc.) can still read the transcript. The supervisor_state row is
         // also kept — `load_supervisor_states` restores it on reopen. Hard-delete
         // only happens via `purge_session_hard` / `purge_solution_fully`.
-        if let Some(db) = &self.persistence {
+        // An ephemeral session never had a row written (`is_ephemeral_session`
+        // gates every persist helper), so marking it closed would either be a
+        // no-op or — worse, if a row ever leaked in — publish it to "Reopen
+        // Closed Chat", which is exactly the fail-open this flag exists to
+        // prevent. Leave the DB untouched.
+        if let Some(db) = &self.persistence
+            && !teardown.was_ephemeral
+        {
             db.mark_closed(id, Some(Utc::now())).detach_and_log_err(cx);
         }
         self.finalize_session_teardown(id, teardown, cx);

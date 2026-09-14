@@ -519,6 +519,25 @@ fn session_open_params(
     )
 }
 
+/// Spell one name as a segment of a dotted configuration-override path. A name
+/// that is a valid bare key is emitted as-is; anything else — a dot, a space,
+/// `@`, a quote — MUST be quoted, or the override lands on a different path
+/// (`mcp_servers.my.server.enabled` disables a phantom `server` under `my`) and
+/// the server it was meant to disable stays ENABLED in a read-only session.
+/// The inherited names come from the user's own Codex configuration, so they
+/// are arbitrary; only the editor-injected ones are known-safe.
+fn override_key_segment(name: &str) -> String {
+    let bare = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        name.to_owned()
+    } else {
+        serde_json::to_string(name).expect("string serialization")
+    }
+}
+
 // Empty tables merge with inherited configuration. Explicitly disable both
 // inherited servers and editor-injected servers so read-only cannot call MCP.
 fn disable_mcp_servers(config: &mut Value, effective: &Value) {
@@ -534,7 +553,8 @@ fn disable_mcp_servers(config: &mut Value, effective: &Value) {
         .filter_map(|key| key.strip_prefix("mcp_servers.").map(str::to_owned))
         .collect();
     for name in inherited.chain(injected) {
-        config[format!("mcp_servers.{name}.enabled")] = json!(false);
+        let segment = override_key_segment(&name);
+        config[format!("mcp_servers.{segment}.enabled")] = json!(false);
     }
     // Plugins may contribute additional MCP servers not in mcp_servers.
     for name in effective["plugins"]
@@ -542,8 +562,8 @@ fn disable_mcp_servers(config: &mut Value, effective: &Value) {
         .into_iter()
         .flat_map(|m| m.keys())
     {
-        let quoted = serde_json::to_string(name).expect("string serialization");
-        config[format!("plugins.{quoted}.enabled")] = json!(false);
+        let segment = override_key_segment(name);
+        config[format!("plugins.{segment}.enabled")] = json!(false);
     }
     config["features.apps"] = json!(false);
 }
@@ -733,6 +753,19 @@ mod tests {
         let mut empty = session_config(&[]);
         disable_mcp_servers(&mut empty, &json!({}));
         assert_eq!(empty["features.apps"], false);
+        // A name the user is free to choose but that is NOT a bare key: an
+        // unquoted `mcp_servers.my.server.enabled` would disable a phantom
+        // `server` table and leave the real one callable from a read-only
+        // session.
+        let mut exotic = session_config(&[]);
+        disable_mcp_servers(
+            &mut exotic,
+            &json!({"mcp_servers":{"my.server":{"command":"x"},"team mcp":{"command":"y"},"ok-1_A":{"command":"z"}}}),
+        );
+        assert_eq!(exotic["mcp_servers.\"my.server\".enabled"], false);
+        assert_eq!(exotic["mcp_servers.\"team mcp\".enabled"], false);
+        assert_eq!(exotic["mcp_servers.ok-1_A.enabled"], false);
+        assert!(exotic.get("mcp_servers.my.server.enabled").is_none());
     }
     #[test]
     fn child_and_unscoped_events_cannot_complete_parent_turn() {
