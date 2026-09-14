@@ -174,6 +174,45 @@ mod tests {
         });
     }
 
+    /// "Send now" shares `cancel_turn` with Stop, but it is the opposite
+    /// intent: the user is SENDING, not stopping. Holding peers there is also a
+    /// one-way trap for a peer-only queue — the hold is lifted by a `from_user`
+    /// send, and the bundles being flushed are peer messages, which never
+    /// clear it.
+    #[gpui::test]
+    async fn send_now_is_not_a_stop_and_keeps_peer_eligibility(cx: &mut gpui::TestAppContext) {
+        let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
+        store.update(cx, |store, cx| {
+            store.peer_wake_sessions.insert(id);
+            let session = store.session(id).unwrap();
+            session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+                s.pending_messages.push_back(crate::model::PendingBundle {
+                    origin: MessageOrigin::User,
+                    id: uuid::Uuid::new_v4(),
+                    target: QueueTarget::Main,
+                    blocks: text("flush me"),
+                });
+            });
+            // Errors on the missing ACP thread, well after the peer decision.
+            store.interrupt_and_flush_pending(id, cx).ok();
+            assert!(
+                !session.read(cx).peer_messages_held,
+                "Send now must not hold peer messaging"
+            );
+            assert!(store.peer_wake_sessions.contains(&id));
+
+            // …whereas a real Stop still does.
+            session.update(cx, |s, _| s.flush_after_cancel = false);
+            store.cancel_turn(id, cx).ok();
+            assert!(session.read(cx).peer_messages_held);
+            assert!(!store.peer_wake_sessions.contains(&id));
+        });
+    }
+
     #[gpui::test]
     async fn peer_queue_preserves_origin_and_cannot_resume_a_hold(cx: &mut gpui::TestAppContext) {
         let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;

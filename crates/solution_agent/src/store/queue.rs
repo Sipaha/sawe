@@ -318,10 +318,20 @@ impl SolutionAgentStore {
         let session = self
             .session(session_id)
             .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
-        // Explicit Stop revokes peer wake even during a cold handshake,
-        // before there is a native connection to cancel.
-        session.update(cx, |s, _| s.peer_messages_held = true);
-        self.peer_wake_sessions.remove(&session_id);
+        // Explicit Stop revokes peer wake even during a cold handshake or on an
+        // already-idle session — the human said "stop", and re-earning peer
+        // eligibility requires a user message (see `peer_recipient_ready`).
+        // That is why this runs BEFORE the in-flight check below.
+        //
+        // "Send now" is NOT a Stop: it cancels the turn only so the user's own
+        // queued message lands immediately, so it must not hold peers. Holding
+        // there is also a one-way trap for a peer-only queue — the hold is
+        // lifted by a `from_user` send, and the bundles about to be flushed are
+        // peer messages, which never clear it.
+        if !session.read(cx).flush_after_cancel {
+            session.update(cx, |s, _| s.peer_messages_held = true);
+            self.peer_wake_sessions.remove(&session_id);
+        }
         // Idempotent: only an in-flight turn can be stopped. A cancel in
         // Stopping/Idle/Errored is a safe no-op (covers repeated taps and the
         // mobile's deferred resend-on-reconnect).

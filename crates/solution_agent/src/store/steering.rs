@@ -42,6 +42,25 @@ pub(super) struct PendingSteer {
 }
 
 impl SolutionAgentStore {
+    /// Test seam: reserve `bundles` as an in-flight steer for `session`.
+    /// `PendingSteer`'s token is private to this module, so there is no other
+    /// way for a test outside it to set up the "the agent already accepted this
+    /// follow-up" state that `handle_acp_event`'s Stop path has to respect.
+    #[cfg(test)]
+    pub(crate) fn reserve_steer_for_test(
+        &mut self,
+        session: SolutionSessionId,
+        bundles: HashSet<uuid::Uuid>,
+    ) {
+        self.active_steers.insert(
+            session,
+            PendingSteer {
+                token: uuid::Uuid::new_v4(),
+                bundles,
+            },
+        );
+    }
+
     pub(super) fn rotation_steering_ready(
         &self,
         id: SolutionSessionId,

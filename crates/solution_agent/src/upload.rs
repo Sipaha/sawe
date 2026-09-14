@@ -344,6 +344,13 @@ impl UploadManager {
         // promote this to `sync_all()`.
         entry.received_bytes = new_total;
         entry.last_activity_at = Instant::now();
+        // This write answers any rejection still queued for this upload, so
+        // drop it. The drainer emits every ack BEFORE every rejection, so a
+        // stale one would arrive after the ack that supersedes it and send the
+        // client back to an `expected_offset` it has already passed — an extra
+        // round trip per glitch, unbounded on a flaky link.
+        self.rejection_queue
+            .retain(|queued| queued.upload_id != id);
         self.ack_queue.push(ChunkAck {
             upload_id: id,
             received_bytes: new_total,
@@ -840,6 +847,26 @@ mod tests {
             err.contains("out-of-order"),
             "expected out-of-order error, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_successful_chunk_drops_the_superseded_rejection() {
+        let (mut m, _dir) = mgr();
+        let id = m
+            .init("s".into(), "image/png".into(), "a".into(), 8, None)
+            .expect("init");
+        m.write_chunk(id, 0, &[1, 2, 3]).expect("c1");
+        assert!(m.drain_acks().len() == 1);
+        // Out of order: the client is told to rewind to 3.
+        m.write_chunk(id, 10, &[9, 9]).unwrap_err();
+        // …and then sends the right chunk inside the same 100 ms drain window.
+        m.write_chunk(id, 3, &[4, 5]).expect("c2");
+        assert_eq!(
+            m.drain_rejections().len(),
+            0,
+            "the rejection was answered; emitting it after the ack rewinds the client past acked bytes"
+        );
+        assert_eq!(m.drain_acks().last().expect("ack").received_bytes, 5);
     }
 
     #[test]

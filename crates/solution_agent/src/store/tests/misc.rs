@@ -453,6 +453,76 @@ async fn stopping_safety_net_force_flips_to_idle(cx: &mut TestAppContext) {
     );
 }
 
+/// A Stop discards the queue on purpose — but NOT a bundle the agent has
+/// already accepted through steering. The receipt is what turns that bundle
+/// into a transcript entry (`apply_receipt_to_queue` looks it up in
+/// `pending_messages`), so clearing it here made the user's message vanish from
+/// the conversation while the agent was acting on it.
+#[gpui::test]
+async fn cancelled_stop_keeps_bundles_reserved_by_an_in_flight_steer(cx: &mut TestAppContext) {
+    let (session_id, _cancel_calls, _tmp) = create_session_with_cancel_counter(cx).await;
+
+    let reserved_id = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session exists");
+            let reserved_id = session.update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+                let mut push = |text: &str| {
+                    let id = uuid::Uuid::new_v4();
+                    s.pending_messages.push_back(crate::model::PendingBundle {
+                        origin: crate::model::MessageOrigin::User,
+                        id,
+                        target: crate::model::QueueTarget::Main,
+                        blocks: vec![agent_client_protocol::schema::ContentBlock::Text(
+                            agent_client_protocol::schema::TextContent::new(text),
+                        )],
+                    });
+                    id
+                };
+                let reserved_id = push("already accepted by the agent");
+                push("still only queued");
+                reserved_id
+            });
+            store.reserve_steer_for_test(session_id, [reserved_id].into_iter().collect());
+            reserved_id
+        })
+    });
+
+    // Plain Stop: `flush_after_cancel` is not set, so this is the silent-drop path.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let thread = session.read(cx).acp_thread().cloned().unwrap();
+        thread.update(cx, |_t, cx| {
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(
+                agent_client_protocol::schema::StopReason::Cancelled,
+            ));
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let remaining: Vec<uuid::Uuid> = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .expect("session")
+            .read(cx)
+            .pending_messages
+            .iter()
+            .map(|bundle| bundle.id)
+            .collect()
+    });
+    assert_eq!(
+        remaining,
+        vec![reserved_id],
+        "the steering reservation must survive the Stop; everything else is dropped"
+    );
+}
+
 /// Regression (the "⚡ переводит в Stopping, потом снова Running" report):
 /// `interrupt_and_flush_pending` arms `flush_after_cancel` and relies on the
 /// backend's `Stopped(Cancelled)` to deliver the queue. When the backend never

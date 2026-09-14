@@ -362,17 +362,34 @@ impl SolutionAgentStore {
                         // user-typed content vanishing without a
                         // trace, which is exactly the failure mode we
                         // want to be able to grep for.
+                        // A bundle reserved by an in-flight steer is NOT the
+                        // user's to discard: the agent may have already
+                        // accepted it, and its receipt is what later turns it
+                        // into a transcript entry (`apply_receipt_to_queue`
+                        // looks the bundle up in `pending_messages` and pushes
+                        // the user message only if it is still there). Clearing
+                        // it here makes the message vanish from the
+                        // conversation while the agent acts on it — the worst
+                        // possible shape of "where did my message go?". Leave
+                        // the reservation to the steering completion path,
+                        // which resolves it either way: an Accepted receipt
+                        // records the entry, a Rejected one puts the bundle
+                        // back in the queue.
+                        let reserved: std::collections::HashSet<uuid::Uuid> = self
+                            .active_steers
+                            .get(&session_id)
+                            .map(|pending| pending.bundles.clone())
+                            .unwrap_or_default();
                         let had_pending = if let Some(s) = self.sessions.get(&session_id).cloned() {
                             s.update(cx, |s, _| {
-                                let dropped = s.pending_messages.len();
+                                let previews: Vec<String> = s
+                                    .pending_messages
+                                    .iter()
+                                    .filter(|bundle| !reserved.contains(&bundle.id))
+                                    .map(|bundle| queue::summarize_blocks_for_log(&bundle.blocks))
+                                    .collect();
+                                let dropped = previews.len();
                                 if dropped > 0 {
-                                    let previews: Vec<String> = s
-                                        .pending_messages
-                                        .iter()
-                                        .map(|bundle| {
-                                            queue::summarize_blocks_for_log(&bundle.blocks)
-                                        })
-                                        .collect();
                                     log::warn!(
                                         target: "solution_agent::queue",
                                         "session={session_id} dropped {dropped} queued bundle(s) on Cancelled stop \
@@ -380,7 +397,8 @@ impl SolutionAgentStore {
                                         previews.join(" | "),
                                     );
                                 }
-                                s.pending_messages.clear();
+                                s.pending_messages
+                                    .retain(|bundle| reserved.contains(&bundle.id));
                                 dropped > 0
                             })
                         } else {

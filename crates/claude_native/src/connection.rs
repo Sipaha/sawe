@@ -538,6 +538,30 @@ fn build_default_hooks() -> std::collections::BTreeMap<String, Vec<HookConfig>> 
     hooks
 }
 
+/// Hooks to register on `initialize`, by session policy.
+///
+/// Only a GENERATION-ONLY session goes without them: it is one shot with no
+/// conversation to interject into. A READ-ONLY session still has a user typing
+/// into it, and these hooks are the editor's own delivery channel
+/// (`PostToolUse`/`Stop`/`SubagentStop` → `shared.pending_pull`), not a
+/// capability grant — they hand the agent the user's own text and nothing else;
+/// the actual restriction lives in `answer_tool_authorization`, which denies
+/// every `can_use_tool` for both policies. Excluding read-only here was a silent
+/// downgrade: `try_steer_pending` only knows how to steer a `CodexConnection`,
+/// so this hook is the ONLY mid-turn path a Claude session has. Without it a
+/// follow-up waits for the turn to end, a cooperative compaction request cannot
+/// arrive before the context limit does, and the degenerate-tool-call self-heal
+/// nudge never fires — none of which is logged.
+fn initialize_hooks(
+    generation_only: bool,
+    read_only: bool,
+) -> std::collections::BTreeMap<String, Vec<HookConfig>> {
+    match (generation_only, read_only) {
+        (true, _) => Default::default(),
+        (false, _) => build_default_hooks(),
+    }
+}
+
 /// Format a pending follow-up so the agent can tell apart "the user said this
 /// at the start of the turn" from "the user added this mid-turn at HH:MM:SS".
 fn format_inject_message(message: &str) -> String {
@@ -628,16 +652,28 @@ fn read_only_command_allowed(name: &str) -> bool {
     )
 }
 
+/// The command name of a leading slash command, or `None` when the text merely
+/// starts with a `/`. A leading slash is NOT enough: `/home/spk/src/main.rs:42 —
+/// explain this` is ordinary prose about an absolute path, and the CLI treats it
+/// as such. Only a bare `/name` token (letters, digits, `_`, `-`, and `:` for
+/// namespaced plugin commands) is a command — the moment the first token carries
+/// a `/` or a `.` it is a path, not a command. Getting this wrong rejects real
+/// user text, and a rejection is not recoverable: the queue already drained the
+/// bundle before `prompt()` is called, so the text is gone rather than requeued.
+fn leading_slash_command(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let name = rest.split_whitespace().next().unwrap_or_default();
+    let is_command_token = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':'));
+    is_command_token.then_some(name)
+}
+
 fn read_only_prompt_allowed(blocks: &[acp::ContentBlock]) -> bool {
     blocks.iter().all(|block| match block {
-        acp::ContentBlock::Text(text) => {
-            text.text
-                .trim_start()
-                .strip_prefix('/')
-                .is_none_or(|command| {
-                    read_only_command_allowed(command.split_whitespace().next().unwrap_or_default())
-                })
-        }
+        acp::ContentBlock::Text(text) => leading_slash_command(&text.text)
+            .is_none_or(read_only_command_allowed),
         _ => true,
     })
 }
@@ -739,11 +775,7 @@ fn dispatch_initialize(
     cx: &mut gpui::AsyncApp,
 ) {
     let Ok(receiver) = process.send_control(ControlRequestOut::Initialize {
-        hooks: if shared.generation_only || shared.read_only {
-            Default::default()
-        } else {
-            build_default_hooks()
-        },
+        hooks: initialize_hooks(shared.generation_only, shared.read_only),
     }) else {
         log::warn!(
             target: "claude_native::initialize",
@@ -2492,11 +2524,29 @@ mod tests {
                 acp::TextContent::new(command)
             )]));
         }
-        for text in ["Read the source", "/compact", "/context", "/model"] {
-            assert!(read_only_prompt_allowed(&[acp::ContentBlock::Text(
-                acp::TextContent::new(text)
-            )]));
+        for text in [
+            "Read the source",
+            "/compact",
+            "/context",
+            "/model",
+            // Prose that merely opens with an absolute path. The CLI would
+            // treat these as text; rejecting them loses the message, because
+            // the queue has already drained the bundle by the time `prompt()`
+            // runs.
+            "/home/spk/proj/src/main.rs:42 — explain this",
+            "/etc/hosts is the file I mean",
+            "/ ",
+            "/",
+        ] {
+            assert!(
+                read_only_prompt_allowed(&[acp::ContentBlock::Text(acp::TextContent::new(text))]),
+                "read-only must accept {text:?}"
+            );
         }
+        assert_eq!(leading_slash_command("/compact now"), Some("compact"));
+        assert_eq!(leading_slash_command("  /plugin:skill x"), Some("plugin:skill"));
+        assert_eq!(leading_slash_command("/home/spk/a.rs"), None);
+        assert_eq!(leading_slash_command("no slash"), None);
     }
 
     #[test]
@@ -2668,6 +2718,26 @@ mod tests {
         let stop = hooks.get("Stop").expect("Stop registered");
         assert_eq!(stop.len(), 1);
         assert_eq!(stop[0].hook_callback_ids, vec!["stop_inj".to_string()]);
+    }
+
+    #[test]
+    fn read_only_sessions_keep_the_mid_turn_delivery_hooks() {
+        // The only mid-turn path a Claude session has. Generation-only is the
+        // sole policy that legitimately has nothing to deliver.
+        let read_only = initialize_hooks(false, true);
+        for event in ["PostToolUse", "Stop", "SubagentStop"] {
+            assert!(
+                read_only.contains_key(event),
+                "read-only must keep the {event} hook"
+            );
+        }
+        assert_eq!(
+            read_only.keys().collect::<Vec<_>>(),
+            build_default_hooks().keys().collect::<Vec<_>>(),
+            "read-only must register exactly the default hook set"
+        );
+        assert!(initialize_hooks(true, false).is_empty());
+        assert!(initialize_hooks(true, true).is_empty());
     }
 
     #[test]
