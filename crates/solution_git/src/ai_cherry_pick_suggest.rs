@@ -56,7 +56,15 @@ pub const DEFAULT_DAYS_BACK: u32 = 30;
 
 /// Default estimated token budget across an entire analyze run. Mirrors
 /// `docs/superpowers/plans/git-panel-plan.md` § S-AI-CHP.
-pub const DEFAULT_TOKEN_BUDGET: u32 = 25_000;
+///
+/// The original 25 000 was set when a pair's prompt was a subject line and a
+/// path list (~250 tokens, ~100 pairs per run). Grounding the prompt in bounded
+/// revision evidence — up to 8 KiB of patch plus up to four 8 KiB target files —
+/// made one pair cost ~6 300 estimated tokens, so the old default would fund
+/// three. Sized here for roughly 24 evidence-grounded pairs; the run is opt-in
+/// (`background` is off by default) and stops the moment the budget is spent.
+/// Keep in sync with `solutions::AiCherryPickSuggestSettings::default`.
+pub const DEFAULT_TOKEN_BUDGET: u32 = 150_000;
 
 /// Bump whenever the evidence semantics or response contract changes.
 const PROMPT_CONTRACT_VERSION: u32 = 2;
@@ -112,6 +120,9 @@ pub struct AnalyzeStats {
     pub pairs_processed: usize,
     /// Pairs omitted because bounded evidence was incomplete or binary.
     pub pairs_skipped_evidence: usize,
+    /// Pairs whose evidence alone costs more than the whole `token_budget`.
+    /// They are skipped rather than ending the run — see [`BudgetVerdict`].
+    pub pairs_skipped_oversized: usize,
     pub tokens_consumed_estimate: u32,
     pub budget_exhausted: bool,
 }
@@ -212,7 +223,22 @@ pub(crate) async fn analyze_solution_with(
             })?;
         let target_head = git_text(&work_dir, &["rev-parse", "--verify", "HEAD"], 128).await?;
         let target_head = target_head.trim().to_string();
-        let target_paths = list_head_paths(&work_dir, &target_head).await?;
+        // Degrade this member, never the whole run. A single non-UTF-8 path in
+        // a HEAD tree, or a tree listing over `MAX_GIT_METADATA_BYTES`, is a
+        // property of ONE repository; propagating it aborts the cross-member
+        // analysis for every other member too. An empty path set simply means
+        // the prefilter finds no overlap for this target.
+        let target_paths = match list_head_paths(&work_dir, &target_head).await {
+            Ok(paths) => paths,
+            Err(error) => {
+                log::warn!(
+                    "ai_cherry_pick_suggest: no HEAD path list for member `{member_id}` ({}): {error} — \
+                     it stays in the run as a source, but nothing will be suggested INTO it",
+                    work_dir.display(),
+                );
+                HashSet::new()
+            }
+        };
         members.push(MemberCommits {
             member_id,
             work_dir,
@@ -293,8 +319,10 @@ pub(crate) async fn analyze_solution_with(
                 }
 
                 let estimated_tokens = estimate_tokens(&prompt);
-                if should_stop_for_budget(&mut stats, config.token_budget, estimated_tokens) {
-                    return Ok(AnalyzeOutcome { suggestions, stats });
+                match budget_verdict(&mut stats, config.token_budget, estimated_tokens) {
+                    BudgetVerdict::Fits => {}
+                    BudgetVerdict::SkipPair => continue,
+                    BudgetVerdict::Stop => return Ok(AnalyzeOutcome { suggestions, stats }),
                 }
 
                 let raw = match &runner {
@@ -386,17 +414,32 @@ fn path_overlap(source_paths: &[String], target_paths: &HashSet<String>) -> bool
     source_paths.iter().any(|p| target_paths.contains(p))
 }
 
-/// Predicate for the token-budget gate. Returns `true` (and flips
-/// `stats.budget_exhausted`) when one more pair's estimated tokens
-/// would push past `budget`. Pure data so it can be tested without the
-/// AI runner / Project plumbing.
-fn should_stop_for_budget(stats: &mut AnalyzeStats, budget: u32, estimated_tokens: u32) -> bool {
+/// What the token-budget gate says about one pair. Pure data so it can be
+/// tested without the AI runner / Project plumbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetVerdict {
+    /// Charge it and make the call.
+    Fits,
+    /// This ONE pair is bigger than the entire budget, so it can never be
+    /// afforded — in this run or any re-run. Skip it and keep going; aborting
+    /// here would let one oversized pair hide every cheaper pair behind it,
+    /// deterministically, on every run.
+    SkipPair,
+    /// The budget is spent. Stop the run.
+    Stop,
+}
+
+fn budget_verdict(stats: &mut AnalyzeStats, budget: u32, estimated_tokens: u32) -> BudgetVerdict {
+    if estimated_tokens > budget {
+        stats.pairs_skipped_oversized += 1;
+        return BudgetVerdict::SkipPair;
+    }
     let projected = stats.tokens_consumed_estimate.checked_add(estimated_tokens);
     if projected.is_none_or(|projected| projected > budget) {
         stats.budget_exhausted = true;
-        true
+        BudgetVerdict::Stop
     } else {
-        false
+        BudgetVerdict::Fits
     }
 }
 
@@ -404,9 +447,18 @@ fn should_stop_for_budget(stats: &mut AnalyzeStats, budget: u32, estimated_token
 // AI prompt + reply parsing
 // ---------------------------------------------------------------------
 
+/// Bytes per token. ~4 is the conventional back-of-envelope for BPE tokenizers
+/// on English prose and source code, and deliberately conservative (real ratios
+/// for code run 3.5–5). Charging raw BYTES against a budget the setting calls
+/// `token_budget` overcharged every pair by 4×, on top of the 20× growth the
+/// evidence-grounded prompt brought: at the old 25 000 default a run funded
+/// about ONE pair and then reported "budget exhausted".
+const BYTES_PER_TOKEN_ESTIMATE: u32 = 4;
+
 fn estimate_tokens(prompt: &str) -> u32 {
     u32::try_from(prompt.len())
         .unwrap_or(u32::MAX)
+        .div_ceil(BYTES_PER_TOKEN_ESTIMATE)
         .saturating_add(TOKEN_ENVELOPE_ESTIMATE)
 }
 
@@ -557,7 +609,19 @@ async fn list_commits(work_dir: &Path, days_back: u32) -> Result<Vec<CommitInfo>
         if sha.len() < 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             continue;
         }
-        let paths = list_commit_paths(work_dir, sha).await?;
+        // Same reasoning as the HEAD listing above: one unreadable commit must
+        // not take the member's whole history with it. Without paths the commit
+        // simply never clears the path-overlap prefilter.
+        let paths = match list_commit_paths(work_dir, sha).await {
+            Ok(paths) => paths,
+            Err(error) => {
+                log::warn!(
+                    "ai_cherry_pick_suggest: no path list for commit {sha} in {}: {error} — skipping that commit",
+                    work_dir.display(),
+                );
+                continue;
+            }
+        };
         commits.push(CommitInfo {
             sha: sha.to_string(),
             subject: subject.to_string(),
@@ -903,32 +967,72 @@ mod tests {
         assert_eq!(parsed.reasoning, "different language entirely");
     }
 
-    /// The token-budget gate is a pure-data check (`projected > budget`).
-    /// We exercise it directly via [`should_stop_for_budget`] so the test
-    /// doesn't need to spin up a real `Entity<Project>` — the production
-    /// `analyze_solution_with` path holds the same predicate.
+    /// The token-budget gate is a pure-data check. We exercise it directly via
+    /// [`budget_verdict`] so the test doesn't need to spin up a real
+    /// `Entity<Project>` — the production `analyze_solution_with` path holds the
+    /// same predicate.
     #[test]
     fn token_budget_stops_at_limit() {
-        // Budget below one pair's estimated cost — first pair should
-        // trigger exhaustion before any AI call.
+        // A pair that alone costs more than the whole budget is SKIPPED, not
+        // fatal: aborting would hide every cheaper pair behind it on every run.
         let mut stats = AnalyzeStats::default();
         let estimated_tokens = estimate_tokens("small prompt");
-        let stop = should_stop_for_budget(&mut stats, 100, estimated_tokens);
-        assert!(stop, "stats: {stats:?}");
-        assert!(stats.budget_exhausted);
+        let verdict = budget_verdict(&mut stats, 100, estimated_tokens);
+        assert_eq!(verdict, BudgetVerdict::SkipPair, "stats: {stats:?}");
+        assert_eq!(stats.pairs_skipped_oversized, 1);
+        assert!(
+            !stats.budget_exhausted,
+            "an unaffordable pair does not mean the budget is spent"
+        );
+        // …and the run keeps going: a pair that does fit still gets made.
+        assert_eq!(
+            budget_verdict(&mut stats, 100, 10),
+            BudgetVerdict::Fits,
+            "a cheap pair after an oversized one must still be analyzed"
+        );
 
         // Budget exactly equal to one pair — first pair fits, second
         // would exceed.
         let mut stats = AnalyzeStats::default();
-        let first_stop = should_stop_for_budget(&mut stats, estimated_tokens, estimated_tokens);
-        assert!(!first_stop, "first pair must fit at exactly one slot");
+        assert_eq!(
+            budget_verdict(&mut stats, estimated_tokens, estimated_tokens),
+            BudgetVerdict::Fits,
+            "first pair must fit at exactly one slot"
+        );
         // Charge it.
         stats.tokens_consumed_estimate = stats
             .tokens_consumed_estimate
             .saturating_add(estimated_tokens);
-        let second_stop = should_stop_for_budget(&mut stats, estimated_tokens, estimated_tokens);
-        assert!(second_stop, "second pair must trigger exhaustion");
+        assert_eq!(
+            budget_verdict(&mut stats, estimated_tokens, estimated_tokens),
+            BudgetVerdict::Stop,
+            "second pair must trigger exhaustion"
+        );
         assert!(stats.budget_exhausted);
+    }
+
+    /// The budget is denominated in TOKENS. Charging bytes made one
+    /// evidence-grounded pair (~17 KB of patch + target files) cost ~19 000 of
+    /// the 25 000 default, so a run funded a single pair.
+    #[test]
+    fn estimate_is_in_tokens_not_bytes() {
+        let prompt = "x".repeat(17_000);
+        let estimate = estimate_tokens(&prompt);
+        assert_eq!(estimate, 17_000 / 4 + TOKEN_ENVELOPE_ESTIMATE);
+        assert!(
+            estimate < 17_000,
+            "a byte count must not be charged against a token budget"
+        );
+        let mut stats = AnalyzeStats::default();
+        let mut afforded = 0;
+        while budget_verdict(&mut stats, DEFAULT_TOKEN_BUDGET, estimate) == BudgetVerdict::Fits {
+            stats.tokens_consumed_estimate += estimate;
+            afforded += 1;
+        }
+        assert!(
+            afforded >= 20,
+            "the default budget must fund a useful run, got {afforded} pair(s)"
+        );
     }
 
     async fn test_git(path: &Path, args: &[&str]) -> String {
@@ -1015,7 +1119,10 @@ mod tests {
             assert!(estimate > 250);
             assert!(estimate_tokens(&new_prompt.repeat(2)) > estimate);
             let mut stats = AnalyzeStats::default();
-            assert!(should_stop_for_budget(&mut stats, estimate - 1, estimate));
+            assert_eq!(
+                budget_verdict(&mut stats, estimate - 1, estimate),
+                BudgetVerdict::SkipPair
+            );
             assert_eq!(stats.pairs_processed, 0);
         });
     }

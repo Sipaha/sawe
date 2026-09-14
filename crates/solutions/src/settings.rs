@@ -37,7 +37,8 @@ pub struct AiCherryPickSuggestSettings {
     /// Run analyze in the background on a daily cadence + every Fetch
     /// All. Off by default — every run spends AI tokens.
     pub background: bool,
-    /// Hard cap on estimated tokens per analyze run.
+    /// Hard cap on estimated tokens per analyze run. Tokens, not bytes —
+    /// `solution_git::ai_cherry_pick_suggest::estimate_tokens` converts.
     pub token_budget: u32,
 }
 
@@ -45,7 +46,10 @@ impl Default for AiCherryPickSuggestSettings {
     fn default() -> Self {
         Self {
             background: false,
-            token_budget: 25_000,
+            // Keep in sync with
+            // `solution_git::ai_cherry_pick_suggest::DEFAULT_TOKEN_BUDGET`,
+            // which documents the arithmetic behind the figure.
+            token_budget: 150_000,
         }
     }
 }

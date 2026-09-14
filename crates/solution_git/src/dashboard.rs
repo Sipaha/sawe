@@ -1541,10 +1541,18 @@ impl SolutionStatusDashboard {
                     .py_2()
                     .child(
                         Label::new(SharedString::from(format!(
-                            "No suggestions found ({} pair(s) seen, {} after prefilter, {} processed{}).",
+                            "No suggestions found ({} pair(s) seen, {} after prefilter, {} processed{}{}).",
                             outcome.stats.pairs_seen,
                             outcome.stats.pairs_after_prefilter,
                             outcome.stats.pairs_processed,
+                            if outcome.stats.pairs_skipped_oversized > 0 {
+                                format!(
+                                    "; {} over budget on their own",
+                                    outcome.stats.pairs_skipped_oversized
+                                )
+                            } else {
+                                String::new()
+                            },
                             if outcome.stats.budget_exhausted {
                                 "; token budget exhausted"
                             } else {

@@ -982,13 +982,14 @@
         //
         // Default: false
         "background": false,
-        // Hard cap on estimated tokens consumed per analyze run.
-        // ~$0.10 / Solution on typical Claude pricing. Above this the
-        // analyzer stops early and the dashboard shows "budget
-        // exhausted, processed N pairs of M".
+        // Hard cap on estimated tokens consumed per analyze run. Above
+        // this the analyzer stops early and the dashboard shows "budget
+        // exhausted, processed N pairs of M". One evidence-grounded pair
+        // (a bounded patch plus the target files it touches) costs about
+        // 6300 estimated tokens, so this funds roughly 24 of them.
         //
-        // Default: 25000
-        "token_budget": 25000,
+        // Default: 150000
+        "token_budget": 150000,
       },
     },
   },

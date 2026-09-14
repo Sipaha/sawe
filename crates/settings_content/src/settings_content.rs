@@ -1339,7 +1339,9 @@ pub struct SolutionGitAiCherryPickSuggestSettingsContent {
     /// analyzer stops early when one more pair would exceed this; the
     /// dashboard surfaces a "budget exhausted" indicator.
     ///
-    /// Default: 25000
+    /// One evidence-grounded pair costs roughly 6300 estimated tokens.
+    ///
+    /// Default: 150000
     pub token_budget: Option<u32>,
 }
 
