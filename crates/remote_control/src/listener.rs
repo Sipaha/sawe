@@ -83,9 +83,23 @@ const MIN_WRITE_THROUGHPUT_BYTES_PER_SEC: u64 = 32 * 1024;
 /// of a frame the close preempted. Bounded on purpose: a truncated WS
 /// frame is unparseable, so the close can only go out behind the bytes
 /// already committed — and waiting out a multi-megabyte response on a slow
-/// link would defeat the point of preempting it. A peer that can't drain
-/// within this window gets a reset instead of a reason.
-const CLOSE_WRITE_TIMEOUT_SECS: u64 = 10;
+/// link would defeat the point of preempting it.
+///
+/// Be precise about what this does and does not buy. The close does NOT
+/// wait for a peer that is merely slow to acknowledge; it waits for the
+/// REMAINDER OF THE PREEMPTED FRAME, which tungstenite has already accepted
+/// and must push out before a close can be framed behind it. At the
+/// pessimistic [`MIN_WRITE_THROUGHPUT_BYTES_PER_SEC`] floor this window
+/// covers `CLOSE_WRITE_TIMEOUT_SECS * MIN_WRITE_THROUGHPUT_BYTES_PER_SEC`
+/// ≈ 640 KiB of backlog — an ordinary response, but NOT the
+/// tens-of-megabytes transcript that motivated making [`write_budget`]
+/// scale in the first place. Those still end in a reset rather than a
+/// reason, and no value here fixes that: the ceiling is
+/// [`CLOSE_GRACE_SECS`], after which the reader abandons the writer anyway.
+/// Genuinely covering a 25 MB frame would need a way to ABANDON buffered
+/// bytes, which tungstenite does not expose. So this is sized to sit just
+/// under the reader's grace, leaving it a margin to reunite and tear down.
+const CLOSE_WRITE_TIMEOUT_SECS: u64 = 20;
 
 /// How long the reader waits for the writer to deliver the close frame
 /// before abandoning it and tearing the socket down. Must comfortably
@@ -590,16 +604,28 @@ async fn record_auth_failure(state: &ListenerState, ip: IpAddr) {
     let mut bans = state.bans.lock().await;
     let now = Instant::now();
     let key = subnet_key(ip);
-    let entry = bans.entry(key).or_insert_with(|| BanRecord {
-        consecutive_failures: 0,
-        banned_until: None,
-        last_seen: now,
-    });
-    // If the prior ban already ended AND it was long enough ago that
-    // the record decayed, the .or_insert above gave us a brand-new
-    // counter at 0 → step below makes it 1 (= first offense, 30 s).
-    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-    entry.last_seen = now;
+    let failures = {
+        let entry = bans.entry(key).or_insert_with(|| BanRecord {
+            consecutive_failures: 0,
+            banned_until: None,
+            last_seen: now,
+        });
+        // If the prior ban already ended AND it was long enough ago that
+        // the record decayed, the .or_insert above gave us a brand-new
+        // counter at 0 → step below makes it 1 (= first offense, 30 s).
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.last_seen = now;
+        entry.consecutive_failures
+    };
+    // Enforce the cap HERE, on the insert, not after the ban is set. Every
+    // single-failure source returns early below, and a source only has to fail
+    // ONCE to mint a record — so putting the eviction after the grace check
+    // meant the cap never applied to exactly the population that can grow
+    // without bound. `subnet_key` keeps CGNAT addresses whole (/32), which
+    // multiplies the number of distinct keys one carrier range can mint by 256,
+    // and the decay in `is_banned` is an O(n) `retain` on every accept — so an
+    // unbounded map throttles legitimate pairings as well as leaking memory.
+    evict_ban_records_over_cap(&mut bans);
     // 1-failure grace period: the first auth-fail in a window only
     // increments the counter and logs at WARN — no ban yet. The ban
     // ladder kicks in on the SECOND consecutive failure. Why:
@@ -612,7 +638,7 @@ async fn record_auth_failure(state: &ListenerState, ip: IpAddr) {
     // into the 5-minute escalation tier. A scanner spraying random
     // bytes will rack up failures quickly enough to still get banned;
     // a real user with one bad packet eats a single warn.
-    if entry.consecutive_failures == 1 {
+    if failures == 1 {
         log::warn!(
             target: "remote_control",
             "subnet {key} auth failure #1 — no ban yet (grace period); ladder fires on the next consecutive failure",
@@ -621,33 +647,44 @@ async fn record_auth_failure(state: &ListenerState, ip: IpAddr) {
     }
     // `consecutive_failures` is now ≥ 2. Index 0 → 30 s, 1 → 5 min, …
     // The offset of 2 here is what the grace skip earns the table.
-    let idx = ((entry.consecutive_failures as usize) - 2).min(BAN_BACKOFF_SECS.len() - 1);
+    let idx = ((failures as usize) - 2).min(BAN_BACKOFF_SECS.len() - 1);
     let step = BAN_BACKOFF_SECS[idx];
+    // The record was just touched with `last_seen = now`, so the eviction above
+    // cannot have chosen it as the LRU victim unless it is the only record and
+    // the cap is zero. Tolerate that rather than re-inserting a record the cap
+    // just rejected.
+    let Some(entry) = bans.get_mut(&key) else {
+        return;
+    };
     entry.banned_until = Some(now + Duration::from_secs(step));
     log::info!(
         target: "remote_control",
         "subnet {key} banned for {step}s (failure #{count})",
-        count = entry.consecutive_failures,
+        count = failures,
     );
-    // Capacity bound: evict LRU record if we just blew past the cap.
-    // Worst-case overshoot is 1 (we just inserted) so a single pop is
-    // enough. The eviction scan is O(BAN_LIST_MAX_ENTRIES); at the
-    // current 10k cap + ≤ 5 inserts/sec from the accept-rate limit,
-    // that's ≤ 50k comparisons/sec — negligible. Tied `last_seen`
-    // values resolve by HashMap iteration order, which is non-
-    // deterministic but acceptable for an LRU approximation.
-    if bans.len() > BAN_LIST_MAX_ENTRIES {
-        if let Some(victim) = bans
+}
+
+/// Capacity bound for the ban map: evict LRU records until it is back at the
+/// cap. Worst-case overshoot is 1 per insert, but the loop keeps the invariant
+/// true even if a caller ever inserts in bulk. The eviction scan is
+/// O(BAN_LIST_MAX_ENTRIES); at the current 10k cap + ≤ 5 inserts/sec from the
+/// accept-rate limit, that's ≤ 50k comparisons/sec — negligible. Tied
+/// `last_seen` values resolve by HashMap iteration order, which is
+/// non-deterministic but acceptable for an LRU approximation.
+fn evict_ban_records_over_cap(bans: &mut HashMap<IpAddr, BanRecord>) {
+    while bans.len() > BAN_LIST_MAX_ENTRIES {
+        let Some(victim) = bans
             .iter()
             .min_by_key(|(_, rec)| rec.last_seen)
             .map(|(k, _)| *k)
-        {
-            bans.remove(&victim);
-            log::debug!(
-                target: "remote_control",
-                "ban map at cap, evicted LRU subnet {victim}",
-            );
-        }
+        else {
+            return;
+        };
+        bans.remove(&victim);
+        log::debug!(
+            target: "remote_control",
+            "ban map at cap, evicted LRU subnet {victim}",
+        );
     }
 }
 
@@ -1531,9 +1568,12 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
 /// multi-megabyte response is draining over LTE. Preempting truncates
 /// that frame, which is fine — we are closing — but a truncated WS frame
 /// is unparseable, so the close is written only after the partial frame
-/// gets [`CLOSE_WRITE_TIMEOUT_SECS`] to drain. If it can't, the peer gets
-/// a reset instead of a reason; that is the honest outcome for a link
-/// that cannot finish the frame it is on.
+/// gets [`CLOSE_WRITE_TIMEOUT_SECS`] to drain. If the remaining bytes need
+/// longer than that (the constant documents how much backlog it actually
+/// covers), the peer gets a reset instead of a reason; that is the honest
+/// outcome for a link that cannot finish the frame it is on, and the stall
+/// is logged with the frame size so it is diagnosable rather than
+/// mysterious.
 ///
 /// *A slow link is not a dead link.* The per-frame budget scales with the
 /// payload (see [`write_budget`]) instead of being a flat deadline: a flat
@@ -1560,7 +1600,8 @@ where
                 biased;
                 closing = &mut close_rx => match closing {
                     Ok(frame) => {
-                        write_close_frame(&mut sink, frame, &client_name).await;
+                        // Idle between frames: nothing is buffered behind the close.
+                        write_close_frame(&mut sink, frame, &client_name, 0).await;
                         return sink;
                     }
                     Err(_) => {
@@ -1584,7 +1625,8 @@ where
             Outbound::Raw(message) => (message, None),
             Outbound::Json(text, permit) => (encode_json_frame(text, compress_dict), permit),
         };
-        let budget = write_budget(message.len());
+        let frame_bytes = message.len();
+        let budget = write_budget(frame_bytes);
 
         let step = {
             let write = tokio::time::timeout(budget, sink.send(message));
@@ -1626,7 +1668,7 @@ where
                 // The abandoned frame's bytes are still in tungstenite's
                 // write buffer; `write_close_frame` flushes them ahead of
                 // the close, which is what keeps the close parseable.
-                write_close_frame(&mut sink, frame, &client_name).await;
+                write_close_frame(&mut sink, frame, &client_name, frame_bytes).await;
                 return sink;
             }
         }
@@ -1681,6 +1723,7 @@ async fn write_close_frame<S>(
     sink: &mut SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
     frame: Option<CloseFrame>,
     client_name: &str,
+    preempted_bytes: usize,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1697,8 +1740,10 @@ async fn write_close_frame<S>(
         ),
         Err(_) => log::info!(
             target: "remote_control",
-            "close frame to {client_name:?} stalled for {CLOSE_WRITE_TIMEOUT_SECS}s; \
-             the client will see a reset instead of a reason",
+            "close frame to {client_name:?} stalled for {CLOSE_WRITE_TIMEOUT_SECS}s behind a \
+             {preempted_bytes}-byte preempted frame; the client will see a reset instead of a \
+             reason (the budget covers ~{covered} bytes of backlog at the assumed floor)",
+            covered = CLOSE_WRITE_TIMEOUT_SECS * MIN_WRITE_THROUGHPUT_BYTES_PER_SEC,
         ),
     }
 }
@@ -1981,6 +2026,49 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, last_octet))
     }
 
+    /// A source only has to fail ONCE to mint a record, and every
+    /// single-failure source returns through the grace path — which used to
+    /// return before the capacity check, so the cap never applied to the only
+    /// population that can grow without bound.
+    #[tokio::test]
+    async fn single_failure_sources_cannot_grow_the_ban_map_past_the_cap() {
+        let state = ListenerState::default();
+        let now = Instant::now();
+        // Fill to the cap with records that are all older than the one we are
+        // about to add, so LRU has an unambiguous victim.
+        {
+            let mut bans = state.bans.lock().await;
+            for index in 0..BAN_LIST_MAX_ENTRIES {
+                let key = IpAddr::V4(Ipv4Addr::new(10, (index >> 8) as u8, index as u8, 0));
+                bans.insert(
+                    key,
+                    BanRecord {
+                        consecutive_failures: 1,
+                        banned_until: None,
+                        last_seen: now - Duration::from_secs(60 + index as u64 % 30),
+                    },
+                );
+            }
+            assert_eq!(bans.len(), BAN_LIST_MAX_ENTRIES);
+        }
+        // ONE failure from a fresh subnet — the grace path, which used to
+        // return before the capacity check. Every single-failure source takes
+        // this path, and a source only has to fail once to mint a record, so
+        // this is exactly the population that could grow without bound.
+        let newcomer = ip(200);
+        record_auth_failure(&state, newcomer).await;
+        let bans = state.bans.lock().await;
+        assert_eq!(
+            bans.len(),
+            BAN_LIST_MAX_ENTRIES,
+            "the hard cap must hold for one-failure-per-source traffic too"
+        );
+        assert!(
+            bans.contains_key(&subnet_key(newcomer)),
+            "the just-touched record is the most recent — it must not be the LRU victim"
+        );
+    }
+
     #[tokio::test]
     async fn auth_failure_ban_ladder_climbs_tiers() {
         let state = ListenerState::default();
@@ -2220,9 +2308,28 @@ mod tests {
     /// mid-frame.
     #[test]
     fn close_grace_exceeds_the_close_write_budget() {
+        // Not just ">": after the writer gives up, the reader still has to
+        // reunite the halves and tear the socket down, so the writer's budget
+        // has to leave it room. A bare `>` let the two constants sit one second
+        // apart and still pass.
+        const TEARDOWN_MARGIN_SECS: u64 = 5;
         assert!(
-            CLOSE_GRACE_SECS > CLOSE_WRITE_TIMEOUT_SECS,
-            "reader grace {CLOSE_GRACE_SECS}s must exceed writer budget {CLOSE_WRITE_TIMEOUT_SECS}s",
+            CLOSE_GRACE_SECS >= CLOSE_WRITE_TIMEOUT_SECS + TEARDOWN_MARGIN_SECS,
+            "reader grace {CLOSE_GRACE_SECS}s must exceed writer budget \
+             {CLOSE_WRITE_TIMEOUT_SECS}s by at least {TEARDOWN_MARGIN_SECS}s",
+        );
+        // And state how much preempted frame the budget can actually flush, so
+        // a future change to either constant has to face the number rather than
+        // the adjective. A frame larger than this still ends in a reset — a
+        // known limit of preempting a buffered frame, not a regression.
+        let covered_bytes = CLOSE_WRITE_TIMEOUT_SECS * MIN_WRITE_THROUGHPUT_BYTES_PER_SEC;
+        assert!(
+            covered_bytes >= 512 * 1024,
+            "the close budget should cover an ordinary response ({covered_bytes} bytes)"
+        );
+        assert!(
+            write_budget(64 * 1024 * 1024) > Duration::from_secs(CLOSE_GRACE_SECS),
+            "a large frame's own budget outruns the close path — preemption is best-effort"
         );
     }
 }
