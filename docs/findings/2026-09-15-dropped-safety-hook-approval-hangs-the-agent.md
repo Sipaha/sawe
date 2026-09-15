@@ -73,10 +73,6 @@ affected either.
 
 Each of these was checked and cleared, so don't re-check them:
 
-- **The claude version.** `2.1.258` was pinned by an earlier workaround
-  (`~/.spk/sawe/ss/chunkedupload/.agents/claude-code-hang-brief.md`) on the
-  theory that 2.1.259 caused it. All agents were running the pinned build and
-  still hung. That brief's conclusion is superseded.
 - **The `PreToolUse` hook** (`guard_process_probes.py`): 28 ms, exit 0, on the
   exact stalled command.
 - **Permission mode / deny rules.** Sessions run with bypass; this class is
@@ -87,6 +83,39 @@ Each of these was checked and cleared, so don't re-check them:
 - **The command actually running.** A call whose text merely *contained* the
   stalled command inside single quotes — never executing it — stalled the same
   way. The trigger is the text.
+
+## The claude version is not the cause, but it IS a frequency multiplier
+
+An earlier workaround pinned `2.1.258`
+(`~/.spk/sawe/ss/chunkedupload/.agents/claude-code-hang-brief.md`) on the theory
+that `2.1.259` caused the hangs, and rolling back demonstrably stopped them.
+That reads like a contradiction with everything above — yesterday's episode
+happened *on* the pinned build, and the reproducer hangs there too. Both are
+true, and the A/B that reconciles them is cheap to re-run: answer any
+`can_use_tool` correctly and just count whether one is asked for at all.
+
+With a denied file (`secrets/server.key`, matching the user-level
+`Read(./secrets/**)`) under the cwd:
+
+| command | 2.1.258 | 2.1.259 |
+|---|---|---|
+| `grep -rn needle .` | **no ask** | **asks** — "grep on '.' would read '…/secrets', which the deny rule `Read(./secrets/**)` covers; only you can approve" |
+| `for n in a b; do D=…/$n; rm -f "$D"/*.jar; done` | **asks** | **asks** — "Dangerous rm operation on possibly-empty variable path" |
+
+So `2.1.259` introduced a whole new class of asking — exactly the changelog line
+("`grep -r`/`cp -r` over a directory holding a denied file now asks") that the
+brief quoted and then dismissed. Because the client answered *no* ask correctly,
+that new class turned ordinary day-to-day `grep -r` into a hang, and the
+rollback removed the new asks. **The rollback was a real, effective mitigation**
+— of the symptom. It could not touch the residual hangs whose trigger exists in
+both versions, which is why they continued on 31.08 / 01.09 and again yesterday.
+
+It also explains the reproducibility gap. The `2.1.259` trigger depends on the
+cwd and on a denied file living under the traversed tree — the deny globs are
+`./**`-relative — so it fires erratically. The `rm` trigger is a pure function
+of the command text, so it fires every time. And it explains why the brief's own
+A/B saw "no permission requests on either version": run outside a tree the deny
+globs match, neither version asks.
 
 ## Fix
 
