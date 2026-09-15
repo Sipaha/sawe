@@ -12,6 +12,21 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use util::ResultExt as _;
 
+/// Clear the well-known socket path before symlinking the real one onto it.
+///
+/// A missing path is the NORMAL case — a fresh runtime dir, or a clean
+/// shutdown that already unlinked it — so it must not be reported. It used to
+/// go through `log_err()`, which printed a context-free
+/// `ERROR … No such file or directory (os error 2)` on every single launch,
+/// twice. Anything else is worth a line, with the path in it.
+fn remove_stale_socket(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => log::warn!("removing stale socket {}: {error}", path.display()),
+    }
+}
+
 /// Overrides the directory containing `mcp.lock` and `mcp.sock`. Set by
 /// integration tests to isolate the well-known socket from any live
 /// `sawe` instance running on the same machine. Without this,
@@ -634,7 +649,7 @@ pub fn start_server(cx: &mut App) -> Result<()> {
             // well-known path to it so clients can find us deterministically.
             let actual_socket = server.socket_path().to_path_buf();
             if actual_socket != sock {
-                std::fs::remove_file(&sock).log_err();
+                remove_stale_socket(&sock);
                 #[cfg(unix)]
                 {
                     std::os::unix::fs::symlink(&actual_socket, &sock).with_context(|| {
@@ -748,7 +763,7 @@ pub fn open_solution_socket(cx: &mut App, solution_id: i64, root: PathBuf) {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         if actual_socket != socket {
-            std::fs::remove_file(&socket).log_err();
+            remove_stale_socket(&socket);
             #[cfg(unix)]
             std::os::unix::fs::symlink(&actual_socket, &socket).with_context(|| {
                 format!(

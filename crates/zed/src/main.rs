@@ -2863,7 +2863,17 @@ fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut App) {
 
         while let Some(paths) = events.next().await {
             for event in paths {
-                if fs.metadata(&event.path).await.ok().flatten().is_some() {
+                // Skip the watched DIRECTORY's own events. `load_bytes` on it
+                // fails with a context-free `ERROR … Is a directory (os error
+                // 21)` — printed on every launch, because watching a directory
+                // reports the directory.
+                if fs
+                    .metadata(&event.path)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|metadata| !metadata.is_dir)
+                {
                     let theme_registry = cx.update(|cx| ThemeRegistry::global(cx));
                     if let Some(bytes) = fs.load_bytes(&event.path).await.log_err()
                         && load_user_theme(&theme_registry, &bytes).log_err().is_some()

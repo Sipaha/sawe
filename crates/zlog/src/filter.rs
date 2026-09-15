@@ -42,6 +42,14 @@ const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
     // usvg prints a lot of warnings on rendering an SVG with partial errors, which
     // can happen a lot with the SVG preview
     ("usvg::parser", log::LevelFilter::Error),
+    // "unable to remove watch descriptor from inotify: … EINVAL" once per watch
+    // the kernel already dropped because its file was deleted. notify logs it at
+    // INFO and says so in the source ("Log level is info, because it is not a
+    // 'real' error" — it is an expected race). 328 of them in one of the
+    // maintainer's log windows; whatever notify can still report as a genuine
+    // problem is WARN or above and survives this.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    ("notify::inotify", log::LevelFilter::Warn),
 ];
 
 pub fn init_env_filter(filter: env_config::EnvFilter) {
@@ -417,6 +425,34 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         ScopeMap::new_from_settings_and_env(&hash_map, None, &[])
+    }
+
+    /// The built-in noise floor actually applies. `notify` logs one INFO line
+    /// per watch descriptor the kernel had already dropped — its own source
+    /// says "not a 'real' error" — and 328 of them landed in a single log
+    /// window. Anything it reports at WARN or above must still get through.
+    #[test]
+    fn default_filters_silence_notifys_expected_race_but_not_its_warnings() {
+        use log::Level;
+        let map = ScopeMap::new_from_settings_and_env(&HashMap::default(), None, DEFAULT_FILTERS);
+        let unused = scope_from_scope_str("__unused__");
+        assert_eq!(
+            map.is_enabled(&unused, Some("notify::inotify"), Level::Info),
+            EnabledStatus::Disabled,
+        );
+        assert_eq!(
+            map.is_enabled(&unused, Some("notify::inotify"), Level::Warn),
+            EnabledStatus::Enabled,
+        );
+        assert_eq!(
+            map.is_enabled(&unused, Some("notify::inotify"), Level::Error),
+            EnabledStatus::Enabled,
+        );
+        assert_eq!(
+            map.is_enabled(&unused, Some("solution_agent::store"), Level::Info),
+            EnabledStatus::NotConfigured,
+            "an unrelated module must keep the global default",
+        );
     }
 
     #[test]
