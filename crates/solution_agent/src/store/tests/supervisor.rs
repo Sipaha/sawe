@@ -3931,3 +3931,97 @@ async fn a_never_observed_background_agent_stops_suppressing_the_supervisor(
          the supervisor gate shut — waiting out the 1-hour reaper is the bug"
     );
 }
+
+/// The promise in the chat has to be kept. When claude walls a session,
+/// `apply_usage_limit_stop` writes a system note — "The Observer will resume
+/// the session automatically around HH:MM" — and parks `Watching` with
+/// `next_eligible_ms`. That note is a commitment the user reads and then stops
+/// watching the screen, so anything that silently eats it is worse than a late
+/// nudge.
+///
+/// Measured on the maintainer's own session `qv09rxtm` (2026-09-16): wall at
+/// 03:56:52, resume promised for 04:20:58, judge actually fired at **04:37:49**
+/// — 16m51s late, and exactly two seconds after the 1-hour reaper dropped a
+/// managed agent that had finished at 03:41 and was never once snapshotted.
+/// The old liveness predicate mapped "never observed" to alive forever, so the
+/// `has_live_background_work` gate in `tick_supervisor` swallowed every tick
+/// including the scheduled one.
+///
+/// `vouches_for_parent`'s bounded grace fixes the predicate; this pins the
+/// CONSEQUENCE the user actually sees, which the gate and the schedule only
+/// produce together.
+#[gpui::test]
+async fn a_stale_background_agent_does_not_eat_a_scheduled_usage_limit_resume(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::supervisor::SupervisorStatus;
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("ac06613377f11af62");
+
+    // The wall's own shape: the session is `Errored` carrying claude's message,
+    // and the resume moment has already passed.
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        let bg_id = bg_id.clone();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Errored(
+                "You've hit your session limit · resets 4:10am (Asia/Novosibirsk)".into(),
+            );
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: std::path::PathBuf::from("/nonexistent/agent.jsonl"),
+                    // Dispatched a moment ago and never snapshotted — the
+                    // watcher was armed on a directory the session abandoned
+                    // several context rotations back.
+                    registered_at: chrono::Utc::now(),
+                    latest: None,
+                    last_offset: 0,
+                    parent_tool_use_id: Some(gpui::SharedString::from("toolu_spawn")),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id);
+        });
+        store.set_supervision_enabled(id, true, cx);
+        let st = store.supervisor_states.get_mut(&id).expect("state");
+        st.status = SupervisorStatus::Watching;
+        st.next_eligible_ms = Some(chrono::Utc::now().timestamp_millis() - 60_000);
+        store.tick_supervisor(cx);
+    });
+    assert_eq!(
+        store
+            .read_with(cx, |store, _| store.supervisor_state(id))
+            .unwrap()
+            .status,
+        SupervisorStatus::Watching,
+        "inside the grace the dispatch may really be starting up — standing down is correct",
+    );
+
+    // Same agent, still never observed, now past the grace. The reap is an hour
+    // away; the resume is due now.
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            if let Some(agent) = s.background_agents.get_mut(&bg_id) {
+                agent.registered_at = chrono::Utc::now()
+                    - chrono::Duration::seconds(
+                        crate::background_agent::BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS + 60,
+                    );
+            }
+        });
+        store.tick_supervisor(cx);
+    });
+    assert_eq!(
+        store
+            .read_with(cx, |store, _| store.supervisor_state(id))
+            .unwrap()
+            .status,
+        SupervisorStatus::Judging,
+        "a teammate nobody has ever seen must not hold a promised usage-limit resume \
+         hostage until the 1-hour reaper",
+    );
+}
