@@ -85,6 +85,11 @@ pub const FEATURE_CSID_DEDUPE: &str = "csid_dedupe";
 /// N-34 (narrow slice): the `suppress_kinds` parameter on `editor.subscribe`,
 /// enforced per connection in the remote-control proxy.
 pub const FEATURE_QUIET_MESSAGE_APPENDED: &str = "quiet_message_appended";
+/// `ToolCallSummary.authorization_reason`: why a tool call is waiting on a
+/// human, in the agent runtime's own words. A client that has it can render
+/// the question; one that hasn't still gets the buttons, just unexplained —
+/// which is why this is a feature token and not a schema bump.
+pub const FEATURE_TOOL_AUTH_REASON: &str = "tool_auth_reason";
 
 /// How long a `spk_client_send_id` stays deduplicated. 24 h — exactly the
 /// mobile offline queue's TTL, which is the longest a message can sit on the
@@ -104,6 +109,7 @@ pub fn wire_features() -> Vec<String> {
         FEATURE_OMIT_PREVIEW.to_string(),
         FEATURE_CSID_DEDUPE.to_string(),
         FEATURE_QUIET_MESSAGE_APPENDED.to_string(),
+        FEATURE_TOOL_AUTH_REASON.to_string(),
     ]
 }
 

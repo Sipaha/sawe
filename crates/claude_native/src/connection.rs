@@ -33,8 +33,8 @@ use util::path_list::PathList;
 use crate::command::{ClaudeCommandSpec, SessionArg, mcp_config_json};
 use crate::process::ClaudeProcess;
 use crate::protocol::{
-    ControlRequestEnvelope, ControlRequestKind, ControlRequestOut, HookConfig, InputMessage,
-    ModelInfo, OutputMessage, StreamEvent,
+    ControlRequestKind, ControlRequestOut, HookConfig, InputMessage, ModelInfo, OutputMessage,
+    StreamEvent,
 };
 use crate::translate::{
     DEFAULT_CONTEXT_WINDOW, TurnEnd, apply_stream_usage, apply_usage, assistant_usage_update,
@@ -385,6 +385,11 @@ impl AgentServer for ClaudeNativeAgentServer {
 struct SessionShared {
     generation_only: bool,
     read_only: bool,
+    /// The session's work directories (the Solution root first). Read by the
+    /// `can_use_tool` policy to tell an in-Solution target — which the operator
+    /// has already granted full rights to — from one anywhere else on the
+    /// machine, which they want to confirm by hand.
+    work_dirs: Vec<std::path::PathBuf>,
     prompt_tx: RefCell<Option<oneshot::Sender<Result<TurnEnd>>>>,
     sticky_window: Cell<Option<u64>>,
     /// Wall time (executor clock) of the last message the pump pulled off
@@ -672,8 +677,9 @@ fn leading_slash_command(text: &str) -> Option<&str> {
 
 fn read_only_prompt_allowed(blocks: &[acp::ContentBlock]) -> bool {
     blocks.iter().all(|block| match block {
-        acp::ContentBlock::Text(text) => leading_slash_command(&text.text)
-            .is_none_or(read_only_command_allowed),
+        acp::ContentBlock::Text(text) => {
+            leading_slash_command(&text.text).is_none_or(read_only_command_allowed)
+        }
         _ => true,
     })
 }
@@ -1133,6 +1139,7 @@ impl ClaudeNativeConnection {
             let shared = Rc::new(SessionShared {
                 generation_only,
                 read_only,
+                work_dirs: work_dirs.ordered_paths().cloned().collect(),
                 prompt_tx: RefCell::new(None),
                 sticky_window: Cell::new(None),
                 last_output: Rc::new(Cell::new(cx.background_executor().now())),
@@ -1383,6 +1390,7 @@ impl ClaudeNativeConnection {
             let shared = Rc::new(SessionShared {
                 generation_only: blueprint.generation_only,
                 read_only: blueprint.read_only,
+                work_dirs: blueprint.work_dirs.ordered_paths().cloned().collect(),
                 prompt_tx: RefCell::new(None),
                 sticky_window: Cell::new(None),
                 last_output: Rc::new(Cell::new(cx.background_executor().now())),
@@ -1831,18 +1839,79 @@ async fn run_update_pump(
                         })
                         .log_err();
                 }
-                ControlRequestKind::CanUseTool { .. } => {
-                    answer_tool_authorization(
-                        envelope,
-                        outgoing.clone(),
-                        !shared.generation_only && !shared.read_only,
+                ControlRequestKind::CanUseTool {
+                    tool_name,
+                    tool_use_id,
+                    input,
+                    decision_reason,
+                    ..
+                } => {
+                    let policy = if shared.generation_only {
+                        crate::tool_authorization::SessionPolicy::NoTools
+                    } else if shared.read_only {
+                        crate::tool_authorization::SessionPolicy::ReadOnly
+                    } else {
+                        crate::tool_authorization::SessionPolicy::FullAccess
+                    };
+                    let reason = crate::protocol::decision_reason_text(decision_reason);
+                    let decision = crate::tool_authorization::decide(
+                        input,
+                        reason.as_deref(),
+                        &shared.work_dirs,
+                        policy,
                     );
+                    match decision {
+                        crate::tool_authorization::AuthorizationDecision::Allow => {
+                            answer_tool_authorization(
+                                &envelope.request_id,
+                                tool_name,
+                                input,
+                                &outgoing,
+                                true,
+                            )
+                        }
+                        crate::tool_authorization::AuthorizationDecision::Deny => {
+                            answer_tool_authorization(
+                                &envelope.request_id,
+                                tool_name,
+                                input,
+                                &outgoing,
+                                false,
+                            )
+                        }
+                        crate::tool_authorization::AuthorizationDecision::Ask {
+                            reason,
+                            outside_targets,
+                        } => ask_operator_for_tool_authorization(
+                            envelope.request_id.clone(),
+                            tool_name.clone(),
+                            tool_use_id.clone(),
+                            input.clone(),
+                            reason,
+                            outside_targets,
+                            thread.clone(),
+                            outgoing.clone(),
+                            cx,
+                        ),
+                    }
                 }
                 ControlRequestKind::Other => {
-                    log::debug!(
-                        "claude_native: ignoring unknown control_request {}",
+                    // Never leave a control request unanswered: claude blocks
+                    // on the reply and, for a tool gate, stalls BEFORE spawning
+                    // the shell — the session then looks busy forever with no
+                    // process behind it. Declining an unsupported request is
+                    // recoverable; silence is not.
+                    log::warn!(
+                        "claude_native: declining unsupported control_request {}",
                         envelope.request_id
                     );
+                    outgoing
+                        .unbounded_send(InputMessage::permission_response(
+                            envelope.request_id.clone(),
+                            false,
+                            &serde_json::Value::Null,
+                        ))
+                        .log_err();
                 }
             }
             continue;
@@ -2178,47 +2247,142 @@ async fn run_update_pump(
     }
 }
 
-/// Answer a `can_use_tool` control request according to the session policy.
-/// Generation-only sessions deny every request; interactive sessions auto-approve without
-/// surfacing an Allow/Reject prompt.
-///
-/// Why auto-approve: the fork spawns the MAIN agent with
-/// `--permission-mode bypassPermissions`, so it never sends a `can_use_tool`
-/// request — every one that reaches here is from an Agent Teams TEAMMATE.
-/// `claude` deliberately does NOT let an auto-spawned sub-agent inherit
-/// `bypassPermissions` (an autonomous agent with blanket bypass would be a
-/// safety hole), so each teammate tool call would otherwise pop a confirmation
-/// the user has to answer — and a busy multi-teammate run drowns in prompts
-/// (and the session sits in `AwaitingInput` until each is answered). Since the
-/// user has already opted the whole workspace into bypass for the main agent,
-/// we extend the same trust to its teammates. The tool call is still visible
-/// in the teammate's transcript (`claude` streams the `tool_use` block before
-/// this request), so nothing is hidden — only the per-call gate is dropped.
-///
+/// Answer a `can_use_tool` control request by policy, without involving the
+/// operator. Used for the ordinary Agent Teams gate (a teammate cannot inherit
+/// `bypassPermissions`, and the operator already opted the workspace into
+/// bypass for the main agent) and for a safety-hook request whose targets we
+/// proved lie inside the Solution.
 fn answer_tool_authorization(
-    envelope: ControlRequestEnvelope,
-    outgoing: futures::channel::mpsc::UnboundedSender<InputMessage>,
+    request_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+    outgoing: &futures::channel::mpsc::UnboundedSender<InputMessage>,
     allow: bool,
 ) {
-    let ControlRequestKind::CanUseTool {
-        tool_name,
-        tool_use_id,
-        ..
-    } = envelope.request
-    else {
-        return;
-    };
     log::debug!(
-        "claude_native: tool authorization allow={allow} for {tool_name} (tool_use_id={tool_use_id}, \
-         request_id={})",
-        envelope.request_id,
+        "claude_native: tool authorization allow={allow} for {tool_name} (request_id={request_id})"
     );
     outgoing
-        .unbounded_send(InputMessage::permission_response(
-            envelope.request_id,
-            allow,
-        ))
+        .unbounded_send(InputMessage::permission_response(request_id, allow, input))
         .log_err();
+}
+
+/// Put a safety-hook approval in front of the operator and answer claude with
+/// their decision.
+///
+/// This is the class `--permission-mode bypassPermissions` deliberately cannot
+/// auto-allow ("Dangerous rm operation detected: …"), and it names a target we
+/// could not place inside the Solution. The request is raised on the live
+/// `AcpThread` as an ordinary tool-call authorization, so it renders with the
+/// existing Allow/Reject affordance on desktop AND rides the wire to the phone,
+/// which answers it through `solution_agent.authorize_tool_call`.
+///
+/// Runs as a detached task: the pump must keep draining `incoming` while the
+/// operator thinks, or the very UI that has to answer would stop updating.
+#[allow(clippy::too_many_arguments)]
+fn ask_operator_for_tool_authorization(
+    request_id: String,
+    tool_name: String,
+    tool_use_id: Option<String>,
+    input: serde_json::Value,
+    reason: String,
+    outside_targets: Vec<String>,
+    thread: WeakEntity<AcpThread>,
+    outgoing: futures::channel::mpsc::UnboundedSender<InputMessage>,
+    cx: &mut gpui::AsyncApp,
+) {
+    cx.spawn(async move |cx| {
+        // The safety-hook frame carries no `tool_use_id` — the call has not
+        // been admitted yet. Attach the prompt to the tool call claude already
+        // streamed (so the buttons appear under the command the operator is
+        // being asked about); fall back to a synthetic id, which upserts a
+        // standalone entry rather than losing the question.
+        let target_id = match tool_use_id {
+            Some(id) => acp::ToolCallId::new(id),
+            None => thread
+                .update(cx, |thread, _| newest_pending_tool_call(thread, &tool_name))
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| acp::ToolCallId::new(format!("safety-{request_id}"))),
+        };
+
+        let title = match outside_targets.first() {
+            Some(target) => format!("{tool_name} — approval needed for {target}"),
+            None => format!("{tool_name} — approval needed"),
+        };
+        // The reason goes on `content` (so the desktop renders the question
+        // under the call, not hidden behind the args fold) AND on `raw_input`
+        // (where `mcp::dto` picks it up for the phone's
+        // `authorization_reason`). The title names the flagged target so the
+        // ask is legible even collapsed.
+        let update = acp::ToolCallUpdate::new(
+            target_id,
+            acp::ToolCallUpdateFields::new()
+                .title(title)
+                .content(vec![acp::ToolCallContent::Content(acp::Content::new(
+                    format!("**Approval needed — target outside the Solution.** {reason}"),
+                ))])
+                .raw_input(serde_json::json!({
+                    "command": input.get("command").cloned().unwrap_or_default(),
+                    "reason": reason,
+                    "outside_solution": outside_targets,
+                })),
+        );
+
+        let options = vec![
+            acp::PermissionOption::new("allow", "Allow once", acp::PermissionOptionKind::AllowOnce),
+            acp::PermissionOption::new("deny", "Reject", acp::PermissionOptionKind::RejectOnce),
+        ];
+
+        let task = thread.update(cx, |thread, cx| {
+            thread.request_tool_call_authorization(
+                update,
+                acp_thread::PermissionOptions::Flat(options),
+                acp_thread::AuthorizationKind::PermissionGrant,
+                cx,
+            )
+        });
+        // Any failure to raise the question (thread gone, upsert refused) must
+        // still produce a reply — a dropped question is the hang this fixes.
+        let allow = match task {
+            Ok(Ok(task)) => match task.await {
+                acp_thread::RequestPermissionOutcome::Selected(selected) => matches!(
+                    selected.option_kind,
+                    acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
+                ),
+                acp_thread::RequestPermissionOutcome::Cancelled => false,
+            },
+            Ok(Err(error)) => {
+                log::warn!("claude_native: could not raise tool authorization: {error}");
+                false
+            }
+            Err(error) => {
+                log::warn!("claude_native: thread gone while asking for authorization: {error}");
+                false
+            }
+        };
+        answer_tool_authorization(&request_id, &tool_name, &input, &outgoing, allow);
+    })
+    .detach();
+}
+
+/// Id of the newest tool call that is still awaiting a result for `tool_name` —
+/// the one the safety hook is asking about.
+fn newest_pending_tool_call(thread: &AcpThread, tool_name: &str) -> Option<acp::ToolCallId> {
+    thread.entries().iter().rev().find_map(|entry| {
+        let acp_thread::AgentThreadEntry::ToolCall(call) = entry else {
+            return None;
+        };
+        let matches_name = call
+            .tool_name
+            .as_ref()
+            .is_some_and(|name| name.as_ref() == tool_name);
+        let in_flight = matches!(
+            call.status,
+            acp_thread::ToolCallStatus::Pending | acp_thread::ToolCallStatus::InProgress
+        );
+        (matches_name && in_flight).then(|| call.id.clone())
+    })
 }
 
 impl AgentConnection for ClaudeNativeConnection {
@@ -2544,7 +2708,10 @@ mod tests {
             );
         }
         assert_eq!(leading_slash_command("/compact now"), Some("compact"));
-        assert_eq!(leading_slash_command("  /plugin:skill x"), Some("plugin:skill"));
+        assert_eq!(
+            leading_slash_command("  /plugin:skill x"),
+            Some("plugin:skill")
+        );
         assert_eq!(leading_slash_command("/home/spk/a.rs"), None);
         assert_eq!(leading_slash_command("no slash"), None);
     }
@@ -2553,20 +2720,40 @@ mod tests {
     fn generation_tool_requests_are_denied_without_changing_interactive_permissions() {
         for allow in [false, true] {
             let (sender, mut receiver) = futures::channel::mpsc::unbounded();
-            let envelope = serde_json::from_value(serde_json::json!({
-                "request_id": "unexpected-tool",
-                "request": {"subtype": "can_use_tool", "tool_name": "Bash",
-                    "tool_use_id": "t", "input": {"command": "touch should-not-exist"}}
-            }))
-            .unwrap();
-            answer_tool_authorization(envelope, sender, allow);
+            answer_tool_authorization(
+                "unexpected-tool",
+                "Bash",
+                &serde_json::json!({"command": "touch x"}),
+                &sender,
+                allow,
+            );
             let response = receiver.try_recv().unwrap();
             let response = serde_json::to_value(response).unwrap();
+            // The decision sits inside the nested success envelope — a flat
+            // body is ignored by the SDK (see `permission_response`).
             assert_eq!(
-                response["response"]["behavior"],
+                response["response"]["response"]["behavior"],
                 if allow { "allow" } else { "deny" }
             );
+            assert_eq!(response["response"]["subtype"], "success");
         }
+    }
+
+    /// Every control request must be answered. An unsupported subtype used to
+    /// be logged and dropped, which leaves claude waiting forever on a reply
+    /// it will never get — the stall this whole path exists to prevent.
+    #[test]
+    fn an_unsupported_control_request_is_declined_not_dropped() {
+        let parsed: crate::protocol::ControlRequestEnvelope =
+            serde_json::from_value(serde_json::json!({
+                "request_id": "future-subtype",
+                "request": {"subtype": "something_we_do_not_know", "x": 1}
+            }))
+            .unwrap();
+        assert!(matches!(
+            parsed.request,
+            crate::protocol::ControlRequestKind::Other
+        ));
     }
 
     #[test]

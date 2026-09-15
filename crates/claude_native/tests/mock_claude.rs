@@ -136,7 +136,7 @@ async fn delivers_control_request_and_writes_response(cx: &mut TestAppContext) {
     };
 
     process
-        .send_control_response(&request_id, true)
+        .send_control_response(&request_id, true, &serde_json::Value::Null)
         .expect("write control response");
 
     // The mock only emits `result` after it reads our control_response, so

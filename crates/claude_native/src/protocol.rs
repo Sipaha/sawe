@@ -140,16 +140,54 @@ pub struct ControlRequestEnvelope {
     pub request: ControlRequestKind,
 }
 
+/// Human-readable rendering of a `can_use_tool` request's `decision_reason`,
+/// or `None` when it carries none. Presence is what separates a safety-hook
+/// approval — which only the operator may answer — from the ordinary teammate
+/// gate the session policy answers on its own.
+pub fn decision_reason_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) if text.trim().is_empty() => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub enum ControlRequestKind {
+    /// Claude asks the client whether a tool may run. TWO shapes arrive here
+    /// and every field must be optional, because an unparsed control request is
+    /// never answered and claude then blocks forever waiting for a reply — it
+    /// stalls BEFORE spawning the shell, so the UI shows a tool "running" with
+    /// no process behind it and no way out but restarting the agent.
+    ///
+    /// * **Ordinary gate** (an Agent Teams teammate, which cannot inherit
+    ///   `bypassPermissions`): carries `tool_use_id`, no `decision_reason`.
+    /// * **Safety hook** (e.g. "Dangerous rm operation detected" for an `rm`
+    ///   whose target is a variable claude cannot prove non-empty): carries
+    ///   `decision_reason` and `display_name`, and **no `tool_use_id`** — the
+    ///   call has not been admitted yet, so no id exists. `tool_use_id` was
+    ///   declared required, so serde rejected the whole frame and
+    ///   `process.rs`'s reader dropped it with a warning. That was the hang.
+    ///
+    /// This class of approval is the one thing `--permission-mode
+    /// bypassPermissions` deliberately cannot auto-allow, so it must reach the
+    /// operator rather than be answered by policy.
     CanUseTool {
+        #[serde(default)]
         tool_name: String,
-        tool_use_id: String,
+        #[serde(default)]
+        tool_use_id: Option<String>,
         #[serde(default)]
         input: serde_json::Value,
         #[serde(default)]
         permission_suggestions: Vec<serde_json::Value>,
+        /// Why claude refused to decide on its own. A plain string today;
+        /// kept as `Value` so a richer shape tomorrow cannot resurrect the
+        /// dropped-frame hang.
+        #[serde(default)]
+        decision_reason: serde_json::Value,
     },
     /// `PostToolUse` / `Stop` hook firing from the SDK. Sent between the
     /// previous tool's `tool_result` and the next assistant generation; our
@@ -316,11 +354,41 @@ impl InputMessage {
     }
 
     /// Reply to a `can_use_tool` control request.
-    pub fn permission_response(request_id: impl Into<String>, allow: bool) -> Self {
+    ///
+    /// An allow MUST carry `updatedInput`: that is the input claude actually
+    /// runs, and the SDK treats a reply without it as malformed — it keeps
+    /// waiting, which looks exactly like the stall this whole path exists to
+    /// fix. Pass the request's own `input` back unchanged to approve as-is.
+    pub fn permission_response(
+        request_id: impl Into<String>,
+        allow: bool,
+        input: &serde_json::Value,
+    ) -> Self {
+        let decision = if allow {
+            serde_json::json!({
+                "behavior": "allow",
+                "updatedInput": input.clone(),
+            })
+        } else {
+            serde_json::json!({
+                "behavior": "deny",
+                "message": "Declined by the operator in Sawe.",
+            })
+        };
+        // The body must be NESTED — `{"subtype":"success","request_id":…,
+        // "response":<decision>}` — exactly as `build_hook_response` already
+        // does it, because `ControlResponse` only adds the outer `type` +
+        // `request_id`. A flat body is silently IGNORED by the SDK: claude
+        // keeps waiting on the approval, which is indistinguishable from the
+        // dropped-frame stall. Verified by A/B against a live claude: flat →
+        // never runs; nested → tool result 0.2 s later.
+        let request_id = request_id.into();
         Self::ControlResponse {
-            request_id: request_id.into(),
+            request_id: request_id.clone(),
             response: serde_json::json!({
-                "behavior": if allow { "allow" } else { "deny" },
+                "subtype": "success",
+                "request_id": request_id,
+                "response": decision,
             }),
         }
     }
@@ -377,6 +445,30 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+    /// The safety-hook variant of `can_use_tool` carries NO `tool_use_id` — it
+    /// is raised before the tool call is admitted, so there is no id yet. It
+    /// brings `display_name` / `description` / `decision_reason` instead. This
+    /// is the frame claude sends for "Dangerous rm operation detected", the one
+    /// class of approval that `bypassPermissions` explicitly cannot auto-allow.
+    /// Captured verbatim from a live 2.1.258 session.
+    #[test]
+    fn parses_safety_hook_can_use_tool_without_tool_use_id() {
+        let v = r#"{"type":"control_request","request_id":"77f18954","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"for n in a b; do D=/tmp/p/$n; rm -f \"$D\"/*.jar; done","description":"clean"},"description":"clean","permission_suggestions":[],"decision_reason":"Dangerous rm operation detected: '\"$D\"/*.jar'"}}"#;
+        match OutputMessage::parse(v).unwrap() {
+            OutputMessage::ControlRequest(env) => {
+                assert_eq!(env.request_id, "77f18954");
+                assert!(
+                    matches!(env.request, ControlRequestKind::CanUseTool { .. }),
+                    "a can_use_tool frame without tool_use_id must still be \
+                     recognised — dropping it leaves claude blocked forever \
+                     waiting for an approval that never comes: {:?}",
+                    env.request
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn parses_assistant_with_parent_tool_use_id() {
         let v = r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"role":"assistant","content":[]},"uuid":"u","session_id":"s"}"#;
@@ -480,11 +572,29 @@ mod tests {
     }
     #[test]
     fn serializes_permission_response_allow_and_deny() {
-        let allow = serde_json::to_string(&InputMessage::permission_response("r1", true)).unwrap();
+        let input = serde_json::json!({"command": "ls -la"});
+        let allow =
+            serde_json::to_string(&InputMessage::permission_response("r1", true, &input)).unwrap();
         assert!(allow.contains(r#""type":"control_response""#));
         assert!(allow.contains(r#""behavior":"allow""#));
-        let deny = serde_json::to_string(&InputMessage::permission_response("r1", false)).unwrap();
+        // Nested envelope, matching `build_hook_response`. Flat is ignored.
+        assert!(
+            allow.contains(r#""subtype":"success""#),
+            "the decision must sit inside a success envelope: {allow}"
+        );
+        // An allow without `updatedInput` is malformed to the SDK: it keeps
+        // waiting, which is indistinguishable from the stall this path fixes.
+        assert!(
+            allow.contains(r#""updatedInput":{"command":"ls -la"}"#),
+            "allow must echo the input back: {allow}"
+        );
+        let deny =
+            serde_json::to_string(&InputMessage::permission_response("r1", false, &input)).unwrap();
         assert!(deny.contains(r#""behavior":"deny""#));
+        assert!(
+            !deny.contains("updatedInput"),
+            "deny carries no input: {deny}"
+        );
     }
     #[test]
     fn set_model_control_request_wire_shape() {

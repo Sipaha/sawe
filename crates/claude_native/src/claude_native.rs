@@ -8,6 +8,7 @@ pub mod command;
 mod connection;
 pub mod process;
 pub mod protocol;
+pub mod tool_authorization;
 mod translate;
 mod watchdog;
 pub mod worktree_hook;

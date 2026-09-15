@@ -172,10 +172,17 @@ impl ClaudeProcess {
     }
 
     /// Reply to a `can_use_tool` control request from `claude` with an
-    /// allow/deny decision. `request_id` is the id `claude` sent.
-    pub fn send_control_response(&self, request_id: &str, allow: bool) -> Result<()> {
+    /// allow/deny decision. `request_id` is the id `claude` sent; `input` is
+    /// that request's own tool input, echoed back as `updatedInput` when
+    /// allowing (the SDK requires it — see [`InputMessage::permission_response`]).
+    pub fn send_control_response(
+        &self,
+        request_id: &str,
+        allow: bool,
+        input: &serde_json::Value,
+    ) -> Result<()> {
         self.outgoing
-            .unbounded_send(InputMessage::permission_response(request_id, allow))
+            .unbounded_send(InputMessage::permission_response(request_id, allow, input))
             .context("claude process stdin closed")
     }
 

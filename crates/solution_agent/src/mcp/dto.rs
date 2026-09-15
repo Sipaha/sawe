@@ -658,6 +658,25 @@ pub struct ToolCallSummary {
     /// `solution_agent.authorize_tool_call`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<ToolCallAuthOption>,
+    /// WHY this call needs a human answer, in the agent runtime's own words —
+    /// e.g. "Dangerous rm operation detected: `"$D"/*.jar` … points at the
+    /// filesystem root when the variable is unset or empty."
+    ///
+    /// Present only alongside `options`, and only for an approval the editor
+    /// could not settle by policy: a target it could not place inside the
+    /// Solution. Without it the phone shows two buttons and no question — the
+    /// reason otherwise survives only inside the truncated `args_preview`.
+    /// Gated by the `tool_auth_reason` `wire_features` token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_reason: Option<String>,
+}
+
+/// A live `WaitingForConfirmation` call's prompt, harvested off the thread:
+/// the choices plus, when the editor raised it, why it is being asked.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LiveToolAuth {
+    pub options: Vec<ToolCallAuthOption>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -978,7 +997,7 @@ pub(crate) fn summarize_entry(
     include_full_content: bool,
     include_images: bool,
     image_cursor: &mut usize,
-    live_auth_options: &HashMap<String, Vec<ToolCallAuthOption>>,
+    live_auth_options: &HashMap<String, LiveToolAuth>,
     body_delta: Option<&KnownEntryDto>,
     omit_preview_when_markdown: bool,
 ) -> EntrySummary {
@@ -1202,7 +1221,7 @@ pub(crate) fn extract_images_for_entry(
 /// transcript itself is served from the unified entry model.
 pub(crate) fn tool_call_summary(
     kind: &crate::session_entry::SessionEntryKind,
-    live_auth_options: &HashMap<String, Vec<ToolCallAuthOption>>,
+    live_auth_options: &HashMap<String, LiveToolAuth>,
 ) -> ToolCallSummary {
     use crate::session_entry::SessionEntryKind;
     let SessionEntryKind::ToolCall {
@@ -1226,6 +1245,7 @@ pub(crate) fn tool_call_summary(
             result_preview: String::new(),
             tool_status_started_at_ms: None,
             options: Vec::new(),
+            authorization_reason: None,
         };
     };
     let name = tool_name
@@ -1246,7 +1266,9 @@ pub(crate) fn tool_call_summary(
     let tool_status_started_at_ms = *status_started_at;
     // Surface authorization choices only while the call is blocked on the
     // user, sourced from the live thread (cold sessions have none).
-    let options = live_auth_options.get(id).cloned().unwrap_or_default();
+    let live = live_auth_options.get(id);
+    let options = live.map(|l| l.options.clone()).unwrap_or_default();
+    let authorization_reason = live.and_then(|l| l.reason.clone());
     ToolCallSummary {
         tool_call_id: id.clone(),
         name,
@@ -1255,6 +1277,7 @@ pub(crate) fn tool_call_summary(
         result_preview,
         tool_status_started_at_ms,
         options,
+        authorization_reason,
     }
 }
 
@@ -1266,7 +1289,7 @@ pub(crate) fn tool_call_summary(
 pub(crate) fn live_auth_options_for_session(
     session: &crate::model::SolutionSession,
     cx: &App,
-) -> HashMap<String, Vec<ToolCallAuthOption>> {
+) -> HashMap<String, LiveToolAuth> {
     let mut map = HashMap::new();
     let Some(thread) = session.acp_thread() else {
         return map;
@@ -1284,7 +1307,22 @@ pub(crate) fn live_auth_options_for_session(
                         is_allow: button.is_allow(),
                     })
                     .collect();
-                map.insert(call.id.0.to_string(), buttons);
+                // The editor puts its own explanation on `raw_input.reason`
+                // when it raises a safety-hook approval (see
+                // `claude_native::ask_operator_for_tool_authorization`).
+                let reason = call
+                    .raw_input
+                    .as_ref()
+                    .and_then(|v| v.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                map.insert(
+                    call.id.0.to_string(),
+                    LiveToolAuth {
+                        options: buttons,
+                        reason,
+                    },
+                );
             }
         }
     }
