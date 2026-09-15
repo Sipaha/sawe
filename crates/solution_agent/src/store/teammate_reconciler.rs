@@ -1103,6 +1103,65 @@ impl SolutionAgentStore {
         self.reconcile_finished_teammate_streams(session_id, cx);
     }
 
+    /// Tail the JSONL of every registered background agent the `fs.watch`
+    /// pipeline has not reported on recently, so a missed watch event costs one
+    /// tick instead of an hour.
+    ///
+    /// The watcher is a single point of failure with no self-healing of its own:
+    /// it can be armed on a directory the session has since rotated away from,
+    /// it can lose the race against claude creating `subagents/`, and the OS
+    /// watch backend can drop events under load. When that happened the agent
+    /// simply kept `latest: None` — invisible to every consumer of its
+    /// snapshot — until the reaper aged it out at
+    /// [`BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS`]. Making the 5 s tick a second
+    /// source demotes `fs.watch` to an optimisation (it still delivers
+    /// sub-second updates; this only covers what it misses).
+    ///
+    /// Cheap by construction: `tail_jsonl` reads forward from the agent's
+    /// `last_offset`, so a re-tail with nothing new is a `stat`, and an agent
+    /// whose watcher IS working has a snapshot newer than
+    /// [`BACKGROUND_AGENT_TAIL_FALLBACK_SECS`] and is skipped outright.
+    /// Terminal and killed agents are skipped too — no further line can arrive.
+    fn tail_unobserved_background_agents(&mut self, cx: &mut Context<Self>) {
+        let fallback_after =
+            std::time::Duration::from_secs(BACKGROUND_AGENT_TAIL_FALLBACK_SECS);
+        let now = std::time::SystemTime::now();
+        let session_ids: Vec<SolutionSessionId> =
+            self.all_sessions().map(|e| e.read(cx).id).collect();
+        let mut to_tail: Vec<(
+            SolutionSessionId,
+            crate::background_agent::BackgroundAgentId,
+        )> = Vec::new();
+        for session_id in session_ids {
+            let Some(session) = self.session(session_id) else {
+                continue;
+            };
+            let s = session.read(cx);
+            for id in &s.background_agent_order {
+                let Some(agent) = s.background_agents.get(id) else {
+                    continue;
+                };
+                if agent.killed {
+                    continue;
+                }
+                let needs_tail = match agent.latest.as_ref() {
+                    Some(snapshot) => {
+                        snapshot.stop_reason.is_none()
+                            && now.duration_since(snapshot.mtime).unwrap_or_default()
+                                > fallback_after
+                    }
+                    None => true,
+                };
+                if needs_tail {
+                    to_tail.push((session_id, id.clone()));
+                }
+            }
+        }
+        for (session_id, agent_id) in to_tail {
+            self.refresh_background_agent_snapshot(session_id, agent_id, cx);
+        }
+    }
+
     /// One pass over every session's background agents. The `Stop` hook
     /// ([`Self::close_teammate_on_stop`]) closes every normal completion the
     /// moment it happens, so this tick is now a pure backstop: it removes
@@ -1119,7 +1178,12 @@ impl SolutionAgentStore {
     /// #9). Dead detection itself (orange pill) is rendering-side using the
     /// same stale timeout — the tick just drops the entries that have fully
     /// expired.
+    ///
+    /// It is also the FALLBACK source of snapshots: see
+    /// [`Self::tail_unobserved_background_agents`], which runs first so the
+    /// reaping below decides on the freshest state available.
     pub fn tick_background_agents(&mut self, cx: &mut Context<Self>) {
+        self.tail_unobserved_background_agents(cx);
         let expiry = std::time::Duration::from_secs(
             MANAGED_AGENT_STALE_TIMEOUT_SECS + MANAGED_AGENT_DEAD_LINGER_SECS,
         );

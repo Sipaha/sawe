@@ -84,6 +84,15 @@ const MANAGED_AGENT_DEAD_LINGER_SECS: u64 = 300;
 /// completion notification can ever arrive) is reaped on the ordinary
 /// `STALE + DEAD_LINGER` timeout instead — that orphan is the real leak case.
 const BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS: u64 = 60 * 60;
+/// How stale a managed agent's last snapshot may get before the 5 s tick
+/// re-tails its JSONL itself instead of waiting for an `fs.watch` event
+/// ([`SolutionAgentStore::tail_unobserved_background_agents`]). An agent whose
+/// watcher is working is refreshed within ~200 ms of every write and never
+/// crosses this; one whose watcher is dead (rotated ACP session, lost create
+/// race, dropped OS event) is picked up on the next tick rather than staying
+/// unobserved until the reaper. Comfortably above the watch debounce so a
+/// healthy agent is never double-tailed, and far below any liveness cutoff.
+const BACKGROUND_AGENT_TAIL_FALLBACK_SECS: u64 = 30;
 /// How long a session may sit in `Running` with zero streaming activity AND no
 /// in-progress tool call before the stuck-session watchdog
 /// ([`SolutionAgentStore::tick_stuck_sessions`]) treats its subprocess as

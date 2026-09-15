@@ -3548,3 +3548,149 @@ async fn arming_the_agent_watcher_materialises_the_watched_directory(cx: &mut Te
         "arming must materialise the watched directory, or the watch is dead on arrival"
     );
 }
+
+/// `fs.watch` is an OPTIMISATION, not the only source of truth. It can be armed
+/// on the wrong directory (a rotated ACP session), lose the create-race, or be
+/// dropped by the OS watch backend — and when it does, nothing else ever tailed
+/// the JSONL, so the agent kept `latest: None` for the full hour until the
+/// reaper aged it out. The 5 s `tick_background_agents` pass already walks every
+/// registered agent; it must also tail the ones it has not observed recently, so
+/// a missed watch event costs a tick rather than an hour.
+#[gpui::test]
+async fn the_tick_snapshots_an_agent_whose_watcher_never_fired(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("bg_unwatched");
+
+    let dir = tempfile::tempdir().unwrap();
+    let jsonl = dir.path().join("agent-bg_unwatched.jsonl");
+    std::fs::write(
+        &jsonl,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}}"#,
+    )
+    .unwrap();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| {
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: jsonl.clone(),
+                    registered_at: chrono::Utc::now(),
+                    // The watcher never fired: no snapshot was ever taken.
+                    latest: None,
+                    last_offset: 0,
+                    parent_tool_use_id: Some(SharedString::from("toolu_unwatched")),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id.clone());
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.tick_background_agents(cx));
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            let agent = s
+                .background_agents
+                .get(&bg_id)
+                .expect("agent still registered");
+            assert_eq!(
+                agent
+                    .latest
+                    .as_ref()
+                    .and_then(|snap| snap.stop_reason.as_ref())
+                    .map(|r| r.to_string()),
+                Some("end_turn".to_string()),
+                "the tick must tail the JSONL of an agent the watcher never reported"
+            );
+            assert!(
+                !agent.is_messageable(),
+                "the terminal stop_reason must reach the liveness predicate"
+            );
+        });
+    });
+}
+
+/// The tick's fallback tail must stay cheap: an agent whose `fs.watch` pipeline
+/// IS delivering has a snapshot only milliseconds old, and re-reading its JSONL
+/// every 5 s would be pure waste (and would churn `change_seq` on every live
+/// teammate in every open session). Only an agent that has gone unobserved past
+/// `BACKGROUND_AGENT_TAIL_FALLBACK_SECS` is tailed — `last_offset` is the
+/// witness, since `refresh_background_agent_snapshot` always advances it.
+#[gpui::test]
+async fn the_tick_does_not_re_tail_a_freshly_observed_agent(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let fresh = crate::background_agent::BackgroundAgentId::new("bg_fresh");
+    let stale = crate::background_agent::BackgroundAgentId::new("bg_stale");
+
+    let dir = tempfile::tempdir().unwrap();
+    let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#;
+    let fresh_jsonl = dir.path().join("agent-bg_fresh.jsonl");
+    let stale_jsonl = dir.path().join("agent-bg_stale.jsonl");
+    std::fs::write(&fresh_jsonl, line).unwrap();
+    std::fs::write(&stale_jsonl, line).unwrap();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| {
+            let mut register = |id: &crate::background_agent::BackgroundAgentId,
+                                jsonl: &std::path::Path,
+                                observed_secs_ago: u64| {
+                s.background_agents.insert(
+                    id.clone(),
+                    crate::background_agent::BackgroundAgent {
+                        id: id.clone(),
+                        jsonl_path: jsonl.to_path_buf(),
+                        registered_at: chrono::Utc::now(),
+                        latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                            mtime: std::time::SystemTime::now()
+                                - std::time::Duration::from_secs(observed_secs_ago),
+                            activity_label: SharedString::from("Generating…"),
+                            stop_reason: None,
+                            usage_limited: false,
+                        }),
+                        last_offset: 0,
+                        parent_tool_use_id: None,
+                        latest_seq: 0,
+                        killed: false,
+                    },
+                );
+                s.background_agent_order.push(id.clone());
+            };
+            register(&fresh, &fresh_jsonl, 0);
+            register(&stale, &stale_jsonl, BACKGROUND_AGENT_TAIL_FALLBACK_SECS + 10);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| store.tick_background_agents(cx));
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.read_with(cx, |s, _| {
+            assert_eq!(
+                s.background_agents.get(&fresh).unwrap().last_offset,
+                0,
+                "an agent observed moments ago must not be re-tailed by the fallback"
+            );
+            assert!(
+                s.background_agents.get(&stale).unwrap().last_offset > 0,
+                "an agent unobserved past the fallback window must be tailed"
+            );
+        });
+    });
+}
