@@ -27,7 +27,7 @@ pub struct SeedColdSessionEntry {
     /// `"user"`, `"assistant"` (default), `"observer"`/`"system"` (an
     /// agent-invisible Observer `System` bubble — FORK.md #29), or `"nudge"` (an
     /// agent-VISIBLE observer nudge — a UserMessage carrying the observer-nudge
-    /// `_meta` marker; renders the "Наблюдатель · агенту" plaque).
+    /// `_meta` marker; renders the "Observer · to the agent" plaque).
     pub role: String,
     /// `toolu_…` teammate id, or omitted/empty for a Main entry.
     pub subagent_id: Option<String>,
@@ -137,7 +137,7 @@ impl McpServerTool for SeedColdSessionTool {
                 } else if e.role.eq_ignore_ascii_case("nudge") {
                     // Agent-VISIBLE observer nudge: a UserMessage whose chunk
                     // carries the `spk_observer_nudge` `_meta` marker so
-                    // `render_user_message` paints the "Наблюдатель · агенту"
+                    // `render_user_message` paints the "Observer · to the agent"
                     // plaque (not a plain user bubble) — distinct from the
                     // agent-invisible `observer` note above. Lets the screenshot
                     // gate show both observer bubbles at once.

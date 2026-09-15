@@ -521,7 +521,7 @@ impl SolutionAgentStore {
                             self.push_system_note(
                                 session_id,
                                 acp_thread::SystemNoteLevel::Error,
-                                "Достигнут лимит claude — текущий ход остановлен.",
+                                "claude usage limit reached — the current turn was stopped.",
                                 cx,
                             );
                             self.apply_usage_limit_stop(session_id, &wall, cx);

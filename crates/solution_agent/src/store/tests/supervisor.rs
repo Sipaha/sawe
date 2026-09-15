@@ -2478,6 +2478,70 @@ async fn escalate_sets_marker_and_waiting(cx: &mut gpui::TestAppContext) {
     assert_eq!(q.as_deref(), Some("Which API did you mean?"));
 }
 
+/// Regression: a long markdown escalation must reach the three operator
+/// surfaces at three different lengths. Before this, `escalate_to_user` put the
+/// SAME paragraph on all of them, so the pinned banner re-printed — as raw,
+/// unrendered markdown — the very text the Observer bubble had just rendered
+/// directly above it, and the desktop toast was an unreadable slab.
+#[gpui::test]
+async fn escalation_condenses_the_banner_and_keeps_the_bubble_full(cx: &mut gpui::TestAppContext) {
+    let (id, thread, _tmp) = create_session_with_thread(cx).await;
+    let store = cx.update(|cx| SolutionAgentStore::global(cx));
+    let question = "Этап Б закрыт полностью, кроме Б8 (живая проверка end-to-end). \
+                    Числа с диска: медиатор 541 тест, хост 681, фронт 231 сьют.\n\n\
+                    **(а) Разрешаете** поднять настоящий `ecos-integrations` локально \
+                    с профилем `dev_local`?"
+        .to_string();
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.escalate_to_user(id, question.clone(), cx);
+    });
+
+    let banner = store.read_with(cx, |store, cx| {
+        store
+            .session(id)
+            .unwrap()
+            .read(cx)
+            .supervisor_question
+            .clone()
+    });
+    let note = thread.read_with(cx, |thread, _| {
+        thread.entries().iter().rev().find_map(|entry| match entry {
+            acp_thread::AgentThreadEntry::SystemNote(note)
+                if note.level == acp_thread::SystemNoteLevel::Observer =>
+            {
+                Some(note.text.to_string())
+            }
+            _ => None,
+        })
+    });
+
+    let banner = banner.expect("escalation must set the banner");
+    assert_eq!(
+        banner.as_ref(),
+        "Этап Б закрыт полностью, кроме Б8 (живая проверка end-to-end). \
+         Числа с диска: медиатор 541 тест, хост 681, фронт 231 сьют.",
+        "the banner carries the lede only — at most the first two sentences"
+    );
+    assert!(
+        banner.chars().count() < question.chars().count(),
+        "the banner must be a condensation, not a copy"
+    );
+    assert!(
+        banner.chars().count() <= crate::supervisor::GIST_MAX_CHARS,
+        "banner must stay within the gist budget: {banner:?}"
+    );
+    assert!(
+        !banner.contains("**") && !banner.contains('`'),
+        "banner is a plain Label — markdown markup must not leak into it: {banner:?}"
+    );
+    assert_eq!(
+        note.as_deref(),
+        Some(question.as_str()),
+        "the in-chat Observer bubble keeps the FULL markdown question"
+    );
+}
+
 /// Regression: a human reply into a supervised session that is paused in
 /// `WaitingUser` (after an `ask`) must RESUME supervision (→ `Watching`) and
 /// clear the question banner — but ONLY for a genuine user send (`from_user:

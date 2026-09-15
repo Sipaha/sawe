@@ -241,9 +241,9 @@ impl BackgroundAgent {
             )
         } else if self.hit_usage_limit() {
             format!(
-                "{activity}\n\nЛимит claude достигнут — этот фоновый агент \
-                 остановлен и не завершил работу. Наблюдатель перезапустит \
-                 после сброса лимита."
+                "{activity}\n\nclaude usage limit reached — this background agent \
+                 was stopped and did NOT finish its work. The Observer will \
+                 restart it once the limit resets."
             )
         } else {
             activity
@@ -365,7 +365,7 @@ pub fn parse_jsonl_snapshot(line: &str) -> BackgroundAgentSnapshot {
             let usage_limited = assistant_text(&message)
                 .is_some_and(|text| crate::supervisor::is_usage_limit_error(&text));
             let label = if usage_limited {
-                SharedString::new_static("Достигнут лимит claude")
+                SharedString::new_static("claude usage limit reached")
             } else {
                 derive_assistant_label(&message)
             };

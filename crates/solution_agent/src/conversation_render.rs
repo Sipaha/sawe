@@ -446,12 +446,12 @@ pub(crate) fn render_entry(
                 SystemEntryLevel::Info => (IconName::Info, Color::Muted, "System"),
                 SystemEntryLevel::Error => (IconName::Warning, Color::Error, "System"),
                 // Agent-INVISIBLE observer note (the agent never sees this) — a
-                // crossed-eye icon + "только вам" tag + a dashed border mark it
+                // crossed-eye icon + "you only" tag + a dashed border mark it
                 // as private to the operator, visually distinct from the
                 // agent-VISIBLE observer nudge (plain eye, solid border,
-                // "агенту") rendered in `render_user_message` below.
+                // "to the agent") rendered in `render_user_message` below.
                 SystemEntryLevel::Observer => {
-                    (IconName::EyeOff, Color::Accent, "Наблюдатель · только вам")
+                    (IconName::EyeOff, Color::Accent, "Observer · you only")
                 }
             };
             let is_observer_note = matches!(level, SystemEntryLevel::Observer);

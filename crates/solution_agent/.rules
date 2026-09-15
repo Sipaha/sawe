@@ -39,6 +39,11 @@ These came up multiple times during initial implementation. Each is **non-obviou
 - Empty-input MCP tools need a custom `Deserialize` that tolerates a missing or `null` `arguments` field. See `ListSessionsParams` for the canonical pattern (delegate to a private `Helper` struct, default on parse error).
 - E2E tests **must** call `editor_mcp::set_runtime_dir_for_test(tempdir)` before `editor_mcp::init` and `start_server`. Without it, tests collide with the user's real `~/.config/sawe/mcp.{lock,sock}`. Cargo's `tests/` convention runs each `tests/*.rs` as a separate binary — keep one e2e scenario per file because `start_server` binds the runtime-dir socket once per process.
 
+## Prompt resources carry no example in the user's language
+
+- `resources/*.md` (`supervisor_judge_instructions`, `supervisor_audit_instructions`, `compact_context_instructions`) and the prompt consts (`SUPERVISOR_SYSTEM_PROMPT`) are English like everything else shipped (see "Product language" in the repo-root `AGENTS.md`), **including their example sentences**. The judge picks its OUTPUT language at runtime from the template's "Language" section (the user's language, read off the intent record), so writing an example in that language does not help it — and a model that sees a Russian sample sentence will happily paste it into an English conversation.
+- Guard: `grep -rlP '[\x{0400}-\x{04FF}]' crates/solution_agent/resources/` must come back empty.
+
 ## Event prefixes
 
 - All MCP events from this crate use `agent_session_*`, **not** `session_*`. Defensive namespacing against future subsystems emitting similar event names.

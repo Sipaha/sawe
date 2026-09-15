@@ -178,9 +178,9 @@ pub(crate) fn render_user_message(
                     .child(
                         // Agent-VISIBLE observer nudge (delivered into the thread
                         // AS a message the agent acts on) — plain eye + solid
-                        // border (above) + "агенту", distinct from the
+                        // border (above) + "to the agent", distinct from the
                         // agent-invisible operator-only note (EyeOff, dashed).
-                        Label::new("Наблюдатель · агенту")
+                        Label::new("Observer · to the agent")
                             .size(LabelSize::XSmall)
                             .color(color),
                     ),

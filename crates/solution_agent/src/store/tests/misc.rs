@@ -6311,7 +6311,7 @@ async fn reconnect_resume_failure_surfaces_after_retry(cx: &mut TestAppContext) 
             match state {
                 SessionState::Errored(msg) => {
                     assert!(
-                        msg.contains("перезапустите"),
+                        msg.contains("restart the agent"),
                         "terminal error must carry actionable guidance (not stuck at \
                          reconnecting…), got {msg:?}"
                     );
@@ -6750,11 +6750,11 @@ async fn restart_and_watchdog_respawn_report_differently(cx: &mut TestAppContext
             match state {
                 SessionState::Errored(msg) => {
                     assert!(
-                        msg.contains("перезапуск"),
+                        msg.contains("restart failed"),
                         "a user-initiated restart must report itself as a restart, got {msg:?}"
                     );
                     assert!(
-                        !msg.contains("переподключение"),
+                        !msg.contains("reconnect"),
                         "must not blame a reconnect the user did not ask for, got {msg:?}"
                     );
                 }
@@ -6786,11 +6786,11 @@ async fn restart_and_watchdog_respawn_report_differently(cx: &mut TestAppContext
             match state {
                 SessionState::Errored(msg) => {
                     assert!(
-                        msg.contains("переподключение"),
+                        msg.contains("reconnect failed"),
                         "the watchdog must report itself as a reconnect, got {msg:?}"
                     );
                     assert!(
-                        !msg.contains("перезапуск"),
+                        !msg.contains("restart failed"),
                         "the watchdog must not claim the user pressed Restart, got {msg:?}"
                     );
                 }

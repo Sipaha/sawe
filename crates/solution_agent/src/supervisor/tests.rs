@@ -611,8 +611,7 @@ fn eta_same_local_day_is_time_only() {
         .with_ymd_and_hms(2026, 8, 26, 21, 0, 0)
         .unwrap();
     let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
-    assert_eq!(eta.log, "21:00");
-    assert_eq!(eta.user, "21:00");
+    assert_eq!(eta, "21:00");
 }
 
 #[test]
@@ -625,8 +624,7 @@ fn eta_next_local_day_carries_date() {
         .with_ymd_and_hms(2026, 8, 27, 9, 0, 0)
         .unwrap();
     let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
-    assert_eq!(eta.log, "Aug 27 09:00");
-    assert_eq!(eta.user, "27 авг, 09:00");
+    assert_eq!(eta, "Aug 27 09:00");
 }
 
 /// The weekly-limit case that motivated this fix: a reset days out must not
@@ -641,8 +639,7 @@ fn eta_days_out_carries_date() {
         .with_ymd_and_hms(2026, 8, 29, 21, 0, 0)
         .unwrap();
     let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
-    assert_eq!(eta.log, "Aug 29 21:00");
-    assert_eq!(eta.user, "29 авг, 21:00");
+    assert_eq!(eta, "Aug 29 21:00");
 }
 
 /// The naive-24h-delta trap: resume is under an hour away but crosses local
@@ -657,6 +654,5 @@ fn eta_just_after_midnight_is_different_day_despite_short_delta() {
         .with_ymd_and_hms(2026, 8, 27, 0, 30, 0)
         .unwrap();
     let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
-    assert_eq!(eta.log, "Aug 27 00:30");
-    assert_eq!(eta.user, "27 авг, 00:30");
+    assert_eq!(eta, "Aug 27 00:30");
 }

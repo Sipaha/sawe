@@ -8,8 +8,8 @@
 //! preamble + wrapping code-fences before handing it back to the
 //! resolver, which renders it as a diff against the current Result buffer.
 //!
-//! Internal call only — never exposed as an MCP tool (per the
-//! plan: AI-тулы не выставляются как MCP — это internal calls). The
+//! Internal call only — never exposed as an MCP tool (per the plan: AI tools
+//! are not published as MCP, they are internal calls). The
 //! suggestion is ALSO never auto-applied: the resolver shows it in a
 //! review modal and the user must explicitly Accept.
 

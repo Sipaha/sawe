@@ -960,7 +960,7 @@ impl SolutionAgentStore {
                             // Clearing it dropped the user's message on the
                             // floor with nothing but a log line, while
                             // `maybe_send_reconnect_continuation` went on to send
-                            // its canned "твой процесс завис" nudge — so the chat
+                            // its canned "your process stopped responding" nudge — so the chat
                             // showed a recovery that silently ate what the user
                             // had said. Keeping the bundles lets the normal
                             // idle-flush deliver them as the turn after the

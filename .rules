@@ -387,6 +387,27 @@ If you discover a non-obvious pattern that would help future sessions, include a
 
 Mechanical post-feature maintenance is fine without a separate suggestion (e.g. bumping the tool catalog count when a new MCP namespace lands). Architectural rules and "trap to avoid" entries follow the suggestion path.
 
+## Product language
+
+Everything the product ships is **English**: UI labels, buttons, tooltips,
+status text, system notes pushed into a chat (`push_system_note`), error
+strings, and every prompt sent to a model (`crates/*/resources/*.md`, prompt
+consts). English is the base language, not a fallback — there is no localisation
+layer yet, and when one arrives it will translate *from* these strings.
+
+The trap this replaces: parts of the fork used to hand-roll Russian UI strings
+(observer plaques, usage-limit notices, reconnect notes) because the maintainer
+is Russian-speaking. That is gone. Do not reintroduce it, and do not "match the
+surrounding style" if you find a stray Russian string — translate it.
+
+Two deliberate exceptions, both non-shipping:
+- **Verbatim quotes** in comments, `FORK.md` and `docs/findings/*` — the
+  maintainer's own words («…») recorded as evidence for why a decision was made.
+  Translating a quote destroys what it is for.
+- **Test fixtures and parser input samples** that exist precisely to exercise
+  non-ASCII handling (Unicode folder names, multi-byte truncation, the Cyrillic
+  sample of claude's own output in `supervisor/state.rs`). Keep those.
+
 ## High bar for new rules
 Editing or clarifying existing rules is always welcome. New rules must meet **all three** criteria:
 1. **Non-obvious** — someone familiar with the codebase would still get it wrong without the rule.

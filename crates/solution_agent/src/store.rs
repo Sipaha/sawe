@@ -1051,19 +1051,17 @@ impl RespawnReason {
 
     fn failure_status(self) -> &'static str {
         match self {
-            RespawnReason::Watchdog => {
-                "переподключение не удалось — перезапустите агента (Restart)"
-            }
-            RespawnReason::UserRestart => "перезапуск не удался — история цела, попробуйте ещё раз",
+            RespawnReason::Watchdog => "reconnect failed — restart the agent (Restart)",
+            RespawnReason::UserRestart => "restart failed — history is intact, try again",
         }
     }
 
     fn recovered_note(self) -> &'static str {
         match self {
             RespawnReason::Watchdog => {
-                "Агент не отвечал — переподключил сессию (история и контекст сохранены)."
+                "The agent stopped responding — reconnected the session (history and context kept)."
             }
-            RespawnReason::UserRestart => "Агент перезапущен (история и контекст сохранены).",
+            RespawnReason::UserRestart => "Agent restarted (history and context kept).",
         }
     }
 }
@@ -3258,7 +3256,7 @@ impl SolutionAgentStore {
         // `claude --resume <same session id>` still executing the interrupted
         // turn, and the reconnect spawns a SECOND one on the same id. Both then
         // write the same worktree and append the same transcript — every
-        // "Агент не отвечал — переподключил сессию" added another writer.
+        // "The agent stopped responding — reconnected the session" added another writer.
         // Observed live: three processes resuming one session, committing over
         // each other in a shared worktree.
         if let Some(thread) = session.read(cx).acp_thread().cloned() {
@@ -5412,8 +5410,19 @@ impl SolutionAgentStore {
                         "Awaiting your input after {} min",
                         decision.elapsed.as_secs() / 60
                     ),
+                    // An agent error can be a multi-paragraph dump (stack
+                    // trace, provider JSON). A toast shows ~2 lines, so send
+                    // the lede; the full text stays on the session state.
                     notifier::NotifyKind::Errored => match &next {
-                        SessionState::Errored(msg) => format!("Failed: {msg}"),
+                        SessionState::Errored(msg) => {
+                            let gist = crate::supervisor::short_gist(msg);
+                            let body = if gist.is_empty() {
+                                msg.as_ref()
+                            } else {
+                                gist.as_str()
+                            };
+                            format!("Failed: {body}")
+                        }
                         _ => "Failed".to_string(),
                     },
                 };

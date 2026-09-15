@@ -1169,8 +1169,7 @@ impl SolutionAgentStore {
                     self.append_supervisor_diary_note(
                             id,
                             &format!(
-                                "usage limit hit; auto-resume scheduled ~{} local (reset + 2-15min jitter)",
-                                eta.log
+                                "usage limit hit; auto-resume scheduled ~{eta} local (reset + 2-15min jitter)"
                             ),
                             cx,
                         );
@@ -1178,8 +1177,7 @@ impl SolutionAgentStore {
                             id,
                             acp_thread::SystemNoteLevel::Info,
                             format!(
-                                "Достигнут лимит claude. Наблюдатель продолжит сессию автоматически примерно в {}.",
-                                eta.user
+                                "claude usage limit reached. The Observer will resume the session automatically around {eta}."
                             ),
                             cx,
                         );
@@ -1639,9 +1637,17 @@ impl SolutionAgentStore {
     }
 
     /// Escalate a supervisor question to the user: set `WaitingUser`, store
-    /// the question on the session for the banner, surface it in-chat as an
-    /// agent-invisible Observer bubble, fire a high-priority desktop
-    /// notification, and emit `SessionStateChanged`.
+    /// the question's GIST on the session for the banner, surface the FULL
+    /// question in-chat as an agent-invisible Observer bubble, fire a
+    /// high-priority desktop notification (gist again), and emit
+    /// `SessionStateChanged`.
+    ///
+    /// The three surfaces deliberately carry different lengths. The transcript
+    /// bubble renders markdown and scrolls, so it gets everything. The banner
+    /// and the toast are plain-text attention strips with no renderer and ~2
+    /// lines of room: dumping the same paragraph there printed raw `**bold**`
+    /// twice — once properly rendered in the bubble, once as an unreadable slab
+    /// right under it — so both get `short_gist` (≤2 sentences).
     pub(crate) fn escalate_to_user(
         &mut self,
         id: SolutionSessionId,
@@ -1652,10 +1658,14 @@ impl SolutionAgentStore {
             state.status = crate::supervisor::SupervisorStatus::WaitingUser;
         }
         self.persist_supervisor_state(id, cx);
+        let gist = crate::supervisor::short_gist(&question);
         if let Some(session) = self.session(id) {
-            session.update(cx, |s, _| {
-                s.supervisor_question = Some(question.clone().into())
-            });
+            let banner = if gist.is_empty() {
+                question.clone()
+            } else {
+                gist.clone()
+            };
+            session.update(cx, |s, _| s.supervisor_question = Some(banner.into()));
         }
         // Surface the observer's question in the transcript as an Observer
         // bubble (FORK.md #29 render — eye badge, Accent). It is a `SystemNote`,
@@ -1670,7 +1680,7 @@ impl SolutionAgentStore {
             cx,
         );
         let title = "Sawe — Supervisor".to_string();
-        let body = format!("🛡 {question}");
+        let body = format!("🛡 {}", if gist.is_empty() { &question } else { &gist });
         crate::notifier::dispatch_raw(
             id,
             crate::notifier::NotifyKind::AwaitingInput,
@@ -1708,7 +1718,11 @@ impl SolutionAgentStore {
             cx,
         );
         let title = "Sawe — Supervisor".to_string();
-        let body = format!("{label}: {reason}");
+        // Toast body is the lede only — `reason` is a full markdown paragraph
+        // (for `done` it is the whole session summary). The untruncated text
+        // stays in the Observer bubble above and in the durable session log.
+        let gist = crate::supervisor::short_gist(reason);
+        let body = format!("{label}: {}", if gist.is_empty() { reason } else { &gist });
         // A park is "the agent is blocked on YOU" — the same attention class as
         // `AwaitingInput` (→ high-priority toast), not a genuine completion.
         let kind = if is_park {
@@ -1770,7 +1784,7 @@ impl SolutionAgentStore {
         // The nudge is the SINGLE visible element: stamp it with the
         // `spk_observer_nudge` `_meta` marker so `conversation_render` shows it
         // as an OBSERVER comment (eye plaque) instead of a plain user bubble. We
-        // no longer emit a separate "Наблюдатель направил агента: …" breadcrumb
+        // no longer emit a separate "Observer directed the agent: …" breadcrumb
         // note — the marked message itself carries the full instruction and the
         // observer attribution, so the old two-element layout (gist note + plain
         // bubble) is gone. The marker rides on `_meta`, invisible to the agent's
@@ -1947,7 +1961,7 @@ impl SolutionAgentStore {
                     self.push_system_note(
                         id,
                         acp_thread::SystemNoteLevel::Error,
-                        "Достигнут лимит claude — текущий ход остановлен (без переподключения).",
+                        "claude usage limit reached — the current turn was stopped (no reconnect).",
                         cx,
                     );
                     self.apply_usage_limit_stop(id, &message, cx);
@@ -2102,7 +2116,7 @@ impl SolutionAgentStore {
                         // judge — charging it as a transient failure would, over
                         // repeated phantoms, spiral to a FALSE
                         // `Stopped(ProviderError)` that silently kills supervision
-                        // (and breaks the "продолжит автоматически" quota promise on
+                        // (and breaks the "will resume automatically" quota promise on
                         // a cold-restored tab). Un-wedge to `Watching` with NO
                         // penalty; the fire re-engages once the session warms up.
                         if let Some(st) = self.supervisor_states.get_mut(&id) {
