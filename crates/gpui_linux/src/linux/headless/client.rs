@@ -9,7 +9,8 @@ use crate::linux::headless::HeadlessDisplay;
 use crate::linux::{LinuxClient, LinuxCommon, LinuxKeyboardLayout};
 use gpui::{
     AnyWindowHandle, Bounds, CursorStyle, DisplayId, HeadlessWindow, Pixels, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, Size, WindowParams, px,
+    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, Size, WeakHeadlessWindow,
+    WindowParams, px,
 };
 
 /// Default canonical viewport for the native headless platform. Matches
@@ -55,16 +56,22 @@ use gpui_wgpu::{DEFAULT_OFFSCREEN_HEIGHT, DEFAULT_OFFSCREEN_WIDTH, WgpuHeadlessR
 
 /// One open window's tracked state in `HeadlessClient`.
 ///
-/// We retain the `HeadlessWindow` itself (not just the `AnyWindowHandle`) so
-/// the refresh timer can call `window.refresh()` directly — that fires the
-/// `request_frame` callback gpui registered, which drives `Window::draw` →
-/// scene build → atlas upload → `rendered_frame.scene` populated. Without
-/// the timer, gpui would paint once at startup and stay frozen on async
-/// state changes (file loads, git status arriving, etc.), and a subsequent
-/// `workspace.screenshot` would see a stale first-paint scene.
+/// We retain a handle to the `HeadlessWindow` itself (not just the
+/// `AnyWindowHandle`) so the refresh timer can call `window.refresh()`
+/// directly — that fires the `request_frame` callback gpui registered, which
+/// drives `Window::draw` → scene build → atlas upload → `rendered_frame.scene`
+/// populated. Without the timer, gpui would paint once at startup and stay
+/// frozen on async state changes (file loads, git status arriving, etc.), and
+/// a subsequent `workspace.screenshot` would see a stale first-paint scene.
+///
+/// WEAK on purpose. A closed window is closed by gpui dropping its
+/// `Box<dyn PlatformWindow>` — there is no platform-side close callback to
+/// hook, the way X11 has `X11ClientStatePtr::drop_window`. Holding a clone
+/// here made that drop a no-op, so nothing ever left `windows`: see
+/// [`HeadlessClient::live_windows`].
 struct TrackedWindow {
     handle: AnyWindowHandle,
-    window: HeadlessWindow,
+    window: WeakHeadlessWindow,
 }
 
 pub struct HeadlessClientState {
@@ -107,14 +114,7 @@ impl HeadlessClient {
             .insert_source(
                 calloop::timer::Timer::immediate(),
                 move |mut instant, (), client: &mut HeadlessClient| {
-                    let windows: Vec<HeadlessWindow> = client
-                        .0
-                        .borrow()
-                        .windows
-                        .iter()
-                        .map(|tracked| tracked.window.clone())
-                        .collect();
-                    for window in windows {
+                    for window in client.live_windows() {
                         window.refresh(RequestFrameOptions {
                             require_presentation: false,
                             force_render: false,
@@ -138,6 +138,43 @@ impl HeadlessClient {
             windows: Vec::new(),
             display,
         })))
+    }
+
+    /// The windows gpui still owns, dropping any that have closed.
+    ///
+    /// This is the ONLY removal path. The headless platform has no close
+    /// event: gpui closes a window by dropping its `Box<dyn PlatformWindow>`,
+    /// so "is it still open" is exactly "does the weak handle still upgrade".
+    /// Without this the refresh timer kept ticking closed windows forever —
+    /// each tick firing a dead `request_frame` callback whose three
+    /// `handle.update()` calls all failed, measured at 187 "window not found"
+    /// ERROR lines per second, enough to rotate the log away in a minute, plus
+    /// a leaked offscreen renderer per closed window.
+    ///
+    /// Returns owned windows and releases the borrow before the caller uses
+    /// them: `refresh()` re-enters gpui, which can call back into this client.
+    fn live_windows(&self) -> Vec<HeadlessWindow> {
+        let mut state = self.0.borrow_mut();
+        let mut live = Vec::with_capacity(state.windows.len());
+        state
+            .windows
+            .retain(|tracked| match tracked.window.upgrade() {
+                Some(window) => {
+                    live.push(window);
+                    true
+                }
+                None => false,
+            });
+        live
+    }
+
+    /// Drop closed windows without collecting the live ones — for the handle
+    /// accessors, which must not answer with a window that is already gone.
+    fn prune_closed_windows(&self) {
+        self.0
+            .borrow_mut()
+            .windows
+            .retain(|tracked| tracked.window.upgrade().is_some());
     }
 }
 
@@ -184,11 +221,15 @@ impl LinuxClient for HeadlessClient {
         // Last-opened window, matching the X11/Wayland behaviour where the
         // most recently focused window is the "active" one. `dispatch_action`
         // routes through here, so returning `None` (the old stub) silently
-        // dropped action dispatches in headless mode.
+        // dropped action dispatches in headless mode — and answering with a
+        // CLOSED window's handle drops them just as silently, which is what
+        // tracking a never-removed clone used to do.
+        self.prune_closed_windows();
         self.0.borrow().windows.last().map(|t| t.handle)
     }
 
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
+        self.prune_closed_windows();
         let state = self.0.borrow();
         if state.windows.is_empty() {
             None
@@ -253,10 +294,12 @@ impl LinuxClient for HeadlessClient {
 
         // Track the window (not just the handle) so the refresh timer can
         // call `refresh()` on it directly — `AnyWindowHandle` alone won't
-        // let us reach the request_frame callback.
+        // let us reach the request_frame callback. Weakly, so that the box
+        // returned below is the only strong reference and closing the window
+        // is enough to untrack it.
         self.0.borrow_mut().windows.push(TrackedWindow {
             handle,
-            window: window.clone(),
+            window: window.downgrade(),
         });
 
         Ok(Box::new(window))
@@ -293,5 +336,94 @@ impl LinuxClient for HeadlessClient {
             .expect("App is already running");
 
         event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        AnyWindowHandle, Context, IntoElement, Render, WindowHandle, WindowId, WindowKind, div,
+    };
+
+    /// `WindowHandle::<V>::new` is the only public way to mint an
+    /// `AnyWindowHandle`, and it needs a concrete view type. The window is
+    /// never drawn here — only the platform-side bookkeeping is under test.
+    struct TestRoot;
+
+    impl Render for TestRoot {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn window_params() -> WindowParams {
+        WindowParams {
+            bounds: Bounds {
+                origin: Point::new(px(0.0), px(0.0)),
+                size: Size::new(px(320.0), px(240.0)),
+            },
+            titlebar: None,
+            kind: WindowKind::Normal,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            focus: false,
+            show: false,
+            icon: None,
+            display_id: None,
+            window_min_size: None,
+        }
+    }
+
+    fn handle(id: u64) -> AnyWindowHandle {
+        WindowHandle::<TestRoot>::new(WindowId::from(id)).into()
+    }
+
+    /// A window gpui has dropped must stop being tracked. Before this was
+    /// enforced, `open_window` pushed a clone that nothing ever removed, so the
+    /// 60Hz refresh timer kept firing the dead window's `request_frame`
+    /// callback forever — three failed `handle.update()` per frame, measured at
+    /// 187 "window not found" ERROR lines per second, which rotated the real
+    /// log away in about a minute. `active_window()` also kept answering with
+    /// the dead handle, so action dispatch had nowhere to go.
+    #[test]
+    fn a_window_gpui_dropped_stops_being_tracked() {
+        let client = HeadlessClient::new();
+        let first = handle(1);
+        let second = handle(2);
+
+        let first_window = client.open_window(first, window_params()).unwrap();
+        let second_window = client.open_window(second, window_params()).unwrap();
+        assert_eq!(client.window_stack().unwrap(), vec![first, second]);
+        assert_eq!(client.active_window(), Some(second));
+
+        // What `solutions.open` does: the replacement window is up and the old
+        // one is closed. gpui drops its `Box<dyn PlatformWindow>`; nothing else
+        // may keep the platform side alive.
+        drop(first_window);
+        assert_eq!(
+            client.window_stack().unwrap(),
+            vec![second],
+            "a dropped window must leave the stack"
+        );
+        assert_eq!(client.active_window(), Some(second));
+        assert_eq!(
+            client.live_windows().len(),
+            1,
+            "the refresh timer must not keep ticking a dropped window"
+        );
+
+        drop(second_window);
+        assert!(
+            client.window_stack().is_none(),
+            "no windows left means no window stack"
+        );
+        assert_eq!(client.active_window(), None);
+        assert!(client.live_windows().is_empty());
     }
 }

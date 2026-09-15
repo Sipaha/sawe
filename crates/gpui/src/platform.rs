@@ -83,7 +83,7 @@ pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream}
 
 #[cfg(any(test, feature = "bench"))]
 pub use bench_dispatcher::BenchDispatcher;
-pub use headless::{HeadlessDisplay, HeadlessWindow};
+pub use headless::{HeadlessDisplay, HeadlessWindow, WeakHeadlessWindow};
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test::VisualTestPlatform;

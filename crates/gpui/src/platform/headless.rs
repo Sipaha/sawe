@@ -12,4 +12,4 @@ mod display;
 mod window;
 
 pub use display::HeadlessDisplay;
-pub use window::HeadlessWindow;
+pub use window::{HeadlessWindow, WeakHeadlessWindow};

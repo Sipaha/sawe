@@ -52,7 +52,31 @@ pub(crate) struct HeadlessWindowState {
 #[derive(Clone)]
 pub struct HeadlessWindow(Rc<Mutex<HeadlessWindowState>>);
 
+/// A non-owning handle to a [`HeadlessWindow`].
+///
+/// The platform client tracks its open windows through this rather than
+/// through a clone, so that the only STRONG reference is the
+/// `Box<dyn PlatformWindow>` gpui holds. Closing a window drops that box, and
+/// the client's next look at its tracked windows finds this weak handle dead
+/// and prunes it. Tracking a clone instead kept the closed window alive and
+/// being ticked forever — see `HeadlessClient::live_windows`.
+#[derive(Clone)]
+pub struct WeakHeadlessWindow(std::rc::Weak<Mutex<HeadlessWindowState>>);
+
+impl WeakHeadlessWindow {
+    /// The window, if gpui still owns it. `None` once the window has closed.
+    pub fn upgrade(&self) -> Option<HeadlessWindow> {
+        self.0.upgrade().map(HeadlessWindow)
+    }
+}
+
 impl HeadlessWindow {
+    /// A non-owning handle to this window. See [`WeakHeadlessWindow`] for why
+    /// the platform client must not hold a clone instead.
+    pub fn downgrade(&self) -> WeakHeadlessWindow {
+        WeakHeadlessWindow(Rc::downgrade(&self.0))
+    }
+
     /// Build a new headless window. `display` is used for `display()` /
     /// scale-factor reporting; `renderer`, when present, satisfies
     /// `render_to_image`.
