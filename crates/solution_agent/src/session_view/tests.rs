@@ -1311,3 +1311,126 @@ async fn slash_clear_recovers_cold_error_without_sending_a_prompt(cx: &mut gpui:
         assert!(session.acp_thread().unwrap().read(cx).entries().is_empty());
     });
 }
+
+/// The compact-context prompt is a ~100-line agent-only template, and the
+/// transcript renderer already folds it into a one-line chip
+/// (`render_compaction_prompt_chip`). But a Compact issued while the agent is
+/// mid-turn never reaches the transcript: it is parked in `pending_messages`
+/// and painted by the SEPARATE queued-bubble path, which rendered its markdown
+/// verbatim — so the whole template unfolded into the chat, exactly what the
+/// fold exists to prevent. (The mobile client does not have this hole: it
+/// re-renders queued bundles through the same `UserBubble` that carries the
+/// fold.)
+///
+/// Both sides are asserted: a compaction bundle must paint the chip and NOT the
+/// full body, and an ordinary follow-up must still paint the full body.
+#[gpui::test]
+async fn a_queued_compaction_prompt_paints_the_folded_chip(cx: &mut gpui::TestAppContext) {
+    use crate::session_view::render_queue::{
+        QUEUED_BODY_FULL_SELECTOR, QUEUED_COMPACT_CHIP_SELECTOR,
+    };
+    use crate::store::SolutionAgentStore;
+    use gpui::VisualTestContext;
+    use std::sync::Arc;
+
+    let (solution_id, _tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+    });
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let workspace_window =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| {
+        workspace_window
+            .root(cx)
+            .expect("workspace window alive")
+            .downgrade()
+    });
+
+    let session = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            crate::store::tests::insert_cold_session(
+                session_id,
+                solution_id,
+                agent_id.clone(),
+                Some(120_000),
+                Some(project.clone()),
+                store,
+                cx,
+            )
+        })
+    });
+
+    // Queue the compact prompt exactly as `send_message_blocks` does: a
+    // standalone `[HH:MM:SS] ` stamp block, then the template.
+    let queue_bundle = |blocks: Vec<acp::ContentBlock>, cx: &mut gpui::App| {
+        session.update(cx, |s, cx| {
+            cx.notify();
+            s.pending_messages.clear();
+            s.pending_messages.push_back(crate::model::PendingBundle {
+                origin: crate::model::MessageOrigin::User,
+                id: uuid::Uuid::new_v4(),
+                target: crate::model::QueueTarget::Main,
+                blocks,
+            });
+        });
+    };
+
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(
+            session_id,
+            session.clone(),
+            workspace_weak.clone(),
+            window,
+            cx,
+        )
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+
+    vcx.update(|_window, cx| {
+        queue_bundle(
+            vec![
+                text_block("[14:23:01] "),
+                text_block(
+                    "# Compact this session and prepare a clean handoff\n\n\
+                     The user or autonomous supervisor requested compaction. This may be for \
+                     context headroom or recovery; do not assume the context is full.\n",
+                ),
+            ],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.debug_bounds(QUEUED_COMPACT_CHIP_SELECTOR).is_some(),
+        "a queued compact-context prompt must paint the folded chip"
+    );
+    assert!(
+        vcx.debug_bounds(QUEUED_BODY_FULL_SELECTOR).is_none(),
+        "…and must NOT also dump the whole template into the queued bubble"
+    );
+
+    // An ordinary follow-up is unaffected.
+    vcx.update(|_window, cx| {
+        queue_bundle(
+            vec![text_block("[14:24:10] "), text_block("keep going please")],
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+
+    assert!(
+        vcx.debug_bounds(QUEUED_BODY_FULL_SELECTOR).is_some(),
+        "an ordinary queued follow-up still paints its full body"
+    );
+    assert!(
+        vcx.debug_bounds(QUEUED_COMPACT_CHIP_SELECTOR).is_none(),
+        "…and must not be mistaken for the compaction prompt"
+    );
+}

@@ -22,6 +22,14 @@ use ui::prelude::*;
 use ui::{Color, IconName, IconSize, Label, LabelSize, Tooltip};
 
 use super::SolutionSessionView;
+
+/// `debug_selector` on the queued bubble's FULL-markdown body. Paired with
+/// [`QUEUED_COMPACT_CHIP_SELECTOR`] so a paint test can assert which of the two
+/// shapes actually rendered — asserting the predicate alone would not.
+pub(crate) const QUEUED_BODY_FULL_SELECTOR: &str = "QUEUED-BODY-FULL";
+/// `debug_selector` on the folded compact-context chip shown in place of the
+/// full body when the queued bundle IS the auto-injected compaction prompt.
+pub(crate) const QUEUED_COMPACT_CHIP_SELECTOR: &str = "QUEUED-COMPACT-CHIP";
 use crate::conversation_render::{decode_image_local, open_image_preview};
 use crate::model::SessionState;
 
@@ -42,6 +50,16 @@ impl SolutionSessionView {
             return None;
         }
         let is_running = matches!(self.session.read(cx).state, SessionState::Running { .. });
+        // A Compact issued while the agent is mid-turn is parked here like any
+        // follow-up — but it is a ~100-line agent-only template, not something
+        // the user wrote. The transcript renderer folds it into a one-line chip;
+        // this path used to paint its markdown verbatim, so the whole template
+        // unfolded into the chat while it waited. Fold it here too. Only when
+        // EVERY queued bundle is the compact prompt: a merged bundle carrying a
+        // real follow-up alongside it must still show the user their own words.
+        let is_compaction = bundles
+            .iter()
+            .all(|bundle| crate::compact::is_compaction_blocks(&bundle.blocks));
 
         // Ghost bubble: selectable markdown text + clickable `[image #N]`
         // links wired through `spk-image://` to `open_image_preview`. Reuses
@@ -69,19 +87,40 @@ impl SolutionSessionView {
                 }
             }
             let images_for_handler = images;
-            let body = MarkdownElement::new(entity, style).on_url_click(move |url, window, cx| {
-                if let Some(idx_str) = url.strip_prefix("spk-image://")
-                    && let Ok(idx) = idx_str.parse::<usize>()
-                    && let Some(image) = images_for_handler.get(idx).cloned()
-                {
-                    open_image_preview(image, window, cx);
-                    return;
-                }
-                cx.open_url(url.as_ref());
-            });
+            let body: AnyElement = if is_compaction {
+                // `usize::MAX` keeps the chip's element id clear of the
+                // transcript's own compaction chips, which key on entry index.
+                crate::conversation_render::render_compaction_prompt_chip(
+                    usize::MAX,
+                    Some(entity),
+                    Some(style),
+                    self.pending_markdown_source.to_string(),
+                    cx,
+                )
+            } else {
+                MarkdownElement::new(entity, style)
+                    .on_url_click(move |url, window, cx| {
+                        if let Some(idx_str) = url.strip_prefix("spk-image://")
+                            && let Ok(idx) = idx_str.parse::<usize>()
+                            && let Some(image) = images_for_handler.get(idx).cloned()
+                        {
+                            open_image_preview(image, window, cx);
+                            return;
+                        }
+                        cx.open_url(url.as_ref());
+                    })
+                    .into_any_element()
+            };
             Some(
                     h_flex().w_full().child(
                         div()
+                            .debug_selector(move || {
+                                if is_compaction {
+                                    QUEUED_COMPACT_CHIP_SELECTOR.into()
+                                } else {
+                                    QUEUED_BODY_FULL_SELECTOR.into()
+                                }
+                            })
                             .relative()
                             .w_full()
                             .px_2p5()
