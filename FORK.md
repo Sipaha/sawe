@@ -4192,3 +4192,30 @@ cancel semantics were and whether the new one can honour them. If it cannot, the
 new channel must be an alternative to the old, not a stage of it. And before
 trusting a predicate built out of an existing helper, check what that helper
 actually scans — `entries` is not one agent's transcript.
+
+### 176. The headless platform has no close event — ownership is the signal
+
+`HeadlessClient::open_window` tracked each window by pushing a `HeadlessWindow`
+CLONE into its `windows` vec, and nothing ever removed one. Every other backend
+has a platform-side teardown to hook (X11 removes its entry from
+`X11ClientStatePtr::drop_window`); the headless backend has none, because gpui
+closes a window by dropping the `Box<dyn PlatformWindow>` it owns. Holding a
+clone made that drop a no-op, so the 60 Hz refresh timer kept firing the dead
+window's `request_frame` callback forever — three failed `handle.update()` per
+frame, **12 786 `window not found` ERROR lines per minute**, enough to rotate a
+1 MB log away in under a minute (which cost three probe runs before anyone
+looked at why the log kept resetting). It also leaked the closed window's
+offscreen wgpu renderer, and left `active_window()` — the routing point for
+`dispatch_action` — answering with a dead handle.
+
+So `TrackedWindow` holds a `WeakHeadlessWindow`: the box gpui owns is the ONLY
+strong reference, "is it still open" is exactly "does the weak handle upgrade",
+and `HeadlessClient::live_windows()` is the single removal path (the two handle
+accessors prune too, so neither can answer with a window that is gone). Details
+and the A/B in `docs/findings/2026-09-15-log-noise-triage.md`.
+
+How to apply: when a backend has no teardown callback to hook, do not invent
+bookkeeping that outlives the thing it describes — hold the tracked object
+weakly so the owner's drop IS the event. And treat a log that rotates itself
+away as a bug to investigate, not a fact of life: it is usually one call site
+firing at frame rate, and it destroys every other signal in the file.

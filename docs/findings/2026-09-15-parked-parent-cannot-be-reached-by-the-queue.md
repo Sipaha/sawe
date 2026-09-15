@@ -90,8 +90,12 @@ while Idle — and `Done in 3s` no longer claims completion while work continues
 
 - The probe editor's log rotated every ~60s under a flood of
   `gpui/window.rs … window not found` ERRORs in headless mode, which threw away
-  the INFO lines being measured. `ZED_LOG="solution_agent=info,gpui=off"`.
-  (`ZED_LOG` / `RUST_LOG`; without either, only ERROR is recorded.)
+  the INFO lines being measured. Worked around at the time with
+  `ZED_LOG="solution_agent=info,gpui=off"`; the flood itself is fixed in
+  `2026-09-15-log-noise-triage.md`, so plain `script/run-mcp` is enough now.
+  **Correction to what this file first said:** INFO *is* on by default
+  (`LEVEL_ENABLED_MAX_DEFAULT`); the ERROR-only logs that suggested otherwise
+  were simply rotated copies containing nothing but the flood.
 - `solution_agent.get_session`'s `entries` are the demuxed **Main** stream, so a
   teammate's in-flight tool is invisible there — which is exactly why the
   first three probe runs could not see why the predicate refused to fire. Read
