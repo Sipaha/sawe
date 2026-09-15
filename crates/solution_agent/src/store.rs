@@ -368,6 +368,14 @@ pub struct SolutionAgentStore {
     peer_wake_sessions: std::collections::HashSet<SolutionSessionId>,
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
+    /// Cold sessions whose member directory is gone, and the member list they
+    /// were last reported against. `gc_orphan_members` runs on EVERY
+    /// `SolutionStoreEvent::Changed`, and a stranded cold session stays
+    /// stranded — re-logging it each sweep produced 1583 identical WARN lines
+    /// (44% of the user's log) for ~23 sessions across 69 sweeps. The
+    /// condition is standing, not an event, so it is reported once and again
+    /// only when it actually changes.
+    cold_orphan_warnings: HashMap<SolutionSessionId, String>,
     pool: parking_lot::Mutex<SubprocessPool>,
     persistence: Option<Arc<SolutionAgentDb>>,
     default_permission_mode: SessionPermissionMode,
@@ -1129,6 +1137,7 @@ impl SolutionAgentStore {
             peer_wake_sessions: Default::default(),
             sessions: HashMap::new(),
             by_solution: HashMap::new(),
+            cold_orphan_warnings: HashMap::new(),
             pool: parking_lot::Mutex::new(SubprocessPool::new()),
             persistence: None,
             default_permission_mode: Default::default(),

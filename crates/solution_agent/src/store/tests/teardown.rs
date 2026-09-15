@@ -961,6 +961,50 @@ async fn gc_orphan_members_purges_only_removed_member_sessions(cx: &mut gpui::Te
              logged, NOT hard-purged — see gc_orphan_members' doc"
         );
     });
+
+    // The warning must be reported once per SITUATION, not once per sweep.
+    // `gc_orphan_members` runs on every `SolutionStoreEvent::Changed`, and the
+    // stranding does not change between sweeps — re-logging it put 1583
+    // identical WARN lines (44% of the log) in front of the user.
+    let situation = store.read_with(cx, |store, _| {
+        assert_eq!(
+            store.cold_orphan_warnings.len(),
+            1,
+            "only the cold orphan is recorded; the purged live one is gone"
+        );
+        store
+            .cold_orphan_warnings
+            .get(&cold_orphan)
+            .cloned()
+            .expect("the cold orphan was reported")
+    });
+
+    store.update(cx, |store, cx| store.gc_orphan_members(cx));
+    cx.run_until_parked();
+    store.read_with(cx, |store, _| {
+        assert_eq!(
+            store.cold_orphan_warnings.get(&cold_orphan),
+            Some(&situation),
+            "an unchanged stranding must not be re-reported on the next sweep"
+        );
+    });
+
+    // Re-adding the member un-strands it, so the record is dropped and a future
+    // removal is reported again rather than staying silent forever.
+    cx.update(|cx| {
+        let solution_store = solutions::SolutionStore::try_global(cx).expect("solution store");
+        solution_store.update(cx, |s, _| {
+            s.test_add_member_with_path(sol, "also", root.join("also-removed-member"));
+        });
+    });
+    store.update(cx, |store, cx| store.gc_orphan_members(cx));
+    cx.run_until_parked();
+    store.read_with(cx, |store, _| {
+        assert!(
+            store.cold_orphan_warnings.is_empty(),
+            "a session that stopped being orphaned must stop being recorded"
+        );
+    });
 }
 
 #[gpui::test]

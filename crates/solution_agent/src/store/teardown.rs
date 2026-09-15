@@ -349,6 +349,10 @@ impl SolutionAgentStore {
         // Collect orphan ids first; purging mutates `by_solution`, so we must not
         // iterate it while purging.
         let mut orphans: Vec<SolutionSessionId> = Vec::new();
+        // Cold orphans seen by THIS sweep, each with the situation it is
+        // stranded in. Compared against the previous sweep's map so a standing
+        // condition is reported once — see `cold_orphan_warnings`.
+        let mut cold_orphans: HashMap<SolutionSessionId, String> = HashMap::new();
         for (solution_id, session_ids) in &self.by_solution {
             let Some((root, members)) = roots.get(solution_id) else {
                 // Whole solution vanished — handled by gc_orphan_solutions.
@@ -391,27 +395,38 @@ impl SolutionAgentStore {
                     continue;
                 }
                 if session.acp_thread().is_none() {
-                    log::warn!(
-                        target: "solution_agent::gc",
-                        "solution={} session={} title={:?} cwd={} is orphaned \
-                         (no current member covers it) but was restored from disk \
-                         and never resumed — NOT purging. Current members: [{}]. \
-                         Close the chat to archive it, or re-add the member.",
-                        solution_id.0,
-                        id,
-                        session.title,
-                        cwd.display(),
-                        members
-                            .iter()
-                            .map(|m| m.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
+                    let members_label = members
+                        .iter()
+                        .map(|m| m.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    // The situation this session is stranded in. Re-report only
+                    // when it changes (member added/removed, cwd rewritten by a
+                    // rename) — the sweep itself runs on every store mutation.
+                    let situation = format!("{}|{}", cwd.display(), members_label);
+                    if self.cold_orphan_warnings.get(id) != Some(&situation) {
+                        log::warn!(
+                            target: "solution_agent::gc",
+                            "solution={} session={} title={:?} cwd={} is orphaned \
+                             (no current member covers it) but was restored from disk \
+                             and never resumed — NOT purging. Current members: [{}]. \
+                             Close the chat to archive it, or re-add the member.",
+                            solution_id.0,
+                            id,
+                            session.title,
+                            cwd.display(),
+                            members_label,
+                        );
+                    }
+                    cold_orphans.insert(*id, situation);
                     continue;
                 }
                 orphans.push(*id);
             }
         }
+        // Drops sessions that stopped being stranded (member re-added, session
+        // closed), so a later re-orphaning is reported again.
+        self.cold_orphan_warnings = cold_orphans;
         for id in orphans {
             // The member dir is gone but the solution (and its root) is still in
             // the store, so `purge_session_hard` resolves the archive path via
