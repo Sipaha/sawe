@@ -1398,7 +1398,7 @@ async fn refresh_rebuilds_a_detached_agent_pill_so_it_is_not_frozen(cx: &mut Tes
 /// A terminal `stop_reason` observed in the JSONL tail no longer closes the
 /// async `Agent` teammate's demux `Teammate` stream — the subagent `Stop`
 /// hook is the sole close authority (Task 1). The snapshot content is still
-/// updated (feeds `is_messageable`/supervisor gating), but the stream stays
+/// updated (feeds `transcript_is_open`/supervisor gating), but the stream stays
 /// live until the hook fires.
 #[gpui::test]
 async fn background_agent_terminal_does_not_close_teammate_stream(cx: &mut TestAppContext) {
@@ -3189,7 +3189,7 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
 /// thread so a fresh subprocess can be spawned) every still-running background
 /// agent died with that process. Before the fix nothing marked them, so their
 /// teammate tabs kept painting `Live` ("Agent … · running") for work that no
-/// longer existed, and `is_messageable()` kept reporting them as live background
+/// longer existed, and `transcript_is_open()` kept reporting them as live background
 /// work (which suppresses the stuck-session watchdog, `turn_is_wedged`).
 ///
 /// The terminal state is `killed`, NOT a `stop_reason` completion: the agent was
@@ -3256,7 +3256,7 @@ async fn dropping_the_thread_kills_background_agents(cx: &mut TestAppContext) {
                 );
             }
             assert!(
-                s.background_agents.values().all(|a| a.is_messageable()),
+                s.background_agents.values().all(|a| a.transcript_is_open()),
                 "running agents count as live background work"
             );
         });
@@ -3279,7 +3279,7 @@ async fn dropping_the_thread_kills_background_agents(cx: &mut TestAppContext) {
             "every background agent of a dropped subprocess is killed"
         );
         assert!(
-            s.background_agents.values().all(|a| !a.is_messageable()),
+            s.background_agents.values().all(|a| !a.transcript_is_open()),
             "a killed agent is NOT live background work — else the stuck-session \
              watchdog stays suppressed forever after a reconnect"
         );
@@ -3614,7 +3614,7 @@ async fn the_tick_snapshots_an_agent_whose_watcher_never_fired(cx: &mut TestAppC
                 "the tick must tail the JSONL of an agent the watcher never reported"
             );
             assert!(
-                !agent.is_messageable(),
+                !agent.transcript_is_open(),
                 "the terminal stop_reason must reach the liveness predicate"
             );
         });

@@ -310,7 +310,7 @@ impl SolutionAgentStore {
                     // completing (`mark_background_shell_state`). Only on the
                     // transition into terminal (a done agent's JSONL stops
                     // growing, so this fires once). `stop_reason` still feeds
-                    // `is_messageable`/supervisor gating, but no longer drives a
+                    // `transcript_is_open`/supervisor gating, but no longer drives a
                     // stream close — the subagent `Stop` hook is the sole close
                     // authority (`close_teammate_on_stop`).
                     let was_terminal = ba.latest.as_ref().is_some_and(|s| s.stop_reason.is_some());

@@ -124,7 +124,7 @@ const TOOL_OUTPUT_SILENCE_SECS: u64 = 15 * 60;
 /// given its newest in-progress tool call as `(tool_secs, shows_liveness)` —
 /// how long that tool has been running and whether it's still making progress —
 /// and whether the session has live background work (see
-/// [`background_work_shows_liveness`]).
+/// [`crate::model::SolutionSession::has_live_background_work`]).
 /// `None` means no tool is executing: claude hung between steps → wedged, UNLESS
 /// background work is running, because a parent awaiting its background agents
 /// has exactly this shape (the spawning `Agent` call completes immediately) and
@@ -138,14 +138,6 @@ fn turn_is_wedged(active_tool: Option<(i64, bool)>, background_alive: bool) -> b
         Some((tool_secs, shows_liveness)) => tool_secs >= TOOL_STUCK_SECS as i64 && !shows_liveness,
         None => !background_alive,
     }
-}
-
-/// Whether a background agent still vouches for its silent parent, given how long
-/// its JSONL has been quiet. A teammate counts as liveness only while it is itself
-/// making progress: past [`TOOL_OUTPUT_SILENCE_SECS`] of silence it stops
-/// suppressing the watchdog, so a hung parent+teammate pair is still recovered.
-fn background_work_shows_liveness(quiet_secs: i64) -> bool {
-    quiet_secs < TOOL_OUTPUT_SILENCE_SECS as i64
 }
 
 /// How long after an auto-reconnect the stuck-turn watchdog must leave a
@@ -2637,7 +2629,7 @@ impl SolutionAgentStore {
             || s.is_compaction_pending()
             || s.background_agents
                 .values()
-                .any(|agent| agent.is_messageable())
+                .any(|agent| agent.transcript_is_open())
             || s.background_shells.values().any(|shell| {
                 matches!(
                     shell.state,
@@ -5371,13 +5363,7 @@ impl SolutionAgentStore {
         // done/ask notification when the work actually concludes.
         let (has_pending_messages, has_live_background_work, is_supervisor_ephemeral) = {
             let s = session.read(cx);
-            let has_live_background_work =
-                s.background_shells.values().any(|sh| {
-                    matches!(
-                        sh.state,
-                        crate::background_shell::ShellRuntimeState::Running
-                    )
-                }) || s.background_agents.values().any(|a| a.is_messageable());
+            let has_live_background_work = s.has_live_background_work(Utc::now());
             (
                 !s.pending_messages.is_empty(),
                 has_live_background_work,

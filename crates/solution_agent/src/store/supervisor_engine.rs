@@ -1886,21 +1886,7 @@ impl SolutionAgentStore {
                 // spawning `Agent` call returns immediately) — the exact shape
                 // `turn_is_wedged` otherwise reads as a hang. A teammate only
                 // vouches for the parent while its own JSONL keeps growing.
-                let background_alive = s.background_shells.values().any(|shell| {
-                    matches!(
-                        shell.state,
-                        crate::background_shell::ShellRuntimeState::Running
-                    )
-                }) || s.background_agents.values().any(|agent| {
-                    let last_seen: chrono::DateTime<Utc> = agent
-                        .latest
-                        .as_ref()
-                        .map_or(agent.registered_at, |snapshot| snapshot.mtime.into());
-                    agent.is_messageable()
-                        && background_work_shows_liveness(
-                            now.signed_duration_since(last_seen).num_seconds(),
-                        )
-                });
+                let background_alive = s.has_live_background_work(now);
                 if !turn_is_wedged(active_tool, background_alive) {
                     return None;
                 }
@@ -2009,7 +1995,8 @@ impl SolutionAgentStore {
 
     pub(crate) fn tick_supervisor(&mut self, cx: &mut Context<Self>) {
         use crate::model::SessionState;
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
 
         // Auditor-stuck sweep: a meta-auditor spawns while the supervised
         // session is `Watching` (not `Judging`), so the judge-stuck timeout in
@@ -2162,14 +2149,10 @@ impl SolutionAgentStore {
                 // launched is legitimately idle — the agent is waiting on that
                 // work, so there is nothing for the supervisor to judge. Live =
                 // any background shell still `Running`, or any managed agent that
-                // has not hit a terminal stop.
-                let has_live_background_work =
-                    s.background_shells.values().any(|sh| {
-                        matches!(
-                            sh.state,
-                            crate::background_shell::ShellRuntimeState::Running
-                        )
-                    }) || s.background_agents.values().any(|a| a.is_messageable());
+                // still vouches for its parent
+                // ([`BackgroundAgent::vouches_for_parent`] — the one predicate
+                // this gate, the stuck-turn watchdog and the notifier share).
+                let has_live_background_work = s.has_live_background_work(now);
                 (
                     idle_or_errored,
                     s.last_activity_at.timestamp_millis(),

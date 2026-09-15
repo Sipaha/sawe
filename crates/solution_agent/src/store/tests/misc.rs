@@ -1691,7 +1691,7 @@ async fn reset_context_swaps_acp_thread_without_bumping_count(cx: &mut TestAppCo
 /// `/clear` (and `/compact`, which swaps the thread the same way) closes the
 /// PRE-reset acp session, killing the subprocess every async `Agent` teammate
 /// was a child of. Those children never get a `stop_reason`, so unless the swap
-/// itself marks them killed they keep `is_messageable()` true forever: the
+/// itself marks them killed they keep `transcript_is_open()` true forever: the
 /// teammate pill paints Live, the supervisor skips every tick on
 /// `has_live_background_work`, and the stuck-session watchdog stays shielded
 /// until the 1h stale backstop. Before the fix `set_acp_thread` only marked them
@@ -1735,7 +1735,7 @@ async fn reset_context_kills_the_orphaned_background_agents(cx: &mut TestAppCont
             );
             s.background_agent_order.push(bg_id.clone());
             assert!(
-                s.background_agents.values().any(|a| a.is_messageable()),
+                s.background_agents.values().any(|a| a.transcript_is_open()),
                 "teammate counts as live background work before the reset"
             );
             assert!(s.streams.contains_key(&teammate), "teammate stream is live");
@@ -1763,7 +1763,7 @@ async fn reset_context_kills_the_orphaned_background_agents(cx: &mut TestAppCont
                 "the thread swap orphaned the agent — it must be marked killed"
             );
             assert!(
-                !s.background_agents.values().any(|a| a.is_messageable()),
+                !s.background_agents.values().any(|a| a.transcript_is_open()),
                 "has_live_background_work must be false after the swap"
             );
         });

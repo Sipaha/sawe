@@ -159,22 +159,96 @@ pub const KILLED_REASON: SharedString = SharedString::new_static("killed");
 /// replaced): the work is paused at the wall, awaiting the reset.
 pub const USAGE_LIMIT_REASON: SharedString = SharedString::new_static("limit reached");
 
+/// Silence budget for a managed agent we HAVE observed at least once: how long
+/// its JSONL may go without a new line before it stops vouching for its silent
+/// parent. Generous on purpose (hardening #9) — a background agent inside one
+/// long quiet tool call (a multi-minute build, a slow test suite, a quiet
+/// network call) writes nothing for the duration and is not dead. Deliberately
+/// the same number the reaper uses for a live-parent agent, so "still vouches"
+/// and "still tracked" expire together.
+pub const BACKGROUND_AGENT_QUIET_MAX_SECS: i64 = 60 * 60;
+
+/// Grace period for a managed agent that was registered but has NEVER been
+/// snapshotted. This is the state the fork's three liveness predicates used to
+/// disagree on, and the one that silenced the Observer on session `qv09rxtm`:
+/// the supervisor gate read "no snapshot" as alive with no expiry at all, so a
+/// single agent whose JSONL was never tailed held that gate shut until the
+/// 1-hour reaper removed it.
+///
+/// Unproven liveness gets a BOUNDED grace instead. Short is safe here because
+/// the 5 s tick now tails every registered agent's JSONL itself
+/// (`tail_unobserved_background_agents`): an agent that is running at all is
+/// observed within seconds, so still having no snapshot at the end of the grace
+/// means there is no transcript to read — the dispatch never produced one.
+pub const BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS: i64 = 5 * 60;
+
 impl BackgroundAgent {
-    /// True while the managed agent is still running — no terminal
-    /// `stop_reason` has been observed in its JSONL yet (or it has only
-    /// just registered, before any snapshot) AND its parent subprocess is
-    /// still the one that spawned it. Since phase 6d-tail this only
-    /// feeds the supervisor's `has_live_background_work` gate (the compose row
-    /// no longer branches on it — async agents render as view-only `Task`
-    /// teammate tabs). A `killed` agent is NOT live work: counting it there
-    /// would suppress the stuck-session watchdog forever after a reconnect.
-    pub fn is_messageable(&self) -> bool {
+    /// Has this agent's transcript NOT ended? True while no terminal
+    /// `stop_reason` has been observed in its JSONL (including before the first
+    /// snapshot), its parent subprocess is still the one that spawned it, and it
+    /// has not parked at a usage-limit wall.
+    ///
+    /// **This is not a liveness predicate** — that is
+    /// [`Self::vouches_for_parent`], and conflating the two is what this
+    /// function used to be called `is_messageable` for. The difference is time:
+    /// "the transcript has not ended" is a fact about what was observed and
+    /// never expires, so it answers bookkeeping questions — does this agent
+    /// still get a tab ([`Self::renders_stream`]), does a reconnect have to mark
+    /// it `killed`, does it block a permission-mode change. It must NOT answer
+    /// "is this agent still working", because an agent whose JSONL was never
+    /// readable satisfies it forever.
+    pub fn transcript_is_open(&self) -> bool {
         !self.killed
             && !self.hit_usage_limit()
             && self
                 .latest
                 .as_ref()
                 .map_or(true, |snapshot| snapshot.stop_reason.is_none())
+    }
+
+    /// **The** answer to "does this background agent still vouch for its
+    /// parent's silence?" — the single predicate behind the supervisor's
+    /// `has_live_background_work` gate, the stuck-turn watchdog's
+    /// `background_alive`, and the "agent finished" notifier.
+    ///
+    /// Those three used to ask it three different ways and agreed on every
+    /// state but one. The supervisor and the notifier called `is_messageable()`
+    /// (now [`Self::transcript_is_open`], which is a bookkeeping question, not
+    /// this one) — it mapped "no snapshot" to alive with no expiry whatsoever.
+    /// The watchdog called `background_work_shows_liveness(quiet_secs)`, the
+    /// same question with a 15-minute cutoff measured from a snapshot that, in
+    /// that state, did not exist. So an agent that was registered and never once
+    /// observed held the supervisor gate shut until the 1-hour reaper removed
+    /// it — which is exactly how session `qv09rxtm` sat 39 minutes idle with the
+    /// Observer never firing.
+    ///
+    /// Liveness is not a property of a caller, so it is not a per-caller
+    /// number. It is a property of the evidence, and there are two kinds:
+    ///
+    /// * **Observed** — a snapshot exists. Age its `mtime` against
+    ///   [`BACKGROUND_AGENT_QUIET_MAX_SECS`].
+    /// * **Never observed** — age `registered_at` against the much shorter
+    ///   [`BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS`], because nothing has
+    ///   corroborated this agent's existence yet.
+    ///
+    /// A terminal outcome — a real `stop_reason`, a `killed` parent, a
+    /// usage-limit wall — stops vouching at once, with no budget and no grace.
+    pub fn vouches_for_parent(&self, now: DateTime<Utc>) -> bool {
+        if self.killed || self.hit_usage_limit() {
+            return false;
+        }
+        let (since, budget) = match self.latest.as_ref() {
+            Some(snapshot) if snapshot.stop_reason.is_some() => return false,
+            Some(snapshot) => (
+                DateTime::<Utc>::from(snapshot.mtime),
+                BACKGROUND_AGENT_QUIET_MAX_SECS,
+            ),
+            None => (
+                self.registered_at,
+                BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS,
+            ),
+        };
+        now.signed_duration_since(since).num_seconds() < budget
     }
 
     /// True once this agent's last snapshot is a claude usage-limit wall — a
@@ -190,7 +264,7 @@ impl BackgroundAgent {
     /// `stop_reason` is dropped straight away (`tick_background_agents` removes
     /// it from the map on the next pass) — its transcript ended normally.
     pub fn renders_stream(&self) -> bool {
-        self.killed || self.hit_usage_limit() || self.is_messageable()
+        self.killed || self.hit_usage_limit() || self.transcript_is_open()
     }
 
     /// Render state of this agent's derived teammate stream.
@@ -974,7 +1048,7 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm"}]}}"#,
         ));
         assert!(agent.hit_usage_limit());
-        assert!(!agent.is_messageable(), "a walled agent is not live work");
+        assert!(!agent.transcript_is_open(), "a walled agent is not live work");
         assert!(
             agent.renders_stream(),
             "but its tab stays visible with the reason"
@@ -1364,5 +1438,121 @@ mod tests {
             .expect("post-truncation tail should re-read from start");
         assert!(line.contains("\"fresh\""));
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // vouches_for_parent — THE liveness predicate. One function, used by the
+    // supervisor gate, the stuck-turn watchdog and the "agent finished"
+    // notifier, so those three can never disagree again about whether a
+    // background agent is still holding its parent's silence open.
+    // -----------------------------------------------------------------------
+
+    fn liveness_agent(
+        killed: bool,
+        registered_secs_ago: i64,
+        latest: Option<BackgroundAgentSnapshot>,
+    ) -> BackgroundAgent {
+        BackgroundAgent {
+            id: BackgroundAgentId::new("a30f92a688e431edc"),
+            jsonl_path: PathBuf::from("/tmp/agent.jsonl"),
+            registered_at: Utc::now() - chrono::Duration::seconds(registered_secs_ago),
+            latest,
+            last_offset: 0,
+            parent_tool_use_id: Some(SharedString::new_static("toolu_1")),
+            latest_seq: 0,
+            killed,
+        }
+    }
+
+    fn observed(secs_ago: i64, stop_reason: Option<&'static str>) -> BackgroundAgentSnapshot {
+        BackgroundAgentSnapshot {
+            mtime: SystemTime::now() - std::time::Duration::from_secs(secs_ago.max(0) as u64),
+            activity_label: SharedString::new_static("Generating…"),
+            stop_reason: stop_reason.map(SharedString::new_static),
+            usage_limited: false,
+        }
+    }
+
+    /// The state the three old predicates disagreed on: an agent that was
+    /// REGISTERED but never once snapshotted. `transcript_is_open` read it as alive
+    /// forever (`latest.map_or(true, …)`), which is what kept
+    /// `has_live_background_work` true and the Observer silent for 39 minutes on
+    /// session qv09rxtm. Unproven liveness gets a bounded grace, not an
+    /// unbounded one — with the 5s tick tailing every agent's JSONL, an agent
+    /// that is running at all is observed within seconds, so "never observed" at
+    /// the end of the grace means the transcript is not there to read.
+    #[test]
+    fn a_never_observed_agent_vouches_only_for_the_grace_period() {
+        let now = Utc::now();
+        assert!(
+            liveness_agent(false, 1, None).vouches_for_parent(now),
+            "an agent dispatched a second ago must hold the gate"
+        );
+        assert!(
+            liveness_agent(false, BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS - 1, None)
+                .vouches_for_parent(now),
+            "still inside the grace"
+        );
+        assert!(
+            !liveness_agent(false, BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS + 1, None)
+                .vouches_for_parent(now),
+            "never observed past the grace must stop vouching, not vouch forever"
+        );
+    }
+
+    /// An agent we HAVE seen gets the generous silence budget hardening #9 exists
+    /// for: a background agent inside one long quiet tool call (a multi-minute
+    /// build, a slow test suite) writes nothing to its JSONL for the duration and
+    /// is not dead. Its budget is the same one the reaper uses, so "vouches for
+    /// its parent" and "is still tracked" expire together.
+    #[test]
+    fn an_observed_agent_vouches_until_its_silence_budget_runs_out() {
+        let now = Utc::now();
+        assert!(
+            liveness_agent(false, 7200, Some(observed(1, None))).vouches_for_parent(now),
+            "recently observed, no terminal stop — alive regardless of registration age"
+        );
+        assert!(
+            liveness_agent(
+                false,
+                7200,
+                Some(observed(BACKGROUND_AGENT_QUIET_MAX_SECS - 60, None))
+            )
+            .vouches_for_parent(now),
+            "a long silent tool call inside the budget is not death"
+        );
+        assert!(
+            !liveness_agent(
+                false,
+                7200,
+                Some(observed(BACKGROUND_AGENT_QUIET_MAX_SECS + 60, None))
+            )
+            .vouches_for_parent(now),
+            "past the budget a silent teammate stops shielding a hung parent"
+        );
+    }
+
+    /// The three terminal outcomes all stop vouching immediately — no budget, no
+    /// grace. A killed agent in particular must not keep the stuck-turn watchdog
+    /// suppressed after the reconnect that killed it.
+    #[test]
+    fn terminal_outcomes_stop_vouching_at_once() {
+        let now = Utc::now();
+        assert!(
+            !liveness_agent(false, 1, Some(observed(0, Some("end_turn")))).vouches_for_parent(now),
+            "a completed agent is not live work"
+        );
+        assert!(
+            !liveness_agent(true, 1, Some(observed(0, None))).vouches_for_parent(now),
+            "a killed agent is not live work"
+        );
+        let mut walled = liveness_agent(false, 1, Some(observed(0, None)));
+        if let Some(snapshot) = walled.latest.as_mut() {
+            snapshot.usage_limited = true;
+        }
+        assert!(
+            !walled.vouches_for_parent(now),
+            "an agent parked at a usage-limit wall is not live work"
+        );
     }
 }

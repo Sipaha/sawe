@@ -63,9 +63,10 @@ impl TeammateWatchers {
         Self::default()
     }
 
-    /// True when a background-agent watcher is already armed for `session_id`
-    /// (the arm-once guard — a second `ensure_background_agent_watcher` is a
-    /// no-op).
+    /// True when a background-agent watcher is armed for `session_id`, whatever
+    /// directory it is watching. The arm-once guard itself is
+    /// [`Self::agent_watcher_path`]; this is the teardown tests' leak check.
+    #[cfg(test)]
     pub(crate) fn has_agent_watcher(&self, session_id: SolutionSessionId) -> bool {
         self.background_agent_watchers.contains_key(&session_id)
     }

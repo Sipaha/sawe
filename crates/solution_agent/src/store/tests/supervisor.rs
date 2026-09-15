@@ -1277,16 +1277,10 @@ fn live_background_work_spares_a_quiet_parent() {
         Some((TOOL_STUCK_SECS as i64 + 1, false)),
         true
     ));
-    // A teammate vouches for the parent only while its own JSONL keeps growing;
-    // once it has been silent past the output window it stops counting, so a hung
-    // parent+teammate pair is still recovered.
-    assert!(background_work_shows_liveness(0));
-    assert!(background_work_shows_liveness(
-        TOOL_OUTPUT_SILENCE_SECS as i64 - 1
-    ));
-    assert!(!background_work_shows_liveness(
-        TOOL_OUTPUT_SILENCE_SECS as i64
-    ));
+    // Whether a teammate counts as liveness at all is one shared question now
+    // (`SolutionSession::has_live_background_work` →
+    // `BackgroundAgent::vouches_for_parent`), covered by its own tests; this one
+    // only pins the wedged-turn decision that consumes the answer.
 }
 
 /// Verdict authentication (#6): a `supervisor_verdict` call is honoured only
@@ -3852,4 +3846,88 @@ async fn active_compact_verdict_drops_after_worker_returns_idle(cx: &mut gpui::T
         assert!(!session.read(cx).is_compaction_pending());
         assert!(session.read(cx).pending_messages.is_empty());
     });
+}
+
+/// The `qv09rxtm` regression, at the level where it actually hurt. A managed
+/// agent was registered at 10:35:53 and finished at 10:46:43, but the editor
+/// never took a single snapshot of it (its `fs.watch` was armed on a directory
+/// abandoned at the first compaction). `transcript_is_open()` mapped "no snapshot"
+/// to alive with no expiry, so `has_live_background_work` stayed true and the
+/// Observer did not fire for 39 minutes — until the 1-hour reaper dropped the
+/// entry, two seconds after which the judge finally ran.
+///
+/// A never-observed agent gets a bounded grace now: inside it the supervisor
+/// still stands down (the dispatch is legitimately young), past it the gate
+/// opens instead of waiting out the reaper.
+#[gpui::test]
+async fn a_never_observed_background_agent_stops_suppressing_the_supervisor(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::supervisor::SupervisorStatus;
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let bg_id = crate::background_agent::BackgroundAgentId::new("aa8f18c4ba8c3c92f");
+
+    let register = |store: &mut crate::store::SolutionAgentStore,
+                    cx: &mut gpui::Context<crate::store::SolutionAgentStore>,
+                    registered_secs_ago: i64| {
+        let session = store.session(id).unwrap();
+        let bg_id = bg_id.clone();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Idle;
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(120);
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: std::path::PathBuf::from("/nonexistent/agent.jsonl"),
+                    registered_at: chrono::Utc::now()
+                        - chrono::Duration::seconds(registered_secs_ago),
+                    // The watcher never fired — this is the whole incident.
+                    latest: None,
+                    last_offset: 0,
+                    parent_tool_use_id: Some(gpui::SharedString::from("toolu_spawn")),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id);
+        });
+    };
+
+    store.update(cx, |store, cx| {
+        register(store, cx, 5);
+        store.set_supervision_enabled(id, true, cx);
+        store.tick_supervisor(cx);
+    });
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Watching,
+        "a just-dispatched agent keeps the supervisor quiet while it starts up"
+    );
+
+    // Same agent, still never observed, now well past the grace.
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            if let Some(agent) = s.background_agents.get_mut(&bg_id) {
+                agent.registered_at = chrono::Utc::now()
+                    - chrono::Duration::seconds(
+                        crate::background_agent::BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS + 60,
+                    );
+            }
+        });
+        store.tick_supervisor(cx);
+    });
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Judging,
+        "an agent that has never been observed past the grace must stop holding \
+         the supervisor gate shut — waiting out the 1-hour reaper is the bug"
+    );
 }

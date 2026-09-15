@@ -791,6 +791,28 @@ impl SolutionSession {
         self.acp_thread.as_ref()
     }
 
+    /// Is there background work in flight that legitimately explains this
+    /// session's silence? The single source for that question: the supervisor's
+    /// Observer gate (`tick_supervisor`), the stuck-turn watchdog's
+    /// `background_alive` and the "agent finished" notifier all read it here.
+    ///
+    /// They used to inline this disjunction three times over, and the agent half
+    /// diverged — one site applied a silence cutoff, two applied none — so a
+    /// background agent could simultaneously be "live work" to the supervisor
+    /// and "not liveness" to the watchdog. Keep it one function; the per-agent
+    /// half is [`crate::background_agent::BackgroundAgent::vouches_for_parent`].
+    pub fn has_live_background_work(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.background_shells.values().any(|shell| {
+            matches!(
+                shell.state,
+                crate::background_shell::ShellRuntimeState::Running
+            )
+        }) || self
+            .background_agents
+            .values()
+            .any(|agent| agent.vouches_for_parent(now))
+    }
+
     pub(crate) fn is_compaction_pending(&self) -> bool {
         self.pending_compaction.is_some()
     }
@@ -878,7 +900,7 @@ impl SolutionSession {
         )> = self
             .background_agents
             .iter()
-            .filter(|(_, agent)| !agent.killed && agent.is_messageable())
+            .filter(|(_, agent)| !agent.killed && agent.transcript_is_open())
             .map(|(id, agent)| (id.clone(), agent.parent_tool_use_id.clone()))
             .collect();
         if to_kill.is_empty() {

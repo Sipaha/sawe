@@ -1707,7 +1707,7 @@ fn streamed_anew(session: &SolutionSession) -> std::collections::HashSet<crate::
 /// — whether a background agent contributes a derived teammate stream at all.
 ///
 /// Deliberately re-derived from the agent's `pub` fields instead of calling the
-/// production predicate (or its `hit_usage_limit` / `is_messageable` parts):
+/// production predicate (or its `hit_usage_limit` / `transcript_is_open` parts):
 /// this is decision logic, and a reference that delegates it makes the property
 /// tautological for the fold's existence guard. Measured, not assumed —
 /// dropping the `killed` disjunct from production used to leave the whole crate
@@ -2499,4 +2499,128 @@ fn count_bound(session: &SolutionSession) -> u64 {
         .map(|entry| entry.mod_seq)
         .max()
         .unwrap_or(0)
+}
+
+/// One session, one answer to "is there background work in flight that
+/// legitimately explains this silence?" — the supervisor's `Observer` gate, the
+/// stuck-turn watchdog and the "agent finished" notifier all read it from here.
+/// They used to each inline their own disjunction over `background_shells` +
+/// `background_agents`, and the agent half diverged: the watchdog applied a
+/// 15-minute silence cutoff, the other two applied none at all.
+#[test]
+fn live_background_work_covers_shells_and_vouching_agents_only() {
+    let now = chrono::Utc::now();
+    let new_session = || {
+        SolutionSession::new_idle(
+            SolutionSessionId::new(),
+            solutions::SolutionId(1),
+            SharedString::new_static("mock-agent"),
+            acp::SessionId::new("acp-1"),
+        )
+    };
+
+    assert!(
+        !new_session().has_live_background_work(now),
+        "a session with nothing in flight has no background work"
+    );
+
+    let mut with_shell = new_session();
+    let shell_id = crate::background_shell::BackgroundShellId::new("shell-1");
+    with_shell.background_shells.insert(
+        shell_id.clone(),
+        crate::background_shell::BackgroundShell {
+            id: shell_id.clone(),
+            command: "sleep 100".into(),
+            output_path: std::path::PathBuf::from("/tmp/x.output"),
+            registered_at: now,
+            latest: None,
+            last_offset: 0,
+            state: crate::background_shell::ShellRuntimeState::Running,
+        },
+    );
+    assert!(
+        with_shell.has_live_background_work(now),
+        "a running background shell is live work"
+    );
+    if let Some(shell) = with_shell.background_shells.get_mut(&shell_id) {
+        shell.state = crate::background_shell::ShellRuntimeState::Exited(Some(0));
+    }
+    assert!(
+        !with_shell.has_live_background_work(now),
+        "an exited shell is not"
+    );
+
+    let mut with_agent = new_session();
+    let bg_id = crate::background_agent::BackgroundAgentId::new("bg-1");
+    with_agent.background_agents.insert(
+        bg_id.clone(),
+        crate::background_agent::BackgroundAgent {
+            id: bg_id.clone(),
+            jsonl_path: std::path::PathBuf::from("/tmp/agent.jsonl"),
+            registered_at: now,
+            latest: None,
+            last_offset: 0,
+            parent_tool_use_id: None,
+            latest_seq: 0,
+            killed: false,
+        },
+    );
+    assert!(
+        with_agent.has_live_background_work(now),
+        "a freshly dispatched agent is live work"
+    );
+    if let Some(agent) = with_agent.background_agents.get_mut(&bg_id) {
+        agent.registered_at = now
+            - chrono::Duration::seconds(
+                crate::background_agent::BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS + 1,
+            );
+    }
+    assert!(
+        !with_agent.has_live_background_work(now),
+        "an agent that stopped vouching for its parent is not live work"
+    );
+}
+
+/// Characterization guard for the third "is this background work alive?"
+/// definition — the one the fold applies. A background agent that has been
+/// registered but never snapshotted MUST still get its teammate tab: the
+/// dispatch is real, and rendering nothing until the first JSONL line would
+/// leave the operator with no evidence that work was even started. (The
+/// diagnosis of the `qv09rxtm` incident guessed this fold failed CLOSED on a
+/// missing snapshot, inverted against the supervisor gate; it does not — the
+/// tab renders "Starting…", and what the operator actually saw was the tab
+/// already closed by the subagent `Stop` hook after the agent finished.)
+#[test]
+fn rebuild_streams_folds_an_agent_that_has_never_been_snapshotted() {
+    use crate::stream::{StreamId, StreamKind, StreamState};
+    let mut s = build_session();
+    let id = crate::background_agent::BackgroundAgentId::new("aa8f18c4ba8c3c92f");
+    s.background_agents.insert(
+        id.clone(),
+        crate::background_agent::BackgroundAgent {
+            id: id.clone(),
+            jsonl_path: std::path::PathBuf::from("/tmp/agent.jsonl"),
+            registered_at: chrono::Utc::now(),
+            latest: None,
+            last_offset: 0,
+            parent_tool_use_id: Some(SharedString::from("toolu_unobserved")),
+            latest_seq: 0,
+            killed: false,
+        },
+    );
+    s.background_agent_order.push(id);
+    s.rebuild_streams();
+
+    let sid = StreamId::Teammate(SharedString::from("toolu_unobserved"));
+    let stream = s
+        .streams
+        .get(&sid)
+        .expect("a dispatched but unobserved agent must still render its tab");
+    assert_eq!(stream.kind, StreamKind::Teammate);
+    assert_eq!(stream.state, StreamState::Live);
+    let body = format!("{:?}", stream.entries[0].kind);
+    assert!(
+        body.contains("Starting…") && body.contains("no output yet"),
+        "the tab must say it has produced nothing yet, got: {body}"
+    );
 }
