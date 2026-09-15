@@ -8,6 +8,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use agent_client_protocol::schema as acp;
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot;
@@ -169,6 +170,20 @@ impl ClaudeProcess {
             .unbounded_send(message)
             .context("claude process stdin closed")?;
         Ok(receiver)
+    }
+
+    /// Write a user turn straight to the subprocess's stdin WITHOUT going
+    /// through `prompt()` — no `prompt_tx` is armed and no watchdog is
+    /// re-armed, because there is no new turn to resolve: the message joins the
+    /// turn already in flight. Same wire shape `prompt()` writes
+    /// (`InputMessage::user_blocks`), so text and images both survive.
+    ///
+    /// Only [`ClaudeNativeConnection::inject_user_message`] should call this;
+    /// its doc comment carries the "why not the hook pull" rationale.
+    pub fn send_user_blocks(&self, blocks: &[acp::ContentBlock]) -> Result<()> {
+        self.outgoing
+            .unbounded_send(InputMessage::user_blocks(blocks))
+            .context("claude process stdin closed")
     }
 
     /// Reply to a `can_use_tool` control request from `claude` with an

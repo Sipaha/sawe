@@ -833,6 +833,36 @@ fn dispatch_initialize(
 }
 
 impl ClaudeNativeConnection {
+    /// Write a user turn to `session_id`'s subprocess stdin RIGHT NOW, without
+    /// arming `prompt_tx` and without starting a turn of our own — the message
+    /// joins the turn that is already in flight. Same wire shape `prompt()`
+    /// writes, so text and images both survive.
+    ///
+    /// Contrast [`Self::inject_user_message`], which only BUFFERS the text for
+    /// the next hook firing: both of the editor's ordinary follow-up channels
+    /// (that buffer and the store pull registered by
+    /// [`Self::set_store_pull`]) need the agent to reach a tool boundary or
+    /// end its turn, and that is also what makes a queued follow-up
+    /// cancellable by Stop. A parent parked on async Agents reaches neither
+    /// boundary for as long as its teammates run, so `solution_agent`'s queue
+    /// uses THIS instead of enqueuing — see `store::queue::inject_while_parked`
+    /// for the exact conditions and the residual "Stop cannot un-send it"
+    /// hazard that follows from stdin having no recall.
+    ///
+    /// Errors when the session has no live process, which the caller treats as
+    /// "fall back to the queue".
+    pub fn write_user_message_to_stdin(
+        &self,
+        session_id: &acp::SessionId,
+        blocks: &[acp::ContentBlock],
+    ) -> anyhow::Result<()> {
+        let sessions = self.sessions.borrow();
+        let state = sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow::anyhow!("no live claude process for {session_id:?}"))?;
+        state.process.send_user_blocks(blocks)
+    }
+
     /// Register the store's follow-up pull. First registration wins (the store
     /// calls this on every session attach, but the closure is store-global).
     /// Shared by `Rc` with every `SessionShared`, so this is visible to sessions

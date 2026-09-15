@@ -184,6 +184,11 @@ pub(crate) fn render_status_row(
         // a message to wake it up).
         (SharedString::from("Sleeping"), None)
     } else {
+        // One read of "what background work is alive", shared by the Running
+        // (parked) and Idle arms so the two can never name different work for
+        // the same instant.
+        let now = chrono::Utc::now();
+        let background_work = background_work_summary(s, now);
         match &s.state {
             SessionState::Errored(msg) => (
                 SharedString::from(format!("Error: {msg}")),
@@ -208,16 +213,42 @@ pub(crate) fn render_status_row(
                             format!("Running {tool}")
                         }
                     }
+                    // No tool of its own. That is EITHER the model actually
+                    // thinking/streaming, OR the parked state — the parent has
+                    // handed the work to teammates and is doing nothing but
+                    // waiting for them, which can last hours. Calling that
+                    // "Thinking…" mislabels who is busy and hides the one
+                    // condition under which a follow-up bypasses the queue
+                    // (`store::queue::inject_while_parked`).
                     None => {
                         let elapsed = started_at.elapsed().as_secs();
-                        if elapsed >= 1 {
-                            format!("Thinking… {}", format_elapsed(elapsed))
-                        } else {
-                            "Thinking…".to_string()
+                        let parked = parked_on_background_work(s, now)
+                            .then(|| background_work.clone())
+                            .flatten();
+                        match (parked, elapsed >= 1) {
+                            (Some(work), true) => {
+                                format!("Waiting on {work} · {}", format_elapsed(elapsed))
+                            }
+                            (Some(work), false) => format!("Waiting on {work}"),
+                            (None, true) => format!("Thinking… {}", format_elapsed(elapsed)),
+                            (None, false) => "Thinking…".to_string(),
                         }
                     }
                 };
                 (SharedString::from(label), None)
+            }
+            // The parent's own turn has ENDED but work it dispatched is still
+            // running — measured on a probe, an async Agent keeps the parent
+            // Idle for most of the teammate's lifetime, so this is the common
+            // half of "the session itself is doing nothing but there IS
+            // background work", not an edge case. "Done in 3s" is true about
+            // the turn and misleading about the session: nothing is done. Name
+            // the live work instead; the turn's duration is still in the
+            // transcript. Same wording as the Running/parked arm above, because
+            // to the reader it is the same situation.
+            SessionState::Idle if background_work.is_some() => {
+                let work = background_work.unwrap_or_default();
+                (SharedString::from(format!("Waiting on {work}")), None)
             }
             // "Done in Xs" replaces a bare "Idle" right after a turn
             // completes so a foreground user gets an explicit "the
@@ -1379,22 +1410,100 @@ pub(crate) fn ratchet_used_tokens<Id: PartialEq>(
 /// Teams call is more specific than its parent's. `None` when the agent is
 /// between tools — genuinely thinking.
 pub(crate) fn in_progress_tool(s: &crate::model::SolutionSession) -> Option<(String, Option<i64>)> {
-    s.entries.iter().rev().find_map(|entry| match &entry.kind {
-        crate::session_entry::SessionEntryKind::ToolCall {
-            status: crate::session_entry::ToolStatus::InProgress,
-            tool_name,
-            label_md,
-            status_started_at,
-            ..
-        } => {
-            let name = tool_name
-                .clone()
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| first_line_of(label_md));
-            Some((name, *status_started_at))
-        }
-        _ => None,
-    })
+    // MAIN-stream entries only. `s.entries` is the flat ingest buffer and
+    // carries every source, so an unfiltered scan reports a TEAMMATE's tool as
+    // the parent's: a parent that had dispatched a background agent and was
+    // doing nothing but waiting for it rendered "Running Bash · 2m" (the
+    // teammate's Bash), and the queued-bubble hint promised "Delivered when
+    // Bash finishes" — a boundary that fires the TEAMMATE's hook, which does
+    // not drain a Main-targeted bundle. Both callers ask about the main agent;
+    // a teammate tab gets its status from `subagent_status` instead.
+    s.entries
+        .iter()
+        .rev()
+        .filter(|entry| entry.subagent_id.is_none())
+        .find_map(|entry| match &entry.kind {
+            crate::session_entry::SessionEntryKind::ToolCall {
+                status: crate::session_entry::ToolStatus::InProgress,
+                tool_name,
+                label_md,
+                status_started_at,
+                ..
+            } => {
+                let name = tool_name
+                    .clone()
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| first_line_of(label_md));
+                Some((name, *status_started_at))
+            }
+            _ => None,
+        })
+}
+
+/// PARKED: the session is inside an open turn, the MAIN agent is not itself
+/// running a tool, and background work it dispatched (a teammate agent or a
+/// background shell) is still alive.
+///
+/// This is the state where the parent fires no hooks at all — no `PostToolUse`
+/// because it runs no tools, no `Stop` because the turn has not ended — so the
+/// hook pull, the only channel that delivers a queued follow-up into a running
+/// turn, never fires for the main agent. Measured on a real session: a compact
+/// prompt sat in the queue for 8m33s while the parent's teammates fired eight
+/// hooks and the parent fired zero.
+///
+/// ONE predicate for two consumers on purpose: `store::queue` uses it to decide
+/// that a follow-up must go over stdin instead of into the queue, and the status
+/// row uses it to say so. If they could disagree, the row would promise a
+/// delivery the queue does not make (or the reverse).
+pub(crate) fn parked_on_background_work(
+    s: &crate::model::SolutionSession,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    matches!(s.state, SessionState::Running { .. })
+        && in_progress_tool(s).is_none()
+        && s.has_live_background_work(now)
+}
+
+/// "2 agents" / "1 agent, 2 shells" — what the parent is parked ON. Returns
+/// `None` when nothing is alive, which is exactly when
+/// [`parked_on_background_work`] is false, so the status row can use this as
+/// its own gate and never render "Waiting on" with an empty subject.
+pub(crate) fn background_work_summary(
+    s: &crate::model::SolutionSession,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let agents = s
+        .background_agents
+        .values()
+        .filter(|agent| agent.vouches_for_parent(now))
+        .count();
+    let shells = s
+        .background_shells
+        .values()
+        .filter(|shell| {
+            matches!(
+                shell.state,
+                crate::background_shell::ShellRuntimeState::Running
+            )
+        })
+        .count();
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    if agents > 0 {
+        parts.push(format!(
+            "{agents} agent{}",
+            if agents == 1 { "" } else { "s" }
+        ));
+    }
+    if shells > 0 {
+        parts.push(format!(
+            "{shells} shell{}",
+            if shells == 1 { "" } else { "s" }
+        ));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(", "))
 }
 
 /// First non-empty line of a tool's markdown label, clamped — the label can be a

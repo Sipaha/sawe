@@ -539,6 +539,104 @@ impl SolutionAgentStore {
         self.send_message_blocks(session_id, blocks, cx)
     }
 
+    /// Deliver `blocks` straight to the claude subprocess's stdin INSTEAD of
+    /// queueing them, and mirror them into the transcript. Returns `false` when
+    /// the session does not qualify or the write is impossible — the caller
+    /// then enqueues exactly as before, so every rejection path is the status
+    /// quo.
+    ///
+    /// WHY: `pending_messages` is drained only by the hook pull, and the main
+    /// agent's hooks fire at a tool boundary or at end of turn. A parent that
+    /// has dispatched async Agents and is waiting for their
+    /// `<task-notification>` runs no tools and ends no turn, so it fires
+    /// neither — measured on a live session, a compact prompt sat queued for
+    /// 8m33s while the teammates fired eight hooks and the parent fired zero.
+    /// Over stdin the same message landed in 2s.
+    ///
+    /// WHY ONLY AS A REPLACEMENT FOR THE QUEUE: stdin has no recall. Stop
+    /// discards `pending_messages`; it cannot unwrite a line the subprocess has
+    /// already read (measured: inject, then `cancel_turn` 0.3s later, and the
+    /// ask was still answered after Stop). Draining the queue INTO stdin would
+    /// therefore silently break "Stop discards what I typed". Because an
+    /// injected message never enters the queue, that guarantee is untouched and
+    /// the residual exposure shrinks to "the user pressed Stop within about a
+    /// second of sending" — the same window they already have when they hit
+    /// Enter on an idle session and immediately hit Stop.
+    ///
+    /// The conditions are deliberately narrow:
+    /// - `MessageOrigin::User` only. Peer messages and the supervisor's own
+    ///   nudges keep the existing path until someone asks otherwise.
+    /// - `QueueTarget::Main` only. A teammate-targeted follow-up rides its own
+    ///   teammate's hook, which fires normally — that agent is the one working.
+    /// - Parked (see [`crate::status_row::parked_on_background_work`]). If the
+    ///   agent is inside a tool, the hook pull delivers at the boundary and the
+    ///   queued bubble's "Delivered when <tool> finishes" hint stays truthful.
+    /// - Claude only. Codex has its own receipt-based steering
+    ///   (`store::steering`), which is cancellable and needs no stdin poke.
+    ///
+    /// The transcript push is not cosmetic: measured without it, the operator
+    /// sees the assistant answer a question that is nowhere in the chat.
+    fn inject_while_parked(
+        &mut self,
+        session_id: SolutionSessionId,
+        session_entity: &Entity<crate::model::SolutionSession>,
+        blocks: &[acp::ContentBlock],
+        target: &QueueTarget,
+        origin: crate::model::MessageOrigin,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if origin != crate::model::MessageOrigin::User
+            || *target != QueueTarget::Main
+            || self.active_steers.contains_key(&session_id)
+        {
+            return false;
+        }
+        let now = Utc::now();
+        let (parked, acp_session_id, thread) = {
+            let session = session_entity.read(cx);
+            (
+                crate::status_row::parked_on_background_work(session, now),
+                session.acp_session_id.clone(),
+                session.acp_thread().cloned(),
+            )
+        };
+        if !parked {
+            return false;
+        }
+        let Some(thread) = thread else {
+            return false;
+        };
+        let Some(connection) = thread
+            .read(cx)
+            .connection()
+            .clone()
+            .downcast::<claude_native::ClaudeNativeConnection>()
+        else {
+            return false;
+        };
+        if let Err(error) = connection.write_user_message_to_stdin(&acp_session_id, blocks) {
+            log::warn!(
+                target: "solution_agent::queue",
+                "session={session_id} parked on background work but the stdin write failed \
+                 ({error}) — falling back to the queue",
+            );
+            return false;
+        }
+        log::info!(
+            target: "solution_agent::queue",
+            "session={session_id} parked on background work — delivered over stdin instead of \
+             enqueuing preview={}",
+            summarize_blocks_for_log(blocks),
+        );
+        thread.update(cx, |thread, cx| {
+            thread.push_user_message_entry(None, blocks.to_vec(), cx);
+        });
+        session_entity.update(cx, |session, _| session.last_activity_at = now);
+        cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
+        cx.notify();
+        true
+    }
+
     /// Send a structured user message composed of one or more `ContentBlock`s
     /// (text + images, etc). Flips `SessionState` to `Running` synchronously
     /// (before the returned `Task` is awaited) so the UI shows activity
@@ -740,10 +838,12 @@ impl SolutionAgentStore {
         // (The "submit typed text AS a custom/free-text answer" branch is
         // intentionally absent: the current ACP protocol can't express a
         // free-text permission answer — see `pending_authorization_reject`.)
+        let mut unblocked_authorization = false;
         if origin != crate::model::MessageOrigin::Peer
             && let Some(thread) = session_entity.read(cx).acp_thread().cloned()
             && let Some((tool_call_id, reject_outcome)) = pending_authorization_reject(&thread, cx)
         {
+            unblocked_authorization = true;
             log::info!(
                 target: "solution_agent::queue",
                 "session={session_id} send while tool call {tool_call_id} awaiting \
@@ -769,6 +869,23 @@ impl SolutionAgentStore {
         let already_running = matches!(session_entity.read(cx).state, SessionState::Running { .. })
             || self.active_steers.contains_key(&session_id);
         if already_running {
+            // A parent parked on its own background agents fires no hooks, so
+            // the queue below has no drain event and the follow-up can sit for
+            // many minutes. Hand it to the subprocess directly instead — but
+            // only INSTEAD OF queueing, never on top of it (see the method's
+            // doc comment for why that distinction is the whole safety story).
+            if !unblocked_authorization
+                && self.inject_while_parked(
+                    session_id,
+                    &session_entity,
+                    &blocks,
+                    &target,
+                    origin,
+                    cx,
+                )
+            {
+                return Task::ready(Ok(()));
+            }
             // Audit log: queueing is a frequent source of "where did
             // my message go?" bug reports — having every enqueue +
             // queue size in the log lets us reconstruct what reached

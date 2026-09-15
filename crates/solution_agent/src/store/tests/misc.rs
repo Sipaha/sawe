@@ -4117,6 +4117,181 @@ async fn send_during_running_on_native_connection_routes_to_queue(cx: &mut TestA
     drop(server);
 }
 
+/// The parked exception to the rule above: same native-backed Running session,
+/// but with a live background agent vouching for it. The parent fires no hooks
+/// in that state, so the queue has no drain event — the send must go over the
+/// subprocess's stdin instead, leave `pending_messages` EMPTY (that emptiness
+/// is what preserves "Stop discards the queue"), and still show the user their
+/// own words in the transcript.
+#[gpui::test]
+async fn send_while_parked_on_background_work_injects_instead_of_queueing(cx: &mut TestAppContext) {
+    use acp_thread::AgentConnection;
+    use agent_client_protocol::schema as acp;
+    use agent_servers::{AgentServer, AgentServerDelegate};
+    use claude_native::{ClaudeNativeAgentServer, ClaudeNativeConnection};
+    use project::AgentId;
+
+    let mock_binary = native_mock_binary();
+    if !mock_binary.exists() {
+        panic!(
+            "mock claude binary missing at {} — tests/fixtures/mock_claude.sh not bundled?",
+            mock_binary.display()
+        );
+    }
+    cx.executor().allow_parking();
+
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("claude-native");
+
+    let server = Rc::new(ClaudeNativeAgentServer::with_binary(
+        AgentId::new("claude-native"),
+        mock_binary,
+        Vec::new(),
+    ));
+
+    cx.update(|cx| {
+        let registry = Arc::new(AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.register_agent_server(agent_id.clone(), server.clone());
+        });
+    });
+
+    let connection: Rc<dyn acp_thread::AgentConnection> = cx
+        .update(|cx| {
+            let store = project.read(cx).agent_server_store().clone();
+            let delegate = AgentServerDelegate::new(store, None, None);
+            AgentServer::connect(server.as_ref(), delegate, project.clone(), cx)
+        })
+        .await
+        .expect("native connect");
+    let native = connection
+        .clone()
+        .downcast::<ClaudeNativeConnection>()
+        .expect("downcast to ClaudeNativeConnection");
+
+    let work_dirs = util::path_list::PathList::new(&[std::env::temp_dir().as_path()]);
+    let acp_thread = cx
+        .update(|cx| Rc::clone(&native).new_session(project.clone(), work_dirs, cx))
+        .await
+        .expect("new_session");
+
+    let acp_session_id = acp_thread.read_with(cx, |t, _| t.session_id().clone());
+
+    let session_id = SolutionSessionId::new();
+    cx.update(|cx| {
+        let session = cx.new(|_| {
+            let mut s = crate::model::SolutionSession::new_idle(
+                session_id,
+                solution_id,
+                agent_id.clone(),
+                acp_session_id.clone(),
+            );
+            s.title = SharedString::from("parked-test");
+            s.project = Some(project.clone());
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            // The whole difference from the queueing test: one teammate that
+            // was registered a moment ago and has not reported a stop_reason.
+            let bg_id = crate::background_agent::BackgroundAgentId::new("agent-parked");
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: PathBuf::from("/tmp/agent-parked.output"),
+                    registered_at: Utc::now(),
+                    latest: None,
+                    last_offset: 0,
+                    parent_tool_use_id: Some(SharedString::from("toolu_parked")),
+                    latest_seq: 1,
+                    killed: false,
+                },
+            );
+            s.background_agent_order.push(bg_id);
+            s
+        });
+        session.update(cx, |session, cx| {
+            session.set_acp_thread(Some(acp_thread.clone()), cx);
+        });
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _store_cx| {
+            store.sessions.insert(session_id, session);
+            store
+                .by_solution
+                .entry(solution_id)
+                .or_default()
+                .push(session_id);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store
+                .send_message_blocks(
+                    session_id,
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "SCARLET_OTTER".to_string(),
+                    ))],
+                    cx,
+                )
+                .detach_and_log_err(cx);
+        });
+    });
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).expect("session exists");
+            assert!(
+                session.read(cx).pending_messages.is_empty(),
+                "a parked send must NOT enter the queue — that is what keeps \
+                 \"Stop discards the queue\" true"
+            );
+        });
+    });
+
+    let user_texts: Vec<String> = acp_thread.read_with(cx, |thread, _| {
+        thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::UserMessage(message) => Some(
+                    message
+                        .chunks
+                        .iter()
+                        .filter_map(|block| match block {
+                            acp::ContentBlock::Text(text) => Some(text.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                ),
+                _ => None,
+            })
+            .collect()
+    });
+    assert!(
+        user_texts.iter().any(|text| text.contains("SCARLET_OTTER")),
+        "the injected message must be pushed into the transcript too — without it the \
+         operator watches the agent answer a question that is nowhere in the chat; got \
+         {user_texts:?}"
+    );
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store
+            .update(cx, |store, cx| store.close_session(session_id, cx))
+            .ok();
+    });
+    drop(acp_thread);
+    drop(native);
+    drop(server);
+}
+
 /// End-to-end of the pull side: after a native-backed session is wired through
 /// `subscribe_to_session`, the connection holds a store pull-closure. Invoking
 /// that closure (as the live pump does at each hook) must map the ACP session

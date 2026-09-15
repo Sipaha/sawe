@@ -2624,3 +2624,175 @@ fn rebuild_streams_folds_an_agent_that_has_never_been_snapshotted() {
         "the tab must say it has produced nothing yet, got: {body}"
     );
 }
+
+// -----------------------------------------------------------------------
+// PARKED — the one state where a follow-up bypasses the queue.
+// `status_row::parked_on_background_work` is shared by the status label and
+// `store::queue::inject_while_parked`, so these cases pin BOTH behaviours.
+// -----------------------------------------------------------------------
+
+fn running_now() -> SessionState {
+    SessionState::Running {
+        started_at: std::time::Instant::now(),
+        notified: false,
+    }
+}
+
+/// Like [`insert_agent`], but with a FRESH snapshot mtime. The shared helper
+/// stamps a 2024 mtime, which `vouches_for_parent` correctly reads as
+/// long-dead — fine for the render tests it was written for, useless for a
+/// liveness one.
+fn insert_live_agent(s: &mut SolutionSession, agent_id: &str, stop_reason: Option<&str>) {
+    let id = crate::background_agent::BackgroundAgentId::new(agent_id);
+    s.background_agents.insert(
+        id.clone(),
+        crate::background_agent::BackgroundAgent {
+            id: id.clone(),
+            jsonl_path: PathBuf::from("/tmp/a.output"),
+            registered_at: Utc::now(),
+            latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                mtime: std::time::SystemTime::now(),
+                activity_label: SharedString::from("Bash: cargo test"),
+                stop_reason: stop_reason.map(SharedString::from),
+                usage_limited: false,
+            }),
+            last_offset: 0,
+            parent_tool_use_id: Some(SharedString::from(format!("toolu_{agent_id}"))),
+            latest_seq: 7,
+            killed: false,
+        },
+    );
+    s.background_agent_order.push(id);
+}
+
+fn in_progress_bash_entry() -> SessionEntry {
+    SessionEntry {
+        created_ms: 0,
+        mod_seq: 1,
+        subagent_id: None,
+        kind: crate::session_entry::SessionEntryKind::ToolCall {
+            id: "toolu_parked".to_string(),
+            label_md: "Bash".to_string(),
+            kind: acp::ToolKind::Execute,
+            status: crate::session_entry::ToolStatus::InProgress,
+            content_md: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            tool_name: Some("Bash".to_string()),
+            locations: Vec::new(),
+            status_started_at: None,
+        },
+    }
+}
+
+#[test]
+fn parked_only_when_running_toolless_and_backed_by_live_work() {
+    let now = Utc::now();
+
+    let mut parked = build_session();
+    parked.state = running_now();
+    insert_live_agent(&mut parked, "agent-1", None);
+    assert!(
+        crate::status_row::parked_on_background_work(&parked, now),
+        "Running + no main tool + a vouching agent IS the parked state"
+    );
+
+    // Inside a tool of its own: the hook pull fires at the tool boundary, so
+    // the queue works and the "Delivered when Bash finishes" hint is truthful.
+    let mut busy = build_session();
+    busy.state = running_now();
+    insert_live_agent(&mut busy, "agent-1", None);
+    busy.entries = vec![Arc::new(in_progress_bash_entry())];
+    assert!(
+        !crate::status_row::parked_on_background_work(&busy, now),
+        "a main agent inside its own tool call is not parked"
+    );
+
+    // Between tools with nothing delegated: that is the model thinking, and
+    // the next hook is seconds away.
+    let mut thinking = build_session();
+    thinking.state = running_now();
+    assert!(
+        !crate::status_row::parked_on_background_work(&thinking, now),
+        "no background work means no park — the agent is just thinking"
+    );
+
+    // A finished teammate stops vouching the instant its stop_reason lands.
+    let mut finished = build_session();
+    finished.state = running_now();
+    insert_live_agent(&mut finished, "agent-1", Some("end_turn"));
+    assert!(
+        !crate::status_row::parked_on_background_work(&finished, now),
+        "a terminal teammate must not hold the parent in the parked state"
+    );
+
+    // Not in a turn at all: an idle session takes the ordinary send path.
+    let mut idle = build_session();
+    insert_live_agent(&mut idle, "agent-1", None);
+    assert!(
+        !crate::status_row::parked_on_background_work(&idle, now),
+        "an Idle session is never parked — it starts a fresh turn instead"
+    );
+}
+
+#[test]
+fn background_work_summary_names_what_is_being_waited_on() {
+    let now = Utc::now();
+
+    let mut none = build_session();
+    none.state = running_now();
+    assert_eq!(
+        crate::status_row::background_work_summary(&none, now),
+        None,
+        "nothing alive must yield no subject, so the row never says \"Waiting on \""
+    );
+
+    let mut one = build_session();
+    one.state = running_now();
+    insert_live_agent(&mut one, "agent-1", None);
+    assert_eq!(
+        crate::status_row::background_work_summary(&one, now).as_deref(),
+        Some("1 agent"),
+    );
+
+    let mut two = build_session();
+    two.state = running_now();
+    insert_live_agent(&mut two, "agent-1", None);
+    insert_live_agent(&mut two, "agent-2", None);
+    // A terminal one is not counted even though it is still tracked.
+    insert_live_agent(&mut two, "agent-3", Some("end_turn"));
+    assert_eq!(
+        crate::status_row::background_work_summary(&two, now).as_deref(),
+        Some("2 agents"),
+    );
+}
+
+#[test]
+fn in_progress_tool_ignores_a_teammates_tool_call() {
+    // The bug this pins: `s.entries` is the flat ingest buffer and carries
+    // teammate-tagged entries too, so an unfiltered scan made a parent that had
+    // dispatched a background agent and was doing nothing itself report the
+    // TEAMMATE's Bash as its own. Measured on a live probe: the parked
+    // predicate never fired, the status row said "Running Bash", and the queued
+    // bubble promised "Delivered when Bash finishes" — a boundary that fires
+    // the teammate's hook, which does not drain a Main-targeted bundle.
+    let mut s = build_session();
+    s.state = running_now();
+    let mut teammate_tool = in_progress_bash_entry();
+    teammate_tool.subagent_id = Some(SharedString::from("agent-1"));
+    s.entries = vec![Arc::new(teammate_tool)];
+    assert_eq!(
+        crate::status_row::in_progress_tool(&s),
+        None,
+        "a teammate's in-flight tool must not be reported as the main agent's"
+    );
+
+    let mut own = build_session();
+    own.state = running_now();
+    own.entries = vec![Arc::new(in_progress_bash_entry())];
+    assert_eq!(
+        crate::status_row::in_progress_tool(&own).map(|(name, _)| name),
+        Some("Bash".to_string()),
+        "the main agent's own in-flight tool is still reported"
+    );
+}
