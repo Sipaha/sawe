@@ -4139,3 +4139,56 @@ How to apply: treat any request-shaped frame from a runtime as load-bearing. Par
 **The diagnosis needed a tool it did not have.** The first pass cited NULL `last_seen_label` / `last_mtime_ms` / `stop_reason` in `solution_session_background_agent` as proof the agent was never observed. Those columns are written once, at registration, always NULL — no refresh path persists a snapshot, so every agent looks like that. The conclusion survived only on the independent reaper-timing prediction. `solution_agent.get_background_agents` (solution-scoped) now reports the in-memory truth: `observed`, the last snapshot's label / mtime / `stop_reason`, `killed`, `usage_limited`, `vouches_for_parent`, and the `has_live_background_work` roll-up. It is what made the A/B possible — pre-fix, a post-rotation agent stayed `observed=false` / `vouches_for_parent=true` for 200 s after its sub-agent had finished; fixed, the terminal stop lands at +17 s.
 
 How to apply: when one question has several callers, give it one function and key its answer on the strength of the evidence, not on who is asking. And when a state is invisible on the wire, the diagnosis will reach for whatever *is* visible — add the observability in the same session, or the next incident gets analysed from data that cannot answer it.
+
+### 175. A parked parent is delivered to over stdin — instead of the queue, never on top of it
+
+`pending_messages` is drained by exactly one event: the hook pull. The main
+agent's hooks fire at a tool boundary (`PostToolUse`) or at end of turn
+(`Stop`). A parent that has dispatched async Agents and is waiting for their
+`<task-notification>` reaches neither — it runs no tools and ends no turn — so
+for `agent_id=None` there is no delivery event at all. Measured on the user's
+own session: a `/compact` prompt sat queued 8m33s while the parent fired zero
+hooks and its sub-agents fired eight
+(`docs/findings/2026-09-15-parked-parent-cannot-be-reached-by-the-queue.md`).
+
+**The narrowing is the safety argument.** `ClaudeNativeConnection::write_user_message_to_stdin`
+writes the same `InputMessage::user_blocks` frame `prompt()` writes, without
+arming `prompt_tx` — the message joins the turn in flight, and on a probe it was
+answered in 2s where the queue sat past 60s. But stdin has no recall: inject,
+then Stop 0.3s later, and the ask is still answered after `Stop`. `Stop`
+discards `pending_messages`; it cannot unwrite a line the subprocess has read.
+So `store::queue::inject_while_parked` runs **instead of** enqueuing, never as a
+drain of the queue — origin `User`, target `Main`, claude-native, no permission
+prompt just unblocked, and parked. Everything still in the queue keeps today's
+semantics including "Stop discards it", and the residual exposure is "Stop
+pressed within about a second of sending", which is the exposure an idle session
+already has. Any variant that pumps `pending_messages` into stdin reintroduces
+the hazard the 2026-09-11 streaming-input finding rejected. The injected blocks
+are also pushed onto the thread with `push_user_message_entry` — measured
+without that, the operator sees the answer and not the question.
+
+**`in_progress_tool` was counting other agents' tools.** The parked predicate is
+`Running && no in-progress MAIN tool && has_live_background_work`, and it never
+fired: `status_row::in_progress_tool` scans `s.entries`, the flat ingest buffer
+carrying every source, without filtering `subagent_id`. Two user-visible lies
+came from that one line — the status row said `Running Bash · 2m` for a parent
+running nothing, and the queued bubble promised "Delivered when **Bash**
+finishes", naming a boundary that fires the TEAMMATE's hook, which by design
+does not drain a `QueueTarget::Main` bundle. Both callers ask about the main
+agent (a teammate tab reads `subagent_status`), so the scan filters to
+`subagent_id.is_none()`.
+
+**One predicate, two surfaces.** `status_row::parked_on_background_work` answers
+both "does this send bypass the queue" and "what does the row say", so the row
+cannot promise a delivery the queue does not make. `Thinking… 8m` becomes
+`Waiting on 2 agents · 8m`. Measuring it also corrected the plan: over a 150s
+teammate run the parent was `Running` for a few samples and `Idle` for all the
+rest — claude usually ends its turn after dispatching an async Agent — so the
+`Idle` arm carries the same label rather than claiming `Done in 3s` while the
+work continues.
+
+How to apply: when you add a second delivery channel, ask what the FIRST one's
+cancel semantics were and whether the new one can honour them. If it cannot, the
+new channel must be an alternative to the old, not a stage of it. And before
+trusting a predicate built out of an existing helper, check what that helper
+actually scans — `entries` is not one agent's transcript.
