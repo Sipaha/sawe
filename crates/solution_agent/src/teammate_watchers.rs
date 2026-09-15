@@ -18,6 +18,7 @@
 //! state relocation.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use gpui::Task;
 
@@ -29,9 +30,16 @@ use crate::model::SolutionSessionId;
 pub(crate) struct TeammateWatchers {
     /// One per-session background-agent watcher task — alive as long as the
     /// session has >=1 registered `background_agents`. Stored as `Task<()>` so
-    /// dropping kills the watcher cleanly. Armed by
+    /// dropping kills the watcher cleanly, alongside the `subagents/` directory
+    /// it is actually watching. Armed by
     /// `SolutionAgentStore::ensure_background_agent_watcher`.
-    background_agent_watchers: HashMap<SolutionSessionId, Task<()>>,
+    ///
+    /// The PATH is part of the state because it is not stable for the life of a
+    /// session: it embeds the ACP session id, which `rotate_context`,
+    /// `reset_context` and `resume_session` all replace mid-session. An
+    /// arm-once guard keyed on `session_id` alone therefore pins the watcher to
+    /// a directory claude abandoned at the first compaction.
+    background_agent_watchers: HashMap<SolutionSessionId, (PathBuf, Task<()>)>,
     /// One per-session background-shell watcher task — alive as long as the
     /// session has >=1 registered `background_shells`. Stored as `Task<()>` so
     /// dropping kills the watcher cleanly. Armed by
@@ -62,9 +70,26 @@ impl TeammateWatchers {
         self.background_agent_watchers.contains_key(&session_id)
     }
 
-    /// Store the background-agent watcher task for `session_id`.
-    pub(crate) fn arm_agent_watcher(&mut self, session_id: SolutionSessionId, task: Task<()>) {
-        self.background_agent_watchers.insert(session_id, task);
+    /// The `subagents/` directory the background-agent watcher for `session_id`
+    /// is currently watching, or `None` when none is armed. This is the arm-once
+    /// guard's real key: re-arming is required whenever the session's current
+    /// directory no longer matches this one.
+    pub(crate) fn agent_watcher_path(&self, session_id: SolutionSessionId) -> Option<&Path> {
+        self.background_agent_watchers
+            .get(&session_id)
+            .map(|(dir, _)| dir.as_path())
+    }
+
+    /// Store the background-agent watcher task for `session_id`, replacing (and
+    /// thereby cancelling) any watcher previously armed for it.
+    pub(crate) fn arm_agent_watcher(
+        &mut self,
+        session_id: SolutionSessionId,
+        dir: PathBuf,
+        task: Task<()>,
+    ) {
+        self.background_agent_watchers
+            .insert(session_id, (dir, task));
     }
 
     /// True when a background-shell watcher is already armed for `session_id`.

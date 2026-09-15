@@ -172,7 +172,7 @@ pub(crate) fn scan_lines_for_completions(
 
 impl SolutionAgentStore {
     /// Spawn (idempotently) a per-session watcher on the
-    /// `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/`
+    /// `~/.claude/projects/<encoded-cwd>/<acp-session-id>/subagents/`
     /// directory. Each `PathEvent` on an `agent-<id>.jsonl` filename
     /// triggers a `refresh_background_agent_snapshot` for the matching
     /// tracked `BackgroundAgent`. The watcher task lives in
@@ -180,17 +180,20 @@ impl SolutionAgentStore {
     /// entry (or drop the store) to cancel.
     ///
     /// Called from the tool-call handler (Task 8) when claude announces
-    /// a managed agent. Safe to call repeatedly: a second call for the
-    /// same session is a no-op.
+    /// a managed agent. Safe to call repeatedly: a second call is a no-op
+    /// **only while the session's subagents directory is unchanged**. That
+    /// path embeds the ACP session id, which `rotate_context` (compaction),
+    /// `reset_context` (`/clear`) and `resume_session` each replace with a
+    /// freshly-minted one; an arm-once guard keyed on `session_id` alone left
+    /// the watcher pinned to the pre-rotation directory for the rest of the
+    /// session, so every agent dispatched after the first compaction was never
+    /// snapshotted at all.
     pub(crate) fn ensure_background_agent_watcher(
         &mut self,
         session_id: SolutionSessionId,
         fs: Arc<dyn fs::Fs>,
         cx: &mut Context<Self>,
     ) {
-        if self.teammate_watchers.has_agent_watcher(session_id) {
-            return;
-        }
         let Some(session) = self.session(session_id) else {
             return;
         };
@@ -206,7 +209,19 @@ impl SolutionAgentStore {
                 return;
             }
         };
+        if self.teammate_watchers.agent_watcher_path(session_id) == Some(subagents_dir.as_path()) {
+            return;
+        }
+        let watched_dir = subagents_dir.clone();
         let task = cx.spawn(async move |this, cx| {
+            // `RealFs::watch` calls `watcher.add(path)`, which FAILS on a path
+            // that does not exist — it only logs the error and hands back a
+            // stream that never yields, with no retry. claude creates
+            // `subagents/` at the instant it dispatches its first managed agent,
+            // so arming can lose that race and produce a permanently dead
+            // watcher. Materialise the directory first; creating it empty is
+            // inert (claude writes into it either way).
+            fs.create_dir(&subagents_dir).await.log_err();
             let (mut stream, _watcher) = fs
                 .watch(&subagents_dir, std::time::Duration::from_millis(200))
                 .await;
@@ -236,7 +251,8 @@ impl SolutionAgentStore {
                 }
             }
         });
-        self.teammate_watchers.arm_agent_watcher(session_id, task);
+        self.teammate_watchers
+            .arm_agent_watcher(session_id, watched_dir, task);
     }
 
     /// Tail the JSONL file for `agent_id` on `session_id`, parse the

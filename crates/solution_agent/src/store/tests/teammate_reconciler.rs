@@ -3442,3 +3442,109 @@ async fn killed_agent_is_reaped_despite_a_live_parent(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// The managed-agent JSONL watcher is armed on
+/// `~/.claude/projects/<encoded-cwd>/<acp-session-id>/subagents/`, a path that
+/// contains the ACP session id — and `rotate_context` / `reset_context` /
+/// `resume_session` all mint a NEW acp session id (and therefore a new
+/// `subagents/` directory) mid-session. The old arm-once guard keyed on
+/// `session_id` alone, so after the first rotation the watcher kept watching a
+/// directory claude would never write to again: every subsequently dispatched
+/// background agent stayed snapshot-less for the whole hour until the reaper
+/// aged it out, which is exactly what silenced the Observer on session
+/// `qv09rxtm`. The guard must key on the watched PATH, so a rotated session
+/// re-arms on its new directory.
+#[gpui::test]
+async fn agent_watcher_rearms_after_the_acp_session_id_rotates(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    let (cwd, fs, first_acp) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        let fs = s
+            .project
+            .as_ref()
+            .expect("project")
+            .read(cx)
+            .fs()
+            .clone();
+        (s.cwd.clone(), fs, s.acp_session_id.0.to_string())
+    });
+
+    let first_dir = background_agent_dir_for(&cwd, &first_acp).expect("first subagents dir");
+    let rotated_dir = background_agent_dir_for(&cwd, "acp-rotated").expect("rotated subagents dir");
+    assert_ne!(first_dir, rotated_dir);
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.ensure_background_agent_watcher(session_id, fs.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert_eq!(
+            store.read(cx).teammate_watchers.agent_watcher_path(session_id),
+            Some(first_dir.as_path()),
+            "the watcher must be armed on the current acp session's subagents dir"
+        );
+    });
+
+    // Rotate the context the way `rotate_context` does.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        session.update(cx, |s, _| {
+            s.acp_session_id = agent_client_protocol::schema::SessionId::new("acp-rotated");
+        });
+        store.update(cx, |store, cx| {
+            store.ensure_background_agent_watcher(session_id, fs.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert_eq!(
+            store.read(cx).teammate_watchers.agent_watcher_path(session_id),
+            Some(rotated_dir.as_path()),
+            "a rotated session must re-arm its watcher on the NEW subagents dir"
+        );
+    });
+}
+
+/// `fs.watch` on a directory that does not exist yet fails permanently — Zed's
+/// `RealFs::watch` logs `watcher.add`'s error and hands back a stream that never
+/// yields, with no retry. claude creates `<acp-session>/subagents/` only at the
+/// instant it dispatches its first managed agent, so arming can race it. Create
+/// the directory before watching it, so the arm is never a dead one.
+#[gpui::test]
+async fn arming_the_agent_watcher_materialises_the_watched_directory(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+
+    let (cwd, fs, acp) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let s = session.read(cx);
+        let fs = s.project.as_ref().expect("project").read(cx).fs().clone();
+        (s.cwd.clone(), fs, s.acp_session_id.0.to_string())
+    });
+    let dir = background_agent_dir_for(&cwd, &acp).expect("subagents dir");
+    assert!(!fs.is_dir(&dir).await, "precondition: dir does not exist yet");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.ensure_background_agent_watcher(session_id, fs.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        fs.is_dir(&dir).await,
+        "arming must materialise the watched directory, or the watch is dead on arrival"
+    );
+}
