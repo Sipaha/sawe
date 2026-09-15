@@ -65,9 +65,11 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
             store
                 .supervisor_states
                 .insert(id, crate::supervisor::SupervisorState::new(id));
-            store
-                .teammate_watchers
-                .arm_agent_watcher(id, PathBuf::from("/tmp/subagents"), Task::ready(()));
+            store.teammate_watchers.arm_agent_watcher(
+                id,
+                PathBuf::from("/tmp/subagents"),
+                Task::ready(()),
+            );
             store
                 .teammate_watchers
                 .arm_shell_watcher(id, Task::ready(()));
@@ -1039,9 +1041,11 @@ fn cold_close_solution_clears_supervisor_and_watcher_maps(cx: &mut TestAppContex
             store
                 .supervisor_states
                 .insert(id, crate::supervisor::SupervisorState::new(id));
-            store
-                .teammate_watchers
-                .arm_agent_watcher(id, PathBuf::from("/tmp/subagents"), Task::ready(()));
+            store.teammate_watchers.arm_agent_watcher(
+                id,
+                PathBuf::from("/tmp/subagents"),
+                Task::ready(()),
+            );
             store
                 .teammate_watchers
                 .arm_shell_watcher(id, Task::ready(()));

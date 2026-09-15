@@ -289,6 +289,157 @@ impl McpServerTool for GetSessionChildrenTool {
 }
 
 // =====================================================================
+// solution_agent.get_background_agents
+// =====================================================================
+
+/// Per-session managed-agent ("background agent") tracking state.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct GetBackgroundAgentsParams {
+    pub session_id: String,
+}
+
+impl<'de> Deserialize<'de> for GetBackgroundAgentsParams {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct Inner {
+            session_id: String,
+        }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
+        Ok(Self {
+            session_id: inner.session_id,
+        })
+    }
+}
+
+/// One tracked managed agent. `observed` is the field this tool exists for:
+/// it is the difference between "this agent is working and we can see it" and
+/// "we registered it and have never read a single line of its transcript", and
+/// nothing else on the wire distinguished those two.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BackgroundAgentState {
+    pub id: String,
+    /// Canonical JSONL transcript path the editor tails.
+    pub jsonl_path: String,
+    pub registered_at_ms: i64,
+    /// Has ANY snapshot ever been parsed out of `jsonl_path`?
+    pub observed: bool,
+    /// One-line activity from the last snapshot, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_label: Option<String>,
+    /// mtime of the JSONL at the last snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_mtime_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Owning subprocess was replaced (reconnect / crash) while it ran.
+    pub killed: bool,
+    /// Last snapshot is a claude usage-limit wall.
+    pub usage_limited: bool,
+    /// Does this agent currently hold the supervisor gate / stuck-turn watchdog
+    /// off its parent? See `BackgroundAgent::vouches_for_parent`.
+    pub vouches_for_parent: bool,
+    /// The parent `Agent` spawn tool_use id — the key of this agent's teammate
+    /// stream, so a caller can correlate with `streams`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_use_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GetBackgroundAgentsResult {
+    /// Registration order (the same order the teammate tabs are folded in).
+    pub agents: Vec<BackgroundAgentState>,
+    /// Convenience roll-up: does the session have background work that still
+    /// explains its silence? This is the exact boolean the Observer gate and the
+    /// stuck-turn watchdog read, including the running-background-shell half.
+    pub has_live_background_work: bool,
+}
+
+#[derive(Clone)]
+pub struct GetBackgroundAgentsTool;
+
+impl McpServerTool for GetBackgroundAgentsTool {
+    type Input = GetBackgroundAgentsParams;
+    type Output = GetBackgroundAgentsResult;
+    const NAME: &'static str = "solution_agent.get_background_agents";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        anyhow::ensure!(
+            !input.session_id.is_empty(),
+            "invalid_params: session_id is required"
+        );
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("bad session id: {e}"))?;
+        let now = chrono::Utc::now();
+
+        let out = cx.update(|cx| -> Result<GetBackgroundAgentsResult> {
+            let store = SolutionAgentStore::global(cx);
+            store.read_with(cx, |store, cx| -> Result<GetBackgroundAgentsResult> {
+                let session = store
+                    .session(session_id)
+                    .ok_or_else(|| anyhow!("unknown_session: {session_id}"))?;
+                let s = session.read(cx);
+                let agents = s
+                    .background_agent_order
+                    .iter()
+                    .filter_map(|id| s.background_agents.get(id))
+                    .map(|agent| BackgroundAgentState {
+                        id: agent.id.as_str().to_string(),
+                        jsonl_path: agent.jsonl_path.to_string_lossy().into_owned(),
+                        registered_at_ms: agent.registered_at.timestamp_millis(),
+                        observed: agent.latest.is_some(),
+                        last_activity_label: agent
+                            .latest
+                            .as_ref()
+                            .map(|snapshot| snapshot.activity_label.to_string()),
+                        last_mtime_ms: agent.latest.as_ref().and_then(|snapshot| {
+                            snapshot
+                                .mtime
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .map(|since| since.as_millis() as i64)
+                        }),
+                        stop_reason: agent
+                            .latest
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.stop_reason.as_ref())
+                            .map(|reason| reason.to_string()),
+                        killed: agent.killed,
+                        usage_limited: agent.hit_usage_limit(),
+                        vouches_for_parent: agent.vouches_for_parent(now),
+                        parent_tool_use_id: agent
+                            .parent_tool_use_id
+                            .as_ref()
+                            .map(|toolu| toolu.to_string()),
+                    })
+                    .collect();
+                Ok(GetBackgroundAgentsResult {
+                    agents,
+                    has_live_background_work: s.has_live_background_work(now),
+                })
+            })
+        })?;
+
+        let unobserved = out.agents.iter().filter(|a| !a.observed).count();
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: format!(
+                    "{} background agent(s), {} never observed, live_background_work={}",
+                    out.agents.len(),
+                    unobserved,
+                    out.has_live_background_work
+                ),
+            }],
+            structured_content: out,
+        })
+    }
+}
+
+// =====================================================================
 // solution_agent.list_agents
 // =====================================================================
 
@@ -1963,5 +2114,8 @@ pub(crate) fn register_read(cx: &mut App) {
     });
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(GetSessionChildrenTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(GetBackgroundAgentsTool);
     });
 }

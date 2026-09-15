@@ -243,10 +243,7 @@ impl BackgroundAgent {
                 DateTime::<Utc>::from(snapshot.mtime),
                 BACKGROUND_AGENT_QUIET_MAX_SECS,
             ),
-            None => (
-                self.registered_at,
-                BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS,
-            ),
+            None => (self.registered_at, BACKGROUND_AGENT_UNOBSERVED_GRACE_SECS),
         };
         now.signed_duration_since(since).num_seconds() < budget
     }
@@ -1048,7 +1045,10 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm"}]}}"#,
         ));
         assert!(agent.hit_usage_limit());
-        assert!(!agent.transcript_is_open(), "a walled agent is not live work");
+        assert!(
+            !agent.transcript_is_open(),
+            "a walled agent is not live work"
+        );
         assert!(
             agent.renders_stream(),
             "but its tab stays visible with the reason"

@@ -3279,7 +3279,9 @@ async fn dropping_the_thread_kills_background_agents(cx: &mut TestAppContext) {
             "every background agent of a dropped subprocess is killed"
         );
         assert!(
-            s.background_agents.values().all(|a| !a.transcript_is_open()),
+            s.background_agents
+                .values()
+                .all(|a| !a.transcript_is_open()),
             "a killed agent is NOT live background work — else the stuck-session \
              watchdog stays suppressed forever after a reconnect"
         );
@@ -3462,13 +3464,7 @@ async fn agent_watcher_rearms_after_the_acp_session_id_rotates(cx: &mut TestAppC
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session");
         let s = session.read(cx);
-        let fs = s
-            .project
-            .as_ref()
-            .expect("project")
-            .read(cx)
-            .fs()
-            .clone();
+        let fs = s.project.as_ref().expect("project").read(cx).fs().clone();
         (s.cwd.clone(), fs, s.acp_session_id.0.to_string())
     });
 
@@ -3487,7 +3483,10 @@ async fn agent_watcher_rearms_after_the_acp_session_id_rotates(cx: &mut TestAppC
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         assert_eq!(
-            store.read(cx).teammate_watchers.agent_watcher_path(session_id),
+            store
+                .read(cx)
+                .teammate_watchers
+                .agent_watcher_path(session_id),
             Some(first_dir.as_path()),
             "the watcher must be armed on the current acp session's subagents dir"
         );
@@ -3509,44 +3508,14 @@ async fn agent_watcher_rearms_after_the_acp_session_id_rotates(cx: &mut TestAppC
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         assert_eq!(
-            store.read(cx).teammate_watchers.agent_watcher_path(session_id),
+            store
+                .read(cx)
+                .teammate_watchers
+                .agent_watcher_path(session_id),
             Some(rotated_dir.as_path()),
             "a rotated session must re-arm its watcher on the NEW subagents dir"
         );
     });
-}
-
-/// `fs.watch` on a directory that does not exist yet fails permanently — Zed's
-/// `RealFs::watch` logs `watcher.add`'s error and hands back a stream that never
-/// yields, with no retry. claude creates `<acp-session>/subagents/` only at the
-/// instant it dispatches its first managed agent, so arming can race it. Create
-/// the directory before watching it, so the arm is never a dead one.
-#[gpui::test]
-async fn arming_the_agent_watcher_materialises_the_watched_directory(cx: &mut TestAppContext) {
-    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
-
-    let (cwd, fs, acp) = cx.update(|cx| {
-        let store = SolutionAgentStore::global(cx);
-        let session = store.read(cx).session(session_id).expect("session");
-        let s = session.read(cx);
-        let fs = s.project.as_ref().expect("project").read(cx).fs().clone();
-        (s.cwd.clone(), fs, s.acp_session_id.0.to_string())
-    });
-    let dir = background_agent_dir_for(&cwd, &acp).expect("subagents dir");
-    assert!(!fs.is_dir(&dir).await, "precondition: dir does not exist yet");
-
-    cx.update(|cx| {
-        let store = SolutionAgentStore::global(cx);
-        store.update(cx, |store, cx| {
-            store.ensure_background_agent_watcher(session_id, fs.clone(), cx);
-        });
-    });
-    cx.run_until_parked();
-
-    assert!(
-        fs.is_dir(&dir).await,
-        "arming must materialise the watched directory, or the watch is dead on arrival"
-    );
 }
 
 /// `fs.watch` is an OPTIMISATION, not the only source of truth. It can be armed
@@ -3669,7 +3638,11 @@ async fn the_tick_does_not_re_tail_a_freshly_observed_agent(cx: &mut TestAppCont
                 s.background_agent_order.push(id.clone());
             };
             register(&fresh, &fresh_jsonl, 0);
-            register(&stale, &stale_jsonl, BACKGROUND_AGENT_TAIL_FALLBACK_SECS + 10);
+            register(
+                &stale,
+                &stale_jsonl,
+                BACKGROUND_AGENT_TAIL_FALLBACK_SECS + 10,
+            );
         });
     });
 

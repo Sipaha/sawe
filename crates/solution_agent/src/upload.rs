@@ -349,8 +349,7 @@ impl UploadManager {
         // stale one would arrive after the ack that supersedes it and send the
         // client back to an `expected_offset` it has already passed — an extra
         // round trip per glitch, unbounded on a flaky link.
-        self.rejection_queue
-            .retain(|queued| queued.upload_id != id);
+        self.rejection_queue.retain(|queued| queued.upload_id != id);
         self.ack_queue.push(ChunkAck {
             upload_id: id,
             received_bytes: new_total,

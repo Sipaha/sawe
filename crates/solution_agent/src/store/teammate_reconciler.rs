@@ -1123,8 +1123,7 @@ impl SolutionAgentStore {
     /// [`BACKGROUND_AGENT_TAIL_FALLBACK_SECS`] and is skipped outright.
     /// Terminal and killed agents are skipped too — no further line can arrive.
     fn tail_unobserved_background_agents(&mut self, cx: &mut Context<Self>) {
-        let fallback_after =
-            std::time::Duration::from_secs(BACKGROUND_AGENT_TAIL_FALLBACK_SECS);
+        let fallback_after = std::time::Duration::from_secs(BACKGROUND_AGENT_TAIL_FALLBACK_SECS);
         let now = std::time::SystemTime::now();
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();

@@ -8191,3 +8191,85 @@ async fn every_entry_kind_renders_a_non_empty_preview(cx: &mut gpui::TestAppCont
         }
     }
 }
+
+/// Background-agent tracking state had no wire surface at all, which is why
+/// diagnosing why the Observer stayed silent on session `qv09rxtm` meant reading
+/// SQLite rows that are only ever written once, at registration, with every
+/// snapshot column NULL. `solution_agent.get_background_agents` exposes the
+/// in-memory truth instead: whether a snapshot was ever taken, what it says, and
+/// whether the agent still vouches for its parent.
+#[gpui::test]
+async fn get_background_agents_reports_whether_an_agent_was_ever_observed(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let unobserved = crate::background_agent::BackgroundAgentId::new("bg_never_seen");
+    let observed = crate::background_agent::BackgroundAgentId::new("bg_seen");
+
+    cx.update(|cx| {
+        let store = crate::store::SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| {
+            let mut register =
+                |id: &crate::background_agent::BackgroundAgentId,
+                 latest: Option<crate::background_agent::BackgroundAgentSnapshot>| {
+                    s.background_agents.insert(
+                        id.clone(),
+                        crate::background_agent::BackgroundAgent {
+                            id: id.clone(),
+                            jsonl_path: std::path::PathBuf::from("/tmp/agent.jsonl"),
+                            registered_at: chrono::Utc::now(),
+                            latest,
+                            last_offset: 0,
+                            parent_tool_use_id: Some(gpui::SharedString::from("toolu_p")),
+                            latest_seq: 0,
+                            killed: false,
+                        },
+                    );
+                    s.background_agent_order.push(id.clone());
+                };
+            register(&unobserved, None);
+            register(
+                &observed,
+                Some(crate::background_agent::BackgroundAgentSnapshot {
+                    mtime: std::time::SystemTime::now(),
+                    activity_label: gpui::SharedString::from("Bash: cargo test"),
+                    stop_reason: None,
+                    usage_limited: false,
+                }),
+            );
+        });
+    });
+
+    let result = GetBackgroundAgentsTool
+        .run(
+            GetBackgroundAgentsParams {
+                session_id: session_id.to_string(),
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("get_background_agents");
+    let agents = &result.structured_content.agents;
+    assert_eq!(agents.len(), 2);
+
+    let never = agents.iter().find(|a| a.id == "bg_never_seen").unwrap();
+    assert!(
+        !never.observed,
+        "an agent with no snapshot must report observed=false — the whole point"
+    );
+    assert!(never.last_activity_label.is_none());
+    assert!(
+        never.vouches_for_parent,
+        "still inside its grace, so it legitimately holds the supervisor gate"
+    );
+
+    let seen = agents.iter().find(|a| a.id == "bg_seen").unwrap();
+    assert!(seen.observed);
+    assert_eq!(
+        seen.last_activity_label.as_deref(),
+        Some("Bash: cargo test")
+    );
+    assert!(seen.stop_reason.is_none());
+    assert!(seen.vouches_for_parent);
+}
