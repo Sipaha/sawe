@@ -86,7 +86,7 @@ impl Translator {
                     .unwrap_or(kind);
                 if method == "item/started" {
                     return vec![acp::SessionUpdate::ToolCall(
-                        acp::ToolCall::new(id.to_owned(), title.to_owned())
+                        acp::ToolCall::new(id.to_owned(), tool_call_title(title))
                             .kind(tool_kind)
                             .status(acp::ToolCallStatus::InProgress)
                             .raw_input(item.clone()),
@@ -120,6 +120,32 @@ impl Translator {
         }
     }
 }
+/// One-line title for a tool call.
+///
+/// Codex reports a `commandExecution` item's WHOLE command as the title —
+/// heredoc body included — and the conversation view renders a tool title as
+/// Markdown (deliberately: titles are user-facing prose there). A
+/// `/bin/bash -lc "cat > x_test.go <<'EOF' … EOF"` writing Go source therefore
+/// came out as one flowing paragraph with `*testing.T` eaten as emphasis.
+/// Claude never trips this because its titles are plain tool names.
+///
+/// Keep the first non-empty line — the program and its flags, which is the
+/// identifying part — and append an ellipsis when anything followed. Nothing is
+/// lost: the full command is already shown verbatim underneath on the tool
+/// call's preview row, which renders `raw_input` as a plain (non-Markdown)
+/// label with newlines mapped to `↵`.
+fn tool_call_title(raw: &str) -> String {
+    let mut lines = raw.lines().skip_while(|line| line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return raw.to_owned();
+    };
+    if lines.any(|line| !line.trim().is_empty()) {
+        format!("{} …", first.trim_end())
+    } else {
+        first.trim_end().to_owned()
+    }
+}
+
 fn text(value: &str, thinking: bool) -> acp::SessionUpdate {
     let chunk = acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
         value.to_owned(),
@@ -168,6 +194,40 @@ mod tests {
                 .stop_reason,
             acp::StopReason::Cancelled
         );
+    }
+    #[test]
+    fn a_heredoc_command_title_keeps_only_its_first_line() {
+        let command =
+            "/bin/bash -lc \"cat > pool_test.go <<'EOF'\nfunc TestPool(t *testing.T) {\n}\nEOF\"";
+        let updates = Translator::default().translate(
+            "item/started",
+            &json!({"item":{"id":"cmd","type":"commandExecution","command":command}}),
+        );
+        let started = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(
+            started["title"], "/bin/bash -lc \"cat > pool_test.go <<'EOF' …",
+            "a multi-line command must not reach the Markdown-rendered title"
+        );
+        // The full command still travels on `raw_input`, which the tool
+        // call's preview row renders as a plain label.
+        assert_eq!(started["rawInput"]["command"], command);
+    }
+    #[test]
+    fn a_single_line_command_title_is_unchanged() {
+        let updates = Translator::default().translate(
+            "item/started",
+            &json!({"item":{"id":"cmd","type":"commandExecution","command":"go test ./pool/..."}}),
+        );
+        assert_eq!(
+            serde_json::to_value(&updates[0]).unwrap()["title"],
+            "go test ./pool/..."
+        );
+    }
+    #[test]
+    fn titles_survive_odd_command_shapes() {
+        assert_eq!(tool_call_title(""), "");
+        assert_eq!(tool_call_title("\n\n  go build  \n"), "  go build");
+        assert_eq!(tool_call_title("go build\n\n   \n"), "go build");
     }
     #[test]
     fn nonzero_exit_is_failed() {

@@ -24,7 +24,8 @@ use solutions::SolutionId;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SeedColdSessionEntry {
-    /// `"user"`, `"assistant"` (default), `"observer"`/`"system"` (an
+    /// `"user"`, `"assistant"` (default), `"tool"` (a completed shell tool call
+    /// whose raw command is `text`), `"observer"`/`"system"` (an
     /// agent-invisible Observer `System` bubble — FORK.md #29), or `"nudge"` (an
     /// agent-VISIBLE observer nudge — a UserMessage carrying the observer-nudge
     /// `_meta` marker; renders the "Observer · to the agent" plaque).
@@ -148,6 +149,25 @@ impl McpServerTool for SeedColdSessionTool {
                             acp::TextContent::new(text)
                                 .meta(Some(acp_thread::meta_with_observer_nudge())),
                         )],
+                    }
+                } else if e.role.eq_ignore_ascii_case("tool") {
+                    // A completed `Execute` tool call whose RAW command is
+                    // `text`. The title goes through the same
+                    // `single_line_tool_label` clamp the live ingest path uses,
+                    // so a seeded render answers the real question: what does a
+                    // provider that puts a whole heredoc in the title paint like
+                    // (title row vs. the `raw_input` preview row underneath).
+                    crate::session_entry::SessionEntryKind::ToolCall {
+                        id: format!("seed_tool_{i}"),
+                        label_md: crate::session_entry::single_line_tool_label(&text),
+                        kind: acp::ToolKind::Execute,
+                        status: crate::session_entry::ToolStatus::Completed,
+                        content_md: vec![],
+                        raw_input: Some(serde_json::json!({ "command": text })),
+                        raw_output: None,
+                        tool_name: Some("shell".to_string()),
+                        locations: vec![],
+                        status_started_at: None,
                     }
                 } else if e.role.eq_ignore_ascii_case("user") {
                     crate::session_entry::SessionEntryKind::UserMessage {

@@ -235,7 +235,7 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
                 call.subagent_id.clone(),
                 SessionEntryKind::ToolCall {
                     id: call.id.0.to_string(),
-                    label_md: call.label.read(cx).source().to_string(),
+                    label_md: single_line_tool_label(call.label.read(cx).source()),
                     kind: call.kind,
                     status,
                     content_md,
@@ -333,6 +333,28 @@ pub fn kind_from_payload(bytes: &[u8]) -> anyhow::Result<SessionEntryKind> {
     serde_json::from_slice(bytes).map_err(Into::into)
 }
 
+/// Clamp a tool-call title to a single line, whatever the provider emitted.
+///
+/// A tool title is rendered as Markdown (`conversation_render::render_span`
+/// over the `Tool: …` span) because titles are user-facing prose. A provider
+/// that puts a whole shell command in the title — Codex does, heredoc body and
+/// all — therefore got a paragraph of mangled source instead of a header:
+/// newlines collapsed and `*` became emphasis. `codex_native` already clamps at
+/// the source; this is the provider-agnostic backstop so no future adapter can
+/// reintroduce it. The full command is unaffected — it is rendered from
+/// `raw_input` on the preview row below the title.
+pub(crate) fn single_line_tool_label(source: &str) -> String {
+    let mut lines = source.lines().skip_while(|line| line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return source.to_owned();
+    };
+    if lines.any(|line| !line.trim().is_empty()) {
+        format!("{} …", first.trim_end())
+    } else {
+        first.trim_end().to_owned()
+    }
+}
+
 fn user_message_id_to_string(id: &UserMessageId) -> String {
     serde_json::to_value(id)
         .ok()
@@ -364,6 +386,17 @@ mod tests {
                 status_started_at: Some(1_700_000_000_500),
             },
         }
+    }
+
+    #[test]
+    fn a_multi_line_tool_title_is_clamped_before_it_reaches_markdown() {
+        assert_eq!(single_line_tool_label("Bash"), "Bash");
+        assert_eq!(
+            single_line_tool_label("/bin/bash -lc \"cat > a.go <<'EOF'\nfunc T(t *testing.T) {\nEOF\""),
+            "/bin/bash -lc \"cat > a.go <<'EOF' …"
+        );
+        assert_eq!(single_line_tool_label("Read file\n\n  \n"), "Read file");
+        assert_eq!(single_line_tool_label(""), "");
     }
 
     #[gpui::test]

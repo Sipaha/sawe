@@ -4277,3 +4277,33 @@ report the number you got rather than the one you expected — the first estimat
 here was "the bulk of `deps`" and the truth was 13%. And when a disk fills up on
 a dev machine, look for what nothing ever deletes before looking for what is
 too big.
+
+### 178. A tool-call title is one line, whatever the provider sends
+
+The conversation view renders a tool call's title through the Markdown pipeline
+— deliberately, and `claude_native`'s own test says so ("the title goes through
+Markdown rendering and is user-facing"). Claude never suffers for it because its
+titles are plain tool names (`Bash`, `Read`). Codex reports the ENTIRE command
+as the title (`crates/codex_native/src/translate.rs`, `item["command"]`), so a
+`/bin/bash -lc "cat > x_test.go <<'EOF' … EOF"` writing Go source rendered as a
+flowing paragraph with `*testing.T` eaten as Markdown emphasis. Only *some*
+Codex calls looked wrong — a single-line `go test ./…` gives Markdown nothing to
+mangle, which is why this read as random.
+
+Fixed at both ends, and the second one is the point:
+
+- `codex_native::translate::tool_call_title` keeps the command's first non-empty
+  line and appends `…` when anything followed. Single-line commands are
+  byte-identical to before.
+- `session_entry::single_line_tool_label` applies the same clamp on the ingest
+  path (`to_session_entry`), so no future adapter can reintroduce it.
+
+Nothing is lost: the full command is already rendered verbatim on the grey
+preview row underneath, which reads `raw_input` into a plain `Label` with
+newlines mapped to `↵`. The title was redundant detail; it is now a label.
+
+How to apply: treat "this string is rendered as Markdown" as a constraint on
+every producer of that string, not as a property of the one producer you were
+looking at. The clamp belongs where the data enters the model, not in the
+render function — `render_tool_call` only sees a fallback, since the painted
+text comes from the cached `Markdown` entity built out of `entry_text_spans`.
