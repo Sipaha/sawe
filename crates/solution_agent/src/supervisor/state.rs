@@ -81,13 +81,18 @@ pub enum CompactStep {
 /// living in the editor rather than in the judge's prompt is that the judge
 /// starts each wake with no memory of having asked.
 pub fn compact_guard(requests: u32, since_last_ms: Option<i64>) -> CompactStep {
-    if requests >= MAX_COMPACT_REQUESTS {
-        return CompactStep::Force;
-    }
+    // The window is checked BEFORE the cap, and the order is the whole point:
+    // `tick_supervisor` runs every 5 seconds, so a cap that outranked the window
+    // would fire the forced handoff five seconds after the second ask — the
+    // exact interrupt this ladder exists to prevent, and a lie to the agent,
+    // which was just told it had until the next check.
     if let Some(elapsed) = since_last_ms
         && elapsed < (COMPACT_ESCALATION_SECS as i64) * 1000
     {
         return CompactStep::TooSoon;
+    }
+    if requests >= MAX_COMPACT_REQUESTS {
+        return CompactStep::Force;
     }
     if requests == 0 {
         CompactStep::Ask
@@ -475,6 +480,15 @@ pub struct SupervisorState {
     /// mid-handoff any more.
     pub compact_requests: u32,
     pub last_compact_request_ms: Option<i64>,
+    /// TRANSIENT: when the editor last SENT the compaction request itself (the
+    /// ladder's last rung), as opposed to asking the agent to. Tracked apart
+    /// from the asks because a force can be REFUSED — an unanswered permission
+    /// prompt, no headroom left — and a refusal leaves every other input the
+    /// ladder reads unchanged, so without this the 5-second tick would retry it
+    /// forever, writing a diary note each time. An idle session's first force is
+    /// still immediate: nothing has been forced yet, so there is nothing to back
+    /// off from.
+    pub last_force_ms: Option<i64>,
     /// TRANSIENT: the judge's "what this handoff must not lose" note from the
     /// verdict that armed the ladder, kept so the LATER rungs — which the
     /// editor's own timer drives, with no judge in the loop — carry it too.
@@ -524,6 +538,7 @@ impl SupervisorState {
             judge_superseded: false,
             compact_requests: 0,
             last_compact_request_ms: None,
+            last_force_ms: None,
             compact_request_note: None,
             held_by_done: false,
             pending_nudge: None,

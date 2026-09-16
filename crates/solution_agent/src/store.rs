@@ -31,6 +31,7 @@ use crate::pool::SubprocessPool;
 use crate::teammate_watchers::TeammateWatchers;
 
 mod acp_event;
+mod compaction_ladder;
 mod connection_pool;
 mod hydration;
 mod peer;

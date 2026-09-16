@@ -83,7 +83,10 @@ fn tool_call_arg_preview_none_for_empty_input() {
 /// same picked value, but verbatim — newlines intact, no 240-char cap.
 #[test]
 fn tool_call_arg_value_is_the_untruncated_twin_of_the_preview() {
-    let command = format!("cat > a.go <<'EOF'\nfunc T() {{}}\n{}\nEOF", "x".repeat(400));
+    let command = format!(
+        "cat > a.go <<'EOF'\nfunc T() {{}}\n{}\nEOF",
+        "x".repeat(400)
+    );
     let input = serde_json::json!({ "command": command, "description": "write it" });
 
     let full = tool_call_arg_value(&input).expect("value");
@@ -101,7 +104,7 @@ fn tool_call_arg_value_is_the_untruncated_twin_of_the_preview() {
     // Same picker on both sides: a Read call's modal is its file_path, not the
     // first key that happens to sort first.
     let read = serde_json::json!({ "abort_signal": "none", "file_path": "/tmp/a.rs" });
-    assert_eq!(tool_call_arg_value(&read).as_deref(), Some("/tmp/a.rs"));
+    assert_eq!(tool_call_arg_value(&read), Some("/tmp/a.rs"));
     assert!(tool_call_arg_value(&serde_json::json!({})).is_none());
 }
 

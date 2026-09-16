@@ -3,7 +3,8 @@
 
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, rems,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
+    rems,
 };
 use ui::prelude::*;
 use ui::{Button, ButtonStyle, CopyButton, Label, LabelSize};
@@ -26,11 +27,10 @@ pub struct ToolArgumentModal {
 impl ToolArgumentModal {
     pub fn new(
         title: SharedString,
-        argument: String,
+        argument: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let argument = SharedString::from(argument);
         let argument_editor = cx.new(|cx| {
             let mut e = editor::Editor::multi_line(window, cx);
             e.set_show_gutter(false, cx);
@@ -104,7 +104,7 @@ impl Render for ToolArgumentModal {
                             .truncate(),
                     )
                     .child(
-                        CopyButton::new("tool-argument-copy", self.argument.to_string())
+                        CopyButton::new("tool-argument-copy", self.argument.clone())
                             .tooltip_label("Copy the full argument"),
                     ),
             )

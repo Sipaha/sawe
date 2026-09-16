@@ -104,6 +104,37 @@ pub fn truncate_lines_and_trailoff(s: &str, max_lines: usize) -> String {
     }
 }
 
+/// Collapses text to its first non-empty line, appending an ellipsis when
+/// anything followed. Used where a one-line label is rendered from text a
+/// provider may have written as a whole document — a tool-call title carrying a
+/// heredoc, for instance — and the remainder is shown elsewhere.
+pub fn single_line_summary(text: &str) -> String {
+    let mut lines = text.lines().skip_while(|line| line.trim().is_empty());
+    // Nothing but blank lines collapses to nothing: returning the input would
+    // hand back the multi-line string the caller asked to be rid of.
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    // Trimmed on BOTH sides: the caller renders this through Markdown, where a
+    // line indented four spaces is a code block — the same class of mangling the
+    // helper exists to prevent.
+    if lines.any(|line| !line.trim().is_empty()) {
+        format!("{} …", first.trim())
+    } else {
+        first.trim().to_owned()
+    }
+}
+
+#[test]
+fn test_single_line_summary() {
+    assert_eq!(single_line_summary("one line"), "one line");
+    assert_eq!(single_line_summary("head\ntail"), "head …");
+    assert_eq!(single_line_summary("\n\n  head  \n"), "head");
+    assert_eq!(single_line_summary("head\n\n   \n"), "head");
+    assert_eq!(single_line_summary(""), "");
+    assert_eq!(single_line_summary("\n \n\t\n"), "");
+}
+
 /// Truncates the string at a character boundary, such that the result is less than `max_bytes` in
 /// length.
 pub fn truncate_to_byte_limit(s: &str, max_bytes: usize) -> &str {

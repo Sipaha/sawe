@@ -828,7 +828,8 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         judge_superseded: false,
         compact_requests: 0,
         last_compact_request_ms: None,
-            compact_request_note: None,
+        last_force_ms: None,
+        compact_request_note: None,
         held_by_done: false,
         pending_nudge: None,
         wait_until_ms: None,
@@ -1359,7 +1360,10 @@ async fn verdict_nonce_authenticates_and_dedups(cx: &mut gpui::TestAppContext) {
             Default::default(),
             cx,
         );
-        assert!(matches!(ok, VerdictAuth::Applied), "matching nonce applies");
+        assert!(
+            matches!(ok, VerdictAuth::Applied { .. }),
+            "matching nonce applies"
+        );
         assert!(
             !store.judge_sessions.contains_key(&id),
             "applying a verdict reaps the judge handle"
@@ -1428,7 +1432,7 @@ async fn audit_verdict_nonce_authenticates_and_dedups(cx: &mut gpui::TestAppCont
             "healthy".into(),
             cx,
         );
-        assert!(matches!(ok, VerdictAuth::Applied));
+        assert!(matches!(ok, VerdictAuth::Applied { .. }));
         assert!(!store.auditor_sessions.contains_key(&id));
 
         // Re-submit → no in-flight auditor → idempotent no-op.
@@ -2717,6 +2721,45 @@ async fn compact_verdict_does_not_reenter_store(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// The judge cannot see a failed write any more — it has no file of its own to
+/// look at — so a write that does not land has to come back on the verdict's
+/// reply. Failure is injected the portable way: a regular FILE where the
+/// supervisor directory should be, which makes `create_dir_all` fail.
+#[gpui::test]
+async fn a_memory_write_that_fails_is_reported_not_swallowed(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let dir = store.update(cx, |store, cx| {
+        let root = store
+            .solution_root_for(id, cx)
+            .expect("registered solution");
+        crate::supervisor::supervisor_dir(&root, id)
+    });
+    std::fs::create_dir_all(dir.parent().expect("session dir")).unwrap();
+    std::fs::write(&dir, b"not a directory").unwrap();
+
+    let warning = store.update(cx, |store, cx| {
+        store.write_supervisor_memory(
+            id,
+            crate::supervisor::SupervisorMemoryUpdate {
+                intent: Some("User requires verification at every stage.".into()),
+                diary_note: Some("First wake.".into()),
+            },
+            cx,
+        )
+    });
+    let warning = warning.expect("a failed write is reported");
+    assert!(
+        warning.contains("intent record was NOT stored") && warning.contains("diary note"),
+        "both halves are named, since they fail independently: {warning}"
+    );
+
+    // Nothing to report when there was nothing to write.
+    let quiet = store.update(cx, |store, cx| {
+        store.write_supervisor_memory(id, Default::default(), cx)
+    });
+    assert!(quiet.is_none());
+}
+
 /// A `compact` verdict asks the agent to hand off before it takes the decision
 /// away from it: the first two land as observer messages naming the tool, and
 /// only the third queues the compaction itself. Asserted end-to-end on what the
@@ -2763,10 +2806,8 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
                 let epoch = session.read(cx).epoch;
                 let state = store.supervisor_states.get_mut(&session_id).unwrap();
                 state.status = crate::supervisor::SupervisorStatus::Judging;
-                state.active_review = Some(crate::supervisor::ActiveReviewSnapshot {
-                    epoch,
-                    started_at,
-                });
+                state.active_review =
+                    Some(crate::supervisor::ActiveReviewSnapshot { epoch, started_at });
             });
         });
     };
@@ -2916,7 +2957,18 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
          too, though no judge is in the loop by now: {second}"
     );
 
-    // Two asks spent: the next tick stops asking and sends the compaction.
+    // Two asks spent — but the window still governs: the tick five seconds
+    // later must NOT force, or the agent is cut off seconds after being told it
+    // had until the next check.
+    tick(cx);
+    assert_eq!(
+        transcript(cx),
+        second,
+        "the cap does not outrank the escalation window"
+    );
+
+    // Once the window passes, the next tick stops asking and sends the
+    // compaction.
     age_last_ask(cx);
     tick(cx);
     let third = transcript(cx);
@@ -2928,6 +2980,172 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
     assert!(
         third.contains("autonomous observer"),
         "and it is still attributed to the observer, not to the user"
+    );
+}
+
+/// A forced compaction can be REFUSED — no headroom left, an unresolved
+/// permission prompt — and a refusal leaves every other input the ladder reads
+/// unchanged. So the force has to latch its attempt, or the 5-second tick
+/// retries it forever, writing a warn line and a diary note each time (the
+/// diary is capped, so the spam also evicts the observer's real notes).
+#[gpui::test]
+async fn a_refused_force_backs_off_instead_of_retrying_every_tick(cx: &mut gpui::TestAppContext) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    // A refusal that can never self-resolve: past the 10% gate, but with less
+    // headroom left than a handoff needs. `compact_unavailable_reason` answers
+    // "only N tokens of headroom left", which is NOT the transient
+    // "session is busy" the diary filter skips — so every attempt writes a note.
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: 999_000,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let dir = cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.arm_compaction_ladder_for_test(session_id);
+            let root = store.solution_root_for(session_id, cx).expect("registered");
+            crate::supervisor::supervisor_dir(&root, session_id)
+        })
+    });
+    let refusals = |cx: &mut gpui::TestAppContext| {
+        let _ = cx;
+        std::fs::read_to_string(crate::supervisor::diary_path(&dir))
+            .unwrap_or_default()
+            .matches("compact verdict REFUSED")
+            .count()
+    };
+    let tick = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| store.tick_supervisor(cx));
+        });
+        cx.executor().run_until_parked();
+    };
+
+    tick(cx);
+    assert_eq!(
+        refusals(cx),
+        1,
+        "the first tick forces, the compaction is refused, and the refusal is \
+         recorded where the judge will read it"
+    );
+    assert!(
+        cx.update(|cx| !SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .is_compaction_pending()),
+        "nothing was queued — this is a genuine refusal, not a silent success"
+    );
+
+    // Production's own cadence: several more ticks inside the window.
+    for _ in 0..3 {
+        tick(cx);
+    }
+    assert_eq!(
+        refusals(cx),
+        1,
+        "and it is not retried on every tick while the refusal stands"
+    );
+
+    // Past the window it may try once more — a refusal that DOES self-resolve
+    // (an approval the user finally answered) has to get another chance.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            let state = store.supervisor_states.get_mut(&session_id).unwrap();
+            state.last_force_ms = Some(
+                chrono::Utc::now().timestamp_millis()
+                    - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
+                    - 1,
+            );
+        });
+    });
+    tick(cx);
+    assert_eq!(
+        refusals(cx),
+        2,
+        "once the back-off elapses the ladder tries again"
+    );
+}
+
+/// An ask issued while the human is typing is parked rather than delivered, and
+/// a genuine user send discards it. Counting it as a spent rung would walk the
+/// ladder toward a forced handoff on the strength of a message the agent never
+/// saw.
+#[gpui::test]
+async fn an_ask_parked_behind_a_typing_user_does_not_spend_a_rung(cx: &mut gpui::TestAppContext) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: 500_000,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let requests = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx)
+                .read(cx)
+                .supervisor_state(session_id)
+                .unwrap()
+                .compact_requests
+        })
+    };
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.arm_compaction_ladder_for_test(session_id);
+            // The human started typing a second ago.
+            store.note_user_input(session_id);
+            // Working session with its window elapsed: the ladder would ask now.
+            let session = store.session(session_id).unwrap();
+            let started_at = std::time::Instant::now();
+            session.update(cx, |session, _| {
+                session.state = crate::model::SessionState::Running {
+                    started_at,
+                    notified: false,
+                };
+            });
+            let epoch = session.read(cx).epoch;
+            let state = store.supervisor_states.get_mut(&session_id).unwrap();
+            state.active_review =
+                Some(crate::supervisor::ActiveReviewSnapshot { epoch, started_at });
+            state.last_compact_request_ms = Some(
+                chrono::Utc::now().timestamp_millis()
+                    - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
+                    - 1,
+            );
+        });
+    });
+    let before = requests(cx);
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| store.tick_supervisor(cx));
+    });
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        requests(cx),
+        before,
+        "the rung is spent on delivery, not on the attempt"
     );
 }
 
@@ -3084,12 +3302,10 @@ async fn compact_verdict_message_reaches_the_prompt_as_an_observer_note(
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.set_supervision_enabled(session_id, true, cx);
-            // Start at the far end of the escalation ladder: the first two
-            // `compact` verdicts only ASK the agent to hand off (covered by
-            // `a_compact_verdict_asks_before_it_compacts`); this test is about
-            // what the compaction request itself carries once asking is spent.
-            let state = store.supervisor_states.get_mut(&session_id).unwrap();
-            state.compact_requests = crate::supervisor::MAX_COMPACT_REQUESTS;
+            // The session is idle, so the ladder is skipped entirely and the
+            // request is sent at once (`an_idle_session_is_compacted_without_
+            // being_asked`); what this test is about is what that request
+            // CARRIES.
             store.apply_verdict(
                 session_id,
                 crate::supervisor::VerdictAction::Compact,

@@ -160,7 +160,14 @@ impl McpServerTool for SupervisorVerdictTool {
         });
 
         let text = match outcome {
-            crate::store::VerdictAuth::Applied => "recorded",
+            // A warning means the editor could not store what the verdict asked
+            // it to remember. Surfaced rather than logged: the judge is told to
+            // check this reply, and it has no file of its own to notice a lost
+            // write in.
+            crate::store::VerdictAuth::Applied {
+                memory_warning: Some(warning),
+            } => &format!("recorded, but {warning}"),
+            crate::store::VerdictAuth::Applied { .. } => "recorded",
             // Idempotent no-op — reported as success so a retrying judge stops.
             crate::store::VerdictAuth::NoInFlight => {
                 "no active supervision for this session (already processed or superseded); ignored"
@@ -272,7 +279,7 @@ impl McpServerTool for SupervisorAuditVerdictTool {
         });
 
         let text = match outcome {
-            crate::store::VerdictAuth::Applied => "recorded",
+            crate::store::VerdictAuth::Applied { .. } => "recorded",
             crate::store::VerdictAuth::NoInFlight => {
                 "no active auditor for this session (already processed); ignored"
             }

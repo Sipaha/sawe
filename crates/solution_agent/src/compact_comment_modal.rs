@@ -135,11 +135,9 @@ impl Render for CompactCommentModal {
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(
-                        Button::new("compact-comment-cancel", "Cancel").on_click(cx.listener(
-                            |this, _, window, cx| this.cancel(&menu::Cancel, window, cx),
-                        )),
-                    )
+                    .child(Button::new("compact-comment-cancel", "Cancel").on_click(
+                        cx.listener(|this, _, window, cx| this.cancel(&menu::Cancel, window, cx)),
+                    ))
                     .child(
                         Button::new("compact-comment-confirm", "Compact")
                             .style(ButtonStyle::Filled)

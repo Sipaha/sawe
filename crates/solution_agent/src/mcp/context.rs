@@ -330,6 +330,13 @@ pub struct StartCompactParams {
     /// comment field of the desktop's compact modal. Omit for a plain compact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Who is asking: `"user"` (default — a human tapping Compact on a client)
+    /// or `"agent"` when the supervised session compacts ITSELF. The difference
+    /// is not cosmetic: a human compaction also resets the observer's memory
+    /// (FORK.md #37), and an agent's must not, or a session that decides to
+    /// hand off deletes the observer's standing-intent record on its way out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for StartCompactParams {
@@ -339,11 +346,13 @@ impl<'de> Deserialize<'de> for StartCompactParams {
         struct Inner {
             session_id: String,
             comment: Option<String>,
+            initiator: Option<String>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             session_id: inner.session_id,
             comment: inner.comment,
+            initiator: inner.initiator,
         })
     }
 }
@@ -381,11 +390,21 @@ impl McpServerTool for StartCompactTool {
         );
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
+        let initiator = match input.initiator.as_deref() {
+            // `user` is the default so a client that predates this field (the
+            // phone's Compact button) keeps behaving as the human gesture it is.
+            // `Client` rather than `User` because the editor cannot verify the
+            // caller over MCP — see `start_compact_for_session` for what that
+            // costs the claim.
+            None | Some("user") => crate::compact::CompactInitiator::Client,
+            Some("agent") => crate::compact::CompactInitiator::Agent,
+            Some(other) => anyhow::bail!("invalid_params: unknown initiator {other:?}"),
+        };
 
         let outcome = cx.update(|cx| -> Result<crate::compact::StartCompactOutcome> {
             crate::compact::start_compact_for_session(
                 session_id,
-                crate::compact::CompactInitiator::User,
+                initiator,
                 input.comment.as_deref(),
                 cx,
             )

@@ -1600,6 +1600,7 @@ async fn start_compact_declines_below_threshold(cx: &mut gpui::TestAppContext) {
             StartCompactParams {
                 session_id: session_id.to_string(),
                 comment: None,
+                initiator: None,
             },
             &mut cx.to_async(),
         )
@@ -1618,6 +1619,66 @@ async fn start_compact_declines_below_threshold(cx: &mut gpui::TestAppContext) {
     assert!(
         msg.contains("short") || msg.contains("%"),
         "expected reason mentioning short context or percentage; got {msg:?}"
+    );
+}
+
+/// `start_compact` is reachable by the phone AND by the agent compacting
+/// itself, and only one of those carries the human's authority to reset the
+/// observer's memory. An agent can only call a tool from inside its own turn, so
+/// a request against a RUNNING session is the agent's however it identifies
+/// itself — the default (`user`) is not allowed to win there.
+#[gpui::test]
+async fn start_compact_does_not_grant_a_running_session_the_users_authority(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: 250_000,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        crate::store::SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .update(cx, |session, _| {
+                session.state = crate::model::SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+            });
+    });
+    cx.executor().run_until_parked();
+
+    let result = StartCompactTool
+        .run(
+            StartCompactParams {
+                session_id: session_id.to_string(),
+                comment: None,
+                // The default, i.e. exactly what a client that never heard of
+                // the field sends.
+                initiator: None,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("start_compact dispatches");
+    assert!(result.structured_content.queued);
+
+    assert!(
+        cx.update(|cx| !crate::store::SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .compact_reset_observer_memory),
+        "a compaction requested from inside a turn must not wipe the observer"
     );
 }
 
@@ -1648,6 +1709,7 @@ async fn start_compact_queues_prompt_when_idle(cx: &mut gpui::TestAppContext) {
             StartCompactParams {
                 session_id: session_id.to_string(),
                 comment: None,
+                initiator: None,
             },
             &mut cx.to_async(),
         )

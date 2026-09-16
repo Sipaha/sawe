@@ -13,7 +13,7 @@ use super::*;
 /// This is what the "full argument" modal shows. [`tool_call_arg_preview`]
 /// squeezes the same value onto one line for the header row — the two must
 /// agree on WHICH value they are talking about, hence one picker.
-pub(crate) fn tool_call_arg_value(raw_input: &serde_json::Value) -> Option<String> {
+pub(crate) fn tool_call_arg_value(raw_input: &serde_json::Value) -> Option<&str> {
     const PREFERRED_KEYS: &[&str] = &[
         "command",
         "file_path",
@@ -35,7 +35,6 @@ pub(crate) fn tool_call_arg_value(raw_input: &serde_json::Value) -> Option<Strin
             obj.values()
                 .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
         })
-        .map(str::to_owned)
 }
 
 /// One-line preview of [`tool_call_arg_value`] for the tool header's sub-row.
@@ -45,24 +44,24 @@ pub(crate) fn tool_call_arg_value(raw_input: &serde_json::Value) -> Option<Strin
 pub(crate) fn tool_call_arg_preview(raw_input: &serde_json::Value) -> Option<String> {
     // On its own sub-row under the tool header (`render_tool_call`),
     // `.truncate()` on the Label clips to whatever width the container
-    // has. The cap below is a memory guard for pathological inputs
-    // (`raw_input` could carry a multi-megabyte string), not a layout
-    // constraint — leave it generous so wide windows show more.
+    // has. The cap below bounds what this ALLOCATES per frame — `raw_input`
+    // can carry a multi-megabyte string — rather than the layout, so leave it
+    // generous enough that wide windows still show more.
     const MAX_LEN: usize = 240;
     let picked = tool_call_arg_value(raw_input)?;
     // Single-line: replace embedded newlines with `↵` so a multi-line
-    // shell pipeline collapses without dropping content silently.
-    let single_line: String = picked
+    // shell pipeline collapses without dropping content silently. Truncated
+    // while mapping rather than after it, so a megabyte of `raw_input` never
+    // becomes a megabyte of `String` on the way to a 240-char label.
+    let mut preview: String = picked
         .chars()
+        .take(MAX_LEN)
         .map(|c| if c == '\n' { '↵' } else { c })
         .collect();
-    let truncated: String = single_line.chars().take(MAX_LEN).collect();
-    let needs_ellipsis = single_line.chars().count() > MAX_LEN;
-    Some(if needs_ellipsis {
-        format!("{truncated}…")
-    } else {
-        truncated
-    })
+    if picked.chars().nth(MAX_LEN).is_some() {
+        preview.push('…');
+    }
+    Some(preview)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -114,10 +113,22 @@ pub(crate) fn render_tool_call(
     // The same value untruncated, for the modal the preview row opens. A long
     // heredoc or a 300-char pipeline is unreadable on one clipped line, and
     // nothing else in the UI shows what a tool actually ran.
-    let arg_full = raw_input.and_then(tool_call_arg_value);
-    let arg_modal_title = SharedString::from(crate::session_entry::single_line_tool_label(
-        label_text,
-    ));
+    // Bounded, because this allocates on EVERY render of every visible tool
+    // call whether or not the modal is ever opened, and `raw_input` can carry a
+    // multi-megabyte string. The cap is far above anything a person reads in a
+    // modal and far below a per-frame memcpy that matters.
+    const MAX_MODAL_LEN: usize = 64 * 1024;
+    let arg_full = raw_input.and_then(tool_call_arg_value).map(|full| {
+        match full.char_indices().nth(MAX_MODAL_LEN) {
+            Some((cut, _)) => SharedString::from(format!(
+                "{}\n\n[…truncated by the editor at {MAX_MODAL_LEN} characters]",
+                &full[..cut]
+            )),
+            None => SharedString::new(full),
+        }
+    });
+    let arg_modal_title =
+        SharedString::from(crate::session_entry::single_line_tool_label(label_text));
 
     let mut container = v_flex()
         .gap_0p5()

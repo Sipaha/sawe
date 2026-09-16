@@ -282,6 +282,22 @@
     },
   },
   {
+    // Compact-context modal: same shape — the comment editor is multi-line, so
+    // Enter is a newline and Ctrl+Enter starts the compaction.
+    "context": "CompactCommentModal",
+    "bindings": {
+      "ctrl-enter": "menu::Confirm",
+    },
+  },
+  {
+    // Tool-argument modal: read-only, so Ctrl+Enter only has to dismiss it —
+    // the same gesture that confirms the other two, rather than a third habit.
+    "context": "ToolArgumentModal",
+    "bindings": {
+      "ctrl-enter": "menu::Confirm",
+    },
+  },
+  {
     "context": "AcpThread",
     "use_key_equivalents": true,
     "bindings": {

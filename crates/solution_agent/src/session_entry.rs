@@ -341,18 +341,11 @@ pub fn kind_from_payload(bytes: &[u8]) -> anyhow::Result<SessionEntryKind> {
 /// all — therefore got a paragraph of mangled source instead of a header:
 /// newlines collapsed and `*` became emphasis. `codex_native` already clamps at
 /// the source; this is the provider-agnostic backstop so no future adapter can
-/// reintroduce it. The full command is unaffected — it is rendered from
+/// reintroduce it, and both call the same `util` helper so the two layers
+/// cannot drift apart. The full command is unaffected — it is rendered from
 /// `raw_input` on the preview row below the title.
 pub(crate) fn single_line_tool_label(source: &str) -> String {
-    let mut lines = source.lines().skip_while(|line| line.trim().is_empty());
-    let Some(first) = lines.next() else {
-        return source.to_owned();
-    };
-    if lines.any(|line| !line.trim().is_empty()) {
-        format!("{} …", first.trim_end())
-    } else {
-        first.trim_end().to_owned()
-    }
+    util::single_line_summary(source)
 }
 
 fn user_message_id_to_string(id: &UserMessageId) -> String {
@@ -388,15 +381,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_multi_line_tool_title_is_clamped_before_it_reaches_markdown() {
-        assert_eq!(single_line_tool_label("Bash"), "Bash");
-        assert_eq!(
-            single_line_tool_label("/bin/bash -lc \"cat > a.go <<'EOF'\nfunc T(t *testing.T) {\nEOF\""),
-            "/bin/bash -lc \"cat > a.go <<'EOF' …"
-        );
-        assert_eq!(single_line_tool_label("Read file\n\n  \n"), "Read file");
-        assert_eq!(single_line_tool_label(""), "");
+    /// Asserted on `to_session_entry`, not on the helper: the helper's own
+    /// behaviour is `util::test_single_line_summary`'s job, and what can
+    /// actually regress here is the CALL — drop the clamp at the ingest site and
+    /// a pure-helper test stays green while the Markdown-rendered title goes
+    /// back to carrying a whole heredoc.
+    #[gpui::test]
+    fn a_multi_line_tool_title_is_clamped_before_it_reaches_markdown(cx: &mut TestAppContext) {
+        use acp_thread::{AgentThreadEntry, ToolCall, ToolCallStatus};
+        cx.update(|cx| {
+            let command = "/bin/bash -lc \"cat > a.go <<'EOF'\nfunc T(t *testing.T) {\nEOF\"";
+            let call = AgentThreadEntry::ToolCall(ToolCall {
+                id: acp::ToolCallId::new("tc_1".to_string()),
+                label: cx.new(|cx| markdown::Markdown::new(command.into(), None, None, cx)),
+                kind: acp::ToolKind::Execute,
+                content: Vec::new(),
+                status: ToolCallStatus::Completed,
+                locations: Vec::new(),
+                resolved_locations: Vec::new(),
+                raw_input: Some(serde_json::json!({ "command": command })),
+                raw_input_markdown: None,
+                raw_output: None,
+                tool_name: Some("shell".into()),
+                subagent_session_info: None,
+                subagent_id: None,
+                sandbox_authorization_details: None,
+                status_started_at: None,
+            });
+            match to_session_entry(&call, cx).kind {
+                SessionEntryKind::ToolCall { label_md, .. } => assert_eq!(
+                    label_md, "/bin/bash -lc \"cat > a.go <<'EOF' …",
+                    "the title the renderer feeds to Markdown is one line"
+                ),
+                other => panic!("expected ToolCall, got {other:?}"),
+            }
+        });
     }
 
     #[gpui::test]

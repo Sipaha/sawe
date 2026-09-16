@@ -688,6 +688,32 @@ pub struct SolutionSession {
     pub is_ephemeral: bool,
 }
 
+/// Context-window usage as `(used, max)`, live reading first and the cached
+/// figures as the fallback a cold session leaves behind. `None` when neither is
+/// known — which is different from zero and must stay distinguishable, since
+/// every caller renders "unknown" rather than "0%".
+///
+/// One function because several surfaces quote this number to the same person
+/// within the same minute (the judge's briefing, the compaction ask, the status
+/// row): two of them computing it from different fallbacks is how two different
+/// percentages for one session end up on screen.
+pub fn session_context_usage(session: &SolutionSession, cx: &gpui::App) -> Option<(u64, u64)> {
+    let usage = session
+        .acp_thread()
+        .and_then(|thread| thread.read(cx).token_usage().cloned());
+    let used = usage
+        .as_ref()
+        .map(|u| u.used_tokens)
+        .or(session.cached_total_tokens)?;
+    let max = usage
+        .as_ref()
+        .map(|u| u.max_tokens)
+        .filter(|m| *m > 0)
+        .or(session.cached_max_tokens)
+        .filter(|m| *m > 0)?;
+    Some((used, max))
+}
+
 impl SolutionSession {
     /// Fresh, idle session with no live `AcpThread` attached. All
     /// optional state (`title`, `cwd`, `entries`, …) defaults to

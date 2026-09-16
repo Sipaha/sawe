@@ -42,7 +42,12 @@ pub(crate) struct JudgeHandle {
 /// (`apply_verdict_authenticated` / `apply_audit_verdict_authenticated`).
 pub(crate) enum VerdictAuth {
     /// Nonce matched the in-flight judge/auditor; the verdict was applied.
-    Applied,
+    /// `memory_warning` carries a failure to persist what the verdict asked the
+    /// editor to remember (the standing-intent record, the diary note). The
+    /// judge no longer holds a file tool of its own, so a swallowed write would
+    /// drop a standing directive with nobody able to see it happen — the tool
+    /// response is the only channel back.
+    Applied { memory_warning: Option<String> },
     /// No in-flight judge/auditor for this session, so nothing was applied.
     /// This is the idempotent case: the first (successful OR gate-dropped)
     /// verdict already reaped the handle, so a bridge-EOF retry lands here and
@@ -189,18 +194,8 @@ impl SolutionAgentStore {
             return;
         };
         let dir = crate::supervisor::supervisor_dir(&root, id);
-        let diary_path = crate::supervisor::diary_path(&dir);
-        let line = format!("- {} {note}\n", chrono::Utc::now().to_rfc3339());
-        (|| -> std::io::Result<()> {
-            std::fs::create_dir_all(&dir)?;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&diary_path)?;
-            std::io::Write::write_all(&mut file, line.as_bytes())
-        })()
-        .log_err();
-        crate::supervisor::cap_log_tail(&diary_path, crate::supervisor::DIARY_LOG_MAX_BYTES);
+        crate::supervisor::append_diary_entry(&dir, note, chrono::Utc::now().timestamp_millis())
+            .log_err();
     }
 
     /// Spawn an ephemeral judge for the supervised session `id`. Creates a
@@ -270,20 +265,14 @@ impl SolutionAgentStore {
             let context_usage = if audit {
                 None
             } else {
-                let used = s
-                    .acp_thread()
-                    .and_then(|t| t.read(cx).token_usage().map(|u| u.used_tokens))
-                    .or(s.cached_total_tokens);
-                let max = s.cached_max_tokens;
-                match (used, max) {
-                    (Some(used), Some(max)) if max > 0 => {
+                match crate::model::session_context_usage(s, cx) {
+                    Some((used, max)) => {
                         let pct = ((used as f64 / max as f64) * 100.0).round() as u64;
                         Some(format!("{used} / {max} tokens ({pct}%)"))
                     }
-                    (Some(used), _) => {
-                        Some(format!("{used} tokens used (context window size unknown)"))
-                    }
-                    _ => None,
+                    None => s
+                        .cached_total_tokens
+                        .map(|used| format!("{used} tokens used (context window size unknown)")),
                 }
             };
             (s.solution_id, s.agent_id.clone(), project, context_usage)
@@ -373,14 +362,25 @@ impl SolutionAgentStore {
                     .into_owned(),
                 // Read here, not by the judge: it holds no write capability
                 // over its own memory, so it gets no read errand for it either.
-                intent_record: crate::supervisor::read_for_briefing(
-                    &crate::supervisor::intent_path(&dir),
-                    crate::supervisor::BRIEFING_RECORD_MAX_BYTES,
-                ),
-                diary: crate::supervisor::read_for_briefing(
-                    &crate::supervisor::diary_path(&dir),
-                    crate::supervisor::BRIEFING_RECORD_MAX_BYTES,
-                ),
+                // Skipped for the AUDITOR, whose template has no slot for them —
+                // it reviews the judge's trail and opens those files itself, so
+                // reading up to 128 KB off the main thread for it buys nothing.
+                intent_record: (!audit)
+                    .then(|| {
+                        crate::supervisor::read_for_briefing(
+                            &crate::supervisor::intent_path(&dir),
+                            crate::supervisor::BRIEFING_RECORD_MAX_BYTES,
+                        )
+                    })
+                    .flatten(),
+                diary: (!audit)
+                    .then(|| {
+                        crate::supervisor::read_for_briefing(
+                            &crate::supervisor::diary_path(&dir),
+                            crate::supervisor::BRIEFING_RECORD_MAX_BYTES,
+                        )
+                    })
+                    .flatten(),
                 compact_dir: solution_root
                     .join(".agents")
                     .join(id.to_string())
@@ -635,7 +635,7 @@ impl SolutionAgentStore {
                 // capability over any file. Done before the action so a verdict
                 // that rotates the transcript (`compact`) still records what the
                 // judge learned from the transcript it just read.
-                self.write_supervisor_memory(id, memory, cx);
+                let memory_warning = self.write_supervisor_memory(id, memory, cx);
                 self.apply_verdict(
                     id,
                     action,
@@ -646,274 +646,48 @@ impl SolutionAgentStore {
                     wait_seconds,
                     cx,
                 );
-                VerdictAuth::Applied
+                VerdictAuth::Applied { memory_warning }
             }
             Some(false) => VerdictAuth::Unauthorized,
             None => VerdictAuth::NoInFlight,
         }
     }
 
-    /// True while the observer is mid-ladder for this session — it has asked the
-    /// agent to hand off and the transcript has not rotated yet. Read by
-    /// `compact::start_compact_for_session` to answer "who is this compaction
-    /// really coming from": a self-compaction the agent performs because the
-    /// observer asked is an OBSERVER compaction wearing the agent's clothes, and
-    /// must not wipe the observer's memory the way a human `/compact` does.
-    pub(crate) fn observer_requested_compaction(&self, id: SolutionSessionId) -> bool {
-        self.supervisor_states
-            .get(&id)
-            .is_some_and(|state| state.compact_requests > 0)
-    }
-
-    /// Forget the compaction ladder for a session. Called when the transcript
-    /// actually rotates (or is cleared): a fresh context has never been asked to
-    /// hand off, so the next `compact` verdict starts at "ask", not at "force".
-    pub(crate) fn reset_compaction_ladder(&mut self, id: SolutionSessionId) {
-        if let Some(state) = self.supervisor_states.get_mut(&id) {
-            state.compact_requests = 0;
-            state.last_compact_request_ms = None;
-        }
-    }
-
-    /// Which rung of the compaction ladder a `compact` verdict lands on for this
-    /// session, or `None` when the session is already compacting (a request is
-    /// queued and waiting) — in which case the verdict has nothing left to do.
-    fn compaction_request_step(
-        &self,
-        id: SolutionSessionId,
-        cx: &App,
-    ) -> Option<crate::supervisor::CompactStep> {
-        let session = self.session(id)?;
-        {
-            let session = session.read(cx);
-            if session.is_compaction_pending() {
-                return None;
-            }
-            // The ladder exists to let an agent finish what it is holding. A
-            // session that is holding nothing — no turn running, no background
-            // agent or shell still working for it — has nothing to finish, and
-            // "wrap up, then hand off" addressed to a paused session is a
-            // message nobody will act on until the user types again. Compact it
-            // now, which is also what the operator would do by hand.
-            let busy = matches!(session.state, crate::model::SessionState::Running { .. })
-                || session.has_live_background_work(chrono::Utc::now());
-            if !busy {
-                return Some(crate::supervisor::CompactStep::Force);
-            }
-        }
-        let state = self.supervisor_states.get(&id)?;
-        let since = state
-            .last_compact_request_ms
-            .map(|at| chrono::Utc::now().timestamp_millis().saturating_sub(at));
-        Some(crate::supervisor::compact_guard(
-            state.compact_requests,
-            since,
-        ))
-    }
-
-    /// Send the compaction request itself, on the observer's behalf — the
-    /// ladder's last rung, reached either from a `compact` verdict whose asks
-    /// are spent or from the escalation tick.
-    fn run_observer_compaction(
-        &mut self,
-        id: SolutionSessionId,
-        note: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-            // `start_compact_for_session` re-acquires the global
-            // `SolutionAgentStore` and `read_with`s it — but `apply_verdict`
-            // runs INSIDE the MCP tool's `store.update(...)` lease (mcp.rs
-            // `SupervisorVerdictTool::run`), so calling it inline reads the
-            // store entity while it is `&mut`-borrowed → `double_lease_panic`
-            // ("cannot read SolutionAgentStore while it is already being
-            // updated"). Every supervisor "compact" verdict crashed the
-            // editor this way. Defer the call past the current update so the
-            // lease is released first (decision: never read an entity during
-            // its own mutation — snapshot before, or defer).
-            cx.defer(move |cx| {
-                let outcome = crate::compact::start_compact_for_session(
-                    id,
-                    crate::compact::CompactInitiator::Observer,
-                    note.as_deref(),
-                    cx,
-                );
-                // A compact can be SILENTLY refused (session busy, conversation
-                // too short, no headroom) and the refusal never reaches the
-                // judge — so a cap-EXEMPT `compact` verdict can loop every idle
-                // tick. Record the refusal in the observer's diary (which the
-                // judge reads each wake-up) so the "don't re-issue compact if
-                // the transcript didn't rotate" prompt rule can actually fire
-                // (finding #10).
-                let note = match &outcome {
-                    Err(err) => Some(format!("compact verdict could not run: {err}")),
-                    Ok(o) if !o.queued => {
-                        let reason = o.reason.as_deref().unwrap_or("unknown reason");
-                        // "session is busy" is a transient race-window refusal
-                        // (the agent started a turn between the verdict and the
-                        // deferred compact) — it self-resolves and has nothing
-                        // to do with transcript rotation, so don't mislead the
-                        // judge into deferring compaction. Only diary the
-                        // rotation-relevant refusals (too short / no headroom).
-                        if reason.starts_with("session is busy") {
-                            None
-                        } else {
-                            Some(format!(
-                                "compact verdict REFUSED ({reason}); do not re-issue compact until the transcript rotates"
-                            ))
-                        }
-                    }
-                    Ok(_) => None,
-                };
-                if let Some(note) = note {
-                    log::warn!("apply_verdict compact({id}): {note}");
-                    SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                        store.append_supervisor_diary_note(id, &note, cx);
-                    });
-                }
-            });
-    }
-
-    /// Move the compaction ladder for `id` one rung, and report whether the
-    /// caller should now run the compaction itself (`true` = the Force rung).
-    ///
-    /// Shared by the two things that can move it: a judge's `compact` verdict,
-    /// which ARMS it and supplies the handoff note, and the supervisor tick,
-    /// which advances it on the clock. The clock is what makes this a ladder
-    /// rather than a coincidence — a running agent may not be judged again for
-    /// an hour, and "ask, then ask again in fifteen minutes" must not depend on
-    /// the judge happening to wake.
-    fn advance_compaction_ladder(
-        &mut self,
-        id: SolutionSessionId,
-        note: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(step) = self.compaction_request_step(id, cx) else {
-            return false;
-        };
-        match step {
-            crate::supervisor::CompactStep::TooSoon => false,
-            crate::supervisor::CompactStep::Force => true,
-            step => {
-                let again = matches!(step, crate::supervisor::CompactStep::AskAgain);
-                let note = note.or_else(|| {
-                    self.supervisor_states
-                        .get(&id)
-                        .and_then(|state| state.compact_request_note.clone())
-                });
-                let ask = self.compaction_request_message(id, again, note.clone(), cx);
-                if let Some(state) = self.supervisor_states.get_mut(&id) {
-                    state.compact_requests = state.compact_requests.saturating_add(1);
-                    state.last_compact_request_ms = Some(chrono::Utc::now().timestamp_millis());
-                    if note.is_some() {
-                        state.compact_request_note = note;
-                    }
-                }
-                self.send_supervisor_nudge(id, ask, cx).detach();
-                false
-            }
-        }
-    }
-
-    /// Per-tick escalation for a session that was asked to hand off and has not.
-    /// Runs only while the ladder is armed, so an unsupervised or
-    /// never-asked session costs one map lookup.
-    pub(crate) fn tick_compaction_ladder(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
-        let armed = self
-            .supervisor_states
-            .get(&id)
-            .is_some_and(|state| state.enabled && state.compact_requests > 0);
-        if !armed {
-            return;
-        }
-        if self.advance_compaction_ladder(id, None, cx) {
-            // Asking is spent. Run the compaction the way the verdict would
-            // have, carrying the note from the verdict that armed the ladder.
-            let note = self
-                .supervisor_states
-                .get(&id)
-                .and_then(|state| state.compact_request_note.clone());
-            self.run_observer_compaction(id, note, cx);
-        }
-    }
-
-    /// The text the agent is asked to act on. It names the exact tool, because
-    /// "compact when convenient" with no verb is how an agent acknowledges a
-    /// request and does nothing, and it states that the editor will do it
-    /// anyway — the deadline is real, and hiding it would make the eventual
-    /// forced compaction look arbitrary.
-    fn compaction_request_message(
-        &self,
-        id: SolutionSessionId,
-        again: bool,
-        note: Option<String>,
-        cx: &App,
-    ) -> String {
-        let fullness = self.session(id).and_then(|session| {
-            let session = session.read(cx);
-            let usage = session
-                .acp_thread()
-                .and_then(|thread| thread.read(cx).token_usage().cloned());
-            let used = usage
-                .as_ref()
-                .map(|u| u.used_tokens)
-                .or(session.cached_total_tokens)?;
-            let max = usage
-                .as_ref()
-                .map(|u| u.max_tokens)
-                .filter(|m| *m > 0)
-                .or(session.cached_max_tokens)?;
-            (max > 0).then(|| ((used as f64 / max as f64) * 100.0).round() as u64)
-        });
-        let opening = match (again, fullness) {
-            (false, Some(pct)) => format!("Your context is {pct}% full."),
-            (false, None) => "Your context is getting large.".to_string(),
-            (true, Some(pct)) => {
-                format!("Your context is {pct}% full and the earlier handoff request is still open.")
-            }
-            (true, None) => {
-                "The earlier handoff request is still open and your context keeps growing."
-                    .to_string()
-            }
-        };
-        let closing = if again {
-            "If it is still open at the next check, the editor will start the handoff for \
-             you, wherever you happen to be."
-        } else {
-            "If nothing happens, the editor will start it for you."
-        };
-        let mut message = format!(
-            "{opening} Finish the step you are on — do not start new work — then hand off: \
-             call the `solution_agent.start_compact` tool on the `sawe` MCP server with \
-             {{\"session_id\": \"{id}\"}}. It gives you the standard handoff instructions to \
-             follow. {closing}"
-        );
-        if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            message.push_str("\n\nWhat this handoff must not lose: ");
-            message.push_str(note);
-        }
-        message
-    }
-
     /// Persist the memory update a judge returned with its verdict. Both fields
     /// are optional and independent: `intent` REPLACES the standing-intent
     /// record (the judge sends the whole consolidated document, and omits it
     /// when nothing changed), `diary_note` APPENDS one dated entry.
+    ///
+    /// Returns a human-readable warning when part of it could NOT be written.
+    /// The judge is told to check the verdict tool's reply, so a lost standing
+    /// directive reaches it there rather than dying in a log line nobody reads —
+    /// it has no file of its own any more in which to notice the loss.
     pub(crate) fn write_supervisor_memory(
         &mut self,
         id: SolutionSessionId,
         memory: crate::supervisor::SupervisorMemoryUpdate,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<String> {
         if memory.intent.is_none() && memory.diary_note.is_none() {
-            return;
+            return None;
         }
         let Some(root) = self.solution_root_for(id, cx) else {
-            return;
+            return Some(format!(
+                "solution root for {id} is not registered, so nothing was stored"
+            ));
         };
+        let mut failures = Vec::new();
         let dir = crate::supervisor::supervisor_dir(&root, id);
-        if let Some(intent) = memory.intent.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-            crate::supervisor::write_intent_record(&dir, intent).log_err();
+        if let Some(intent) = memory
+            .intent
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            if let Err(err) = crate::supervisor::write_intent_record(&dir, intent) {
+                log::warn!("write_supervisor_memory({id}): intent record: {err}");
+                failures.push(format!("the intent record was NOT stored ({err})"));
+            }
         }
         if let Some(note) = memory
             .diary_note
@@ -921,13 +695,16 @@ impl SolutionAgentStore {
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
-            crate::supervisor::append_diary_entry(
+            if let Err(err) = crate::supervisor::append_diary_entry(
                 &dir,
                 note,
                 chrono::Utc::now().timestamp_millis(),
-            )
-            .log_err();
+            ) {
+                log::warn!("write_supervisor_memory({id}): diary: {err}");
+                failures.push(format!("the diary note was NOT stored ({err})"));
+            }
         }
+        (!failures.is_empty()).then(|| failures.join("; "))
     }
 
     /// Authenticated entry point for the `supervisor_audit_verdict` MCP tool.
@@ -949,7 +726,9 @@ impl SolutionAgentStore {
         match matched {
             Some(true) => {
                 self.apply_audit_verdict(id, ok, escalate, reasoning, cx);
-                VerdictAuth::Applied
+                VerdictAuth::Applied {
+                    memory_warning: None,
+                }
             }
             Some(false) => VerdictAuth::Unauthorized,
             None => VerdictAuth::NoInFlight,
@@ -1998,7 +1777,20 @@ impl SolutionAgentStore {
     /// [`send_message`](crate::store::queue) entry point, this does NOT reset
     /// the consecutive-continue counter — supervisor nudges must never clear
     /// the guard that was incremented just before the nudge was issued.
-    fn send_supervisor_nudge(
+    /// The human is mid-sentence in this session's compose box (a keystroke
+    /// within `IDLE_THRESHOLD_SECS`). Anything the observer sends now is parked
+    /// rather than delivered — see [`Self::send_supervisor_nudge`] — so callers
+    /// that COUNT what they sent have to ask first.
+    pub(crate) fn user_is_composing(&self, id: SolutionSessionId, now_ms: i64) -> bool {
+        self.supervisor_states
+            .get(&id)
+            .and_then(|s| s.last_user_input_ms)
+            .is_some_and(|t| {
+                now_ms.saturating_sub(t) < (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000
+            })
+    }
+
+    pub(crate) fn send_supervisor_nudge(
         &mut self,
         id: SolutionSessionId,
         content: String,
@@ -2015,14 +1807,7 @@ impl SolutionAgentStore {
         // types; it cannot cover a judge that fired while the user was idle and
         // finished after the user began typing — this is that missing seam.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let composing = self
-            .supervisor_states
-            .get(&id)
-            .and_then(|s| s.last_user_input_ms)
-            .is_some_and(|t| {
-                now_ms.saturating_sub(t) < (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000
-            });
-        if composing {
+        if self.user_is_composing(id, now_ms) {
             if let Some(state) = self.supervisor_states.get_mut(&id) {
                 state.pending_nudge = Some(content);
             }

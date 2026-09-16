@@ -4512,6 +4512,20 @@ The verdict is now an escalating request, and the ladder lives in the editor
 3. **Force.** After `MAX_COMPACT_REQUESTS` (2) asks, the editor sends the
    compaction request itself — the old behaviour, unchanged.
 
+The window is checked BEFORE the cap, and the order is load-bearing: the tick
+runs every 5 seconds, so a cap that outranked it would force the handoff seconds
+after the second ask — the exact interrupt the ladder exists to prevent. The
+force also stamps its own attempt (`last_force_ms`, tracked apart from the
+asks), because a forced compaction can be REFUSED — an unanswered permission
+prompt, no headroom left — and a refusal leaves every other input unchanged;
+unstamped, the tick retried it every five seconds and wrote a diary note each
+time, evicting the observer's real notes from a capped file.
+
+A rung is spent on DELIVERY, not on the attempt: an ask issued while the human
+is typing is parked (`pending_nudge`) and a genuine user send discards it, so
+counting it would march the ladder toward a forced handoff on the strength of a
+message the agent never saw.
+
 **Only against a session that is actually working.** `Running`, or holding a
 background agent / shell that still vouches for it. An idle session is compacted
 on the spot: "wrap up, then hand off" addressed to a paused session is a message
@@ -4541,11 +4555,23 @@ Two couplings worth knowing:
   context has never been asked, so it starts at "ask", not at "force". The
   judge's handoff note is kept alongside the counter, because the later rungs
   are fired by the tick with no judge in the loop to re-supply it.
-- **An agent that self-compacts because the observer asked does NOT wipe the
-  observer's memory.** That compaction arrives through the user-initiated path
-  (`start_compact` called by the agent), and #37's wipe keys on exactly that —
-  so the wipe now asks the ladder, not the caller: `is_user && !observer_asked`.
-  Without it, honouring the request would destroy the memory of the request.
+- **An agent that self-compacts does NOT wipe the observer's memory**, whoever
+  prompted it. Two separate holes, both closed: one where the observer ASKED and
+  the agent honoured it — the wipe consults the ladder, `is_user &&
+  !observer_asked`, so honouring a request cannot destroy the memory of it — and
+  one where the agent compacts on its own initiative, for which
+  `solution_agent.start_compact` grew an `initiator` field (`"user"` default,
+  `"agent"`) and `CompactInitiator` two more variants. The MCP tool is reachable
+  by the phone AND by the agent, so "who called it" is not something the editor
+  can infer: an MCP caller claiming to be human is `Client`, whose note is
+  attributed to the user like any other human note, but whose authority to reset
+  the observer holds only while the session is NOT running — an agent can only
+  call a tool from inside its own turn. The cost is a human compacting a working
+  session from the phone and not getting the reset (recoverable with `/clear`);
+  the cost of trusting the claim is an agent silently deleting the
+  standing-intent record on its way out. Attribution and authority are separate
+  axes on purpose — collapsing them demoted a real user comment into "not an
+  instruction from the user" in the agent's own prompt.
 
 How to apply: when an observer action lands in the supervised session, ask
 whether the agent could perform it at a boundary it chooses. If yes, the editor

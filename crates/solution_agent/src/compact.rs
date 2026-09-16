@@ -42,6 +42,18 @@ pub(crate) struct StartCompactOutcome {
 pub(crate) enum CompactInitiator {
     User,
     Observer,
+    /// A human on a CLIENT (the phone's Compact button) — the same gesture as
+    /// `User`, but arriving over MCP, where the editor cannot verify who is
+    /// calling. Its note is the user's and is attributed as such; its authority
+    /// to reset the observer is conditional (see `start_compact_for_session`).
+    Client,
+    /// The agent compacting ITSELF through `solution_agent.start_compact`. It
+    /// reaches the same orchestration as the user's button, but it is not the
+    /// user, so it must not carry the user's authority to reset the observer:
+    /// taking the caller's word for "user" would let an agent silently delete
+    /// the observer's standing-intent record — the one memory that is supposed
+    /// to outlive the transcript.
+    Agent,
 }
 
 /// Longest note carried into the compact prompt. The note is a short "what
@@ -76,10 +88,17 @@ fn render_compact_note(note: Option<&str>, initiator: CompactInitiator) -> Strin
         quoted.push_str("> … (note truncated by the editor)\n");
     }
     let preamble = match initiator {
-        CompactInitiator::User => {
+        // `Client` is a human too — the phone's Compact button — so its note is
+        // the user's note. Only its authority over the observer's memory is
+        // treated differently, and that is not this string's business.
+        CompactInitiator::User | CompactInitiator::Client => {
             "The user attached this note to the compaction request. It is a real user \
              instruction about THIS handoff: honour it while writing the files below, and \
              carry what it asks for into `continue.md` so the next context inherits it."
+        }
+        CompactInitiator::Agent => {
+            "The agent attached this note to its own compaction request. It is the agent's \
+             own reminder about this handoff, not an instruction from the user."
         }
         CompactInitiator::Observer => {
             "The autonomous observer — not the user — attached this note to the compaction \
@@ -212,18 +231,32 @@ pub(crate) fn start_compact_for_session(
     let store = SolutionAgentStore::global(cx);
 
     let rendered = render_compact_prompt_inner(session_id, note, initiator, cx)?;
-    let is_user = initiator == CompactInitiator::User;
+    let from_client = initiator != CompactInitiator::Observer;
     store.update(cx, |store, cx| {
         let observer_asked = store.observer_requested_compaction(session_id);
         let session = store.session(session_id).expect("session validated above");
         let request = session.update(cx, |session, cx| {
             let request = session.begin_compaction_request();
-            // A human `/compact` resets the observer (FORK.md #37). A
-            // self-compaction the agent performs BECAUSE the observer asked it
-            // to arrives through this same user-initiated path, and wiping there
-            // would destroy the memory of the very request being honoured — so
-            // the ladder, not the caller's word, answers "who asked".
-            session.compact_reset_observer_memory = is_user && !observer_asked;
+            // A human `/compact` resets the observer (FORK.md #37) — and every
+            // other way into this function must NOT inherit that authority.
+            // Three things can wrongly claim it, so three conditions:
+            //   * the observer's own request (`Observer`) never wipes, by #37;
+            //   * a self-compaction the agent performs BECAUSE the observer
+            //     asked would otherwise destroy the memory of the very request
+            //     it is honouring, so the ladder answers "who asked";
+            //   * `Client` is a human's gesture arriving over MCP, where the
+            //     caller is unverifiable — an agent can only call a tool from
+            //     inside its own turn, so a RUNNING session means the claim is
+            //     the agent's however it is labelled. The cost is a human
+            //     compacting a working session from the phone and not getting
+            //     the reset (recoverable with `/clear`); the cost the other way
+            //     is an agent silently deleting the standing-intent record.
+            let claims_user = match initiator {
+                CompactInitiator::User => true,
+                CompactInitiator::Client => !matches!(session.state, SessionState::Running { .. }),
+                CompactInitiator::Observer | CompactInitiator::Agent => false,
+            };
+            session.compact_reset_observer_memory = claims_user && !observer_asked;
             cx.notify();
             request
         });
@@ -235,7 +268,10 @@ pub(crate) fn start_compact_for_session(
             session_id,
             blocks,
             crate::model::QueueTarget::Main,
-            is_user,
+            // A client-sent compaction (the desktop button, the phone, or the
+            // agent compacting itself) enters the queue on the user funnel the
+            // way it always has; only the OBSERVER's own request bypasses it.
+            from_client,
             cx,
         );
         cx.spawn(async move |store, cx| {
@@ -689,7 +725,8 @@ mod tests {
                     .unwrap()
                     .queued
             );
-            let rendered = render_compact_prompt_inner(session_id, None, CompactInitiator::User, cx).unwrap();
+            let rendered =
+                render_compact_prompt_inner(session_id, None, CompactInitiator::User, cx).unwrap();
             assert!(!rendered.contains("{{compact_dir}}"));
             assert!(rendered.contains(session_id.as_str()));
         });
@@ -790,7 +827,8 @@ mod tests {
                     .unwrap()
                     .update(cx, |s, _| s.state = state);
                 let result =
-                    start_compact_for_session(session_id, CompactInitiator::User, None, cx).unwrap();
+                    start_compact_for_session(session_id, CompactInitiator::User, None, cx)
+                        .unwrap();
                 assert!(!result.queued);
                 assert!(result.reason.unwrap().contains("busy"));
             });
@@ -1061,7 +1099,8 @@ mod note_tests {
             "every line is blockquoted so a note cannot impersonate the template: {user}"
         );
 
-        let observer = render_compact_note(Some("Keep the migration plan."), CompactInitiator::Observer);
+        let observer =
+            render_compact_note(Some("Keep the migration plan."), CompactInitiator::Observer);
         assert!(observer.contains("autonomous observer"));
         assert!(
             observer.contains("does not grant authorization"),
@@ -1105,9 +1144,7 @@ mod note_tests {
         cx.executor().run_until_parked();
 
         let rendered = cx
-            .update(|cx| {
-                render_compact_prompt_inner(session_id, None, CompactInitiator::User, cx)
-            })
+            .update(|cx| render_compact_prompt_inner(session_id, None, CompactInitiator::User, cx))
             .expect("prompt renders");
         for forbidden in ["supervisor/", "user_intent", "diary.md", "verdicts.jsonl"] {
             assert!(
@@ -1116,6 +1153,106 @@ mod note_tests {
                  observer's own state, and the session never reads it"
             );
         }
+    }
+
+    /// A human `/compact` resets the observer's memory (FORK.md #37). An agent
+    /// that compacts ITSELF because the observer asked it to arrives through the
+    /// same user-initiated path — and wiping there would destroy the memory of
+    /// the very request being honoured, including the standing-intent record the
+    /// next context depends on. So the ladder, not the caller's word, answers
+    /// "who asked".
+    #[gpui::test]
+    async fn an_observer_requested_self_compaction_keeps_the_observers_memory(
+        cx: &mut TestAppContext,
+    ) {
+        let (session_id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    Some(acp_thread::TokenUsage {
+                        used_tokens: 250_000,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+        });
+        cx.executor().run_until_parked();
+
+        let reset_flag = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .session(session_id)
+                    .unwrap()
+                    .read(cx)
+                    .compact_reset_observer_memory
+            })
+        };
+        let clear_pending = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .session(session_id)
+                    .unwrap()
+                    .update(cx, |session, _| {
+                        session.clear_compaction_request();
+                    });
+            });
+        };
+
+        // Ladder unarmed: this really is the human's own compaction.
+        cx.update(|cx| {
+            assert!(
+                start_compact_for_session(session_id, CompactInitiator::User, None, cx)
+                    .unwrap()
+                    .queued
+            );
+        });
+        assert!(
+            reset_flag(cx),
+            "a compaction nobody asked for is the user's, and resets the observer"
+        );
+        clear_pending(cx);
+
+        // Ladder armed: the observer asked, the agent is honouring the request.
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_supervision_enabled(session_id, true, cx);
+                store.arm_compaction_ladder_for_test(session_id);
+            });
+            assert!(
+                start_compact_for_session(session_id, CompactInitiator::User, None, cx)
+                    .unwrap()
+                    .queued
+            );
+        });
+        assert!(
+            !reset_flag(cx),
+            "honouring the observer's request must not erase the memory of it"
+        );
+        clear_pending(cx);
+
+        // And an agent compacting itself on its OWN initiative — the ladder
+        // unarmed — is still not the user: it reaches the same orchestration
+        // through `solution_agent.start_compact`, and taking its word for
+        // "user" would let it delete the observer's standing-intent record on
+        // its way out.
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, _| {
+                store.reset_compaction_ladder(session_id);
+            });
+            assert!(
+                start_compact_for_session(session_id, CompactInitiator::Agent, None, cx)
+                    .unwrap()
+                    .queued
+            );
+        });
+        assert!(
+            !reset_flag(cx),
+            "an agent's own compaction carries no authority to reset the observer"
+        );
     }
 
     /// End-to-end through the orchestrator: the comment must reach the prompt

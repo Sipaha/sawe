@@ -192,7 +192,16 @@ pub fn read_for_briefing(path: &Path, max_bytes: usize) -> Option<String> {
     if trimmed.len() <= max_bytes {
         return Some(trimmed.to_string());
     }
-    let start = trimmed.len().saturating_sub(max_bytes);
+    // The cut is a byte offset into text that is routinely NOT ASCII — the
+    // record quotes the user and the judge is told to keep their language — and
+    // slicing a `&str` anywhere but a char boundary panics. This runs on the
+    // main thread every time a judge is spawned, so that panic would be an
+    // editor crash, not a lost briefing. Walk forward to the next boundary:
+    // forward rather than back, so the result is never LONGER than the cap.
+    let mut start = trimmed.len().saturating_sub(max_bytes);
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
     let tail = &trimmed[start..];
     let line_start = tail.find('\n').map(|i| i + 1).unwrap_or(0);
     Some(format!(

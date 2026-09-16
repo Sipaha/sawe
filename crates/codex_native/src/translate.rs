@@ -129,21 +129,13 @@ impl Translator {
 /// came out as one flowing paragraph with `*testing.T` eaten as emphasis.
 /// Claude never trips this because its titles are plain tool names.
 ///
-/// Keep the first non-empty line — the program and its flags, which is the
-/// identifying part — and append an ellipsis when anything followed. Nothing is
-/// lost: the full command is already shown verbatim underneath on the tool
-/// call's preview row, which renders `raw_input` as a plain (non-Markdown)
-/// label with newlines mapped to `↵`.
+/// Nothing is lost by clamping: the full command is still shown verbatim
+/// underneath on the tool call's preview row, which renders `raw_input` as a
+/// plain (non-Markdown) label with newlines mapped to `↵`.
+/// `solution_agent::session_entry` applies the same clamp on the ingest path as
+/// a provider-agnostic backstop — one algorithm, two layers.
 fn tool_call_title(raw: &str) -> String {
-    let mut lines = raw.lines().skip_while(|line| line.trim().is_empty());
-    let Some(first) = lines.next() else {
-        return raw.to_owned();
-    };
-    if lines.any(|line| !line.trim().is_empty()) {
-        format!("{} …", first.trim_end())
-    } else {
-        first.trim_end().to_owned()
-    }
+    util::single_line_summary(raw)
 }
 
 fn text(value: &str, thinking: bool) -> acp::SessionUpdate {
@@ -222,12 +214,6 @@ mod tests {
             serde_json::to_value(&updates[0]).unwrap()["title"],
             "go test ./pool/..."
         );
-    }
-    #[test]
-    fn titles_survive_odd_command_shapes() {
-        assert_eq!(tool_call_title(""), "");
-        assert_eq!(tool_call_title("\n\n  go build  \n"), "  go build");
-        assert_eq!(tool_call_title("go build\n\n   \n"), "go build");
     }
     #[test]
     fn nonzero_exit_is_failed() {

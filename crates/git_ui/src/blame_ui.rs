@@ -183,21 +183,19 @@ impl BlameRenderer for GitBlameRenderer {
                 None
             };
 
-            Some(
-                h_flex()
-                    .gap_2()
-                    // Named apart from the row container so a test can tell
-                    // "the gutter reserved a row here" from "the row actually
-                    // printed a commit". See `blame_pane_suffix`.
-                    .debug_selector(|| format!("GIT-BLAME-META{pane_suffix}-{ix}"))
-                    .child(date)
-                    .children(avatar)
-                    // Coloured per commit (or per author / per age, under
-                    // the other colour modes), which is what carries the
-                    // "these lines came from one commit" cue now that the
-                    // SHA it used to tint is gone.
-                    .child(div().text_color(resolved_color).child(name)),
-            )
+            h_flex()
+                .gap_2()
+                // Named apart from the row container so a test can tell
+                // "the gutter reserved a row here" from "the row actually
+                // printed a commit". See `blame_pane_suffix`.
+                .debug_selector(|| format!("GIT-BLAME-META{pane_suffix}-{ix}"))
+                .child(date)
+                .children(avatar)
+                // Coloured per commit (or per author / per age, under
+                // the other colour modes), which is what carries the
+                // "these lines came from one commit" cue now that the
+                // SHA it used to tint is gone.
+                .child(div().text_color(resolved_color).child(name))
         };
 
         // The label alone does not mark where one run ends and the next
@@ -265,7 +263,7 @@ impl BlameRenderer for GitBlameRenderer {
                         .h(style.line_height_in_pixels(window.rem_size()))
                         .text_color(cx.theme().status().hint)
                         .debug_selector(|| format!("GIT-BLAME-ROW{pane_suffix}-{ix}"))
-                        .children(metadata)
+                        .child(metadata)
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
                         .cursor_pointer()
                         .on_mouse_down(MouseButton::Right, {

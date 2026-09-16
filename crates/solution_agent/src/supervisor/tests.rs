@@ -236,9 +236,10 @@ fn compact_ladder_asks_twice_then_forces_and_never_repeats_itself() {
     );
     assert_eq!(
         compact_guard(2, just_now),
-        CompactStep::Force,
-        "the cap wins over the window: a context that has ignored two asks does \
-         not get another grace period for judging twice in a minute"
+        CompactStep::TooSoon,
+        "the window outranks the cap — the tick runs every few seconds, so a cap \
+         that fired regardless would force the handoff seconds after the agent \
+         was told it had until the next check"
     );
 }
 
@@ -702,4 +703,42 @@ fn eta_just_after_midnight_is_different_day_despite_short_delta() {
         .unwrap();
     let eta = format_usage_limit_eta(resume.timestamp_millis(), now.timestamp_millis());
     assert_eq!(eta, "Aug 27 00:30");
+}
+
+/// The intent record and the diary are injected into the briefing by tail, and
+/// they are full of the user's own prose — which in this project's case is
+/// Russian, em dashes and ellipses. A tail cut that lands mid-character panics
+/// on the `&str` slice, and this runs on the main thread at every judge spawn,
+/// so the panic is an editor crash rather than a lost briefing.
+#[test]
+fn a_tail_cut_inside_a_multi_byte_character_does_not_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("user_intent.md");
+
+    // Every line is multi-byte, so almost every possible cut point is inside a
+    // character rather than between two.
+    let line = "— пользователь требует проверки на каждом этапе…\n";
+    let body = line.repeat(400);
+    assert!(body.len() > 4096, "the fixture has to exceed the cap");
+    std::fs::write(&path, &body).unwrap();
+
+    // Sweep the caps around the file so the cut lands at many different byte
+    // offsets: one lucky boundary would otherwise pass for a fix.
+    for max_bytes in [1, 2, 3, 17, 100, 1023, 1024, 4095, 4096] {
+        let out = read_for_briefing(&path, max_bytes).expect("non-empty file");
+        assert!(
+            out.starts_with("[earlier entries dropped"),
+            "a capped read announces the cut: {out:.80}"
+        );
+        if max_bytes >= line.len() * 2 {
+            assert!(
+                out.ends_with('…'),
+                "and keeps the END of the record, which is the part that matters"
+            );
+        }
+    }
+
+    // Under the cap the content is returned whole, multi-byte and all.
+    let small = read_for_briefing(&path, body.len() + 1).expect("non-empty file");
+    assert_eq!(small, body.trim());
 }

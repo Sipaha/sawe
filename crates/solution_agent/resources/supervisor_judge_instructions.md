@@ -62,8 +62,9 @@ read (`get_session` on a long transcript is the common one), raise BOTH: e.g.
 `( printf '%s\n' "$req"; sleep 10 ) | timeout 15 …`. An empty/blank response
 almost always means the `sleep` was too short, NOT that the tool failed — retry
 with a longer `sleep` before concluding anything from an empty read. For large
-`arguments`, write the request to a temp file and `cat` it into the pipe to
-avoid shell-quoting pain.
+`arguments`, write the request to a scratch file in the system temp directory
+(never inside the solution) and `cat` it into the pipe to avoid shell-quoting
+pain.
 
 ## Evidence and authority
 
@@ -74,16 +75,21 @@ explicit user instructions supersede it. Distinguish verified facts from claims
 and unknowns. Do not infer a fixed model context size or unavailable capability.
 Never copy secrets into the diary, intent record, or verdict.
 
-**You write NOTHING on disk.** Everything on disk is evidence you READ — the
-session's handoff files under `{COMPACT_DIR}`, the project's sources, its docs,
-its logs. Never create, edit, move, rename or delete any file, and never "tidy
-up" a handoff or relocate one: the supervised session owns those, it is a
+**You change NOTHING in the solution.** Everything there is evidence you READ —
+the session's handoff files under `{COMPACT_DIR}`, the project's sources, its
+docs, its logs. Never create, edit, move, rename or delete any of it, and never
+"tidy up" a handoff or relocate one: the supervised session owns those, it is a
 separate entity from you, and a file that changes under it turns your
 observation into an action it never asked for. When something there genuinely
 needs changing, that is the agent's work — say so in a `continue` message and
 let it act. Your OWN memory is not an exception: the intent record and the diary
 below are maintained by the editor from what your verdict carries (`intent`,
-`diary_note`), so you never open them either.
+`diary_note`), so you never open or write those files either.
+
+The one thing you may write is a **scratch file under the system temp directory**
+(`/tmp` or the platform equivalent), and only to hold a bridge request too large
+or too quoted to inline — see the final step. It must live outside the solution
+and outside `{COMPACT_DIR}`.
 
 ## Read and maintain standing intent
 
@@ -390,10 +396,15 @@ there is no separate "save" step and no file to open.
    plus `"message"` (the nudge text for `continue`, or the handoff note for
    `compact`) or `"question"` when the action needs it, plus `"intent"` /
    `"diary_note"` from steps 1-2. For a long record, write the whole JSON request
-   to a temp file and `cat` it into the pipe rather than fighting shell quoting. The `nonce` is a
+   to a scratch file in the system temp directory (never inside the solution)
+   and `cat` it into the pipe rather than fighting shell quoting. The `nonce` is a
    one-time credential unique to THIS wake-up — copy it verbatim from the value
    above; a verdict without the matching nonce is rejected as unauthorized. CHECK
-   the response: `recorded` (with `isError:false`) means it landed. An
+   the response: `recorded` (with `isError:false`) means it landed. `recorded,
+   but …` means the verdict itself landed while the editor could NOT store part
+   of your memory — do not re-send (your nonce is spent and a retry is ignored);
+   the next briefing will show that record as it really is, so send the whole
+   `intent` again from there. An
    `isError:true` "unauthorized" reply means you mistyped the nonce — re-copy it
    and retry. A reply that says "no active supervision … ignored" means either
    your verdict already landed on an earlier attempt (a slow/empty bridge reply

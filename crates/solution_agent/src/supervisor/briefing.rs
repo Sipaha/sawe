@@ -102,9 +102,9 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
     // it" — which is how a judge talks itself into looking for the file.
     let intent_section = format!(
         "## Your standing-intent record\n\n{}\n",
-        ctx.intent_record.as_deref().unwrap_or(
-            "(empty — you have not recorded the user's standing intent yet)"
-        )
+        ctx.intent_record
+            .as_deref()
+            .unwrap_or("(empty — you have not recorded the user's standing intent yet)")
     );
     let diary_section = format!(
         "## Your diary\n\n{}\n",
