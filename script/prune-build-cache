@@ -1,34 +1,56 @@
 #!/usr/bin/env bash
-# Prune cargo's build CACHES without touching anything you built on purpose.
+# Reclaim disk from cargo without losing anything you still need.
 #
-# Why this exists: `target/*/incremental` is a pure rebuild cache that cargo
-# never collects. On this machine it reached 374 GB across 5995 session
-# directories accumulated over two weeks, inside a `target/` of 1012 GB that
-# filled a 1.8 TB disk to 99%. Upstream ships
-# `script/clear-target-dir-if-larger-than`, but it is only ever called from the
-# CI workflows — all of which are hard-disabled in this fork — and it is a blunt
-# `rm -rf target/*` that would also delete `target/release-fast/sawe`, i.e. the
-# binary the maintainer's editor is currently executing.
+# Why this exists: `target/` reached 1012 GB here — 56% of a 1.8 TB disk, which
+# hit 99% full. Two separate things grow forever and nothing collects either:
 #
-# This one removes caches only. Built binaries, `deps/` and `.fingerprint/` are
-# left alone, so the next build relinks rather than starting from scratch.
+#   1. superseded artifacts in `deps/` / `.fingerprint/` / `build/` — cargo
+#      keeps every older version it has ever built;
+#   2. `target/*/incremental/` — a pure rebuild cache; 374 GB in 5995 session
+#      directories accumulated over two weeks.
+#
+# This script does both, because the two available tools each cover exactly one
+# and neither covers the other (measured, see below).
+#
+#   step 1  cargo-sweep --time N   → (1). Verified on this repo: it leaves the
+#           finished binaries alone, because `target/<profile>/<bin>` is a
+#           HARDLINK to the copy in `deps/` — sweeping drops the deps link and
+#           the top-level file survives with its link count going 2 → 1. That is
+#           what makes it safe to run while the editor is executing
+#           `target/release-fast/sawe`. It does NOT touch `incremental/`
+#           (verified: after a sweep `deps/` was empty and `incremental/` intact).
+#
+#   step 2  this script            → (2). Removes incremental session dirs,
+#           which cargo-sweep ignores. Binaries, `deps/` and `.fingerprint/`
+#           are untouched, so the next build relinks rather than starting over.
+#
+# Do NOT use upstream's `script/clear-target-dir-if-larger-than`: its only
+# callers are the CI workflows, all hard-disabled in this fork, and it is a
+# blunt `rm -rf target/*` that WOULD take `target/release-fast/sawe` with it.
 #
 # Usage:
-#   script/prune-build-cache                 # drop every incremental cache
-#   script/prune-build-cache --days 3        # keep caches touched in the last 3 days
+#   script/prune-build-cache                 # sweep >7d artifacts + all incremental
+#   script/prune-build-cache --days 30       # keep the last 30 days of both
 #   script/prune-build-cache --dry-run       # report only, delete nothing
+#   script/prune-build-cache --no-sweep      # incremental only, skip cargo-sweep
 #
-# Do not run it while a build is in flight — cargo is mid-write into the very
-# directories this removes. It is safe at any other time: the worst case is one
-# slower build.
+# `--days` is the age threshold for both steps, with one asymmetry: incremental
+# defaults to 0 ("drop the lot" — it is only a cache), while cargo-sweep is
+# clamped to a minimum of 1 day so it can never sweep the artifacts of a build
+# that has only just finished.
+#
+# Requires `cargo install cargo-sweep` for step 1; without it the script says so
+# and still does step 2.
 set -euo pipefail
 
 days=0
 dry_run=false
+run_sweep=true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --days) days="${2:?--days needs a number}"; shift 2 ;;
         --dry-run) dry_run=true; shift ;;
+        --no-sweep) run_sweep=false; shift ;;
         -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0 ;;
         *) echo "unknown argument: $1 (try --help)" >&2; exit 1 ;;
     esac
@@ -42,6 +64,24 @@ fi
 kb_of() { du -xs "$1" 2>/dev/null | cut -f1; }
 human() { numfmt --to=iec --suffix=B --format='%.1f' "$(( ${1:-0} * 1024 ))" 2>/dev/null || echo "${1:-0}K"; }
 
+# ---- step 1: superseded artifacts -------------------------------------------
+if [[ "$run_sweep" == true ]]; then
+    if command -v cargo-sweep >/dev/null 2>&1; then
+        sweep_days=$(( days > 0 ? days : 7 ))
+        echo "== cargo-sweep --time ${sweep_days} (superseded artifacts; binaries survive) =="
+        if [[ "$dry_run" == true ]]; then
+            cargo sweep --time "$sweep_days" --dry-run
+        else
+            cargo sweep --time "$sweep_days"
+        fi
+    else
+        echo "== cargo-sweep not installed — skipping superseded artifacts =="
+        echo "   \`cargo install cargo-sweep\` to enable step 1"
+    fi
+fi
+
+# ---- step 2: incremental caches ---------------------------------------------
+echo "== incremental caches (cargo-sweep does not touch these) =="
 total_before=0
 total_after=0
 total_stale=0
@@ -81,12 +121,9 @@ for incremental in target/*/incremental; do
 done
 
 if [[ "$found" == false ]]; then
-    echo "no incremental caches under target/ — nothing to do"
-    exit 0
-fi
-
-if [[ "$dry_run" == true ]]; then
-    echo "dry run: would reclaim $(human "$total_stale")"
+    echo "no incremental caches under target/"
+elif [[ "$dry_run" == true ]]; then
+    echo "dry run: incremental would reclaim $(human "$total_stale")"
 else
-    echo "reclaimed $(human $(( total_before - total_after )))"
+    echo "incremental reclaimed $(human $(( total_before - total_after )))"
 fi

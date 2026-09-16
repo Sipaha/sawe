@@ -4248,15 +4248,29 @@ reason `dev` can afford this at all.
 `--bin sawe` debug tree is 21 GB; the tree that filled the disk was 888 GB, 42×
 that. It got there from test binaries across ~100 crates, a second cfg universe
 (`--all-targets`), two weeks of superseded artifacts cargo never drops, and an
-`incremental/` nothing has ever collected. So the real remedy is a pruner, and
-the fork now has one: `script/prune-build-cache` (`--days N`, `--dry-run`).
+`incremental/` nothing has ever collected. So the real remedy is a pruner:
+`script/prune-build-cache` (`--days N`, `--dry-run`, `--no-sweep`).
 
-It deliberately does NOT reuse upstream's `script/clear-target-dir-if-larger-than`:
-that one is only ever called from the CI workflows, all of which are hard-disabled
-here, and it is a blunt `rm -rf target/*` that would delete
-`target/release-fast/sawe` — the binary the maintainer's editor is executing at
-the time. The fork's pruner removes caches only, so the next build relinks
-instead of starting over.
+**Two sinks, two tools, and neither covers the other** — measured, not assumed:
+
+- `cargo sweep --time N` clears superseded `deps/` / `.fingerprint/` / `build/`
+  and **leaves `incremental/` completely alone** (after a sweep of a scratch
+  project, `deps/` was empty and the incremental session dir was intact).
+- The script's own pass clears `incremental/`, which is where the 374 GB was.
+
+`cargo-sweep` is safe to run while the editor is executing
+`target/release-fast/sawe`, and the reason is structural rather than a
+heuristic: `target/<profile>/<bin>` is a HARDLINK to the copy in `deps/`, so
+sweeping drops the deps link and the top-level file survives with its link count
+going 2 → 1. Verified both on a scratch project whose binary was back-dated ten
+days (swept, still executable) and on the real tree (`release-fast/sawe`: 2
+links). This is exactly what upstream's
+`script/clear-target-dir-if-larger-than` gets wrong for a dev machine — its only
+callers are the CI workflows, all hard-disabled here, and it is a blunt
+`rm -rf target/*` that WOULD delete the running binary.
+
+Scale of what accumulates: a single `cargo build --bin sawe` leaves 246
+incremental session directories and 9.8 GB behind it.
 
 How to apply: measure a build-configuration change before claiming it, and
 report the number you got rather than the one you expected — the first estimate
