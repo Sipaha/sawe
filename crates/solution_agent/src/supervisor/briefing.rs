@@ -7,11 +7,18 @@
 /// pure and unit-testable.
 pub struct JudgeBriefingContext {
     pub supervised_session_id: String,
+    /// Paths to the observer's own breadcrumbs. The AUDITOR reads them off disk
+    /// with its file tool; the JUDGE never touches them — it gets their
+    /// contents inline below and returns updates on its verdict.
     pub diary_path: String,
     pub verdicts_path: String,
-    /// Path to the durable user-intent record the judge maintains (see
-    /// [`super::intent_path`]).
     pub intent_path: String,
+    /// Current contents of the standing-intent record and the diary, injected
+    /// into the judge's briefing so it needs no read tool for its own memory
+    /// (and no write tool either — see [`super::SupervisorMemoryUpdate`]).
+    /// `None` when the file does not exist yet or is empty.
+    pub intent_record: Option<String>,
+    pub diary: Option<String>,
     pub compact_dir: String,
     pub custom_prompt: Option<String>,
     /// Human-readable context-window fullness of the supervised session at
@@ -60,8 +67,9 @@ issue exactly ONE verdict. You reach the editor (to read the conversation and to
 submit your verdict) by piping JSON-RPC through the `--nc` socket bridge from \
 an available shell tool. Do not assume any provider-specific tool names or \
 discover alternate editor tools; use the supplied bridge. The first message gives you the exact bridge command and \
-the `solution_agent.*` method names to call. You may read files and update your \
-diary, but stay outside the work and judge it from the outside.";
+the `solution_agent.*` method names to call. You write NOTHING on disk — your \
+own memory travels back on the verdict and the editor stores it. Read what you \
+need, stay outside the work, and judge it from the outside.";
 
 /// Render the judge's single user-turn briefing by substituting the runtime
 /// paths into the instruction template. The meta-auditor variant (`audit:
@@ -89,6 +97,21 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         Some(usage) => format!("## Context-window fullness (right now)\n\n{usage}\n"),
         None => String::new(),
     };
+    // Rendered even when empty: "you have no record yet" is information the
+    // judge needs, and an absent section reads as "the editor forgot to send
+    // it" — which is how a judge talks itself into looking for the file.
+    let intent_section = format!(
+        "## Your standing-intent record\n\n{}\n",
+        ctx.intent_record.as_deref().unwrap_or(
+            "(empty — you have not recorded the user's standing intent yet)"
+        )
+    );
+    let diary_section = format!(
+        "## Your diary\n\n{}\n",
+        ctx.diary
+            .as_deref()
+            .unwrap_or("(empty — this is your first note on this session)")
+    );
     // Keep human-readable paths separate from arguments in the executable
     // example: a solution or binary path may contain spaces or apostrophes.
     let bridge_shell = crate::prompt_template::quote_shell_argument(&ctx.bridge_bin);
@@ -113,6 +136,8 @@ pub fn build_judge_briefing(ctx: &JudgeBriefingContext) -> String {
         ("{SOCKET_PATH}", ctx.socket_path.as_str()),
         ("{VERDICT_NONCE}", ctx.nonce.as_str()),
         ("{CONTEXT_USAGE_SECTION}", context_section.as_str()),
+        ("{INTENT_RECORD_SECTION}", intent_section.as_str()),
+        ("{DIARY_SECTION}", diary_section.as_str()),
         ("{CUSTOM_PROMPT_SECTION}", custom_section.as_str()),
     ];
     crate::prompt_template::render(template, &replacements)

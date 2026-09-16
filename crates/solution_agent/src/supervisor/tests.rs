@@ -218,6 +218,8 @@ fn briefing_substitutes_paths_and_custom_prompt() {
         diary_path: "/sol/.agents/abcd1234/supervisor/diary.md".into(),
         verdicts_path: "/sol/.agents/abcd1234/supervisor/verdicts.jsonl".into(),
         intent_path: "/sol/.agents/abcd1234/supervisor/user_intent.md".into(),
+        intent_record: None,
+        diary: None,
         compact_dir: "/sol/.agents/abcd1234".into(),
         custom_prompt: Some("don't stop before tests pass".into()),
         context_usage: Some("187,000 / 200,000 tokens (94%)".into()),
@@ -231,7 +233,17 @@ fn briefing_substitutes_paths_and_custom_prompt() {
     assert!(out.contains("abcd1234"));
     assert!(out.contains("## Why this review started\n\nIdle review"));
     assert!(!out.contains("{OBSERVATION_CONTEXT_SECTION}"));
-    assert!(out.contains("/sol/.agents/abcd1234/supervisor/diary.md"));
+    // The JUDGE gets its memory inline and no paths to it: the paths only
+    // reach the auditor, which reads those files with its own file tool.
+    assert!(!out.contains("/sol/.agents/abcd1234/supervisor/diary.md"));
+    assert!(out.contains("## Your standing-intent record"));
+    assert!(out.contains("(empty — you have not recorded"));
+    let audit_out = build_judge_briefing(&JudgeBriefingContext {
+        audit: true,
+        intent_record: Some("the user wants V at every stage".into()),
+        ..ctx
+    });
+    assert!(audit_out.contains("/sol/.agents/abcd1234/supervisor/diary.md"));
     assert!(out.contains("don't stop before tests pass"));
     assert!(out.contains("187,000 / 200,000 tokens (94%)"));
     // The `--nc` bridge command is fully materialized for the judge.
@@ -261,6 +273,8 @@ fn briefing_omits_custom_section_when_absent() {
         diary_path: "d".into(),
         verdicts_path: "v".into(),
         intent_path: "i".into(),
+        intent_record: None,
+        diary: None,
         compact_dir: "c".into(),
         custom_prompt: None,
         context_usage: None,
@@ -283,6 +297,8 @@ fn briefing_shell_arguments_roundtrip_without_executing_paths() {
         diary_path: "d".into(),
         verdicts_path: "v".into(),
         intent_path: "i".into(),
+        intent_record: None,
+        diary: None,
         compact_dir: "c".into(),
         custom_prompt: Some("Keep {SOCKET_PATH} literal".into()),
         context_usage: None,

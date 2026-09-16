@@ -112,6 +112,16 @@ pub fn clamp_wait_secs(requested: Option<u64>) -> u64 {
         .clamp(MIN_WAIT_SECS, MAX_WAIT_SECS)
 }
 
+/// What a judge asks the editor to write into its own memory, carried on the
+/// verdict instead of written by the judge itself. `intent` is a full
+/// replacement of the standing-intent record (absent = unchanged), `diary_note`
+/// is one entry to append (absent = nothing to record).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupervisorMemoryUpdate {
+    pub intent: Option<String>,
+    pub diary_note: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictKind {

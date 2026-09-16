@@ -4448,3 +4448,46 @@ How to apply: when adding anything to the agent-facing compact/clear prompts,
 ask which entity owns the path you are about to name. If the answer is "the
 observer", the prompt must not name it — the wipe can make it disappear at any
 moment, and by design.
+
+### 182. The observer's memory travels on the verdict; the editor writes it
+
+The judge used to maintain two files itself — `user_intent.md` (rewritten) and
+`diary.md` (appended) — which is the last reason it needed write capability over
+anything. Now the briefing carries their CONTENTS (`{INTENT_RECORD_SECTION}`,
+`{DIARY_SECTION}`) and the verdict carries the updates back:
+`intent` replaces the whole standing-intent record, `diary_note` appends one
+entry, and `SolutionAgentStore::write_supervisor_memory` does the writing inside
+the same authenticated call that applies the verdict.
+
+Why this shape:
+
+- **One writer per path.** The editor already wrote `verdicts.jsonl`,
+  `session-log.md` and the mechanical diary notes (`append_supervisor_diary_note`
+  — spawn skipped, compact refused). The judge was the only other writer under
+  `.agents/`, so removing it makes "the editor is the single writer" true rather
+  than nearly true, and #181's separation total.
+- **Token-neutral.** The judge read both files in full on every wake with its
+  own file tool, so injecting them costs the same bytes it already spent, minus
+  two round-trips. `BRIEFING_RECORD_MAX_BYTES` (64 KB) caps the injection by
+  TAIL, because a pathological record must not push the transcript out of the
+  judge's context.
+- **Replace, not patch, for the intent record.** It is a consolidated document
+  the judge rewrites in full; a diff or a fragment would need the judge and the
+  editor to agree on a merge, which is a second place for the record to be
+  wrong. Omitting the field means "unchanged" — the normal case.
+- **`last_analyzed_ms` stays inside the diary prose.** It could be a column on
+  `supervisor_state`, but that is a schema migration to store something only the
+  judge reads, and it already reads its diary in the briefing.
+
+What did NOT change: writes are still possible for the judge in principle — it
+is a real session with file tools, and the `--nc` bridge needs a shell, which
+can redirect. The prompt says it writes nothing and now has no reason to. A
+`SessionPermissionMode::ReadOnly` judge (claude: `--tools Read,Glob,Grep`;
+codex: an OS read-only sandbox) would make that physical, but it also removes
+Bash — and the bridge IS Bash, so the judge could no longer submit a verdict or
+read the transcript. That is a separate redesign (bind editor MCP natively,
+replace shell verification with MCP read primitives) and was explicitly left
+undone.
+
+How to apply: when the observer needs to persist something new, add a field to
+the verdict and a writer in the store — never a file for the judge to open.

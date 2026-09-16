@@ -135,6 +135,77 @@ pub fn append_session_log(
     Ok(())
 }
 
+/// Replace the standing-intent record with `text`.
+///
+/// The judge does NOT write this file: it returns the updated record in its
+/// verdict and the editor writes it here. That is what lets the observer hold
+/// no write capability over any file, and it leaves every path under
+/// `.agents/<sid>/` with exactly one writer — the editor.
+pub fn write_intent_record(dir: &Path, text: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut body = text.trim_end().to_string();
+    body.push('\n');
+    std::fs::write(intent_path(dir), body)
+}
+
+/// Append one dated entry to the diary. Multi-line notes are indented under
+/// their bullet so the file stays a readable markdown list. Shared by the
+/// judge's own note (carried in its verdict) and the editor's mechanical notes,
+/// so the two cannot drift into different shapes.
+pub fn append_diary_entry(dir: &Path, note: &str, now_ms: i64) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let stamp = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+    let mut entry = String::new();
+    for (idx, line) in note.trim().lines().enumerate() {
+        if idx == 0 {
+            entry.push_str(&format!("- {stamp} {line}\n"));
+        } else {
+            entry.push_str(&format!("  {line}\n"));
+        }
+    }
+    if entry.is_empty() {
+        return Ok(());
+    }
+    let path = diary_path(dir);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(entry.as_bytes())?;
+    cap_log_tail(&path, DIARY_LOG_MAX_BYTES);
+    Ok(())
+}
+
+/// Read a supervisor breadcrumb file for injection into the briefing, keeping
+/// at most `max_bytes` of its TAIL (whole lines) — the recent end is the part
+/// that informs the next verdict, and a pathological file must not be able to
+/// push the actual transcript out of the judge's context. `None` when the file
+/// is missing or empty, which the briefing renders as "no record yet".
+pub fn read_for_briefing(path: &Path, max_bytes: usize) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= max_bytes {
+        return Some(trimmed.to_string());
+    }
+    let start = trimmed.len().saturating_sub(max_bytes);
+    let tail = &trimmed[start..];
+    let line_start = tail.find('\n').map(|i| i + 1).unwrap_or(0);
+    Some(format!(
+        "[earlier entries dropped — showing the last {max_bytes} bytes]\n{}",
+        &tail[line_start..]
+    ))
+}
+
+/// How much of the intent record / diary the briefing carries. Generous: the
+/// judge used to read both files in full with its own file tool, so injecting
+/// them costs the same tokens it already spent, minus two round-trips.
+pub const BRIEFING_RECORD_MAX_BYTES: usize = 64 * 1024;
+
 pub fn append_verdict(dir: &Path, rec: &VerdictRecord) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut line = serde_json::to_string(rec).map_err(std::io::Error::other)?;

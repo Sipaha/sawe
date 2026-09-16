@@ -50,6 +50,15 @@ pub struct SupervisorVerdictParams {
     /// actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_seconds: Option<u64>,
+    /// The FULL updated standing-intent record. You do not write that file —
+    /// send the whole consolidated document here and the editor replaces it.
+    /// Omit when nothing about the user's intent changed this wake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// One diary entry to append (what you learned this wake, including the
+    /// `last_analyzed_ms` you reached). The editor stamps and writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diary_note: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for SupervisorVerdictParams {
@@ -64,6 +73,8 @@ impl<'de> Deserialize<'de> for SupervisorVerdictParams {
             message: Option<String>,
             question: Option<String>,
             wait_seconds: Option<u64>,
+            intent: Option<String>,
+            diary_note: Option<String>,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
@@ -74,6 +85,8 @@ impl<'de> Deserialize<'de> for SupervisorVerdictParams {
             message: inner.message,
             question: inner.question,
             wait_seconds: inner.wait_seconds,
+            intent: inner.intent,
+            diary_note: inner.diary_note,
         })
     }
 }
@@ -137,6 +150,10 @@ impl McpServerTool for SupervisorVerdictTool {
                     input.message,
                     input.question,
                     input.wait_seconds,
+                    crate::supervisor::SupervisorMemoryUpdate {
+                        intent: input.intent,
+                        diary_note: input.diary_note,
+                    },
                     cx,
                 )
             })

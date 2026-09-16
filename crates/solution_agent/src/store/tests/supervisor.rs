@@ -1327,6 +1327,7 @@ async fn verdict_nonce_authenticates_and_dedups(cx: &mut gpui::TestAppContext) {
             Some("Continue please.".into()),
             None,
             None,
+            Default::default(),
             cx,
         );
         assert!(
@@ -1352,6 +1353,7 @@ async fn verdict_nonce_authenticates_and_dedups(cx: &mut gpui::TestAppContext) {
             Some("Continue please.".into()),
             None,
             None,
+            Default::default(),
             cx,
         );
         assert!(matches!(ok, VerdictAuth::Applied), "matching nonce applies");
@@ -1372,6 +1374,7 @@ async fn verdict_nonce_authenticates_and_dedups(cx: &mut gpui::TestAppContext) {
             Some("Continue please.".into()),
             None,
             None,
+            Default::default(),
             cx,
         );
         assert!(
@@ -2708,6 +2711,64 @@ async fn compact_verdict_does_not_reenter_store(cx: &mut gpui::TestAppContext) {
         st.status,
         crate::supervisor::SupervisorStatus::Watching,
         "a Compact verdict leaves supervision Watching"
+    );
+}
+
+/// The judge holds no write capability over its own memory: it returns the
+/// updated intent record and a diary note on the verdict, and the EDITOR writes
+/// them. Asserted on the files, because "the field was accepted" is not the
+/// same claim as "the record is on disk".
+#[gpui::test]
+async fn a_verdict_carries_the_judges_memory_and_the_editor_writes_it(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    let dir = store.update(cx, |store, cx| {
+        let root = store
+            .solution_root_for(id, cx)
+            .expect("the seeded session's solution is registered");
+        crate::supervisor::supervisor_dir(&root, id)
+    });
+
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.write_supervisor_memory(
+            id,
+            crate::supervisor::SupervisorMemoryUpdate {
+                intent: Some("User requires verification at every stage.".into()),
+                diary_note: Some("First wake.\nlast_analyzed_ms: 42".into()),
+            },
+            cx,
+        );
+    });
+
+    let intent = std::fs::read_to_string(crate::supervisor::intent_path(&dir)).expect("intent");
+    assert_eq!(intent.trim(), "User requires verification at every stage.");
+    let diary = std::fs::read_to_string(crate::supervisor::diary_path(&dir)).expect("diary");
+    assert!(diary.contains("First wake."), "diary entry landed: {diary}");
+    assert!(
+        diary.contains("\n  last_analyzed_ms: 42"),
+        "a multi-line note stays one readable markdown bullet: {diary}"
+    );
+
+    // A second verdict with no `intent` leaves the record standing — omitting
+    // the field is how the judge says "nothing changed", not "erase it".
+    store.update(cx, |store, cx| {
+        store.write_supervisor_memory(
+            id,
+            crate::supervisor::SupervisorMemoryUpdate {
+                intent: None,
+                diary_note: Some("Second wake.".into()),
+            },
+            cx,
+        );
+    });
+    let intent = std::fs::read_to_string(crate::supervisor::intent_path(&dir)).expect("intent");
+    assert_eq!(intent.trim(), "User requires verification at every stage.");
+    let diary = std::fs::read_to_string(crate::supervisor::diary_path(&dir)).expect("diary");
+    assert!(
+        diary.contains("First wake.") && diary.contains("Second wake."),
+        "diary entries accumulate: {diary}"
     );
 }
 

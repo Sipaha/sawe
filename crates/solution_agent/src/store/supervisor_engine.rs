@@ -371,6 +371,16 @@ impl SolutionAgentStore {
                 intent_path: crate::supervisor::intent_path(&dir)
                     .to_string_lossy()
                     .into_owned(),
+                // Read here, not by the judge: it holds no write capability
+                // over its own memory, so it gets no read errand for it either.
+                intent_record: crate::supervisor::read_for_briefing(
+                    &crate::supervisor::intent_path(&dir),
+                    crate::supervisor::BRIEFING_RECORD_MAX_BYTES,
+                ),
+                diary: crate::supervisor::read_for_briefing(
+                    &crate::supervisor::diary_path(&dir),
+                    crate::supervisor::BRIEFING_RECORD_MAX_BYTES,
+                ),
                 compact_dir: solution_root
                     .join(".agents")
                     .join(id.to_string())
@@ -609,6 +619,7 @@ impl SolutionAgentStore {
         message: Option<String>,
         question: Option<String>,
         wait_seconds: Option<u64>,
+        memory: crate::supervisor::SupervisorMemoryUpdate,
         cx: &mut Context<Self>,
     ) -> VerdictAuth {
         // Resolve the nonce match into a bool BEFORE the `&mut self` call so the
@@ -619,6 +630,12 @@ impl SolutionAgentStore {
             .map(|handle| crate::supervisor::verdict_nonce_matches(&handle.nonce, nonce));
         match matched {
             Some(true) => {
+                // The judge's own memory is written HERE, by the editor, from
+                // what the verdict carried — the observer holds no write
+                // capability over any file. Done before the action so a verdict
+                // that rotates the transcript (`compact`) still records what the
+                // judge learned from the transcript it just read.
+                self.write_supervisor_memory(id, memory, cx);
                 self.apply_verdict(
                     id,
                     action,
@@ -633,6 +650,41 @@ impl SolutionAgentStore {
             }
             Some(false) => VerdictAuth::Unauthorized,
             None => VerdictAuth::NoInFlight,
+        }
+    }
+
+    /// Persist the memory update a judge returned with its verdict. Both fields
+    /// are optional and independent: `intent` REPLACES the standing-intent
+    /// record (the judge sends the whole consolidated document, and omits it
+    /// when nothing changed), `diary_note` APPENDS one dated entry.
+    pub(crate) fn write_supervisor_memory(
+        &mut self,
+        id: SolutionSessionId,
+        memory: crate::supervisor::SupervisorMemoryUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        if memory.intent.is_none() && memory.diary_note.is_none() {
+            return;
+        }
+        let Some(root) = self.solution_root_for(id, cx) else {
+            return;
+        };
+        let dir = crate::supervisor::supervisor_dir(&root, id);
+        if let Some(intent) = memory.intent.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            crate::supervisor::write_intent_record(&dir, intent).log_err();
+        }
+        if let Some(note) = memory
+            .diary_note
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            crate::supervisor::append_diary_entry(
+                &dir,
+                note,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .log_err();
         }
     }
 
