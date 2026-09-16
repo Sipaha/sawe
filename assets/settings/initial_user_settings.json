@@ -7,8 +7,12 @@
 // custom settings, run `zed: open default settings` from the
 // command palette (cmd-shift-p / ctrl-shift-p)
 {
-  "ui_font_size": 16,
-  "buffer_font_size": 13.75,
+  // Font sizes are left to the defaults (measured to match IntelliJ IDEA —
+  // see `buffer_font_size` in the default settings). Uncomment to override;
+  // a value pinned here wins over the default forever, including after the
+  // default changes.
+  // "ui_font_size": 14,
+  // "buffer_font_size": 14,
   "theme": {
     "mode": "system",
     "light": "One Light",

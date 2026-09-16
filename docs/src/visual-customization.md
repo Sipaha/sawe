@@ -51,7 +51,8 @@ If you would like to use distinct themes for light mode/dark mode that can be se
   "ui_font_size": 16,
 
   // Buffer Font - Used by editor buffers
-  // use ".ZedMono" for the bundled default monospace (currently Lilex)
+  // Sawe's default is the bundled JetBrains Mono, sized to match IDEA;
+  // ".ZedMono" is the other bundled monospace (Lilex), upstream Zed's default
   "buffer_font_family": "Berkeley Mono", // Font name for editor buffers
   "buffer_font_size": 15,                 // Font size for editor buffers
   "buffer_font_weight": 400,              // Font weight in CSS units [100-900]

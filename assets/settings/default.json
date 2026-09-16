@@ -27,10 +27,14 @@
   // 5. "SublimeText"
   // 6. "TextMate"
   "base_keymap": "VSCode",
-  // The name of a font to use for rendering text in the editor
-  // ".ZedMono" currently aliases to Lilex
-  // but this may change in the future.
-  "buffer_font_family": ".ZedMono",
+  // The name of a font to use for rendering text in the editor.
+  //
+  // Sawe bundles JetBrains Mono (`assets/fonts/jetbrains-mono`, OFL 1.1,
+  // v2.304 — byte-identical to the copies IntelliJ IDEA ships in its JBR) and
+  // makes it the default, so that the editor renders the same glyphs at the
+  // same width as IDEA's does. `.ZedMono` still aliases to Lilex and is still
+  // bundled; set it here to go back to it.
+  "buffer_font_family": "JetBrains Mono",
   // Set the buffer text's font fallbacks, this will be merged with
   // the platform's default fallbacks.
   "buffer_font_fallbacks": null,
@@ -43,18 +47,11 @@
   },
   // The default font size for text in the editor.
   //
-  // 13.75, not a round number, because it is a measurement: it is the size at
-  // which the bundled `.ZedMono` (Lilex) renders the same *glyph* as IntelliJ
-  // IDEA's editor at its own default (JetBrains Mono 13, line spacing 1.2, at
-  // scale 1). The two families need different em sizes for the same apparent
-  // size — per 1000 em Lilex has a cap height of 698 against JetBrains Mono's
-  // 730, and an x-height of 516 against 550 — so matching cap height asks for
-  // 13 × 730/698 = 13.60 and matching x-height asks for 13 × 550/516 = 13.86.
-  // 13.75 splits them: cap +1.2 %, x-height −0.9 % (measured with AWT
-  // `FontMetrics` on both TTFs). It also lands the line pitch exactly on
-  // IDEA's 22px — `round(13.75 × 1.618)` — so `buffer_line_height` stays
-  // "comfortable".
-  "buffer_font_size": 13.75,
+  // 13 because that is IntelliJ IDEA's own default for the same font
+  // (`FontPreferences.DEFAULT_FONT_SIZE`), and the family above is now the
+  // same family — so every glyph metric matches, including the character
+  // advance, which no choice of size could match while the families differed.
+  "buffer_font_size": 13,
   // The weight of the editor font in standard CSS units from 100 to 900.
   "buffer_font_weight": 400,
   // Set the buffer's line height.
@@ -67,7 +64,14 @@
   //         "buffer_line_height": {
   //           "custom": 2
   //         },
-  "buffer_line_height": "comfortable",
+  //
+  // 1.662 rather than "comfortable" (1.618) because it is IDEA's own rule
+  // re-expressed against the em. IDEA paints `ceil(FontMetrics.getHeight() *
+  // lineSpacing)` (`EditorView.initMetricsIfNeeded`), which for JetBrains Mono
+  // at 13 is `ceil(18 * 1.2)` = 22px; this multiplier is `(18 / 13) * 1.2`, and
+  // `round(13 * 1.662)` is the same 22. "comfortable" would paint 21 — a pixel
+  // tighter per line than the editor this is matched against.
+  "buffer_line_height": { "custom": 1.662 },
   // The name of a font to use for rendering text in the UI
   // You can set this to ".SystemUIFont" to use the system font
   // ".ZedSans" currently aliases to "IBM Plex Sans", but this may
@@ -83,8 +87,19 @@
   },
   // The weight of the UI font in standard CSS units from 100 to 900.
   "ui_font_weight": 400,
-  // The default font size for text in the UI
-  "ui_font_size": 16,
+  // The default font size for text in the UI.
+  //
+  // Measured against IDEA the same way the buffer font was: IDEA's UI font is
+  // Inter at 13 (`NotRoamableUiSettings.fontSize`), and per 1000 em Inter has a
+  // cap height of 727 and an x-height of 545 against IBM Plex Sans' 698 and
+  // 516 — so matching cap height asks for 13.54 and matching x-height asks for
+  // 13.73. 13.75 covers both (cap +1.6 %, x-height +0.1 %). At the old 16 the
+  // UI text was 18 % taller than IDEA's.
+  //
+  // This is also the window's rem size (`ThemeSettings::setup_ui`), so it
+  // scales row heights, icon sizes and padding with it — which is the point:
+  // matching IDEA means matching its density, not only its glyphs.
+  "ui_font_size": 13.75,
   // The default font size for agent responses in the agent panel. Falls back to the UI font size if unset.
   "agent_ui_font_size": null,
   // The default font size for user messages in the agent panel.

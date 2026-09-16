@@ -134,7 +134,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/paths/src/paths.rs` | `.zed` → `.sawe` rename for per-worktree config dir. Adds `run_configurations_file()` (global `~/.spk/sawe/config/run-configurations.json`) and `local_run_configurations_file_relative_path()` (`.sawe/run-configurations.json`) for S-RUN. Adds `remote_control_settings_file()` (`~/.spk/sawe/config/remote-control.json`) for R-1. Adds `remote_control_cert_file()` / `remote_control_key_file()` siblings for the R-2 self-signed TLS cert + key (persisted across restarts so fingerprint pinning stays stable). | rebrand / `run_config` (S-RUN) / `remote_control` (R-1 / R-2) |
 | `crates/gpui_tokio/src/gpui_tokio.rs` | Adds `Tokio::try_handle(cx) -> Option<tokio::runtime::Handle>` — the non-panicking analogue of `Tokio::handle`, used by `remote_control::store::start_listener_async` to short-circuit when the runtime isn't installed (rather than panic deep in the bootstrap path). | `remote_control` (R-2) |
 | `assets/keymaps/default-*.json` | Default shortcuts for Solutions / sessions. Adds `alt-shift-f10` → `run_config::Run`, `alt-shift-f9` → `run_config::Debug`, `alt-shift-f2` → `run_config::Stop` (Workspace context; IntelliJ-style — `alt-shift` variants chosen because `shift-f10`/`shift-f9`/`ctrl-f2` are already bound in Editor context). | `solutions_ui` / `run_config_ui` |
-| `assets/settings/default.json`, `assets/settings/initial_user_settings.json` | Default `solutions.root`; default `icon_theme: "Material Icon Theme"` + auto-install of the matching extension (colored project tree, IDEA-like, vs upstream's monochrome `Zed (Default)`); default `toolbar.{breadcrumbs,quick_actions,selections_menu}: false` (IDEA-style — no toolbar row under the tab bar; whole row disappears when all items hidden, Ctrl+F search bars unaffected; re-enable per-user in settings or per-editor via `editor::ToggleBreadcrumb`); default `project_panel.{sticky_scroll,auto_fold_dirs}: false` (the pinned ancestor rows cover the tree while scrolling, and the folded `a/b/c` chains hide real directory levels — both are opt-in here, doc-comment defaults in `settings_content/src/workspace.rs` updated to match); **decision #184** — `buffer_font_size: 13.75` in both files, the measured match for IDEA's JetBrains Mono 13. | `solutions` / rebrand |
+| `assets/settings/default.json`, `assets/settings/initial_user_settings.json`, `assets/fonts/jetbrains-mono/` | Default `solutions.root`; default `icon_theme: "Material Icon Theme"` + auto-install of the matching extension (colored project tree, IDEA-like, vs upstream's monochrome `Zed (Default)`); default `toolbar.{breadcrumbs,quick_actions,selections_menu}: false` (IDEA-style — no toolbar row under the tab bar; whole row disappears when all items hidden, Ctrl+F search bars unaffected; re-enable per-user in settings or per-editor via `editor::ToggleBreadcrumb`); default `project_panel.{sticky_scroll,auto_fold_dirs}: false` (the pinned ancestor rows cover the tree while scrolling, and the folded `a/b/c` chains hide real directory levels — both are opt-in here, doc-comment defaults in `settings_content/src/workspace.rs` updated to match); **decision #184** — the editor is sized and shaped against IDEA: bundled JetBrains Mono as `buffer_font_family`, `buffer_font_size: 13`, `buffer_line_height: {custom: 1.662}`, `ui_font_size: 13.75`, and the seed template pins no font size at all. | `solutions` / rebrand |
 | `crates/zed/Cargo.toml` `[[bin]]` | Binary name overridden to `sawe` (cargo crate `zed` unchanged). | rebrand |
 | `.cargo/config.toml` | `[target.x86_64-unknown-linux-gnu]` block forcing `-fuse-ld=mold`. See decision 15. | build |
 | `crates/terminal_view/src/terminal_panel.rs` | Dropped the now-unused `TerminalDockPosition` import (a local edit had removed its only use, leaving a dead import that failed `clippy -D warnings`). | upstream-fix |
@@ -4578,48 +4578,67 @@ whether the agent could perform it at a boundary it chooses. If yes, the editor
 asks first and escalates on a timer; the state for that belongs in
 `SupervisorState`, transient, reset by the event that makes it moot.
 
-### 184. The default buffer font size is a measurement against IDEA, not a preference
+### 184. The editor's fonts are measured against IDEA, not chosen
 
-`buffer_font_size` is **13.75**, and the odd number is the whole point: it is the
-size at which the bundled `.ZedMono` renders the same glyph as IntelliJ IDEA's
-editor at its own defaults. The maintainer compared the two side by side and
-Sawe's editor text read too large.
+The maintainer put the two editors side by side: Sawe's editor text was too
+large. Everything below is measured at the settings both actually run with — X11,
+96 DPI, `Xft.dpi 96`, `text-scaling-factor 1.0`, so IDEA's JBUIScale is 1 and its
+"13pt" is 13 px.
 
-Both sides measured rather than guessed, at the settings they actually run with
-(X11, 96 DPI, `Xft.dpi 96`, `text-scaling-factor 1.0`, so IDEA's JBUIScale is 1
-and its "13pt" is 13 px):
+IDEA carries no editor font in `editor-font.xml` at all, so its defaults apply:
+`FontPreferences.DEFAULT_FONT_SIZE = 13`, `DEFAULT_LINE_SPACING = 1.2f`, family
+JetBrains Mono. (`other.xml`'s `fontSize: 13.0` is the *UI* font, a different
+setting that happens to share the number. Its UI family is Inter.)
 
-- IDEA carries no editor font in `editor-font.xml` at all, so the defaults apply:
-  `FontPreferences.DEFAULT_FONT_SIZE = 13`, `DEFAULT_LINE_SPACING = 1.2f`, family
-  JetBrains Mono. (`other.xml`'s `fontSize: 13.0` is the *UI* font — a different
-  setting that happens to share the number.)
-- `.ZedMono` is `assets/fonts/lilex/Lilex-Regular.ttf`.
+**The font family is the setting that mattered.** The first pass kept Lilex
+(`.ZedMono`) and solved for the size, which cannot converge: per 1000 em Lilex
+has a cap height of 698 against JetBrains Mono's 730 and an x-height of 516
+against 550, so matching cap height asked for 13.60 and matching x-height asked
+for 13.86 — and *neither* could fix the character advance, since both families
+are 600/1000 em and matching glyph height therefore necessarily widens the
+columns. Bundling the same font removes the trade-off instead of splitting it.
 
-The two families need different em sizes for the same apparent size. Per 1000 em,
-Lilex has a cap height of 698 against JetBrains Mono's 730 and an x-height of 516
-against 550, so matching cap height asks for 13 × 730/698 = 13.60 and matching
-x-height asks for 13 × 550/516 = 13.86. 13.75 splits them (cap +1.2 %, x-height
-−0.9 %, AWT `FontMetrics` on both TTFs), and `round(13.75 × 1.618)` is 22 px —
-exactly IDEA's `ceil(18 × 1.2)` line pitch — so `buffer_line_height` stays
-`"comfortable"` and is not part of this.
+So: `assets/fonts/jetbrains-mono/` carries the four styles from the official
+v2.304 release (byte-identical, verified by sha256, to the copies IDEA ships in
+`jbr/lib/fonts/`) plus its `OFL.txt`. SIL OFL 1.1 with **no** Reserved Font Name,
+so bundling unmodified costs us only keeping the notice next to the font — which
+is where `assets/fonts/lilex/OFL.txt` and `assets/fonts/ibm-plex-sans/license.txt`
+already put it. `Assets::load_fonts` walks `fonts/**` for `.ttf`, so dropping the
+directory in is the whole wiring. `.ZedMono` still aliases Lilex and Lilex is
+still bundled.
 
-Verified in a running editor, not on paper: the painted line pitch went 24 px →
-22 px (pixel distance between ink rows in a headless screenshot), and rendering
-the same string through Java2D in both fonts gives 9 px cap ink and 7 px x-height
-ink on both sides, against 11 px and 8 px at the old 15 px.
+The three numbers that follow from it:
 
-What does NOT match, and cannot at any size: character advance. Lilex and
-JetBrains Mono are both 600/1000 em, so matching glyph *height* necessarily makes
-Sawe's columns wider — 8.22 px/char measured against IDEA's 7.8–8.0. Closing that
-means bundling JetBrains Mono, which is a font-asset decision, not a size one.
+- `buffer_font_size: 13` — IDEA's own default for the same family, so every
+  glyph metric matches by construction rather than by approximation.
+- `buffer_line_height: {custom: 1.662}` rather than `"comfortable"` (1.618).
+  IDEA paints `ceil(FontMetrics.getHeight() * lineSpacing)`
+  (`EditorView.initMetricsIfNeeded`, decompiled — not assumed), which is
+  `ceil(18 * 1.2)` = 22px. 1.662 is `(18 / 13) * 1.2`, IDEA's rule re-expressed
+  against the em, and `round(13 * 1.662)` is the same 22. "comfortable" paints
+  21 — a pixel tighter per line than the editor this is matched to.
+- `ui_font_size: 13.75`. IDEA's UI is Inter 13; per 1000 em Inter is cap 727 /
+  x-height 545 against IBM Plex Sans' 698 / 516, so cap asks 13.54 and x-height
+  asks 13.73 and 13.75 covers both (cap +1.6 %, x-height +0.1 %). At the old 16
+  the UI text was 18 % taller than IDEA's. This one is also the window's rem size
+  (`ThemeSettings::setup_ui`), so row heights, icon sizes and padding scale with
+  it — deliberately: matching IDEA means matching its density, not only its
+  glyphs. Inter itself is NOT bundled; only the size was matched.
 
-`assets/settings/initial_user_settings.json` moved with the default. That file is
-the template copied into a new user's `settings.json`, and it pinned the same
-`15` — so changing only `default.json` would have left every existing and every
-newly-seeded profile overriding the new default back to the old value with a line
-the user never chose.
+Measured in a running editor, not on paper: painted line pitch 24 px → 22 px
+(pixel distance between ink rows in a headless screenshot), character advance
+7.78 px against IDEA's 7.80. That the family actually resolved was proved by
+difference, not by reading the setting back — forcing `buffer_font_family:
+"Lilex"` in the same probe changed 15.9 % of the text area's pixels.
 
-How to apply: when a default exists to match another product's rendering, write
-the measurement into the comment next to it, and change the seed template in the
-same commit as the default — a seeded value is an override, and an override
-silently wins.
+**`assets/settings/initial_user_settings.json` is part of this.** It is the
+template copied into a new profile's `settings.json` and it pinned the same
+sizes, so the maintainer's own settings carried `buffer_font_size: 15` because
+the editor put it there, not because they chose it — and a pinned value wins over
+a default forever. It now pins no font size and says why in a comment.
+
+How to apply: when a default exists to match another product's rendering, the
+family is the first thing to check, not the last — a size solved against the
+wrong family converges on a compromise instead of a match. Write the measurement
+into the comment next to the default, and change the seed template in the same
+commit, because a seeded value is an override and an override silently wins.
