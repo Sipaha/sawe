@@ -4491,3 +4491,48 @@ undone.
 
 How to apply: when the observer needs to persist something new, add a field to
 the verdict and a writer in the store — never a file for the judge to open.
+
+### 183. A `compact` verdict asks the agent twice before the editor takes over
+
+A `compact` verdict used to drop the full compaction prompt into the session the
+moment the judge issued it — including mid-turn, which is a deliberate feature
+(the active-review path exists so a runaway context can be caught before it
+ends). It reads as an interrupt: the prompt lands in the middle of a step and
+the agent abandons whatever it was holding.
+
+The verdict is now an escalating request, and the ladder lives in the editor
+(`supervisor::compact_guard` + `CompactStep`), not in the judge's prompt:
+
+1. **Ask.** The agent gets an observer message naming the exact tool —
+   "finish the step you are on, then call `solution_agent.start_compact`" —
+   with the context's real fullness, the judge's handoff note if it sent one,
+   and the fact that the editor will do it anyway if nothing happens.
+2. **Ask again**, on a later verdict, once `COMPACT_ESCALATION_SECS` (5 min) has
+   passed since the last ask. A repeat inside that window sends NOTHING:
+   the agent is plausibly still finishing the step it was asked to finish, and
+   two judge fires a minute apart must not shorten the ladder.
+3. **Force.** After `MAX_COMPACT_REQUESTS` (2) asks, the editor sends the
+   compaction request itself — today's behaviour, unchanged.
+
+Why the editor and not the prompt: the judge wakes with no memory of having
+asked. It can read its own verdict log, but "did the thing I asked for happen,
+and how long ago" is a state question with a deterministic answer, and the fork
+already has this exact shape for nudges (`continue_guard`). The judge's
+instructions were updated to match — "the transcript did not rotate after my
+`compact`" is now the EXPECTED first outcome rather than evidence the verdict
+was refused, so the judge re-issues and the editor escalates.
+
+Two couplings worth knowing:
+
+- **The ladder resets when the transcript rotates** (and on `/clear`): a fresh
+  context has never been asked, so it starts at "ask", not at "force".
+- **An agent that self-compacts because the observer asked does NOT wipe the
+  observer's memory.** That compaction arrives through the user-initiated path
+  (`start_compact` called by the agent), and #37's wipe keys on exactly that —
+  so the wipe now asks the ladder, not the caller: `is_user && !observer_asked`.
+  Without it, honouring the request would destroy the memory of the request.
+
+How to apply: when an observer action lands in the supervised session, ask
+whether the agent could perform it at a boundary it chooses. If yes, the editor
+asks first and escalates on a timer; the state for that belongs in
+`SupervisorState`, transient, reset by the event that makes it moot.

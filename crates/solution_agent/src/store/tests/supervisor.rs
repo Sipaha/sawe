@@ -826,6 +826,8 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         trigger_count: 0,
         last_user_input_ms: None,
         judge_superseded: false,
+        compact_requests: 0,
+        last_compact_request_ms: None,
         held_by_done: false,
         pending_nudge: None,
         wait_until_ms: None,
@@ -2714,6 +2716,149 @@ async fn compact_verdict_does_not_reenter_store(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// A `compact` verdict asks the agent to hand off before it takes the decision
+/// away from it: the first two land as observer messages naming the tool, and
+/// only the third queues the compaction itself. Asserted end-to-end on what the
+/// session actually receives, because the whole complaint was about WHAT lands
+/// in a working session, not about which branch ran.
+#[gpui::test]
+async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: 900_000,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let compact_verdict = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.set_supervision_enabled(session_id, true, cx);
+                store.apply_verdict(
+                    session_id,
+                    crate::supervisor::VerdictAction::Compact,
+                    "context is nearly full".into(),
+                    Some("Keep the migration plan.".into()),
+                    None,
+                    None,
+                    None,
+                    cx,
+                );
+            });
+        });
+        cx.executor().run_until_parked();
+    };
+
+    let transcript = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(session_id)
+                .unwrap()
+                .read(cx)
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    crate::session_entry::SessionEntryKind::UserMessage { content_md, .. } => {
+                        Some(content_md.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+    };
+
+    compact_verdict(cx);
+    let first = transcript(cx);
+    assert!(
+        first.contains("solution_agent.start_compact"),
+        "the first compact verdict ASKS the agent to hand off: {first}"
+    );
+    assert!(
+        first.contains("90%"),
+        "and says how full the context actually is: {first}"
+    );
+    assert!(
+        first.contains("Keep the migration plan."),
+        "carrying the judge's note, so the ask is not generic: {first}"
+    );
+    assert!(
+        !first.starts_with(crate::compact::COMPACT_PROMPT_HEADING),
+        "no compaction was queued yet"
+    );
+    assert!(
+        cx.update(|cx| !SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .is_compaction_pending()),
+        "asking is not compacting"
+    );
+
+    // A second verdict inside the escalation window says nothing at all: the
+    // agent was just asked and may still be finishing its step.
+    compact_verdict(cx);
+    assert_eq!(
+        transcript(cx),
+        first,
+        "a verdict inside the window must not repeat the same sentence"
+    );
+
+    // Age the request past the window: the second ask goes out, firmer.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            let state = store.supervisor_states.get_mut(&session_id).unwrap();
+            state.last_compact_request_ms = Some(
+                chrono::Utc::now().timestamp_millis()
+                    - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
+                    - 1,
+            );
+        });
+    });
+    compact_verdict(cx);
+    let second = transcript(cx);
+    assert!(
+        second.len() > first.len() && second.contains("still open"),
+        "the second ask acknowledges the first went unanswered: {second}"
+    );
+
+    // Two asks spent: the next verdict stops asking and queues the compaction.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store
+                .supervisor_states
+                .get_mut(&session_id)
+                .unwrap()
+                .last_compact_request_ms = Some(
+                chrono::Utc::now().timestamp_millis()
+                    - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
+                    - 1,
+            );
+        });
+    });
+    compact_verdict(cx);
+    let third = transcript(cx);
+    assert!(
+        third.contains(crate::compact::COMPACT_PROMPT_HEADING),
+        "the third verdict sends the compaction request itself: {}",
+        &third[third.len().saturating_sub(400)..]
+    );
+    assert!(
+        third.contains("autonomous observer"),
+        "and it is still attributed to the observer, not to the user"
+    );
+}
+
 /// The judge holds no write capability over its own memory: it returns the
 /// updated intent record and a diary note on the verdict, and the EDITOR writes
 /// them. Asserted on the files, because "the field was accepted" is not the
@@ -2802,6 +2947,12 @@ async fn compact_verdict_message_reaches_the_prompt_as_an_observer_note(
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
             store.set_supervision_enabled(session_id, true, cx);
+            // Start at the far end of the escalation ladder: the first two
+            // `compact` verdicts only ASK the agent to hand off (covered by
+            // `a_compact_verdict_asks_before_it_compacts`); this test is about
+            // what the compaction request itself carries once asking is spent.
+            let state = store.supervisor_states.get_mut(&session_id).unwrap();
+            state.compact_requests = crate::supervisor::MAX_COMPACT_REQUESTS;
             store.apply_verdict(
                 session_id,
                 crate::supervisor::VerdictAction::Compact,

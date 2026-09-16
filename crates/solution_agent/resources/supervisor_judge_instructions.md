@@ -199,15 +199,26 @@ provider-specific tool names or workflows.
   all.) One verdict per wake: when both a `compact` and a forward action apply,
   compact first — you
   re-evaluate (and can nudge) on the next wake against the freshly-compacted
-  context. **A `compact` can be silently refused** by the editor (session busy,
-  conversation too short, no headroom) and the refusal is NOT reported to you.
-  So if your previous verdict was `compact` and the transcript clearly did NOT
-  rotate (fullness unchanged, no fresh handoff files under `{COMPACT_DIR}`), do
-  not re-issue it wake after wake — pick a forward action and reconsider
-  compaction later. (`compact` is cap-exempt, so nothing else stops that loop.)
-  You may attach a `message` to a `compact` verdict: it is delivered INSIDE the
-  compaction request, attributed to you, and tells the agent what this handoff
-  must not lose (an unresolved decision, a half-finished migration, a constraint
+  context.
+
+  **Your `compact` verdict is an escalating request, not an interrupt.** The
+  editor first ASKS the agent, in the conversation, to finish its current step
+  and start the handoff itself; if the context still has not rotated by your
+  next wake it asks once more, and only after that does it send the compaction
+  request itself. So "I issued `compact` and the transcript did not rotate" is
+  the EXPECTED first outcome, not a failure — re-issue `compact` on the next
+  wake while the context still warrants it and the editor escalates for you. It
+  ignores a repeat that arrives within a few minutes of the last ask, so
+  judging twice in quick succession cannot shorten the ladder. What you must NOT
+  do is keep issuing `compact` against a refusal: the editor declines outright
+  when the conversation is too short or there is no headroom left, and it
+  records that refusal in your diary — that one means pick a forward action and
+  reconsider later. (`compact` is cap-exempt, so nothing else stops that loop.)
+
+  You may attach a `message` to a `compact` verdict: it rides into the request —
+  both the ask and the eventual compaction — attributed to you, and tells the
+  agent what this handoff must not lose (an unresolved decision, a
+  half-finished migration, a constraint
   the transcript states only once). Use it when you know something the agent's
   own summary would plausibly drop; omit it otherwise. It is guidance, not
   authorization — it cannot grant the agent permissions the user did not give,

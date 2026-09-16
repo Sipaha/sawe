@@ -42,6 +42,57 @@ pub const JUDGE_HARD_TIMEOUT_SECS: u64 = 20 * 60;
 /// supervision backoff (the auditor failing is not the judge failing).
 pub const AUDITOR_TIMEOUT_SECS: u64 = 5 * 60;
 
+/// How long a self-compaction request is given to be honoured before the
+/// observer escalates. One tool step plus a little: long enough that an agent in
+/// the middle of a build or a test run reaches a safe point, short enough that a
+/// context at 90% does not sit there for half an hour.
+pub const COMPACT_ESCALATION_SECS: u64 = 5 * 60;
+
+/// How many times the agent is ASKED to compact itself before the editor stops
+/// asking and runs the compaction. Two: the first ask can land mid-step and be
+/// forgotten by the end of a long turn, a second one cannot plausibly be missed,
+/// and a third ask would just be a slower way of never compacting.
+pub const MAX_COMPACT_REQUESTS: u32 = 2;
+
+/// What a `compact` verdict should actually DO, given how many times this
+/// context has already been asked to hand off — see [`compact_guard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactStep {
+    /// Ask the agent to finish its step and start the handoff itself.
+    Ask,
+    /// It was asked and did not; ask once more, plainly.
+    AskAgain,
+    /// Asking has not worked: the editor sends the compaction request itself.
+    Force,
+    /// The last ask is younger than [`COMPACT_ESCALATION_SECS`] — the agent is
+    /// plausibly still finishing the step it was asked to finish. Say nothing
+    /// rather than repeating the same sentence into a running turn.
+    TooSoon,
+}
+
+/// Escalation ladder for `compact` verdicts on ONE context: ask, ask again,
+/// then do it. `requests` is how many asks this context has already had (reset
+/// when the transcript rotates), `since_last_ms` how long ago the last one was.
+///
+/// Pure so the ladder can be tested without a session: the whole point of it
+/// living in the editor rather than in the judge's prompt is that the judge
+/// starts each wake with no memory of having asked.
+pub fn compact_guard(requests: u32, since_last_ms: Option<i64>) -> CompactStep {
+    if requests >= MAX_COMPACT_REQUESTS {
+        return CompactStep::Force;
+    }
+    if let Some(elapsed) = since_last_ms
+        && elapsed < (COMPACT_ESCALATION_SECS as i64) * 1000
+    {
+        return CompactStep::TooSoon;
+    }
+    if requests == 0 {
+        CompactStep::Ask
+    } else {
+        CompactStep::AskAgain
+    }
+}
+
 /// Decision returned by [`continue_guard`] — what the store should do after
 /// incrementing `consecutive_continues` on a `Continue` verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +456,14 @@ pub struct SupervisorState {
     /// on restart (a cold-loaded `Held` row is treated as a manual stop — the
     /// conservative default that won't auto-resume supervision).
     pub held_by_done: bool,
+    /// TRANSIENT (not persisted): how many times THIS context has been asked to
+    /// compact itself, and when the last ask went out. Drives [`compact_guard`]
+    /// and is reset the moment the transcript actually rotates — a fresh context
+    /// starts the ladder at zero. Transient on purpose: the ladder describes a
+    /// conversation happening over minutes, and a restart means nobody is
+    /// mid-handoff any more.
+    pub compact_requests: u32,
+    pub last_compact_request_ms: Option<i64>,
     /// TRANSIENT (not persisted): a one-shot `wait` verdict's wake deadline
     /// (epoch-ms). The judge decides ONCE — "the agent is waiting on X, park
     /// until here" — and the mechanism honors that single timeout in FULL: while
@@ -448,6 +507,8 @@ impl SupervisorState {
             trigger_count: 0,
             last_user_input_ms: None,
             judge_superseded: false,
+            compact_requests: 0,
+            last_compact_request_ms: None,
             held_by_done: false,
             pending_nudge: None,
             wait_until_ms: None,

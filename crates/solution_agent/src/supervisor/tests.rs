@@ -212,6 +212,37 @@ fn should_fire_respects_threshold_and_status() {
 }
 
 #[test]
+fn compact_ladder_asks_twice_then_forces_and_never_repeats_itself() {
+    use crate::supervisor::{COMPACT_ESCALATION_SECS, CompactStep, compact_guard};
+    let long_ago = Some((COMPACT_ESCALATION_SECS as i64) * 1000 + 1);
+    let just_now = Some(1_000i64);
+
+    assert_eq!(compact_guard(0, None), CompactStep::Ask, "first ask");
+    assert_eq!(
+        compact_guard(1, long_ago),
+        CompactStep::AskAgain,
+        "asked once, the window passed, it did not compact"
+    );
+    assert_eq!(
+        compact_guard(2, long_ago),
+        CompactStep::Force,
+        "two asks are enough; the editor stops asking"
+    );
+
+    assert_eq!(
+        compact_guard(1, just_now),
+        CompactStep::TooSoon,
+        "the agent is plausibly still finishing the step it was asked to finish"
+    );
+    assert_eq!(
+        compact_guard(2, just_now),
+        CompactStep::Force,
+        "the cap wins over the window: a context that has ignored two asks does \
+         not get another grace period for judging twice in a minute"
+    );
+}
+
+#[test]
 fn briefing_substitutes_paths_and_custom_prompt() {
     let ctx = JudgeBriefingContext {
         supervised_session_id: "abcd1234".into(),

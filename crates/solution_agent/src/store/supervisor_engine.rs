@@ -653,6 +653,108 @@ impl SolutionAgentStore {
         }
     }
 
+    /// True while the observer is mid-ladder for this session — it has asked the
+    /// agent to hand off and the transcript has not rotated yet. Read by
+    /// `compact::start_compact_for_session` to answer "who is this compaction
+    /// really coming from": a self-compaction the agent performs because the
+    /// observer asked is an OBSERVER compaction wearing the agent's clothes, and
+    /// must not wipe the observer's memory the way a human `/compact` does.
+    pub(crate) fn observer_requested_compaction(&self, id: SolutionSessionId) -> bool {
+        self.supervisor_states
+            .get(&id)
+            .is_some_and(|state| state.compact_requests > 0)
+    }
+
+    /// Forget the compaction ladder for a session. Called when the transcript
+    /// actually rotates (or is cleared): a fresh context has never been asked to
+    /// hand off, so the next `compact` verdict starts at "ask", not at "force".
+    pub(crate) fn reset_compaction_ladder(&mut self, id: SolutionSessionId) {
+        if let Some(state) = self.supervisor_states.get_mut(&id) {
+            state.compact_requests = 0;
+            state.last_compact_request_ms = None;
+        }
+    }
+
+    /// Which rung of the compaction ladder a `compact` verdict lands on for this
+    /// session, or `None` when the session is already compacting (a request is
+    /// queued and waiting) — in which case the verdict has nothing left to do.
+    fn compaction_request_step(
+        &self,
+        id: SolutionSessionId,
+        cx: &App,
+    ) -> Option<crate::supervisor::CompactStep> {
+        let session = self.session(id)?;
+        if session.read(cx).is_compaction_pending() {
+            return None;
+        }
+        let state = self.supervisor_states.get(&id)?;
+        let since = state
+            .last_compact_request_ms
+            .map(|at| chrono::Utc::now().timestamp_millis().saturating_sub(at));
+        Some(crate::supervisor::compact_guard(
+            state.compact_requests,
+            since,
+        ))
+    }
+
+    /// The text the agent is asked to act on. It names the exact tool, because
+    /// "compact when convenient" with no verb is how an agent acknowledges a
+    /// request and does nothing, and it states that the editor will do it
+    /// anyway — the deadline is real, and hiding it would make the eventual
+    /// forced compaction look arbitrary.
+    fn compaction_request_message(
+        &self,
+        id: SolutionSessionId,
+        again: bool,
+        note: Option<String>,
+        cx: &App,
+    ) -> String {
+        let fullness = self.session(id).and_then(|session| {
+            let session = session.read(cx);
+            let usage = session
+                .acp_thread()
+                .and_then(|thread| thread.read(cx).token_usage().cloned());
+            let used = usage
+                .as_ref()
+                .map(|u| u.used_tokens)
+                .or(session.cached_total_tokens)?;
+            let max = usage
+                .as_ref()
+                .map(|u| u.max_tokens)
+                .filter(|m| *m > 0)
+                .or(session.cached_max_tokens)?;
+            (max > 0).then(|| ((used as f64 / max as f64) * 100.0).round() as u64)
+        });
+        let opening = match (again, fullness) {
+            (false, Some(pct)) => format!("Your context is {pct}% full."),
+            (false, None) => "Your context is getting large.".to_string(),
+            (true, Some(pct)) => {
+                format!("Your context is {pct}% full and the earlier handoff request is still open.")
+            }
+            (true, None) => {
+                "The earlier handoff request is still open and your context keeps growing."
+                    .to_string()
+            }
+        };
+        let closing = if again {
+            "If it is still open at the next check, the editor will start the handoff for \
+             you, wherever you happen to be."
+        } else {
+            "If nothing happens, the editor will start it for you."
+        };
+        let mut message = format!(
+            "{opening} Finish the step you are on — do not start new work — then hand off: \
+             call the `solution_agent.start_compact` tool on the `sawe` MCP server with \
+             {{\"session_id\": \"{id}\"}}. It gives you the standard handoff instructions to \
+             follow. {closing}"
+        );
+        if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            message.push_str("\n\nWhat this handoff must not lose: ");
+            message.push_str(note);
+        }
+        message
+    }
+
     /// Persist the memory update a judge returned with its verdict. Both fields
     /// are optional and independent: `intent` REPLACES the standing-intent
     /// record (the judge sends the whole consolidated document, and omits it
@@ -911,6 +1013,31 @@ impl SolutionAgentStore {
                 // as observer-authored so the agent doesn't read it as a user
                 // instruction.
                 let note = message;
+                // Dropping the compact prompt straight into a working session is
+                // the blunt version of this: it lands mid-step, and the agent
+                // has to abandon whatever it was holding in its head. So ASK
+                // first and let the agent pick the boundary — twice, spaced —
+                // and only then take the decision away from it. The ladder lives
+                // here rather than in the judge's prompt because the judge wakes
+                // with no memory of having asked.
+                if let Some(step) = self.compaction_request_step(id, cx) {
+                    match step {
+                        crate::supervisor::CompactStep::TooSoon => return,
+                        crate::supervisor::CompactStep::Ask
+                        | crate::supervisor::CompactStep::AskAgain => {
+                            let again = matches!(step, crate::supervisor::CompactStep::AskAgain);
+                            let ask = self.compaction_request_message(id, again, note, cx);
+                            if let Some(state) = self.supervisor_states.get_mut(&id) {
+                                state.compact_requests = state.compact_requests.saturating_add(1);
+                                state.last_compact_request_ms =
+                                    Some(chrono::Utc::now().timestamp_millis());
+                            }
+                            self.send_supervisor_nudge(id, ask, cx).detach();
+                            return;
+                        }
+                        crate::supervisor::CompactStep::Force => {}
+                    }
+                }
                 // `start_compact_for_session` re-acquires the global
                 // `SolutionAgentStore` and `read_with`s it — but `apply_verdict`
                 // runs INSIDE the MCP tool's `store.update(...)` lease (mcp.rs

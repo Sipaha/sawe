@@ -3852,6 +3852,9 @@ impl SolutionAgentStore {
                 if reset_observer_memory {
                     store.wipe_supervisor_memory(session_id, cx);
                 }
+                // A fresh context has never been asked to hand off, so the next
+                // `compact` verdict starts the ladder at "ask" again.
+                store.reset_compaction_ladder(session_id);
                 if background_agents_killed {
                     cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
                         session_id,
@@ -4048,6 +4051,7 @@ impl SolutionAgentStore {
                 // Only wipe observer memory once the replacement exists and
                 // the reset can commit successfully.
                 store.wipe_supervisor_memory(session_id, cx);
+                store.reset_compaction_ladder(session_id);
                 // Capture the PRE-clear ACP session id + liveness before the graft
                 // overwrites them, so we can reap its orphaned subprocess + release
                 // the pool slot it held (skipped for a cold session — it never

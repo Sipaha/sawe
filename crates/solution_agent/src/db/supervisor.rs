@@ -118,6 +118,8 @@ impl SolutionAgentDb {
                     last_user_input_ms: None,
                     // Transient: no in-flight judge exists for a cold-loaded row.
                     judge_superseded: false,
+                compact_requests: 0,
+                last_compact_request_ms: None,
                     // Transient: a cold-loaded `Held` row is treated as a manual
                     // stop (won't self-resume) — the conservative default.
                     held_by_done: false,

@@ -214,10 +214,16 @@ pub(crate) fn start_compact_for_session(
     let rendered = render_compact_prompt_inner(session_id, note, initiator, cx)?;
     let is_user = initiator == CompactInitiator::User;
     store.update(cx, |store, cx| {
+        let observer_asked = store.observer_requested_compaction(session_id);
         let session = store.session(session_id).expect("session validated above");
         let request = session.update(cx, |session, cx| {
             let request = session.begin_compaction_request();
-            session.compact_reset_observer_memory = is_user;
+            // A human `/compact` resets the observer (FORK.md #37). A
+            // self-compaction the agent performs BECAUSE the observer asked it
+            // to arrives through this same user-initiated path, and wiping there
+            // would destroy the memory of the very request being honoured — so
+            // the ladder, not the caller's word, answers "who asked".
+            session.compact_reset_observer_memory = is_user && !observer_asked;
             cx.notify();
             request
         });
