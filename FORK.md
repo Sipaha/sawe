@@ -4424,16 +4424,25 @@ record a shared file with two owners, which is the thing being removed. The
 maintainer's framing settles it: «две разные сущности, которые взаимодействуют
 исключительно посредством диалога + команд на компакцию».
 
-Two crossings remain, named here so they are not mistaken for oversights, both
-awaiting an explicit call:
+Two things look like crossings and are not. Both were checked against the code
+rather than assumed:
 
-- `.agents/<sid>/session-log.md` has two writers — the rotation appends the
-  agent's `state.md`, and a `done` verdict appends the observer's wrap-up
-  (`store/supervisor_engine.rs`). Write-only: nothing reads it back, and the
-  interleaving is the whole value to the operator.
-- The judge is told to read the handoffs under `{COMPACT_DIR}` to verify the
-  agent's claims. Read-only evidence, like the repository itself; their absence
-  costs the judge evidence and nothing else.
+- **`.agents/<sid>/session-log.md` is the EDITOR's journal**, not shared state.
+  Neither entity writes it and neither is told the path: the editor reads the
+  agent's `state.md` inside the `compact_session` tool and appends it
+  (`mcp/context.rs`), and the editor appends the observer's wrap-up when it
+  applies a `done` verdict (`store/supervisor_engine.rs`). Two event sources,
+  one owner, one writer — which is exactly why the interleaved timeline the
+  operator reads is safe to keep.
+- **The judge READS the session's handoffs under `{COMPACT_DIR}`** to verify the
+  agent's claims, and that is the point of having an observer. Reading is not
+  coupling: the files' absence costs it evidence and nothing else. Writing would
+  be, so the judge's instructions now say it outright — it writes exactly two
+  files (`{INTENT_PATH}`, `{DIARY_PATH}`), never creates, edits, moves or
+  deletes anything else, and never relocates a handoff; when something there
+  needs changing it says so in a `continue` message and the AGENT acts. The
+  auditor writes nothing at all. This matters because the judge is a real
+  session with real file-editing tools, so "it wouldn't" is not a mechanism.
 
 How to apply: when adding anything to the agent-facing compact/clear prompts,
 ask which entity owns the path you are about to name. If the answer is "the

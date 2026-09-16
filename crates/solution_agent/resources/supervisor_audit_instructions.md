@@ -51,6 +51,10 @@ Also read `{INTENT_PATH}` if it exists — the supervisor's own durable record o
 the user's goal — and judge the supervisor's nudges against THAT goal, not some
 drift. It also records the user's language.
 
+**You write nothing on disk.** Your entire output is the audit verdict. The
+supervisor's files are its own and the session's files are the session's; both
+are evidence you read.
+
 ## Required final step
 
 Submit through the bridge — tool `solution_agent.supervisor_audit_verdict`,
