@@ -42,11 +42,14 @@ pub const JUDGE_HARD_TIMEOUT_SECS: u64 = 20 * 60;
 /// supervision backoff (the auditor failing is not the judge failing).
 pub const AUDITOR_TIMEOUT_SECS: u64 = 5 * 60;
 
-/// How long a self-compaction request is given to be honoured before the
-/// observer escalates. One tool step plus a little: long enough that an agent in
-/// the middle of a build or a test run reaches a safe point, short enough that a
-/// context at 90% does not sit there for half an hour.
-pub const COMPACT_ESCALATION_SECS: u64 = 5 * 60;
+/// How long a self-compaction request is given to be honoured before the editor
+/// escalates. Fifteen minutes, because the step the agent was asked to finish
+/// can be a long one — a background agent, a full test run, a migration sweep —
+/// and cutting in after five would be the interrupt this ladder exists to avoid.
+/// Two rungs at this spacing means a forced handoff is at least half an hour
+/// after the first ask, which is affordable precisely because the asking starts
+/// at [`observer_context_threshold`] rather than near the ceiling.
+pub const COMPACT_ESCALATION_SECS: u64 = 15 * 60;
 
 /// How many times the agent is ASKED to compact itself before the editor stops
 /// asking and runs the compaction. Two: the first ask can land mid-step and be
@@ -303,13 +306,21 @@ impl ObserverTrigger {
     }
 }
 
+/// Fullness at which the editor wakes the observer while work is RUNNING, as a
+/// percentage of the window. Lower for bigger windows, because the absolute
+/// headroom is what a handoff actually needs and a percentage of a 1M window is
+/// a lot of tokens: 40% of 1M is 400k used and 600k left, which is room for the
+/// agent to finish its step, write the handoff, and still have the next context
+/// start clean. A small window cannot afford the same fraction — at 80% of 128k
+/// there are still 25k left, and waking earlier would mean compacting a
+/// conversation that has barely started.
 pub fn observer_context_threshold(max: u64) -> Option<u64> {
     match max {
         0 => None,
         1..=128_000 => Some(80),
         128_001..=256_000 => Some(75),
         256_001..=512_000 => Some(65),
-        _ => Some(50),
+        _ => Some(40),
     }
 }
 
@@ -464,6 +475,10 @@ pub struct SupervisorState {
     /// mid-handoff any more.
     pub compact_requests: u32,
     pub last_compact_request_ms: Option<i64>,
+    /// TRANSIENT: the judge's "what this handoff must not lose" note from the
+    /// verdict that armed the ladder, kept so the LATER rungs — which the
+    /// editor's own timer drives, with no judge in the loop — carry it too.
+    pub compact_request_note: Option<String>,
     /// TRANSIENT (not persisted): a one-shot `wait` verdict's wake deadline
     /// (epoch-ms). The judge decides ONCE — "the agent is waiting on X, park
     /// until here" — and the mechanism honors that single timeout in FULL: while
@@ -509,6 +524,7 @@ impl SupervisorState {
             judge_superseded: false,
             compact_requests: 0,
             last_compact_request_ms: None,
+            compact_request_note: None,
             held_by_done: false,
             pending_nudge: None,
             wait_until_ms: None,
@@ -998,7 +1014,7 @@ mod observer_trigger_tests {
             (256_000, 75),
             (256_001, 65),
             (512_000, 65),
-            (512_001, 50),
+            (512_001, 40),
         ] {
             assert_eq!(observer_context_threshold(max), Some(threshold));
             let mut schedule = ObserverSchedule::default();
@@ -1099,7 +1115,7 @@ mod observer_trigger_tests {
         let mut schedule = ObserverSchedule::default();
         assert!(matches!(
             schedule.observe(0, true, Some((u64::MAX, u64::MAX)), 0),
-            Some(ObserverTrigger::Context { threshold: 50, .. })
+            Some(ObserverTrigger::Context { threshold: 40, .. })
         ));
     }
 }

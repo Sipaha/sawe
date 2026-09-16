@@ -120,6 +120,7 @@ impl SolutionAgentDb {
                     judge_superseded: false,
                 compact_requests: 0,
                 last_compact_request_ms: None,
+                compact_request_note: None,
                     // Transient: a cold-loaded `Held` row is treated as a manual
                     // stop (won't self-resume) — the conservative default.
                     held_by_done: false,

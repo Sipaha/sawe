@@ -4507,25 +4507,40 @@ The verdict is now an escalating request, and the ladder lives in the editor
    "finish the step you are on, then call `solution_agent.start_compact`" —
    with the context's real fullness, the judge's handoff note if it sent one,
    and the fact that the editor will do it anyway if nothing happens.
-2. **Ask again**, on a later verdict, once `COMPACT_ESCALATION_SECS` (5 min) has
-   passed since the last ask. A repeat inside that window sends NOTHING:
-   the agent is plausibly still finishing the step it was asked to finish, and
-   two judge fires a minute apart must not shorten the ladder.
+2. **Ask again**, `COMPACT_ESCALATION_SECS` (15 min) later, saying the first ask
+   went unanswered. A repeat inside that window sends NOTHING.
 3. **Force.** After `MAX_COMPACT_REQUESTS` (2) asks, the editor sends the
-   compaction request itself — today's behaviour, unchanged.
+   compaction request itself — the old behaviour, unchanged.
 
-Why the editor and not the prompt: the judge wakes with no memory of having
-asked. It can read its own verdict log, but "did the thing I asked for happen,
-and how long ago" is a state question with a deterministic answer, and the fork
-already has this exact shape for nudges (`continue_guard`). The judge's
-instructions were updated to match — "the transcript did not rotate after my
-`compact`" is now the EXPECTED first outcome rather than evidence the verdict
-was refused, so the judge re-issues and the editor escalates.
+**Only against a session that is actually working.** `Running`, or holding a
+background agent / shell that still vouches for it. An idle session is compacted
+on the spot: "wrap up, then hand off" addressed to a paused session is a message
+nobody acts on until the user types again.
+
+**The clock is the editor's, not the judge's.** `tick_supervisor` advances the
+ladder; a `compact` verdict only arms it. This matters because a judge reviewing
+RUNNING work is on the hourly active-review cadence — waiting for the next
+verdict would make the spacing an hour by accident. It also means the judge
+needs no memory of having asked, which it does not have: it wakes fresh every
+time, the same reason `continue_guard` lives in the editor. Its instructions now
+say the ladder is the editor's to drive, that a repeat cannot speed it up, and
+that "the transcript did not rotate after my `compact`" is the expected first
+outcome rather than a refusal.
+
+**Asking starts early on purpose.** `observer_context_threshold` for windows
+over 512k went 50% → 40% — 400k used and 600k left on a 1M window, which is room
+to finish a step, write the handoff, and start the next context clean. The
+ladder is what makes that affordable: at 90% an ask is a formality before an
+inevitable forced handoff, at 40% it is a real choice the agent can act on at
+its own boundary. Smaller windows keep their higher percentages, where the
+absolute headroom rather than the fraction is what binds.
 
 Two couplings worth knowing:
 
 - **The ladder resets when the transcript rotates** (and on `/clear`): a fresh
-  context has never been asked, so it starts at "ask", not at "force".
+  context has never been asked, so it starts at "ask", not at "force". The
+  judge's handoff note is kept alongside the counter, because the later rungs
+  are fired by the tick with no judge in the loop to re-supply it.
 - **An agent that self-compacts because the observer asked does NOT wipe the
   observer's memory.** That compaction arrives through the user-initiated path
   (`start_compact` called by the agent), and #37's wipe keys on exactly that —

@@ -193,26 +193,36 @@ provider-specific tool names or workflows.
   weighing fullness against the NEXT step: a long / token-heavy run (a live
   migration / scenario sweep, a large multi-file edit — anything spanning many
   turns) warrants compacting NOW so it starts with headroom and a clean handoff;
-  a short next step is fine at higher fullness. (The exact fullness calibration is
-  in the "Context-window fullness" section above WHEN a figure is injected — if
-  this briefing carries no fullness figure, don't `compact` on fullness grounds at
-  all.) One verdict per wake: when both a `compact` and a forward action apply,
+  a short next step is fine at higher fullness. (The current figure is in the
+  "Context-window fullness" section above, and when this review was triggered by
+  fullness the "Why this review started" line names the exact threshold the
+  editor used — that threshold is deliberately well below the ceiling. If this
+  briefing carries no fullness figure at all, don't `compact` on fullness
+  grounds.) One verdict per wake: when both a `compact` and a forward action apply,
   compact first — you
   re-evaluate (and can nudge) on the next wake against the freshly-compacted
   context.
 
-  **Your `compact` verdict is an escalating request, not an interrupt.** The
-  editor first ASKS the agent, in the conversation, to finish its current step
-  and start the handoff itself; if the context still has not rotated by your
-  next wake it asks once more, and only after that does it send the compaction
-  request itself. So "I issued `compact` and the transcript did not rotate" is
-  the EXPECTED first outcome, not a failure — re-issue `compact` on the next
-  wake while the context still warrants it and the editor escalates for you. It
-  ignores a repeat that arrives within a few minutes of the last ask, so
-  judging twice in quick succession cannot shorten the ladder. What you must NOT
-  do is keep issuing `compact` against a refusal: the editor declines outright
-  when the conversation is too short or there is no headroom left, and it
-  records that refusal in your diary — that one means pick a forward action and
+  **Against a WORKING session your `compact` verdict is an escalating request,
+  not an interrupt**, and the editor runs that escalation on its own clock: it
+  asks the agent, in the conversation, to finish its current step and start the
+  handoff itself; about fifteen minutes later, if the context still has not
+  rotated, it asks once more; after that it sends the compaction request itself.
+  You do not drive this — one `compact` verdict arms the whole ladder, and you
+  neither need to re-issue it nor can you speed it up (a repeat inside the
+  window is ignored). So "I issued `compact` and the transcript did not rotate"
+  is the EXPECTED first outcome, not a failure.
+
+  **Against an IDLE session it applies immediately** — nothing is in flight to
+  finish, so there is nothing to ask for.
+
+  Because asking is cheap and early, prefer issuing `compact` when the context
+  crosses the threshold named in "Why this review started" rather than waiting
+  for it to become urgent: an ask at that point costs the agent a sentence,
+  while a forced handoff near the ceiling costs it a step. What you must NOT do
+  is keep issuing `compact` against a refusal: the editor declines outright when
+  the conversation is too short or there is no headroom left, and it records
+  that refusal in your diary — that one means pick a forward action and
   reconsider later. (`compact` is cap-exempt, so nothing else stops that loop.)
 
   You may attach a `message` to a `compact` verdict: it rides into the request —

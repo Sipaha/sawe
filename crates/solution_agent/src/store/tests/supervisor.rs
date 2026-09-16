@@ -828,6 +828,7 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         judge_superseded: false,
         compact_requests: 0,
         last_compact_request_ms: None,
+            compact_request_note: None,
         held_by_done: false,
         pending_nudge: None,
         wait_until_ms: None,
@@ -2738,11 +2739,48 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
     });
     cx.executor().run_until_parked();
 
-    let compact_verdict = |cx: &mut gpui::TestAppContext| {
+    // The ladder is about not interrupting work in progress, so the session has
+    // to actually BE working — an idle one is compacted on the spot (asserted by
+    // `an_idle_session_is_compacted_without_being_asked`).
+    // Running + an active-review snapshot: the only shape in which a `compact`
+    // verdict reaches a working session at all (the send-time gate drops every
+    // other verdict against a worker that is mid-turn).
+    let set_running = |cx: &mut gpui::TestAppContext| {
         cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
+                let session = store.session(session_id).unwrap();
+                // The snapshot has to name the SAME turn the session is running
+                // (`ActiveReviewSnapshot::permits` compares the `Instant`), or
+                // the send-time gate drops the verdict as stale.
+                let started_at = std::time::Instant::now();
+                session.update(cx, |session, _| {
+                    session.state = crate::model::SessionState::Running {
+                        started_at,
+                        notified: false,
+                    };
+                });
+                let epoch = session.read(cx).epoch;
+                let state = store.supervisor_states.get_mut(&session_id).unwrap();
+                state.status = crate::supervisor::SupervisorStatus::Judging;
+                state.active_review = Some(crate::supervisor::ActiveReviewSnapshot {
+                    epoch,
+                    started_at,
+                });
+            });
+        });
+    };
+
+    let compact_verdict = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
                 store.set_supervision_enabled(session_id, true, cx);
+            });
+        });
+        set_running(cx);
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
                 store.apply_verdict(
                     session_id,
                     crate::supervisor::VerdictAction::Compact,
@@ -2758,13 +2796,29 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
         cx.executor().run_until_parked();
     };
 
+    // Everything addressed to a WORKING session lands in its queue first (the
+    // runtime's mid-turn hook drains it), so that is where the asks are read
+    // back from — together with the transcript, since the forced compaction may
+    // land in either depending on where the turn is.
     let transcript = |cx: &mut gpui::TestAppContext| {
         cx.update(|cx| {
-            SolutionAgentStore::global(cx)
+            let session = SolutionAgentStore::global(cx)
                 .read(cx)
                 .session(session_id)
-                .unwrap()
-                .read(cx)
+                .unwrap();
+            let session = session.read(cx);
+            let queued = session
+                .pending_messages
+                .iter()
+                .flat_map(|bundle| bundle.blocks.iter())
+                .filter_map(|block| match block {
+                    agent_client_protocol::schema::ContentBlock::Text(text) => {
+                        Some(text.text.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<String>();
+            let entries = session
                 .entries
                 .iter()
                 .filter_map(|entry| match &entry.kind {
@@ -2773,7 +2827,8 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
                     }
                     _ => None,
                 })
-                .collect::<String>()
+                .collect::<String>();
+            format!("{entries}{queued}")
         })
     };
 
@@ -2814,39 +2869,56 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
         "a verdict inside the window must not repeat the same sentence"
     );
 
-    // Age the request past the window: the second ask goes out, firmer.
-    cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            let state = store.supervisor_states.get_mut(&session_id).unwrap();
-            state.last_compact_request_ms = Some(
-                chrono::Utc::now().timestamp_millis()
-                    - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
-                    - 1,
-            );
+    // From here the EDITOR escalates on its own clock — no further verdict. A
+    // running agent may not be judged again for an hour, so waiting for the
+    // judge would make the ladder's spacing a coincidence.
+    let age_last_ask = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, _| {
+                store
+                    .supervisor_states
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .last_compact_request_ms = Some(
+                    chrono::Utc::now().timestamp_millis()
+                        - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
+                        - 1,
+                );
+            });
         });
-    });
-    compact_verdict(cx);
+    };
+    let tick = |cx: &mut gpui::TestAppContext| {
+        set_running(cx);
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| store.tick_supervisor(cx));
+        });
+        cx.executor().run_until_parked();
+    };
+
+    tick(cx);
+    assert_eq!(
+        transcript(cx),
+        first,
+        "a tick inside the window changes nothing"
+    );
+
+    age_last_ask(cx);
+    tick(cx);
     let second = transcript(cx);
     assert!(
         second.len() > first.len() && second.contains("still open"),
-        "the second ask acknowledges the first went unanswered: {second}"
+        "once the window passes, the tick asks again and says the first went \
+         unanswered: {second}"
+    );
+    assert!(
+        second.contains("Keep the migration plan."),
+        "the note from the verdict that armed the ladder rides the later rungs \
+         too, though no judge is in the loop by now: {second}"
     );
 
-    // Two asks spent: the next verdict stops asking and queues the compaction.
-    cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            store
-                .supervisor_states
-                .get_mut(&session_id)
-                .unwrap()
-                .last_compact_request_ms = Some(
-                chrono::Utc::now().timestamp_millis()
-                    - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
-                    - 1,
-            );
-        });
-    });
-    compact_verdict(cx);
+    // Two asks spent: the next tick stops asking and sends the compaction.
+    age_last_ask(cx);
+    tick(cx);
     let third = transcript(cx);
     assert!(
         third.contains(crate::compact::COMPACT_PROMPT_HEADING),
@@ -2856,6 +2928,71 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
     assert!(
         third.contains("autonomous observer"),
         "and it is still attributed to the observer, not to the user"
+    );
+}
+
+/// The ladder is for work in flight. A session that is idle — no turn running,
+/// no background agent still working for it — is holding nothing to finish, so
+/// asking it to "wrap up, then hand off" would just sit there until the user
+/// types. It is compacted on the spot instead.
+#[gpui::test]
+async fn an_idle_session_is_compacted_without_being_asked(cx: &mut gpui::TestAppContext) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: 500_000,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.apply_verdict(
+                session_id,
+                crate::supervisor::VerdictAction::Compact,
+                "context is large; compact".into(),
+                None,
+                None,
+                None,
+                None,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let transcript = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                crate::session_entry::SessionEntryKind::UserMessage { content_md, .. } => {
+                    Some(content_md.clone())
+                }
+                _ => None,
+            })
+            .collect::<String>()
+    });
+    assert!(
+        transcript.contains(crate::compact::COMPACT_PROMPT_HEADING),
+        "an idle session gets the compaction request immediately: {transcript}"
+    );
+    assert!(
+        !transcript.contains("solution_agent.start_compact"),
+        "and is not asked to do it itself first: {transcript}"
     );
 }
 
