@@ -41,8 +41,20 @@
     // with `"calt": true` in settings.json.
     "calt": false
   },
-  // The default font size for text in the editor
-  "buffer_font_size": 15,
+  // The default font size for text in the editor.
+  //
+  // 13.75, not a round number, because it is a measurement: it is the size at
+  // which the bundled `.ZedMono` (Lilex) renders the same *glyph* as IntelliJ
+  // IDEA's editor at its own default (JetBrains Mono 13, line spacing 1.2, at
+  // scale 1). The two families need different em sizes for the same apparent
+  // size — per 1000 em Lilex has a cap height of 698 against JetBrains Mono's
+  // 730, and an x-height of 516 against 550 — so matching cap height asks for
+  // 13 × 730/698 = 13.60 and matching x-height asks for 13 × 550/516 = 13.86.
+  // 13.75 splits them: cap +1.2 %, x-height −0.9 % (measured with AWT
+  // `FontMetrics` on both TTFs). It also lands the line pitch exactly on
+  // IDEA's 22px — `round(13.75 × 1.618)` — so `buffer_line_height` stays
+  // "comfortable".
+  "buffer_font_size": 13.75,
   // The weight of the editor font in standard CSS units from 100 to 900.
   "buffer_font_weight": 400,
   // Set the buffer's line height.
