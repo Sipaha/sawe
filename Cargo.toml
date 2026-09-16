@@ -947,16 +947,25 @@ webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev 
 split-debuginfo = "unpacked"
 incremental = true
 codegen-units = 16
-debug = "limited"
+# Sawe fork-local: "line-tables-only", not upstream's "limited". `limited`
+# emits type information for every type in every crate, and this workspace's
+# dev tree is enormous — `target/debug` reached 888 GB (deps 490 GB) and filled
+# a 1.8 TB disk to 99%. Line tables are what the dev loop actually consumes:
+# panics, `RUST_BACKTRACE`, and the crash handler all need file:line, none of
+# them need variable or type DWARF. A real debugger session has its own profile
+# (`dbg`, below) which still carries `debug = "full"`.
+debug = "line-tables-only"
 
 # mirror configuration for crates compiled for the build platform
 # (without this cargo will compile ~400 crates twice)
 [profile.dev.build-override]
 codegen-units = 16
 split-debuginfo = "unpacked"
-debug = "limited"
+debug = "line-tables-only"
 
-# "debug" is a reserved profile name.
+# "debug" is a reserved profile name. This is the escape hatch for stepping
+# through code in gdb/lldb, and the reason `dev` can afford line tables only:
+# `cargo build --profile dbg` / `cargo test --profile dbg`.
 [profile.dbg]
 inherits = "dev"
 debug = "full"

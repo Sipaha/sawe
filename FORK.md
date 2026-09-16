@@ -4219,3 +4219,47 @@ bookkeeping that outlives the thing it describes — hold the tracked object
 weakly so the owner's drop IS the event. And treat a log that rotates itself
 away as a bug to investigate, not a fact of life: it is usually one call site
 firing at frame rate, and it destroys every other signal in the file.
+
+### 177. Dev debuginfo is line tables, and the build caches have a pruner
+
+`target/` reached **1012 GB** on the maintainer's machine — 56% of a 1.8 TB
+disk, which hit 99% full. Breakdown: `debug` 888 GB (`deps` 490 GB,
+`incremental` 374 GB across 5995 session directories accumulated since 2 Sept),
+`release-fast` 114 GB, `release` 9.9 GB.
+
+**`[profile.dev] debug = "limited"` → `"line-tables-only"`, and it is a modest
+win, not the fix.** Measured, two from-scratch `cargo build --bin sawe` runs:
+
+| | `limited` | `line-tables-only` |
+|---|---|---|
+| `target/debug/deps` | 10.72 GiB | 9.33 GiB (**−13.0%**) |
+| `target/debug` | 21.67 GiB | 20.27 GiB (−6.5%) |
+| `sawe` binary | 1.4621 GB | 1.4626 GB (unchanged) |
+| wall clock | 10m52s | 11m04s (unchanged) |
+
+The binary does not move because `split-debuginfo = "unpacked"` already keeps
+DWARF out of it, and the whole-tree number is diluted by `build/` and
+`incremental/`. What this buys is 13% of the largest directory for no build-time
+cost; what it costs is variable/type DWARF, which only a debugger session wants
+— and that already has its own profile (`dbg`, `debug = "full"`), which is the
+reason `dev` can afford this at all.
+
+**The dominant factor is accumulation, not debuginfo level.** One full
+`--bin sawe` debug tree is 21 GB; the tree that filled the disk was 888 GB, 42×
+that. It got there from test binaries across ~100 crates, a second cfg universe
+(`--all-targets`), two weeks of superseded artifacts cargo never drops, and an
+`incremental/` nothing has ever collected. So the real remedy is a pruner, and
+the fork now has one: `script/prune-build-cache` (`--days N`, `--dry-run`).
+
+It deliberately does NOT reuse upstream's `script/clear-target-dir-if-larger-than`:
+that one is only ever called from the CI workflows, all of which are hard-disabled
+here, and it is a blunt `rm -rf target/*` that would delete
+`target/release-fast/sawe` — the binary the maintainer's editor is executing at
+the time. The fork's pruner removes caches only, so the next build relinks
+instead of starting over.
+
+How to apply: measure a build-configuration change before claiming it, and
+report the number you got rather than the one you expected — the first estimate
+here was "the bulk of `deps`" and the truth was 13%. And when a disk fills up on
+a dev machine, look for what nothing ever deletes before looking for what is
+too big.

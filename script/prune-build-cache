@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Prune cargo's build CACHES without touching anything you built on purpose.
+#
+# Why this exists: `target/*/incremental` is a pure rebuild cache that cargo
+# never collects. On this machine it reached 374 GB across 5995 session
+# directories accumulated over two weeks, inside a `target/` of 1012 GB that
+# filled a 1.8 TB disk to 99%. Upstream ships
+# `script/clear-target-dir-if-larger-than`, but it is only ever called from the
+# CI workflows — all of which are hard-disabled in this fork — and it is a blunt
+# `rm -rf target/*` that would also delete `target/release-fast/sawe`, i.e. the
+# binary the maintainer's editor is currently executing.
+#
+# This one removes caches only. Built binaries, `deps/` and `.fingerprint/` are
+# left alone, so the next build relinks rather than starting from scratch.
+#
+# Usage:
+#   script/prune-build-cache                 # drop every incremental cache
+#   script/prune-build-cache --days 3        # keep caches touched in the last 3 days
+#   script/prune-build-cache --dry-run       # report only, delete nothing
+#
+# Do not run it while a build is in flight — cargo is mid-write into the very
+# directories this removes. It is safe at any other time: the worst case is one
+# slower build.
+set -euo pipefail
+
+days=0
+dry_run=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --days) days="${2:?--days needs a number}"; shift 2 ;;
+        --dry-run) dry_run=true; shift ;;
+        -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0 ;;
+        *) echo "unknown argument: $1 (try --help)" >&2; exit 1 ;;
+    esac
+done
+
+if [[ ! -f Cargo.toml || ! -d target ]]; then
+    echo "run this from the repository root (Cargo.toml and target/ must be here)" >&2
+    exit 1
+fi
+
+kb_of() { du -xs "$1" 2>/dev/null | cut -f1; }
+human() { numfmt --to=iec --suffix=B --format='%.1f' "$(( ${1:-0} * 1024 ))" 2>/dev/null || echo "${1:-0}K"; }
+
+total_before=0
+total_after=0
+total_stale=0
+found=false
+
+for incremental in target/*/incremental; do
+    [[ -d "$incremental" ]] || continue
+    found=true
+    profile="$(basename "$(dirname "$incremental")")"
+    before="$(kb_of "$incremental")"
+    total_before=$(( total_before + before ))
+
+    # Spelled out rather than computed: `-mtime "+$((days-1))"` yields
+    # `-mtime +-1` for the default, which GNU find happens to accept as "every
+    # file" while bfs and BSD find reject it outright — the default would
+    # silently prune nothing there.
+    if [[ "$days" -le 0 ]]; then
+        mapfile -t stale < <(find "$incremental" -mindepth 1 -maxdepth 1 -type d)
+    else
+        mapfile -t stale < <(find "$incremental" -mindepth 1 -maxdepth 1 -type d -mtime "+$(( days - 1 ))")
+    fi
+
+    dirs="$(find "$incremental" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+    stale_kb=0
+    if [[ ${#stale[@]} -gt 0 ]]; then
+        stale_kb="$(du -xsc -- "${stale[@]}" 2>/dev/null | tail -1 | cut -f1)"
+    fi
+    echo "${profile}/incremental: $(human "$before") in ${dirs} dirs — $(human "$stale_kb") in ${#stale[@]} to prune"
+
+    if [[ ${#stale[@]} -gt 0 && "$dry_run" == false ]]; then
+        rm -rf "${stale[@]}"
+    fi
+    total_stale=$(( total_stale + stale_kb ))
+
+    after="$(kb_of "$incremental")"
+    total_after=$(( total_after + after ))
+done
+
+if [[ "$found" == false ]]; then
+    echo "no incremental caches under target/ — nothing to do"
+    exit 0
+fi
+
+if [[ "$dry_run" == true ]]; then
+    echo "dry run: would reclaim $(human "$total_stale")"
+else
+    echo "reclaimed $(human $(( total_before - total_after )))"
+fi
