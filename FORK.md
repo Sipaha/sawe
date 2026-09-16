@@ -4342,3 +4342,32 @@ parameter through the single orchestrator every surface already shares
 (`start_compact_for_session`) rather than letting each surface build its own
 prompt — and mark who wrote it, because "the user said" and "a bot suggested"
 are different instructions to the agent.
+
+### 180. The tool-call preview row is the handle for the full argument
+
+A tool call's grey sub-row shows one squeezed line of what the tool ran
+(newlines → `↵`, 240-char cap, then `Label::truncate` clips it to the container
+width on top of that). For a heredoc or a long pipeline that is unreadable, and
+the raw command appeared nowhere else in the UI — the transcript keeps
+`raw_input`, but nothing rendered it.
+
+The row is now clickable and opens `ToolArgumentModal`: the same value,
+verbatim, in a read-only soft-wrapped editor with a copy button. Read-only
+editor rather than a label so a fragment can be selected — copying the whole
+thing is one click, copying just the path is not.
+
+Two things keep it honest:
+
+- **One picker, two renderings.** `tool_call_arg_value` chooses WHICH argument
+  matters (`command`, `file_path`, `pattern`, …, else the first non-empty
+  string); `tool_call_arg_preview` is defined as its one-line squeeze. The modal
+  therefore cannot show a different argument than the row that opened it, and a
+  test asserts the preview is a prefix of the full value.
+- **No handle threading.** The render cluster is a set of free functions with
+  `&App` and no workspace handle; `Workspace::for_window(window, cx)` inside the
+  click handler gets one, so opening a modal from a deeply-nested render needs
+  no new parameter on `render_entry` / `render_tool_call`.
+
+Every preview is clickable, not just the ellipsised ones: width-clipping means
+a preview that fits the character cap is usually still cut on screen, so "is it
+truncated" is not something the render path can answer.

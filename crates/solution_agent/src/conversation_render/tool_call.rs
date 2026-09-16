@@ -4,16 +4,16 @@
 
 use super::*;
 
-/// Extract a one-line summary of the most informative string value from a
-/// tool call's `raw_input` for display next to the tool name. Mirrors the
-/// pattern from `background_agent::derive_assistant_label`: prefers a
-/// well-known argument name (`command`, `file_path`, `path`, `pattern`,
-/// `query`, `url`) when present so a Bash call surfaces its command,
-/// a Read surfaces its file_path, etc. Falls back to the first non-empty
-/// string value in the input object. Truncates to ~120 chars (single
-/// line, ellipsis suffix on overflow) so even a multi-line bash invocation
-/// stays glanceable on the tool header.
-pub(crate) fn tool_call_arg_preview(raw_input: &serde_json::Value) -> Option<String> {
+/// The single most informative string value in a tool call's `raw_input`,
+/// VERBATIM — newlines and full length intact. Prefers a well-known argument
+/// name (`command`, `file_path`, `path`, `pattern`, `query`, `url`) when
+/// present so a Bash call surfaces its command, a Read its file_path, a Grep
+/// its pattern; falls back to the first non-empty string value.
+///
+/// This is what the "full argument" modal shows. [`tool_call_arg_preview`]
+/// squeezes the same value onto one line for the header row — the two must
+/// agree on WHICH value they are talking about, hence one picker.
+pub(crate) fn tool_call_arg_value(raw_input: &serde_json::Value) -> Option<String> {
     const PREFERRED_KEYS: &[&str] = &[
         "command",
         "file_path",
@@ -23,14 +23,8 @@ pub(crate) fn tool_call_arg_preview(raw_input: &serde_json::Value) -> Option<Str
         "url",
         "old_string",
     ];
-    // On its own sub-row under the tool header (`render_tool_call`),
-    // `.truncate()` on the Label clips to whatever width the container
-    // has. The cap below is a memory guard for pathological inputs
-    // (`raw_input` could carry a multi-megabyte string), not a layout
-    // constraint — leave it generous so wide windows show more.
-    const MAX_LEN: usize = 240;
     let obj = raw_input.as_object()?;
-    let picked = PREFERRED_KEYS
+    PREFERRED_KEYS
         .iter()
         .find_map(|k| {
             obj.get(*k)
@@ -40,7 +34,22 @@ pub(crate) fn tool_call_arg_preview(raw_input: &serde_json::Value) -> Option<Str
         .or_else(|| {
             obj.values()
                 .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
-        })?;
+        })
+        .map(str::to_owned)
+}
+
+/// One-line preview of [`tool_call_arg_value`] for the tool header's sub-row.
+/// Truncates to ~240 chars (ellipsis suffix on overflow) so even a multi-line
+/// bash invocation stays glanceable; the row is clickable and the modal behind
+/// it carries the untruncated text.
+pub(crate) fn tool_call_arg_preview(raw_input: &serde_json::Value) -> Option<String> {
+    // On its own sub-row under the tool header (`render_tool_call`),
+    // `.truncate()` on the Label clips to whatever width the container
+    // has. The cap below is a memory guard for pathological inputs
+    // (`raw_input` could carry a multi-megabyte string), not a layout
+    // constraint — leave it generous so wide windows show more.
+    const MAX_LEN: usize = 240;
+    let picked = tool_call_arg_value(raw_input)?;
     // Single-line: replace embedded newlines with `↵` so a multi-line
     // shell pipeline collapses without dropping content silently.
     let single_line: String = picked
@@ -102,6 +111,13 @@ pub(crate) fn render_tool_call(
     // ambiguous (a green `cargo check` and a green `cargo build` look
     // identical post-hoc).
     let arg_preview = raw_input.and_then(tool_call_arg_preview);
+    // The same value untruncated, for the modal the preview row opens. A long
+    // heredoc or a 300-char pipeline is unreadable on one clipped line, and
+    // nothing else in the UI shows what a tool actually ran.
+    let arg_full = raw_input.and_then(tool_call_arg_value);
+    let arg_modal_title = SharedString::from(crate::session_entry::single_line_tool_label(
+        label_text,
+    ));
 
     let mut container = v_flex()
         .gap_0p5()
@@ -139,12 +155,39 @@ pub(crate) fn render_tool_call(
         // status stays glanceable.
         .when_some(arg_preview, |this, preview| {
             this.child(
-                div().pl_4().child(
-                    Label::new(SharedString::from(preview))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate(),
-                ),
+                div()
+                    .id(("tool-arg-preview", entry_idx))
+                    .pl_4()
+                    .when_some(arg_full, |this, full| {
+                        // Click anywhere on the row to read the whole thing.
+                        // `Label::truncate` clips to the container width, so
+                        // even a preview that fits the 240-char cap is usually
+                        // cut on screen — the affordance has to exist for every
+                        // preview, not only the ellipsised ones.
+                        this.cursor_pointer()
+                            .tooltip(ui::Tooltip::text("Show the full argument"))
+                            .on_click(move |_, window, cx| {
+                                let Some(workspace) = workspace::Workspace::for_window(window, cx)
+                                else {
+                                    return;
+                                };
+                                let title = arg_modal_title.clone();
+                                let full = full.clone();
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.toggle_modal(window, cx, move |window, cx| {
+                                        crate::tool_argument_modal::ToolArgumentModal::new(
+                                            title, full, window, cx,
+                                        )
+                                    });
+                                });
+                            })
+                    })
+                    .child(
+                        Label::new(SharedString::from(preview))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
             )
         });
 

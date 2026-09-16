@@ -79,6 +79,32 @@ fn tool_call_arg_preview_none_for_empty_input() {
     assert!(tool_call_arg_preview(&serde_json::json!({ "command": "" })).is_none());
 }
 
+/// The modal behind the preview row must show what the tool actually ran:
+/// same picked value, but verbatim — newlines intact, no 240-char cap.
+#[test]
+fn tool_call_arg_value_is_the_untruncated_twin_of_the_preview() {
+    let command = format!("cat > a.go <<'EOF'\nfunc T() {{}}\n{}\nEOF", "x".repeat(400));
+    let input = serde_json::json!({ "command": command, "description": "write it" });
+
+    let full = tool_call_arg_value(&input).expect("value");
+    assert_eq!(full, command, "the modal shows the command byte-for-byte");
+    assert!(full.contains('\n'), "newlines survive for the modal");
+
+    let preview = tool_call_arg_preview(&input).unwrap();
+    assert!(preview.ends_with('…'));
+    assert!(!preview.contains('\n'));
+    assert!(
+        full.starts_with(preview.trim_end_matches('…').replace('↵', "\n").as_str()),
+        "preview is a prefix of the full value, so the modal can't show a different argument"
+    );
+
+    // Same picker on both sides: a Read call's modal is its file_path, not the
+    // first key that happens to sort first.
+    let read = serde_json::json!({ "abort_signal": "none", "file_path": "/tmp/a.rs" });
+    assert_eq!(tool_call_arg_value(&read).as_deref(), Some("/tmp/a.rs"));
+    assert!(tool_call_arg_value(&serde_json::json!({})).is_none());
+}
+
 #[test]
 fn user_message_single_newline_becomes_hard_break() {
     let out = clean_user_message_text("first line\nsecond line");

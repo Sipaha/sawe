@@ -39,6 +39,7 @@ pub mod store;
 pub mod stream;
 pub mod supervisor;
 pub mod supervisor_instruction_modal;
+pub mod tool_argument_modal;
 pub(crate) mod teammate_watchers;
 pub mod upload;
 pub mod utility_buttons;
