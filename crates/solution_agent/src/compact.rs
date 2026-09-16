@@ -1075,6 +1075,43 @@ mod note_tests {
         assert!(!rendered.contains(&"x".repeat(MAX_COMPACT_NOTE_CHARS + 1)));
     }
 
+    /// The session and the observer keep separate state and talk only through
+    /// the conversation and compaction requests. So nothing the AGENT is told
+    /// to read or to write may live under `supervisor/` — the editor wipes that
+    /// directory on a user-initiated compaction (by design, see FORK.md #37),
+    /// and a handoff that pointed into it left the next context chasing files
+    /// the rotation had just deleted.
+    #[gpui::test]
+    async fn the_compact_prompt_never_points_at_observer_state(cx: &mut TestAppContext) {
+        let (session_id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    Some(acp_thread::TokenUsage {
+                        used_tokens: 250_000,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+        });
+        cx.executor().run_until_parked();
+
+        let rendered = cx
+            .update(|cx| {
+                render_compact_prompt_inner(session_id, None, CompactInitiator::User, cx)
+            })
+            .expect("prompt renders");
+        for forbidden in ["supervisor/", "user_intent", "diary.md", "verdicts.jsonl"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "the compact prompt must not mention {forbidden:?} — that is the \
+                 observer's own state, and the session never reads it"
+            );
+        }
+    }
+
     /// End-to-end through the orchestrator: the comment must reach the prompt
     /// the AGENT receives, not just the template renderer.
     #[gpui::test]

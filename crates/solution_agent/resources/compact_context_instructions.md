@@ -43,14 +43,14 @@ Before writing anything, classify the conversation:
 - **A. Clear next task.** You and the user have an agreed-upon plan or an
   in-flight feature with obvious next steps. Capture the plan; the
   continuation prompt should resume that plan.
-- **B. Multiple possible next steps, none picked.** Read the supervisor's
-  user-intent record if it exists
-  (`<solution_root>/.agents/<SESSION_ID>/supervisor/user_intent.md`) and reconcile
-  it with the latest actual user instructions. If it settles the direction,
-  use case A. Otherwise preserve the alternatives and unresolved question in
-  the handoff. Compaction itself does not require choosing a new goal. Tell
-  the next session to continue independent authorized work and ask for the
-  missing decision only when it blocks progress; do not invent authorization.
+- **B. Multiple possible next steps, none picked.** Re-read what the user
+  actually asked for across this conversation — you still have it in front of
+  you, and the handoff you are writing is the only place it survives. If the
+  user's own instructions settle the direction, use case A. Otherwise preserve
+  the alternatives and the unresolved question in the handoff. Compaction
+  itself does not require choosing a new goal. Tell the next session to
+  continue independent authorized work and ask for the missing decision only
+  when it blocks progress; do not invent authorization.
 - **C. No clear forward task** (exploration, debugging, post-mortem
   with no commitments). Skip the "next task" assumptions; just dump
   what was *learned* so the next session can pick up cold without
@@ -63,7 +63,12 @@ emojis, no "I will now …" preamble. Each file stands alone.
 
 ### `state.md`
 What is the current state of the world?
-- What was the user trying to accomplish in this session.
+- What the user was trying to accomplish in this session.
+- **The user's standing directives and constraints** — the things they said
+  once and expect to hold throughout ("verify every stage", "no force-push",
+  "answer in Russian", an approach they ruled out). The next context starts
+  cold and has no other way to learn them; a constraint dropped here reads to
+  the user as you ignoring what they told you.
 - What got *done* (concretely: files edited, commits, PRs, tools run,
   conclusions reached).
 - What is *in flight* (e.g. "branch X has uncommitted changes to Y").
@@ -96,13 +101,10 @@ two real steps, write two.
 session.** Write it as if you are a teammate who has read all of the
 above files and is briefing a fresh agent. It must:
 - State the goal in one paragraph.
-- **Point the new agent at the supervisor's user-intent record** if it
-  exists: `<solution_root>/.agents/<SESSION_ID>/supervisor/user_intent.md`.
-  The chat supervisor maintains there a durable, compaction-surviving summary
-  of the user's standing directives and constraints (e.g. "user required V at
-  every stage"); this transcript is about to be wiped, so instruct the new
-  agent to read that file and honor it. If the file is absent (supervision
-  off, or its memory was reset by a manual `/clear`/`/compact`), skip this.
+- **Carry the user's standing directives forward yourself**, in your own
+  words: the constraints and preferences recorded in `state.md` are about to
+  become the only trace of them. Do not point the new agent at any file
+  outside `COMPACT_DIR` for this — nothing else is guaranteed to be there.
 - Reference `state.md`, `decisions.md`, `next.md` by their full
   absolute paths (they live in `COMPACT_DIR` — i.e. under
   `<solution_root>/.agents/<SESSION_ID>/c<NN>/`). The new session

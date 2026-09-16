@@ -609,6 +609,8 @@ How to apply: the click-routing lives in the `zed` crate because it spans `solut
 
 ### 37. The supervisor reads the agent's ANSWER, never anchors on its own nudges, and a manual `/clear`/`/compact` wipes its memory
 
+*(See also #181: the wipe stays, but nothing on the session side may point at the files it removes.)*
+
 Three linked fixes to what the observer (judge) sees, all rooted in the same DTO/filter surface (`solution_agent::mcp` `get_session` + `apply_user_anchored_filter`, instructions in `resources/supervisor_judge_instructions.md`). Full story: `docs/findings/2026-07-05-observer-cant-see-agent-answer.md`.
 
 - **The judge now sees the agent's answer.** `apply_user_anchored_filter` gained a **trail**: after each real-user anchor it keeps up to `USER_ANCHORED_TRAIL_ASSISTANT` (5) assistant *text* turns (the reply), skipping tool calls, stopping at the next user-role entry so adjacent messages don't overlap. Before, only the entries *before* a user message (lead) + the resting turn were kept, so an answer the agent gave then worked past was invisible next wake-up → the observer re-nudged the same already-answered directive.
@@ -4381,3 +4383,59 @@ Two things keep it honest:
 Every preview is clickable, not just the ellipsised ones: width-clipping means
 a preview that fits the character cap is usually still cut on screen, so "is it
 truncated" is not something the render path can answer.
+
+### 181. The session and the observer share no files
+
+Rule: the supervised session and its observer are two entities with two
+memories. They interact through exactly two channels — the **conversation**
+(observer nudges and questions arrive as transcript entries; the agent answers
+in the transcript) and a **compaction request** (the observer's `compact`
+verdict, optionally carrying an attributed note, #179). Neither reads the
+other's files.
+
+What this replaces: the compact prompt used to tell the agent to read
+`supervisor/user_intent.md` in Step 1 and to point the NEXT context at that path
+from `continue.md`. A user-initiated compaction deletes exactly that file at
+rotation — deliberately, #37, the operator's escape hatch for a looping
+observer. So the handoff cited a file the same operation was about to remove,
+and the fresh context spent its first turn discovering an empty directory.
+
+Measured on disk before the fix, and it is not an edge case: of twelve
+`supervisor/` directories on this machine five were empty, each with an mtime
+equal to a rotation minute — `Columns-Migration/.agents/qv09rxtm/supervisor`
+emptied at 23:05:57 against a `c09/` written at 23:05, `Sawe1/.agents/1nvxcd39`
+emptied at the minute `c01/` was created. A session that had never been
+user-compacted (`citeck-forge/.agents/xjrn2pmv`) still held a 31 KB
+`user_intent.md`, which is what rules out "the observer never wrote one".
+
+The fix is a subtraction, not a repair: the agent-facing prompt no longer
+mentions `supervisor/`, `user_intent`, `diary.md` or `verdicts.jsonl` at all —
+`compact::note_tests::the_compact_prompt_never_points_at_observer_state`
+asserts on the rendered prompt, not on the template file. What the observer's
+record used to supply is now produced where it belongs: `state.md` gained an
+explicit "the user's standing directives and constraints" bullet, and
+`continue.md` must carry them forward in the agent's own words and cite nothing
+outside `COMPACT_DIR`. The agent never needed the distillation — it has the
+actual conversation in front of it while it writes the handoff.
+
+**Rejected: moving `user_intent.md` out of `supervisor/` into session space.**
+It looks like the same fix and is the opposite one — it would make the intent
+record a shared file with two owners, which is the thing being removed. The
+maintainer's framing settles it: «две разные сущности, которые взаимодействуют
+исключительно посредством диалога + команд на компакцию».
+
+Two crossings remain, named here so they are not mistaken for oversights, both
+awaiting an explicit call:
+
+- `.agents/<sid>/session-log.md` has two writers — the rotation appends the
+  agent's `state.md`, and a `done` verdict appends the observer's wrap-up
+  (`store/supervisor_engine.rs`). Write-only: nothing reads it back, and the
+  interleaving is the whole value to the operator.
+- The judge is told to read the handoffs under `{COMPACT_DIR}` to verify the
+  agent's claims. Read-only evidence, like the repository itself; their absence
+  costs the judge evidence and nothing else.
+
+How to apply: when adding anything to the agent-facing compact/clear prompts,
+ask which entity owns the path you are about to name. If the answer is "the
+observer", the prompt must not name it — the wipe can make it disappear at any
+moment, and by design.
