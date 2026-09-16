@@ -4637,8 +4637,24 @@ sizes, so the maintainer's own settings carried `buffer_font_size: 15` because
 the editor put it there, not because they chose it — and a pinned value wins over
 a default forever. It now pins no font size and says why in a comment.
 
+**Build gotcha, found by checking the binary rather than trusting the build:**
+adding files under `assets/` does NOT invalidate a cached `assets` rlib. The
+first `release-fast` build after the fonts landed exited 0, produced a fresh
+binary — and shipped a rust-embed manifest with `fonts/ibm-plex-sans/…` and
+`fonts/lilex/…` and no `fonts/jetbrains-mono/…` at all, because cargo considered
+the crate fresh and the derive never re-expanded. **Debug hides this**: rust-embed
+reads from disk in a debug build, so the probe rendered JetBrains Mono perfectly
+from a binary that contained none of it. `touch crates/assets/src/assets.rs` and
+rebuild. Verify with
+`strings -a target/<profile>/sawe | grep -o 'fonts/[a-z-]*/[A-Za-z.-]*ttf' | sort -u`,
+and — since a missing font falls back silently rather than failing — confirm the
+render: the release-fast binary in an isolated `SAWE_HOME` produced a screenshot
+pixel-identical (0 differing pixels) to the debug one.
+
 How to apply: when a default exists to match another product's rendering, the
 family is the first thing to check, not the last — a size solved against the
 wrong family converges on a compromise instead of a match. Write the measurement
 into the comment next to the default, and change the seed template in the same
 commit, because a seeded value is an override and an override silently wins.
+After ADDING (not editing) anything under `assets/`, touch the `assets` crate and
+grep the built binary's manifest before handing the build over.
