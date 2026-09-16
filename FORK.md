@@ -3041,10 +3041,19 @@ How to apply:
 
 ### 140. A blame run is classified in the editor, from row adjacency, and the gutter only draws what it is told
 
-What: the blame gutter prints the date and the shortened author **once per run** of consecutive
-lines that came from one commit, and marks where one run ends and the next begins with a
-hairline. Continuation rows draw no metadata and keep every affordance they had — hover
-background, tooltip, right-click menu, left-click `OpenAtCommit`.
+What: the blame gutter prints the date and the shortened author on **every** blamed row, and
+marks where one run of consecutive lines from one commit ends and the next begins with a
+hairline.
+
+*(Amended 2026-09-16. This entry previously read "once per run … continuation rows draw no
+metadata", and the collapsing is what the maintainer asked to remove: «пусть будет на каждой
+строке надпись … пробелы имеют смысл там где ручные правки есть => git blame для этих строк
+нету». The point is what a BLANK row means. Collapsing gave it two readings — "same commit as
+above" and "this line is not committed yet" — and the second is the one worth seeing at a
+glance, so it now has the column to itself. The repetition the collapsing removed is the price;
+the hairline, which survives, is what still says "a new commit starts here" when two commits
+share a date and an author. Everything below about how a run is classified stands unchanged:
+the run is now drawn as a boundary only, not as a label position.)*
 
 **Why the renderer cannot decide this.** `BlameRenderer` is handed one entry at a time and
 cannot see its neighbours; the only place that holds both the viewport's display-row metadata
@@ -3097,8 +3106,9 @@ selection.)* The classification is now **seeded** with what sits above the rows 
 parameter and the second return value of `blame_run_positions`, so classifying the rows above a
 slice and classifying the slice **compose**, and `GitBlame::run_predecessor_above` obtains the
 seed by running the rows above the viewport through *the same function* rather than through a
-second reading of the rule. A run that begins above the visible rows therefore keeps its label
-up there and leaves its visible tail blank, the way IntelliJ does. The scan above the viewport
+second reading of the rule. A run that begins above the visible rows therefore keeps its
+BOUNDARY up there and draws no hairline on its visible tail (before the 2026-09-16 amendment
+above, its label stayed up there too). The scan above the viewport
 doubles its reach (1, 2, 4, … display rows) and stops as soon as the scanned window classifies
 to anything but `DisplayStart` — one row settles it unless the rows above are soft-wrap
 continuations or alignment spacers, which stand for nothing in this buffer and settle nothing —
@@ -3118,10 +3128,10 @@ excerpt header or a hunk block between two lines has to sever the run, and none 
 visible from buffer rows — it would be a second, weaker copy of the rule.
 
 **The hairline is absolutely positioned, not a border**, and it is added *after* the row in the
-child list. A head row is 22.5px of intrinsic text height inside a 23px row pitch and has no
-explicit height (only continuation rows get one, because a childless flex collapses and would
-take the hit area with it), so a `border_t_1` would both grow the row and push its date down a
-pixel relative to the code line it annotates — jitter between labelled and unlabelled rows. Out
+child list. A blamed row is 22.5px of intrinsic text height inside a 23px row pitch (the row
+states its height explicitly so a hair-short container leaves no dead band between two lines),
+so a `border_t_1` would both grow the row and push its date down a pixel relative to the code
+line it annotates — jitter between a head row and the rows around it. Out
 of flow, it lands on the row's top edge and changes no other geometry. After the row rather
 than before it, because the row paints its hover background across its whole box and would
 swallow a hairline drawn underneath. **Which rows get one is read off the position alone**:

@@ -2209,48 +2209,41 @@ mod tests {
         view
     }
 
-    /// The date and the author identify a commit, so repeating them on every
-    /// line of a run says nothing the row above did not. Asserted on the
-    /// painted tree, and on both sides of it: the metadata is there on the row
-    /// that opens each run and gone on the row that continues it. Row 2 opening
-    /// the second run is what keeps this from passing for a renderer that only
-    /// ever labels the top row of the viewport.
+    /// Every row that HAS a blame entry prints it, head and continuation
+    /// alike, so a blank gutter row means one thing only: no entry for that
+    /// line, i.e. it is a local edit. Asserted on the painted tree and on both
+    /// panes. Row 2 opening a second run is what keeps this from passing for a
+    /// renderer that labels the first row of each run and nothing else.
     #[gpui::test]
-    async fn test_only_the_head_of_a_run_draws_its_blame_metadata(cx: &mut TestAppContext) {
+    async fn test_every_blamed_row_draws_its_blame_metadata(cx: &mut TestAppContext) {
         let (context, mut cx) = diff_test_context(cx).await;
         let _view = open_two_run_commit_diff(&context, &mut cx).await;
 
-        assert!(
-            cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_some(),
-            "row 0 opens the first run, so it names its commit"
-        );
-        assert!(
-            cx.debug_bounds("GIT-BLAME-META-RIGHT-1").is_none(),
-            "row 1 came from the same commit as the row above it, so repeating \
-             the date and the author there is noise"
-        );
-        assert!(
-            cx.debug_bounds("GIT-BLAME-META-RIGHT-2").is_some(),
-            "row 2 came from a different commit, so it opens a run of its own"
-        );
-        assert!(
-            cx.debug_bounds("GIT-BLAME-META-RIGHT-3").is_none(),
-            "and row 3 continues that second run"
-        );
+        for selector in [
+            "GIT-BLAME-META-RIGHT-0",
+            "GIT-BLAME-META-RIGHT-1",
+            "GIT-BLAME-META-RIGHT-2",
+            "GIT-BLAME-META-RIGHT-3",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} carries a blame entry, so it names its commit — \
+                 whether or not the row above came from the same one"
+            );
+        }
         assert!(
             cx.debug_bounds("GIT-BLAME-META-LEFT-0").is_some()
-                && cx.debug_bounds("GIT-BLAME-META-LEFT-1").is_none(),
-            "the left pane groups its own rows, not the right pane's"
+                && cx.debug_bounds("GIT-BLAME-META-LEFT-1").is_some(),
+            "the left pane labels its own rows the same way"
         );
     }
 
-    /// A continuation row draws nothing, and an empty flex is zero pixels tall:
-    /// left at that, the row would keep its hover background, its tooltip, its
-    /// context menu and its click-to-open listener and none of them could ever
-    /// fire, because there would be no hit area to land on. The container has
-    /// to stay the size of the line it annotates.
+    /// Each gutter row carries a hover background, a tooltip, a context menu
+    /// and a click-to-open listener, and none of them can fire on a row that
+    /// measures short of the line it annotates — the mouse falls into the band
+    /// between two rows. The container has to cover its whole line.
     #[gpui::test]
-    async fn test_a_continuation_row_keeps_a_full_height_hit_area(cx: &mut TestAppContext) {
+    async fn test_a_blame_row_keeps_a_full_height_hit_area(cx: &mut TestAppContext) {
         let (context, mut cx) = diff_test_context(cx).await;
         let _view = open_two_run_commit_diff(&context, &mut cx).await;
 
@@ -2284,9 +2277,9 @@ mod tests {
         );
     }
 
-    /// With the date and the author printed once per run, the only thing left
-    /// saying "a new commit starts here" is the blank rows above the label —
-    /// and blank rows say nothing at the boundary itself. The hairline does.
+    /// Every row prints a date and an author, so two consecutive commits by
+    /// one person on one day print identical rows and nothing says where the
+    /// first ends. The hairline does.
     /// Asserted on the painted tree and on both sides: present on the row that
     /// opens the second run, absent on both continuation rows, and absent on
     /// the first row of the *file*, where a line would read as a frame edge
@@ -2356,33 +2349,36 @@ mod tests {
         assert_eq!(landed, row as f64, "the pane scrolled to display row {row}");
     }
 
-    /// The gutter label belongs to the line a run starts on, not to whichever
+    /// A run boundary belongs to the line the run starts on, not to whichever
     /// line the scroll leaves on top. Scrolled one line into a two-line run,
-    /// the visible half of it is continuation rows: no date, no author, no
-    /// hairline — the label stays on the row that is now above the viewport,
-    /// exactly as IntelliJ leaves the tail of a scrolled-through run blank.
+    /// the visible half of it draws no hairline — the boundary stays on the
+    /// row that is now above the viewport.
     ///
-    /// Both sides of it, at two offsets, because the defect was a label that
-    /// moved: at offset 1 the second run's head is one row down and keeps its
-    /// metadata and its hairline, and at offset 2 that same head is the top
-    /// row and keeps both there too. A rule reading the visible rows alone
-    /// passes the second half and fails the first.
+    /// Both sides of it, at two offsets, because the defect was a boundary
+    /// that moved: at offset 1 the second run's head is one row down and keeps
+    /// its hairline, and at offset 2 that same head is the top row and keeps it
+    /// there too. A rule reading the visible rows alone passes the second half
+    /// and fails the first. The date and the author are on every row either
+    /// way, so they cannot answer this one.
     #[gpui::test]
-    async fn test_a_run_scrolled_past_its_head_leaves_its_rows_blank(cx: &mut TestAppContext) {
+    async fn test_a_run_scrolled_past_its_head_keeps_its_boundary_up_there(
+        cx: &mut TestAppContext,
+    ) {
         let (context, mut cx) = diff_test_context(cx).await;
         let view = open_two_run_commit_diff(&context, &mut cx).await;
         let rhs = view.read_with(&cx, |view, cx| view.editor.read(cx).rhs_editor().clone());
 
         scroll_to_row(&rhs, 1, &mut cx);
         assert!(
-            cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_none(),
-            "the top row continues a run whose head is now above the viewport, \
-             so the date and the author stay up there with it"
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_some(),
+            "the top row has a blame entry, so it names its commit — the run \
+             it belongs to has nothing to do with that"
         );
         assert!(
             cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-0").is_none(),
-            "and there is no boundary on that row to draw a hairline for — one \
-             appearing as the run's head scrolls past is the flicker"
+            "but it continues a run whose head is now above the viewport, so \
+             there is no boundary on it — a hairline appearing as the head \
+             scrolls past is the flicker"
         );
         assert!(
             cx.debug_bounds("GIT-BLAME-META-RIGHT-1").is_some()
@@ -2393,19 +2389,16 @@ mod tests {
 
         scroll_to_row(&rhs, 2, &mut cx);
         assert!(
-            cx.debug_bounds("GIT-BLAME-META-RIGHT-0").is_some(),
-            "scrolled one line further, that same head is the top row, and a \
-             run's head names its commit wherever the viewport happens to sit"
-        );
-        assert!(
             cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-0").is_some(),
-            "including its hairline: the row above it came from another \
-             commit, so the boundary is real even on the top edge"
+            "scrolled one line further, that same head is the top row and \
+             keeps its hairline: the row above it came from another commit, so \
+             the boundary is real even on the top edge"
         );
         assert!(
-            cx.debug_bounds("GIT-BLAME-META-RIGHT-1").is_none()
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-1").is_some()
                 && cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-1").is_none(),
-            "and the row below it continues that run"
+            "and the row below it continues that run: labelled like every \
+             blamed row, with no boundary of its own"
         );
     }
 
@@ -2502,19 +2495,17 @@ mod tests {
             continuation.size.height
         );
         assert!(
-            cx.debug_bounds("GIT-BLAME-META-RIGHT-3").is_none(),
-            "while the row below the spacer came from that same commit, so \
-             repeating its date and author under the spacer says nothing"
+            cx.debug_bounds("GIT-BLAME-META-RIGHT-3").is_some(),
+            "and the row below the spacer names its commit like any blamed row"
         );
         assert!(
             cx.debug_bounds("GIT-BLAME-SEPARATOR-RIGHT-3").is_none(),
             "nor is there a run boundary to mark below it"
         );
 
-        // The left pane's own continuation rows, both sides again: all four
-        // of its lines are one run, so three of them draw no metadata, and
-        // three empty containers are exactly what a collapse would look like
-        // to an `is_none`-only assertion.
+        // The left pane's own rows, both sides again: the container has to be
+        // there AND be the size of its line, since a collapsed container is
+        // what an `is_some`-only assertion would happily accept.
         for selector in [
             "GIT-BLAME-ROW-LEFT-0",
             "GIT-BLAME-ROW-LEFT-1",
@@ -2532,11 +2523,12 @@ mod tests {
         }
         assert!(
             cx.debug_bounds("GIT-BLAME-META-LEFT-0").is_some()
-                && cx.debug_bounds("GIT-BLAME-META-LEFT-1").is_none()
-                && cx.debug_bounds("GIT-BLAME-META-LEFT-2").is_none()
-                && cx.debug_bounds("GIT-BLAME-META-LEFT-3").is_none(),
-            "which is what the left pane already did — one label for one \
-             commit — and the two panes have to agree"
+                && cx.debug_bounds("GIT-BLAME-META-LEFT-1").is_some()
+                && cx.debug_bounds("GIT-BLAME-META-LEFT-2").is_some()
+                && cx.debug_bounds("GIT-BLAME-META-LEFT-3").is_some(),
+            "all four of the left pane's lines are blamed, so all four are \
+             labelled — the spacer changes what the RIGHT pane is missing, not \
+             what either pane prints"
         );
         assert!(
             cx.debug_bounds("GIT-BLAME-SEPARATOR-LEFT-1").is_none()

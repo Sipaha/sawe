@@ -122,23 +122,19 @@ impl BlameRenderer for GitBlameRenderer {
         // ask the same editor the same question.
         let pane_suffix = blame_pane_suffix(&editor, cx);
 
-        // Consecutive lines from one commit used to repeat the same date and
-        // author on every row, so a file written in a few large commits read
-        // as a wall of identical text. Only the row that opens a run names its
-        // commit; the rest of the run keeps its container — and with it the
-        // hover, the tooltip, the context menu and click-to-open — so the run
-        // costs the repetition and nothing else.
-        let is_continuation = matches!(run_position, BlameRunPosition::Continuation);
-        // A run that starts above the first visible row keeps its label up
-        // there: the rows on screen are continuations and stay blank, rather
-        // than the label sliding down to whichever row the scroll happened to
-        // leave on top. So the only head with nothing above it is the first
-        // row of the display, and it is the only one with no boundary to mark.
+        // Every blamed row names its commit. Labelling only the row that opens
+        // a run (what this did until 2026-09-16) made a blank gutter row
+        // ambiguous: it meant EITHER "same commit as above" OR "this line is
+        // not committed yet", and the second reading is the one worth seeing at
+        // a glance. A blank row now means exactly one thing — `blame_for_rows`
+        // has no entry for that line, i.e. it is a local edit.
+        //
+        // A run is still a run: the hairline below marks where one ends, which
+        // is what distinguishes two commits that happen to share a date and an
+        // author.
         let opens_a_boundary = matches!(run_position, BlameRunPosition::Head);
 
-        let metadata = if is_continuation {
-            None
-        } else {
+        let metadata = {
             let date = blame_entry_gutter_date(&blame_entry);
             let name = truncate_to_columns(
                 ::git::blame::display_author(blame_entry.author.as_deref()),
@@ -190,9 +186,9 @@ impl BlameRenderer for GitBlameRenderer {
             Some(
                 h_flex()
                     .gap_2()
-                    // Named apart from the row container, and per row, because
-                    // the two now differ: a continuation row paints the
-                    // container and not this. See `blame_pane_suffix`.
+                    // Named apart from the row container so a test can tell
+                    // "the gutter reserved a row here" from "the row actually
+                    // printed a commit". See `blame_pane_suffix`.
                     .debug_selector(|| format!("GIT-BLAME-META{pane_suffix}-{ix}"))
                     .child(date)
                     .children(avatar)
@@ -204,10 +200,10 @@ impl BlameRenderer for GitBlameRenderer {
             )
         };
 
-        // Dropping the repeated date and author leaves nothing marking where
-        // one run ends and the next begins: two adjacent labelled rows and a
-        // labelled row following four blank ones read the same. A hairline on
-        // the head row's top edge is that boundary.
+        // The label alone does not mark where one run ends and the next
+        // begins: two consecutive commits by the same author on the same day
+        // print two identical rows. A hairline on the head row's top edge is
+        // that boundary.
         //
         // Drawn wherever a run really begins, on screen or scrolled to — the
         // classification is in display-row space, not viewport space, so the
@@ -262,14 +258,11 @@ impl BlameRenderer for GitBlameRenderer {
                         .gap_2()
                         .font(style.font())
                         .line_height(style.line_height)
-                        // A continuation row has no children, and a flex with
-                        // no children collapses to zero height — which would
-                        // take the hover, the tooltip, the context menu and the
-                        // click target down with it. The height the row would
-                        // have had, stated explicitly.
-                        .when(is_continuation, |row| {
-                            row.h(style.line_height_in_pixels(window.rem_size()))
-                        })
+                        // Stated rather than left to the text: the row carries
+                        // the hover, the tooltip, the context menu and the
+                        // click target, and a row that measured a hair short of
+                        // its line would leave a dead band between two lines.
+                        .h(style.line_height_in_pixels(window.rem_size()))
                         .text_color(cx.theme().status().hint)
                         .debug_selector(|| format!("GIT-BLAME-ROW{pane_suffix}-{ix}"))
                         .children(metadata)
