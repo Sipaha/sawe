@@ -325,6 +325,11 @@ impl McpServerTool for CompactSessionTool {
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct StartCompactParams {
     pub session_id: String,
+    /// Optional free-text note for the agent, carried inside the compact
+    /// prompt — what this handoff must not lose, what to do next. Mirrors the
+    /// comment field of the desktop's compact modal. Omit for a plain compact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for StartCompactParams {
@@ -333,11 +338,12 @@ impl<'de> Deserialize<'de> for StartCompactParams {
         #[serde(default, deny_unknown_fields)]
         struct Inner {
             session_id: String,
+            comment: Option<String>,
         }
+        let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
-            session_id: Option::<Inner>::deserialize(de)?
-                .unwrap_or_default()
-                .session_id,
+            session_id: inner.session_id,
+            comment: inner.comment,
         })
     }
 }
@@ -380,6 +386,7 @@ impl McpServerTool for StartCompactTool {
             crate::compact::start_compact_for_session(
                 session_id,
                 crate::compact::CompactInitiator::User,
+                input.comment.as_deref(),
                 cx,
             )
         })?;

@@ -523,7 +523,7 @@ pub(crate) fn render_status_row(
                 let clear_tooltip = clear_tooltip.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     let compact_label: SharedString = if compact_enabled {
-                        "Compact context".into()
+                        "Compact context…".into()
                     } else {
                         format!("Compact context — {compact_tooltip}").into()
                     };
@@ -533,17 +533,26 @@ pub(crate) fn render_status_row(
                         .disabled(!compact_enabled)
                         .handler({
                             let weak_view = weak_view.clone();
+                            // Ask for the (optional) comment first: the modal
+                            // owns the actual start, so an escape here compacts
+                            // nothing.
                             move |window, cx| {
-                                let Some(view) = weak_view.as_ref().and_then(|w| w.upgrade())
+                                let Some(weak_view) = weak_view.clone() else {
+                                    return;
+                                };
+                                let Some(workspace) = weak_view
+                                    .read_with(cx, |view, _| view.workspace_handle().clone())
+                                    .ok()
+                                    .and_then(|workspace| workspace.upgrade())
                                 else {
                                     return;
                                 };
-                                view.update(cx, |view, cx| {
-                                    if is_cold {
-                                        view.start_compact_from_cold(window, cx);
-                                    } else {
-                                        view.start_compact(cx);
-                                    }
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.toggle_modal(window, cx, move |window, cx| {
+                                        crate::compact_comment_modal::CompactCommentModal::new(
+                                            weak_view, is_cold, window, cx,
+                                        )
+                                    });
                                 });
                             }
                         });

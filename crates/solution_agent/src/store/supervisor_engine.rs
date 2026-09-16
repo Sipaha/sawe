@@ -853,6 +853,12 @@ impl SolutionAgentStore {
                     state.status = SupervisorStatus::Watching;
                 }
                 self.persist_supervisor_state(id, cx);
+                // The judge may attach a `message` to a `compact` verdict — its
+                // own "what this handoff must not lose". It rides into the
+                // compact prompt exactly like the user's modal comment, marked
+                // as observer-authored so the agent doesn't read it as a user
+                // instruction.
+                let note = message;
                 // `start_compact_for_session` re-acquires the global
                 // `SolutionAgentStore` and `read_with`s it — but `apply_verdict`
                 // runs INSIDE the MCP tool's `store.update(...)` lease (mcp.rs
@@ -867,6 +873,7 @@ impl SolutionAgentStore {
                     let outcome = crate::compact::start_compact_for_session(
                         id,
                         crate::compact::CompactInitiator::Observer,
+                        note.as_deref(),
                         cx,
                     );
                     // A compact can be SILENTLY refused (session busy, conversation

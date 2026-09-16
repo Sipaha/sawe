@@ -16,7 +16,8 @@ use crate::store::SolutionAgentStore;
 ///
 /// - `continue`: increment the guard counter, send a nudge message, and
 ///   return the session to `Watching`.
-/// - `compact`: queue a compact-context prompt on the session.
+/// - `compact`: queue a compact-context prompt on the session, carrying the
+///   optional `message` into it as an observer-authored handoff note.
 /// - `done`: park supervision in `Held` (the "done" standby — the operator's
 ///   next message OR the agent's own self-resume re-arms it) and log completion.
 /// - `ask`: pause supervision in `WaitingUser` and escalate the question
@@ -34,8 +35,11 @@ pub struct SupervisorVerdictParams {
     /// One of: "continue", "compact", "done", "ask", "ask_agent", "wait".
     pub action: String,
     pub reasoning: String,
-    /// Optional nudge message sent to the session when action == "continue".
-    /// Defaults to "Continue." when absent.
+    /// Optional message. For action == "continue" it is the nudge text sent to
+    /// the session (defaults to "Continue." when absent). For action ==
+    /// "compact" it is a note carried INSIDE the compaction request — what this
+    /// handoff must not lose — attributed to you, the observer. Ignored by the
+    /// other actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Required when action == "ask". The question to surface to the operator.

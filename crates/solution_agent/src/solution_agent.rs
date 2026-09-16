@@ -13,6 +13,7 @@ pub mod claude_adapter;
 pub mod codex_adapter;
 pub(crate) mod cold_persistence;
 pub(crate) mod compact;
+pub mod compact_comment_modal;
 pub(crate) mod conversation_render;
 pub(crate) mod db;
 pub mod event_sources;

@@ -4307,3 +4307,38 @@ every producer of that string, not as a property of the one producer you were
 looking at. The clamp belongs where the data enters the model, not in the
 render function — `render_tool_call` only sees a fallback, since the painted
 text comes from the cached `Markdown` entity built out of `entry_text_spans`.
+
+### 179. A compaction carries a note from whoever asked for it
+
+"Compact context" used to fire the moment it was clicked. The prompt it sends is
+generic by construction — the agent decides what matters — so the one person who
+knows what this particular handoff must not lose (the user, mid-task) had no way
+to say it, and the observer, which often issues `compact` precisely because it
+noticed something, could only record its reasoning in its own diary.
+
+The menu entry (`Compact context…`) now opens `CompactCommentModal` and the
+modal owns the start, so `escape` compacts nothing. The comment is optional —
+confirming an empty editor renders the prompt byte-identically to before. It
+travels as one parameter (`note: Option<&str>`) through
+`compact::start_compact_for_session`, reaching:
+
+- the desktop modal,
+- `solution_agent.start_compact`'s new optional `comment` (so a phone can send
+  one too),
+- the observer's `compact` verdict, whose existing `message` field is now
+  carried into the prompt instead of being dropped for that action.
+
+Attribution is part of the payload, not decoration: a user note says "honour it
+while writing the files below", an observer note says it does not grant
+authorization and does not override the user's latest instructions —
+`CompactInitiator` already distinguished the two for observer-memory wiping, and
+now it picks the preamble too. The note is blockquoted line by line, so a note
+containing `## Step 3` or a fenced block cannot impersonate the editor's own
+instructions, and it is capped at 4000 chars with a visible
+`(note truncated by the editor)` marker rather than silently.
+
+How to apply: when an action grows an optional human remark, thread it as one
+parameter through the single orchestrator every surface already shares
+(`start_compact_for_session`) rather than letting each surface build its own
+prompt — and mark who wrote it, because "the user said" and "a bot suggested"
+are different instructions to the agent.

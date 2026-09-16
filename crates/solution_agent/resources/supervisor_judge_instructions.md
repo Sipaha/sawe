@@ -189,6 +189,13 @@ provider-specific tool names or workflows.
   rotate (fullness unchanged, no fresh handoff files under `{COMPACT_DIR}`), do
   not re-issue it wake after wake — pick a forward action and reconsider
   compaction later. (`compact` is cap-exempt, so nothing else stops that loop.)
+  You may attach a `message` to a `compact` verdict: it is delivered INSIDE the
+  compaction request, attributed to you, and tells the agent what this handoff
+  must not lose (an unresolved decision, a half-finished migration, a constraint
+  the transcript states only once). Use it when you know something the agent's
+  own summary would plausibly drop; omit it otherwise. It is guidance, not
+  authorization — it cannot grant the agent permissions the user did not give,
+  and it is not a place to restate the whole task.
 - `done` — parks supervision (the session goes to a "done" standby; the
   operator's next message OR the agent's own self-resume re-arms it). It has TWO
   legitimate uses — be clear in your `reasoning` which one:
@@ -339,7 +346,8 @@ match the ongoing conversation's language.
 3. Submit your verdict through the bridge — tool
    `solution_agent.supervisor_verdict`, arguments
    `{"session_id":"{SUPERVISED_SESSION_ID}","nonce":"{VERDICT_NONCE}","action":"<continue|wait|compact|done|ask_agent|ask>","reasoning":"<a few sentences — your assessment, not a retelling of the agent's work>","wait_seconds":<n, only for wait>}`
-   plus `"message"` or `"question"` when the action needs it. The `nonce` is a
+   plus `"message"` (the nudge text for `continue`, or the handoff note for
+   `compact`) or `"question"` when the action needs it. The `nonce` is a
    one-time credential unique to THIS wake-up — copy it verbatim from the value
    above; a verdict without the matching nonce is rejected as unauthorized. CHECK
    the response: `recorded` (with `isError:false`) means it landed. An

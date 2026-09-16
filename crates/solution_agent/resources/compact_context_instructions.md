@@ -15,7 +15,7 @@ particular model, provider, tool name, or context-window size.
 
 The editor has injected the variables you need below; do not invent
 paths, do not write files anywhere else.
-
+{{compact_note}}
 ## Variables
 
 - `SESSION_ID` = `{{session_id}}`

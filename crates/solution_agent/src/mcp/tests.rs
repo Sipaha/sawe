@@ -1599,6 +1599,7 @@ async fn start_compact_declines_below_threshold(cx: &mut gpui::TestAppContext) {
         .run(
             StartCompactParams {
                 session_id: session_id.to_string(),
+                comment: None,
             },
             &mut cx.to_async(),
         )
@@ -1646,6 +1647,7 @@ async fn start_compact_queues_prompt_when_idle(cx: &mut gpui::TestAppContext) {
         .run(
             StartCompactParams {
                 session_id: session_id.to_string(),
+                comment: None,
             },
             &mut cx.to_async(),
         )

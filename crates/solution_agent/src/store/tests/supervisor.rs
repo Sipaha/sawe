@@ -2711,6 +2711,76 @@ async fn compact_verdict_does_not_reenter_store(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// An observer may attach a `message` to its `compact` verdict — its own note
+/// about what the handoff must not lose. It has to reach the compact prompt
+/// the agent receives, and it has to be marked as observer-authored so the
+/// agent does not read it as a user instruction.
+#[gpui::test]
+async fn compact_verdict_message_reaches_the_prompt_as_an_observer_note(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: 250_000,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    // The session stays Idle: a verdict aimed at a session that resumed on its
+    // own is dropped by the send-time gate, so Idle is the only state in which
+    // this path is exercised at all.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.set_supervision_enabled(session_id, true, cx);
+            store.apply_verdict(
+                session_id,
+                crate::supervisor::VerdictAction::Compact,
+                "context is large; compact".into(),
+                Some("The pin decision is still open — carry it forward.".into()),
+                None,
+                None,
+                None,
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+
+    let queued = cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+            .read(cx)
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                crate::session_entry::SessionEntryKind::UserMessage { content_md, .. } => {
+                    Some(content_md.clone())
+                }
+                _ => None,
+            })
+            .collect::<String>()
+    });
+    assert!(
+        queued.contains("> The pin decision is still open — carry it forward."),
+        "observer note missing from the compact prompt: {queued}"
+    );
+    assert!(
+        queued.contains("autonomous observer"),
+        "the note must be attributed to the observer, not the user: {queued}"
+    );
+}
+
 /// A parked one-shot `wait` must be cancelled when the agent's own turn
 /// completes (`Stopped`) — otherwise, if the agent self-resumed and FINISHED
 /// before the wait deadline, the mechanism would still wake it at the deadline
