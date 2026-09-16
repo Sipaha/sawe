@@ -557,6 +557,9 @@ enum ChangedFileRow {
         /// the root group.
         label: SharedString,
         file_count: usize,
+        /// The group's `+N −M` — the sum of the figures its file rows carry,
+        /// or `None` when there is nothing to sum. See [`sum_file_stats`].
+        stat: Option<DiffLineCount>,
         collapsed: bool,
     },
     File(ChangedFileEntry),
@@ -578,6 +581,26 @@ fn changed_file_entries(loaded: &LoadedCommitDiff, show_stats: bool) -> Vec<Chan
             ChangedFileEntry::from_commit_file(file, stat)
         })
         .collect()
+}
+
+/// Fold one directory group's file figures into the folder's own `+N −M`.
+///
+/// `None` means exactly what it means on a file row — *nothing to show* — and
+/// it is reached the same two ways: `git_panel.diff_stats` off strips the
+/// figures from every entry at once, and a group whose files are all binary
+/// has no counted line anywhere in it. Neither case may paint `+0 −0`, which
+/// would be a truthful-looking lie about lines nobody counted. A group mixing
+/// a binary file with a counted one sums the counted ones, so the header keeps
+/// describing exactly the figures its visible rows add up to.
+fn sum_file_stats(files: &[&ChangedFileEntry]) -> Option<DiffLineCount> {
+    files
+        .iter()
+        .filter_map(|file| file.stat)
+        .reduce(|mut sum, stat| {
+            sum.added += stat.added;
+            sum.removed += stat.removed;
+            sum
+        })
 }
 
 /// Flatten a commit's changed files into directory-grouped rows. Files under a
@@ -608,6 +631,7 @@ fn build_changed_file_rows(
                 directory
             },
             file_count: files.len(),
+            stat: sum_file_stats(&files),
             collapsed: is_collapsed,
         });
         if !is_collapsed {
@@ -624,43 +648,79 @@ fn render_changed_directory_row(
     key: SharedString,
     label: SharedString,
     file_count: usize,
+    stat: Option<DiffLineCount>,
     collapsed: bool,
     handlers: ChangedFileRowHandlers,
 ) -> AnyElement {
     let tooltip_label = label.clone();
+    // Carries the figures, not just the row: a paint assertion on this
+    // selector fails both when the header stops being drawn and when it starts
+    // drawing the wrong sum.
+    let stat_selector =
+        stat.map(|stat| format!("COMMIT-DIR-STAT-{label}-{}-{}", stat.added, stat.removed));
     ButtonLike::new(("changed-dir", ix))
         .height(changes_list::list_item_height().into())
+        // Without this the button sizes to its own content, and the `w_full`
+        // inside it resolves against that — which leaves the folder's figures
+        // trailing the file count instead of sitting in the column its files'
+        // figures are in. The file rows get the same effect from the `w_full`
+        // div they are wrapped in for their indent.
+        .full_width()
         .child(
             h_flex()
                 .min_w_0()
                 .w_full()
                 .gap_1()
                 .overflow_hidden()
-                // A plain chevron rather than a `Disclosure`: that renders as
-                // an `IconButton`, a nested button inside the row's own
-                // `ButtonLike` that muddies the click target — the whole row is
-                // the collapse affordance here, as it is on the Changes tab.
+                // Same split as a file row: the naming half takes the slack and
+                // truncates, the figures never shrink. That also lands the
+                // folder's `+N −M` in the same column as its files', which is
+                // what makes the header readable as their sum.
                 .child(
-                    Icon::new(if collapsed {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
+                    h_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap_1()
+                        // A plain chevron rather than a `Disclosure`: that
+                        // renders as an `IconButton`, a nested button inside
+                        // the row's own `ButtonLike` that muddies the click
+                        // target — the whole row is the collapse affordance
+                        // here, as it is on the Changes tab.
+                        .child(
+                            Icon::new(if collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        )
+                        // Default (16px), matching the project panel's folder
+                        // glyph and the 16px status glyph on the file rows
+                        // below it.
+                        .child(Icon::new(IconName::Folder).color(Color::Muted))
+                        .child(Label::new(label).truncate_start())
+                        .child(
+                            div().flex_shrink_0().child(
+                                Label::new(format!(
+                                    "{file_count} {}",
+                                    if file_count == 1 { "file" } else { "files" }
+                                ))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            ),
+                        ),
                 )
-                // Default (16px), matching the project panel's folder glyph and
-                // the 16px status glyph on the file rows below it.
-                .child(Icon::new(IconName::Folder).color(Color::Muted))
-                .child(Label::new(label).truncate_start())
-                .child(
-                    Label::new(format!(
-                        "{file_count} {}",
-                        if file_count == 1 { "file" } else { "files" }
-                    ))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                ),
+                .children(stat.zip(stat_selector).map(|(stat, selector)| {
+                    div()
+                        .flex_shrink_0()
+                        .debug_selector(|| selector)
+                        .child(ui::DiffStat::new(
+                            ("changed-dir-stat", ix),
+                            stat.added,
+                            stat.removed,
+                        ))
+                })),
         )
         .tooltip(move |_, cx| Tooltip::simple(tooltip_label.clone(), cx))
         .on_click(move |_, window, cx| {
@@ -2802,12 +2862,14 @@ impl GitPanel {
                                         key,
                                         label,
                                         file_count,
+                                        stat,
                                         collapsed,
                                     } => render_changed_directory_row(
                                         ix,
                                         key.clone(),
                                         label.clone(),
                                         *file_count,
+                                        *stat,
                                         *collapsed,
                                         handlers.clone(),
                                     ),
@@ -3178,10 +3240,25 @@ mod tests {
     }
 
     fn changed_file_entry(path: &str) -> ChangedFileEntry {
+        changed_file_entry_with_stat(path, None)
+    }
+
+    fn changed_file_entry_with_stat(path: &str, stat: Option<DiffLineCount>) -> ChangedFileEntry {
         ChangedFileEntry::from_commit_file(
             &commit_file(path, Some("old"), Some("new"), false),
-            None,
+            stat,
         )
+    }
+
+    /// Every directory row's figures, in row order, so a test can compare the
+    /// headers against what their files add up to.
+    fn directory_stats(rows: &[ChangedFileRow]) -> Vec<Option<DiffLineCount>> {
+        rows.iter()
+            .filter_map(|row| match row {
+                ChangedFileRow::Directory { stat, .. } => Some(*stat),
+                ChangedFileRow::File(_) => None,
+            })
+            .collect()
     }
 
     fn stat_of(stats: &CommitDiffStats, path: &str) -> Option<DiffLineCount> {
@@ -3347,6 +3424,168 @@ mod tests {
                 "dir[key=docs/plans, label=docs/plans, 2]".to_string(),
             ],
             "a collapsed directory hides its files but keeps its count"
+        );
+    }
+
+    /// A directory header shows the `+N −M` of the files under it, and it must
+    /// be *their* figures — the same numbers the rows below it print — rather
+    /// than a second derivation of the same diff.
+    #[test]
+    fn test_a_directory_row_sums_the_figures_of_its_own_files() {
+        let entries = vec![
+            changed_file_entry_with_stat("src/a.rs", line_count(10, 3)),
+            changed_file_entry_with_stat("src/b.rs", line_count(4, 0)),
+            changed_file_entry_with_stat("README.md", line_count(1, 1)),
+        ];
+        let root: SharedString = "my-repo".into();
+
+        let rows = build_changed_file_rows(&entries, &root, &HashSet::default());
+        assert_eq!(
+            directory_stats(&rows),
+            vec![line_count(1, 1), line_count(14, 3)],
+            "the root group carries its single file's figures and `src` carries \
+             the sum of its two, in the tree's own row order"
+        );
+
+        let mut collapsed = HashSet::default();
+        collapsed.insert(SharedString::from("src"));
+        let rows = build_changed_file_rows(&entries, &root, &collapsed);
+        assert_eq!(
+            directory_stats(&rows),
+            vec![line_count(1, 1), line_count(14, 3)],
+            "a collapsed directory keeps the sum of the files it is hiding — \
+             that is the whole point of showing it on the header"
+        );
+    }
+
+    /// The `None` cases, which must stay `None` rather than collapsing into a
+    /// truthful-looking `+0 −0` about lines nobody counted.
+    #[test]
+    fn test_a_directory_row_shows_no_figures_when_it_has_none_to_sum() {
+        let root: SharedString = "my-repo".into();
+
+        let all_binary = vec![
+            changed_file_entry_with_stat("assets/icon.png", None),
+            changed_file_entry_with_stat("assets/logo.png", None),
+        ];
+        assert_eq!(
+            directory_stats(&build_changed_file_rows(
+                &all_binary,
+                &root,
+                &HashSet::default()
+            )),
+            vec![None],
+            "a group with no counted file anywhere in it shows no figures, the \
+             way each of its rows does"
+        );
+
+        let mixed = vec![
+            changed_file_entry_with_stat("assets/icon.png", None),
+            changed_file_entry_with_stat("assets/theme.json", line_count(7, 2)),
+        ];
+        assert_eq!(
+            directory_stats(&build_changed_file_rows(&mixed, &root, &HashSet::default())),
+            vec![line_count(7, 2)],
+            "a binary file contributes nothing rather than zeroing the group"
+        );
+    }
+
+    /// `git_panel.diff_stats` off strips the figures from the file rows, and a
+    /// folder that summed them then has nothing to sum — one switch, both
+    /// halves of the tree.
+    #[test]
+    fn test_the_diff_stats_setting_reaches_the_directory_rows_too() {
+        let loaded = LoadedCommitDiff {
+            stats: compute_diff_stats(&CommitDiff {
+                files: vec![commit_file(
+                    "src/lib.rs",
+                    Some("a\n"),
+                    Some("a\nb\n"),
+                    false,
+                )],
+            }),
+            diff: CommitDiff {
+                files: vec![commit_file(
+                    "src/lib.rs",
+                    Some("a\n"),
+                    Some("a\nb\n"),
+                    false,
+                )],
+            },
+        };
+        let root: SharedString = "my-repo".into();
+
+        let on = build_changed_file_rows(
+            &changed_file_entries(&loaded, true),
+            &root,
+            &HashSet::default(),
+        );
+        assert_eq!(directory_stats(&on), vec![line_count(1, 0)]);
+
+        let off = build_changed_file_rows(
+            &changed_file_entries(&loaded, false),
+            &root,
+            &HashSet::default(),
+        );
+        assert_eq!(
+            directory_stats(&off),
+            vec![None],
+            "the setting the file rows honour has to reach the header above them"
+        );
+    }
+
+    /// The paint side of the folder figures: the data tests above prove the
+    /// sum, this proves a real Commit tab in a real dock actually draws it —
+    /// and draws the right numbers, since the selector encodes them.
+    #[gpui::test]
+    async fn test_the_commit_tab_paints_each_folders_summed_figures(cx: &mut gpui::TestAppContext) {
+        let (panel, repository, fs, mut cx) = commit_tab_painted_panel(cx).await;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        fs.set_commit_diff(
+            std::path::Path::new(util::path!("/project/.git")),
+            sha,
+            CommitDiff {
+                files: vec![
+                    commit_file(
+                        "src/mixed.rs",
+                        Some("one\ntwo\nthree\n"),
+                        Some("one\nTWO\nthree\nfour\n"),
+                        false,
+                    ),
+                    commit_file("src/appended.rs", Some("a\n"), Some("a\nb\n"), false),
+                    commit_file("README.md", Some("p\nq\nr\n"), None, false),
+                ],
+            },
+        );
+        select_commit_with_refs(&panel, &repository, sha, vec![], &mut cx);
+        // One more frame after the selection: the diff loads asynchronously and
+        // its arrival only marks the panel dirty — without a redraw the window
+        // still holds the bounds of the `Loading` frame, which paints no tree
+        // at all and would fail every assertion below for the wrong reason.
+        cx.update_window_entity(&panel, |_, _, cx| cx.notify());
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("COMMIT-DIR-STAT-src-3-1").is_some(),
+            "the `src` header carries +3 −1 — its two files' +2 −1 and +1 −0 \
+             added up, which is the only way the header can describe the rows \
+             under it"
+        );
+        assert!(
+            cx.debug_bounds("COMMIT-DIR-STAT-project-0-3").is_some(),
+            "and the root group, labelled after the repository, carries the \
+             deleted file's +0 −3"
+        );
+
+        cx.update_window_entity(&panel, |panel, _window, cx| {
+            panel.toggle_commit_directory(&SharedString::from("src"), cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("COMMIT-DIR-STAT-src-3-1").is_some(),
+            "collapsing the folder hides its rows and keeps its figures: with \
+             the files gone the header is the only place the user can still \
+             see how much is in there"
         );
     }
 
