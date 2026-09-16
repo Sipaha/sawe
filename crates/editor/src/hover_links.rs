@@ -2173,6 +2173,13 @@ mod tests {
                 "This is file2.rs".as_bytes().to_vec(),
             )
             .await;
+        // `insert_file` only emits an fs event; the worktree has to observe it
+        // before the file is in the snapshot, and a RELATIVE link resolves
+        // through `resolve_path_in_worktrees` — i.e. the snapshot, not the fs.
+        // Without this wait a test whose only hover fires immediately sees no
+        // link at all (an absolute path would resolve straight off `fs`, which
+        // is why those cases never noticed).
+        cx.run_until_parked();
 
         // Base document with {ABS} placeholder for absolute path prefix.
         // Each test case replaces a specific line to add cursor (ˇ) or highlight («»ˇ) markers.
@@ -2342,6 +2349,9 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // The worktree has to observe the new file first — see the note in
+        // `test_hover_filenames`.
+        cx.run_until_parked();
 
         // file2.rs:5:3 should be highlighted and clickable
         cx.set_state(indoc! {"
@@ -2418,6 +2428,9 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // The worktree has to observe the new file first — see the note in
+        // `test_hover_filenames`.
+        cx.run_until_parked();
 
         // file2.rs:3 should be highlighted and clickable
         cx.set_state(indoc! {"
@@ -2475,6 +2488,9 @@ Sentence ending file2.rs.
                 "line 1\nline 2\nline 3\n".as_bytes().to_vec(),
             )
             .await;
+        // The worktree has to observe the new file first — see the note in
+        // `test_hover_filenames`.
+        cx.run_until_parked();
 
         // file2.rs:2:in should resolve to file2.rs line 2 (like Ruby backtraces)
         cx.set_state(indoc! {"
@@ -2533,6 +2549,9 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // The worktree has to observe the new file first — see the note in
+        // `test_hover_filenames`.
+        cx.run_until_parked();
 
         // Markdown link [text](file2.rs:3:2) should highlight only the inner link,
         // not the surrounding markdown syntax.
@@ -2605,6 +2624,9 @@ Sentence ending file2.rs.
         fs.as_fake()
             .insert_file("/root/dir/file2.rs", "This is file2.rs".as_bytes().to_vec())
             .await;
+        // The worktree has to observe the new file first — see the note in
+        // `test_hover_filenames`.
+        cx.run_until_parked();
 
         cx.set_state(indoc! {"
             You can't open ../diˇr because it's a directory.
