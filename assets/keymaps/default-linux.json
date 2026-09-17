@@ -290,11 +290,23 @@
     },
   },
   {
-    // Tool-argument modal: read-only, so Ctrl+Enter only has to dismiss it —
-    // the same gesture that confirms the other two, rather than a third habit.
-    "context": "ToolArgumentModal",
+    // The shared preview window (an image, or a tool call's full argument).
+    // Read-only, so there is one gesture and it closes: Ctrl+Enter keeps the
+    // habit the tool-argument modal this replaced had.
+    "context": "PreviewWindow",
     "bindings": {
-      "ctrl-enter": "menu::Confirm",
+      "ctrl-enter": "menu::Cancel",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
+    // Text content focuses the read-only editor, and `Editor` is the deeper
+    // context — without this, Escape hits `editor::Cancel` (which has nothing
+    // to cancel in a read-only buffer) and the window stays open.
+    "context": "PreviewWindow > Editor",
+    "bindings": {
+      "ctrl-enter": "menu::Cancel",
+      "escape": "menu::Cancel",
     },
   },
   {

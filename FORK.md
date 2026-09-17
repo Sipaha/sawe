@@ -4766,7 +4766,18 @@ forcing the handle lookup to `None` fails "every preview lands in the same
 window", and returning early instead of falling through on a failed `update`
 fails "closing the window does not stop the next preview".
 
+**Deleting a view means deleting its key context.** Both shipped keymaps still
+bound `ctrl-enter` / `cmd-enter` under `"context": "ToolArgumentModal"` after the
+view was gone — dead bindings that can never fire, and the compiler cannot see
+them because a key context is a string. They now name `PreviewWindow`, and there
+is a second block for `PreviewWindow > Editor`: text content focuses the
+read-only editor, `Editor` is the deeper context, and without it Escape would hit
+`editor::Cancel` (nothing to cancel in a read-only buffer) and leave the window
+open. Verified by booting the editor and checking the log carries no keymap parse
+error, since nothing in the test suite loads the shipped keymaps.
+
 How to apply: a surface whose whole purpose is "this does not fit here" wants a
 window, not a modal. When one is reused, the handle is the state — keep it in a
 global keyed by nothing else, and treat a failed update as "gone", never as an
-error to report.
+error to report. And when a view goes, grep the keymaps for its `key_context`:
+nothing else will tell you.
