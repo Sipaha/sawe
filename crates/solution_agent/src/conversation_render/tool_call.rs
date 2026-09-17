@@ -76,6 +76,7 @@ pub(crate) fn render_tool_call(
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
     thread: gpui::WeakEntity<AcpThread>,
+    workspace: &gpui::WeakEntity<workspace::Workspace>,
     cx: &App,
 ) -> AnyElement {
     let status_text = tool_status_text(status);
@@ -182,7 +183,13 @@ pub(crate) fn render_tool_call(
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
                         )
-                        .child(render_span((entry_idx, 0), label_text, markdown_for, style)),
+                        .child(render_span(
+                            (entry_idx, 0),
+                            label_text,
+                            markdown_for,
+                            style,
+                            workspace,
+                        )),
                 )
                 .child(
                     Label::new(status_text)
@@ -218,6 +225,7 @@ pub(crate) fn render_tool_call(
                 summary,
                 markdown_for,
                 style,
+                workspace,
             )));
             span_idx += 1;
         }
@@ -509,6 +517,7 @@ pub(crate) fn render_plan(
     items: &[crate::session_entry::PlanItem],
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
+    workspace: &gpui::WeakEntity<workspace::Workspace>,
     cx: &App,
 ) -> AnyElement {
     let mut container = v_flex()
@@ -526,14 +535,15 @@ pub(crate) fn render_plan(
                         .size(IconSize::XSmall)
                         .color(Color::Muted),
                 )
-                .child(render_span((entry_idx, 0), "Plan", markdown_for, style)),
+                .child(render_span((entry_idx, 0), "Plan", markdown_for, style, workspace)),
         );
     for (i, _item) in items.iter().enumerate() {
         let span_idx = 1 + i;
         // Bullet prefix is now part of the span text (see
         // entry_text_spans), so the rendered markdown already includes
         // it — list items render as a list line.
-        container = container.child(render_span((entry_idx, span_idx), "", markdown_for, style));
+        container =
+            container.child(render_span((entry_idx, span_idx), "", markdown_for, style, workspace));
     }
     container.into_any_element()
 }

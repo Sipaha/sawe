@@ -102,6 +102,7 @@ pub(crate) fn render_user_message(
     is_last: bool,
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
+    workspace: &gpui::WeakEntity<workspace::Workspace>,
     cx: &App,
 ) -> AnyElement {
     // `clean_user_message_text` strips the literal "`Image`"
@@ -128,12 +129,11 @@ pub(crate) fn render_user_message(
 
     let body = if let Some(entity) = markdown_for.get(&(entry_idx, 0)) {
         let images_for_handler = images;
+        let workspace = workspace.clone();
         MarkdownElement::new(entity.clone(), style.clone())
             .on_url_click(move |url, window, cx| {
-                // Custom URL scheme `spk-image://<idx>` is rewritten
-                // by `clean_user_message_text`. Anything else is a
-                // genuine link the user typed; defer to the system
-                // browser via `cx.open_url`.
+                // Custom URL scheme `spk-image://<idx>` is rewritten by
+                // `clean_user_message_text` and is local to this renderer.
                 if let Some(idx_str) = url.strip_prefix("spk-image://")
                     && let Ok(idx) = idx_str.parse::<usize>()
                     && let Some(image) = images_for_handler.get(idx).cloned()
@@ -141,7 +141,11 @@ pub(crate) fn render_user_message(
                     open_image_preview(image, window, cx);
                     return;
                 }
-                cx.open_url(url.as_ref());
+                // Everything else takes the same route as a link in the
+                // agent's own text — a path the user typed opens in the
+                // preview window, not in a browser that cannot read it.
+                let roots = super::link::project_roots(&workspace, cx);
+                super::link::open_link(url.as_ref(), &roots, window, cx);
             })
             .into_any_element()
     } else if text.is_empty() {

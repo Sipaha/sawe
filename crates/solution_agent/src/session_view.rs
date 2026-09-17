@@ -1864,6 +1864,12 @@ impl Render for SolutionSessionView {
                                     );
                                 }
 
+                                // The workspace, not the thread, is what a
+                                // link in the transcript resolves a relative
+                                // path against: a cold tab has no thread, and
+                                // that is exactly when someone scrolls back to
+                                // a report and clicks it.
+                                let workspace_weak = this.workspace.clone();
                                 render_entry(
                                     idx,
                                     entry,
@@ -1874,6 +1880,7 @@ impl Render for SolutionSessionView {
                                     &this.assistant_label_for_render,
                                     rewind_target,
                                     thread_weak,
+                                    &workspace_weak,
                                     cx,
                                 )
                             },

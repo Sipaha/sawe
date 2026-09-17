@@ -4879,3 +4879,83 @@ on their own.
 How to apply: `buffer_font_size` means "code". Any editor that is not showing
 code — a chat draft, a commit message, a search field — needs its own size, and
 needs it re-applied on settings change.
+
+### 188. A link in the agent's own text goes somewhere
+
+`[Подробный отчёт](docs/audit.md)` in an answer rendered underlined, in the
+accent colour, and did nothing. The `on_url_click` hook was wired on the
+*user*-message renderer (`conversation_render/user_message.rs`, where it serves
+the `spk-image://` scheme) and on the render queue, but not on `render_span` —
+the shared path every other bubble goes through. So links were dead in
+assistant messages, in tool-call titles and in plans: three of the four places
+a link actually appears, all of them painted as working controls. That is the
+dead-control trap this fork bans for settings (decision #180's neighbours) and
+it had been sitting in the conversation the whole time.
+
+**The fix is not "call `cx.open_url`".** The agent writes paths, not URLs, and
+they are relative to the project it is working in — `cx.open_url("docs/audit.md")`
+does nothing useful. `conversation_render/link.rs` splits the decision from the
+action: `resolve_link` is pure and takes an `exists` predicate, so what a URL
+*means* is unit-testable without a window or a filesystem, and the rules are
+visible in one place — a scheme of its own goes to the browser, `file://` is a
+path wearing a scheme, a `#fragment` is dropped before lookup, an in-document
+anchor is dead because we render no anchors to jump to, and a relative path is
+tried against **every** worktree root in turn rather than assumed to live under
+the first. A path that resolves nowhere stays dead: opening the wrong file is
+worse than opening none.
+
+A resolved file opens in the **shared preview window** (decision #186), not in a
+tab. Reading a report the agent just wrote is a glance, and it should not
+displace what is open in the editor — the window is already the fork's answer to
+"this does not fit here", it is a real movable window rather than a modal, and
+its `Text` mode is a read-only editor with soft wrap and a scrollbar, which is
+exactly a file viewer. Bodies are clipped at 512 KiB **on a character
+boundary**: a link to a large log should not freeze the conversation it was
+clicked from, and a naive byte cut renders the split character as a replacement
+glyph. (The test for that pins a three-byte character on purpose — the cap is
+even, so a two-byte one would land on a boundary by luck and prove nothing.)
+
+`render_span` carries a weak handle rather than a precomputed list of roots: a
+relative link is resolved against the project **as it stands when clicked**, not
+as it stood when the frame was painted, and a weak handle per span costs nothing
+where walking every worktree on every frame would. A `Global` — the other way to
+avoid the plumbing — would resolve one Solution's links against whichever window
+rendered last, which is wrong in exactly the multi-Solution setup this fork
+exists for.
+
+**The handle is the workspace's, not the `AcpThread`'s, and that distinction was
+found by a screenshot rather than by reasoning.** The first version resolved
+through the thread, which is what `render_entry` already carried and therefore
+the cheap thing to reach for. It works in a live session and is dead in every
+cold one: a thread exists only while an agent is connected, so a conversation
+reopened from the database has none — which is precisely when someone scrolls
+back to a report the agent wrote last week and clicks the link to it. Driven in
+a seeded cold session (`solution_agent.seed_cold_session`, debug-only), the
+handler fired and logged `roots=[] -> Dead`. `link::project_roots` now goes
+through `Workspace::project`, which is alive whenever the conversation is on
+screen at all.
+
+Verified in a running editor, not only in the suite: a cold session seeded with
+an assistant message holding three links — a resolvable path, a path that is not
+there, and an `https:` URL — paints all three, and clicking the first opens the
+preview window titled `docs/audit.md` with the file's text in it. Clicking the
+broken one changes **zero** of 2 073 600 pixels: it does not retarget the open
+window and does not raise an error, which is the "silence beats the wrong file"
+rule made visible.
+
+(Driving that check needed one more thing worth writing down: a synthetic click
+alone does nothing here. `MarkdownElement`'s `MouseDown` is guarded by
+`hitbox.is_hovered(window)` (`crates/markdown/src/markdown.rs`), so an MCP
+`windows.click_at` with no preceding `windows.hover_at` lands on an unhovered
+hitbox and is swallowed — the link looks dead to the harness for a reason that
+has nothing to do with the link.)
+
+*Rules out:* wiring the hook per-renderer (that is what left three of four
+dead), handing a relative path to `cx.open_url`, resolving a link through a
+handle that outlives only a live agent, guessing a root when the file is not
+under it, and opening a preview in a workspace tab.
+
+How to apply: when a control is painted as interactive, the hook that makes it
+interactive belongs on the SHARED render path, not on the one call site whose
+bug report arrived first. And when a target can be either a URL or a path,
+decide which in a pure function that a test can drive.

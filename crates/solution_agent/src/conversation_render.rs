@@ -27,6 +27,7 @@ use ui::{
 use util::ResultExt as _;
 
 mod image;
+pub(crate) mod link;
 mod tool_call;
 mod user_message;
 
@@ -334,9 +335,22 @@ pub(crate) fn render_span(
     fallback_text: &str,
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
+    workspace: &gpui::WeakEntity<workspace::Workspace>,
 ) -> AnyElement {
     if let Some(entity) = markdown_for.get(&key) {
-        MarkdownElement::new(entity.clone(), style.clone()).into_any_element()
+        // A weak handle rather than a precomputed list of roots: a relative
+        // link is resolved against the project as it stands WHEN IT IS
+        // CLICKED, and carrying the handle costs nothing per span where
+        // walking every worktree on every frame would. It also keeps the
+        // answer per-window — a global would resolve one Solution's links
+        // against whichever window rendered last.
+        let workspace = workspace.clone();
+        MarkdownElement::new(entity.clone(), style.clone())
+            .on_url_click(move |url, window, cx| {
+                let roots = link::project_roots(&workspace, cx);
+                link::open_link(url.as_ref(), &roots, window, cx);
+            })
+            .into_any_element()
     } else if fallback_text.is_empty() {
         Empty.into_any_element()
     } else {
@@ -381,6 +395,7 @@ pub(crate) fn render_entry(
     assistant_label: &SharedString,
     rewind_target: Option<String>,
     thread: gpui::WeakEntity<AcpThread>,
+    workspace: &gpui::WeakEntity<workspace::Workspace>,
     cx: &App,
 ) -> AnyElement {
     // `created_ms == 0` is the "unknown time" sentinel (replayed gap /
@@ -398,6 +413,7 @@ pub(crate) fn render_entry(
             is_last,
             markdown_for,
             style,
+            workspace,
             cx,
         ),
         SessionEntryKind::AssistantMessage { chunks } => render_assistant_message(
@@ -408,6 +424,7 @@ pub(crate) fn render_entry(
             markdown_for,
             style,
             assistant_label,
+            workspace,
         ),
         SessionEntryKind::ToolCall {
             id,
@@ -428,9 +445,12 @@ pub(crate) fn render_entry(
             markdown_for,
             style,
             thread.clone(),
+            workspace,
             cx,
         ),
-        SessionEntryKind::Plan(items) => render_plan(entry_idx, items, markdown_for, style, cx),
+        SessionEntryKind::Plan(items) => {
+            render_plan(entry_idx, items, markdown_for, style, workspace, cx)
+        }
         // Context compaction is a lightweight divider marking where the model
         // summarized its own history; render it as a muted single-line label.
         SessionEntryKind::ContextCompaction { .. } => gpui::div()
@@ -494,6 +514,7 @@ pub(crate) fn render_entry(
                         text_md,
                         markdown_for,
                         style,
+                        workspace,
                     )),
                 )
                 .into_any_element()
@@ -585,6 +606,7 @@ pub(crate) fn render_assistant_message(
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
     style: &MarkdownStyle,
     _assistant_label: &SharedString,
+    workspace: &gpui::WeakEntity<workspace::Workspace>,
 ) -> AnyElement {
     let group_name = SharedString::from(format!("assistant-msg-{entry_idx}"));
     // No "<Adapter>" header above assistant messages either — the absence of
@@ -629,7 +651,7 @@ pub(crate) fn render_assistant_message(
         }
         if !combined.is_empty() {
             container =
-                container.child(render_span((entry_idx, 0), &combined, markdown_for, style));
+                container.child(render_span((entry_idx, 0), &combined, markdown_for, style, workspace));
             container = container.child(render_floating_copy_button(
                 SharedString::from(format!("copy-assistant-{entry_idx}")),
                 combined,
@@ -644,7 +666,8 @@ pub(crate) fn render_assistant_message(
                 if text.is_empty() {
                     continue;
                 }
-                let element = render_span((entry_idx, span_idx), text, markdown_for, style);
+                let element =
+                    render_span((entry_idx, span_idx), text, markdown_for, style, workspace);
                 container = container.child(
                     div()
                         .child(
