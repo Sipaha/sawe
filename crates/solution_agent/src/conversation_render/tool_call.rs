@@ -138,40 +138,52 @@ pub(crate) fn render_tool_call(
         .border_color(cx.theme().colors().border_variant)
         .child(
             h_flex()
-                // The header is the affordance, not the preview row below it.
-                // The row carries the command itself, which is the thing people
-                // reach for with the mouse to read or select — turning it into
-                // a button meant every stray click popped the window open.
-                // `MarkdownElement` does not stop mouse propagation, so a click
-                // on the rendered `Tool: Bash` label reaches this row too.
-                .id(("tool-header", entry_idx))
                 .gap_1p5()
                 .items_center()
-                .when_some(arg_full, |this, full| {
-                    this.cursor_pointer()
-                        .tooltip(ui::Tooltip::text("Show the full argument"))
-                        .on_click(move |_, window, cx| {
-                            // The shared preview window, not a workspace modal:
-                            // the one argument worth opening is the one too big
-                            // for the row, and a modal cannot be moved, cannot
-                            // be resized, and hides the conversation the
-                            // command belongs to.
-                            crate::preview_window::open_preview(
-                                crate::preview_window::PreviewContent::Text {
-                                    title: arg_modal_title.clone(),
-                                    body: full.clone(),
-                                },
-                                window,
-                                cx,
-                            );
-                        })
-                })
                 .child(
-                    Icon::new(IconName::ToolHammer)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
+                    // Only the title itself is the click target — not the row.
+                    // The row is full width, so making IT the button lit up the
+                    // whole line on hover and swallowed clicks aimed at nothing
+                    // in particular; the preview row below is worse still,
+                    // since it carries the command people reach for with the
+                    // mouse to read and select. `w_flex` is deliberately
+                    // absent: this group sizes to its content, so the hit area
+                    // ends where `Tool: Bash` ends.
+                    //
+                    // `MarkdownElement` does not stop mouse propagation, so a
+                    // click on the rendered label reaches this group's handler.
+                    h_flex()
+                        .id(("tool-header", entry_idx))
+                        .flex_none()
+                        .gap_1p5()
+                        .items_center()
+                        .when_some(arg_full, |this, full| {
+                            this.cursor_pointer()
+                                .tooltip(ui::Tooltip::text("Show the full argument"))
+                                .on_click(move |_, window, cx| {
+                                    // The shared preview window, not a
+                                    // workspace modal: the one argument worth
+                                    // opening is the one too big for the row,
+                                    // and a modal cannot be moved, cannot be
+                                    // resized, and hides the conversation the
+                                    // command belongs to.
+                                    crate::preview_window::open_preview(
+                                        crate::preview_window::PreviewContent::Text {
+                                            title: arg_modal_title.clone(),
+                                            body: full.clone(),
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })
+                        })
+                        .child(
+                            Icon::new(IconName::ToolHammer)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(render_span((entry_idx, 0), label_text, markdown_for, style)),
                 )
-                .child(render_span((entry_idx, 0), label_text, markdown_for, style))
                 .child(
                     Label::new(status_text)
                         .size(LabelSize::XSmall)

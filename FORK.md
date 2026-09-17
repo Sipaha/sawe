@@ -4798,13 +4798,15 @@ read-only editor, `Editor` is the deeper context, and without it Escape would hi
 open. Verified by booting the editor and checking the log carries no keymap parse
 error, since nothing in the test suite loads the shipped keymaps.
 
-**The header opens it, not the preview row.** The row under the header carries
-the command itself, which is the thing people reach for with the mouse to read
-or select — making it a button meant every stray click popped a window open
-("случайно часто стал попадать туда"). The affordance moved up to the
-`Tool: Bash` header row, which is a label nobody drags across. `MarkdownElement`
-does not stop mouse propagation, so a click on the rendered label still reaches
-the row's handler.
+**The title opens it — not the preview row, and not the header row either.**
+The row under the header carries the command itself, which is the thing people
+reach for with the mouse to read or select, so making it a button meant every
+stray click popped a window open ("случайно часто стал попадать туда"). Moving
+the handler to the header row was still wrong for the same reason one step up:
+that row is full width, so the whole line lit up on hover and swallowed clicks
+aimed at nothing. The target is now a content-sized group holding just the
+hammer glyph and the `Tool: Bash` label. `MarkdownElement` does not stop mouse
+propagation, so a click on the rendered label reaches that group's handler.
 
 How to apply: a surface whose whole purpose is "this does not fit here" wants a
 window, not a modal. When one is reused, the handle is the state — keep it in a
