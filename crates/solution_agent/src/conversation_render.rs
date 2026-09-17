@@ -16,7 +16,7 @@ use chrono::TimeZone as _;
 use gpui::{
     Anchor, AnyElement, App, Context, DismissEvent, ElementId, Empty, Entity, EventEmitter,
     FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement, Render,
-    SharedString, StatefulInteractiveElement as _, Styled, Window, div, px, relative, rems,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div, relative, rems,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use ui::prelude::*;

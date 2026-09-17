@@ -85,64 +85,18 @@ pub(crate) fn decode_image_local(
     Some(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
 }
 
-/// Opens the given image in a centred OS popup window for full-size
-/// inspection. Used by the chat thumbnail click handler.
+/// Opens the given image in the shared preview window (see
+/// [`crate::preview_window`]). Used by the chat thumbnail click handler; a
+/// second click retargets the window that is already up rather than opening
+/// another one.
 pub(crate) fn open_image_preview(
     image: std::sync::Arc<gpui::Image>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let display_size = window
-        .display(cx)
-        .or_else(|| cx.primary_display())
-        .map(|d| d.bounds().size)
-        .unwrap_or(gpui::Size {
-            width: px(800.0),
-            height: px(600.0),
-        });
-    let size = gpui::Size {
-        width: display_size.width * 0.6,
-        height: display_size.height * 0.7,
-    };
-    let bounds = gpui::WindowBounds::centered(size, cx);
-    if let Err(err) = cx.open_window(
-        gpui::WindowOptions {
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Image preview".into()),
-                appears_transparent: false,
-                traffic_light_position: None,
-            }),
-            window_bounds: Some(bounds),
-            is_resizable: true,
-            is_minimizable: true,
-            kind: gpui::WindowKind::Normal,
-            ..Default::default()
-        },
-        move |window, cx| {
-            window.activate_window();
-            cx.new(|_| ImagePreviewWindowView { image })
-        },
-    ) {
-        log::error!("failed to open image preview window: {err:?}");
-    }
-}
-
-pub(crate) struct ImagePreviewWindowView {
-    image: std::sync::Arc<gpui::Image>,
-}
-
-impl Render for ImagePreviewWindowView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .bg(cx.theme().colors().editor_background)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                gpui::img(self.image.clone())
-                    .object_fit(gpui::ObjectFit::Contain)
-                    .size_full(),
-            )
-    }
+    crate::preview_window::open_preview(
+        crate::preview_window::PreviewContent::Image(image),
+        window,
+        cx,
+    );
 }

@@ -4726,3 +4726,47 @@ objects; anything that hands the user a working copy they are about to edit
 wants `ensure_fresh_cache`. When a step is allowed to fail softly, say so on the
 progress stream rather than only in the log — the log is not where the person
 waiting for the clone is looking.
+
+### 186. One preview window, for images and for tool arguments alike
+
+Two surfaces that both mean "show me the thing that does not fit in the row"
+were built as different kinds of thing, and each was wrong in its own way.
+
+**Images opened an OS window per click.** `open_image_preview` called
+`cx.open_window` unconditionally, so walking a conversation with screenshots in
+it buried the desktop under a stack of "Image preview" windows to be closed one
+by one.
+
+**The full tool argument opened a workspace modal.** A modal cannot be moved,
+cannot be resized, and covers the conversation the command came from — the worst
+surface for the one case that needs room (a heredoc, a long pipeline), which is
+exactly why the row is clickable at all.
+
+Both now go through `solution_agent::preview_window::open_preview`, which owns a
+single `WindowHandle<PreviewWindow>` in a global and retargets it: swap the
+content, retitle, `activate_window`. `PreviewContent` is `Image | Text` in ONE
+view rather than two window types, which is what lets a click on an image
+retarget a window currently showing a shell command and the other way round —
+two types would have meant closing one to open the other, i.e. the stacking
+again.
+
+**Liveness is discovered, not tracked.** There is no "the user closed it" event
+to subscribe to, and a handle to a closed window is indistinguishable from a live
+one until you use it. `WindowHandle::update` failing IS the check, so the reuse
+path falls through to opening a new window. `update` moves its closure, so a
+failed call would eat the content with it — the closure gets an `Option` to
+`take` and the caller reads afterwards whether it actually ran.
+
+The header row is a drag handle (`window.start_window_move()`) rather than
+relying on the window manager: gpui may draw this window without server-side
+decorations, and "move it aside" must not depend on that.
+
+Both properties are pinned by tests whose failure was executed, not reasoned:
+forcing the handle lookup to `None` fails "every preview lands in the same
+window", and returning early instead of falling through on a failed `update`
+fails "closing the window does not stop the next preview".
+
+How to apply: a surface whose whole purpose is "this does not fit here" wants a
+window, not a modal. When one is reused, the handle is the state — keep it in a
+global keyed by nothing else, and treat a failed update as "gone", never as an
+error to report.

@@ -178,19 +178,19 @@ pub(crate) fn render_tool_call(
                         this.cursor_pointer()
                             .tooltip(ui::Tooltip::text("Show the full argument"))
                             .on_click(move |_, window, cx| {
-                                let Some(workspace) = workspace::Workspace::for_window(window, cx)
-                                else {
-                                    return;
-                                };
-                                let title = arg_modal_title.clone();
-                                let full = full.clone();
-                                workspace.update(cx, |workspace, cx| {
-                                    workspace.toggle_modal(window, cx, move |window, cx| {
-                                        crate::tool_argument_modal::ToolArgumentModal::new(
-                                            title, full, window, cx,
-                                        )
-                                    });
-                                });
+                                // The shared preview window, not a workspace
+                                // modal: the one argument worth opening is the
+                                // one too big for the row, and a modal cannot
+                                // be moved, cannot be resized, and hides the
+                                // conversation the command belongs to.
+                                crate::preview_window::open_preview(
+                                    crate::preview_window::PreviewContent::Text {
+                                        title: arg_modal_title.clone(),
+                                        body: full.clone(),
+                                    },
+                                    window,
+                                    cx,
+                                );
                             })
                     })
                     .child(
