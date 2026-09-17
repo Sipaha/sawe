@@ -307,7 +307,11 @@ mod tests {
         // the cut lands INSIDE a character and the walk back is what saves it.
         // A two-byte character would not do: the cap is even, so a naive cut
         // would land on a boundary by luck and the test would prove nothing.
-        assert_ne!(MAX_PREVIEW_BYTES % 3, 0, "pick a cap the cut can land inside of");
+        assert_ne!(
+            MAX_PREVIEW_BYTES % 3,
+            0,
+            "pick a cap the cut can land inside of"
+        );
         let text = "€".repeat(MAX_PREVIEW_BYTES);
         let body = preview_body(text.into_bytes());
         assert!(

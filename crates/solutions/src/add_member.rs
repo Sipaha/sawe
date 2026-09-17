@@ -310,10 +310,11 @@ impl SolutionStore {
                     // An unreachable remote still yields a member — see that
                     // function for why the fetch is allowed to fail.
                     let cache_tx = tx.clone();
-                    let cache_path = cache::ensure_fresh_cache(&cache_root, &remote_url, move |p| {
-                        let _ = cache_tx.try_send(p);
-                    })
-                    .await?;
+                    let cache_path =
+                        cache::ensure_fresh_cache(&cache_root, &remote_url, move |p| {
+                            let _ = cache_tx.try_send(p);
+                        })
+                        .await?;
                     if cancel_flag.load(Ordering::SeqCst) {
                         bail!("cancelled");
                     }

@@ -1117,7 +1117,12 @@ mod tests {
 
     /// Shapes `text` with one bundled face and returns `(glyph x positions,
     /// line width)`, dropping the byte index [`shape_glyphs`] carries.
-    fn shape_with(family: &str, face: &'static [u8], text: &str, font_size: f32) -> (Vec<f32>, f32) {
+    fn shape_with(
+        family: &str,
+        face: &'static [u8],
+        text: &str,
+        font_size: f32,
+    ) -> (Vec<f32>, f32) {
         let (glyphs, width) = shape_glyphs(family, face, text, font_size);
         (glyphs.into_iter().map(|(_, x)| x).collect(), width)
     }

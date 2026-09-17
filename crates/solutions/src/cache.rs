@@ -350,7 +350,10 @@ mod tests {
 
         let path = smol::block_on(ensure_fresh_cache(&cache_root, &url, |_| {})).expect("clones");
         assert_eq!(path, cache_path(&cache_root, &url));
-        assert!(is_usable_mirror(&path), "a fresh cache must be a bare mirror");
+        assert!(
+            is_usable_mirror(&path),
+            "a fresh cache must be a bare mirror"
+        );
 
         std::fs::remove_dir_all(&bare).expect("remove origin");
         let cache_root_2 = dir.path().join("cache2");

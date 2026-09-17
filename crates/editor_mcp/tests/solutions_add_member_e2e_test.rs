@@ -343,7 +343,11 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    assert_eq!(members.len(), 1, "expected the re-added member: {members:?}");
+    assert_eq!(
+        members.len(),
+        1,
+        "expected the re-added member: {members:?}"
+    );
     let refreshed_id = members[0].get("id").and_then(|v| v.as_i64()).expect("id");
     let refreshed_path = members[0]
         .get("local_path")

@@ -650,8 +650,13 @@ pub(crate) fn render_assistant_message(
             }
         }
         if !combined.is_empty() {
-            container =
-                container.child(render_span((entry_idx, 0), &combined, markdown_for, style, workspace));
+            container = container.child(render_span(
+                (entry_idx, 0),
+                &combined,
+                markdown_for,
+                style,
+                workspace,
+            ));
             container = container.child(render_floating_copy_button(
                 SharedString::from(format!("copy-assistant-{entry_idx}")),
                 combined,

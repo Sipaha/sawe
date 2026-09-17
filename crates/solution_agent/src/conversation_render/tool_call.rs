@@ -535,15 +535,26 @@ pub(crate) fn render_plan(
                         .size(IconSize::XSmall)
                         .color(Color::Muted),
                 )
-                .child(render_span((entry_idx, 0), "Plan", markdown_for, style, workspace)),
+                .child(render_span(
+                    (entry_idx, 0),
+                    "Plan",
+                    markdown_for,
+                    style,
+                    workspace,
+                )),
         );
     for (i, _item) in items.iter().enumerate() {
         let span_idx = 1 + i;
         // Bullet prefix is now part of the span text (see
         // entry_text_spans), so the rendered markdown already includes
         // it — list items render as a list line.
-        container =
-            container.child(render_span((entry_idx, span_idx), "", markdown_for, style, workspace));
+        container = container.child(render_span(
+            (entry_idx, span_idx),
+            "",
+            markdown_for,
+            style,
+            workspace,
+        ));
     }
     container.into_any_element()
 }
