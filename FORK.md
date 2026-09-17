@@ -4692,3 +4692,37 @@ into the comment next to the default, and change the seed template in the same
 commit, because a seeded value is an override and an override silently wins.
 After ADDING (not editing) anything under `assets/`, touch the `assets` crate and
 grep the built binary's manifest before handing the build over.
+
+### 185. Adding a project to a Solution fetches the base clone first
+
+`SolutionStore::add_member` cut every member checkout from the catalog cache
+with [`ensure_cache`], which answers "do I have this repository at all" from
+disk and never talks to the remote. So the second and every later add of the
+same project produced a checkout at whatever commit the mirror was last left
+at — the user's first act in a project they just asked for was a `git pull`.
+
+It now calls `cache::ensure_fresh_cache`: fetch the mirror, then
+`clone_local` from it. Same two-step pipeline, one step earlier.
+
+**A failed fetch does not fail the add.** The fetch is an improvement on top of
+a cache that already works, and propagating its error would mean a laptop with
+no network could no longer add a project whose objects are sitting right there —
+which has never been the case. The failure is logged and announced on the
+progress stream the UI paints during the add ("Could not reach the remote —
+using the cached copy"), and the existing mirror is used as it stands. A cache
+that is *missing or unusable* is a different case entirely: `ensure_cache` then
+clones it from the remote and that clone IS the fresh copy, so its failure is a
+real failure and propagates.
+
+Pinned by the e2e test, not by a test of the helper: `solutions_add_member_e2e_test`
+adds the project, pushes a new commit past the cache, adds it again, and asserts
+the new file is in the second checkout. Reverting the one call site back to
+`ensure_cache` fails exactly that assertion (executed, not reasoned) — a test of
+`ensure_fresh_cache` alone would have stayed green through the regression it
+exists to catch.
+
+How to apply: `ensure_cache` is the right call for anything that only needs the
+objects; anything that hands the user a working copy they are about to edit
+wants `ensure_fresh_cache`. When a step is allowed to fail softly, say so on the
+progress stream rather than only in the log — the log is not where the person
+waiting for the clone is looking.

@@ -72,6 +72,50 @@ pub async fn refresh_cache(
     Ok(path)
 }
 
+/// The cache a *new checkout* should be cut from: the mirror, fetched first.
+///
+/// [`ensure_cache`] is the "do I have this repository at all" question and
+/// answers it from disk, which is right for everything that only needs the
+/// objects. Adding a project to a Solution is a different question — the user
+/// asked for that project *now*, and a checkout cut from a mirror last fetched
+/// weeks ago lands them in a repository that is behind before they have opened
+/// a file, with no way to tell except by pulling. So this fetches first and
+/// clones from the result.
+///
+/// **A failed fetch does not fail the caller.** The fetch is an improvement on
+/// top of a cache that already works; propagating its error would mean a
+/// laptop with no network could no longer add a project it has the objects for,
+/// which has never been the case. The failure is logged and announced on the
+/// progress stream — that stream is what the UI paints during the add — and the
+/// existing mirror is used as it is. A cache that is missing or unusable is not
+/// this case at all: [`ensure_cache`] then clones it from the remote, and that
+/// clone IS the fresh copy, so its failure is a real failure.
+pub async fn ensure_fresh_cache(
+    cache_root: &Path,
+    remote_url: &str,
+    mut on_progress: impl FnMut(GitProgress),
+) -> Result<PathBuf> {
+    let path = cache_path(cache_root, remote_url);
+    if !path.exists() || !is_usable_mirror(&path) {
+        return ensure_cache(cache_root, remote_url, on_progress).await;
+    }
+    on_progress(GitProgress {
+        stage: "Updating cached copy".into(),
+        percent: None,
+    });
+    if let Err(err) = fetch_all(&path, &mut on_progress).await {
+        log::warn!(
+            "solutions cache: fetching {remote_url} failed, cloning from the cached copy as it \
+             stands: {err:#}"
+        );
+        on_progress(GitProgress {
+            stage: "Could not reach the remote — using the cached copy".into(),
+            percent: None,
+        });
+    }
+    Ok(path)
+}
+
 /// Test-only override for [`default_cache_root`]. `paths::temp_dir()` derives
 /// from `util::paths::home_dir()`, which a `test-support` build hard-codes to
 /// `/home/zed` (deterministic snapshots) — a directory that does not exist. Any
@@ -218,6 +262,102 @@ mod tests {
                 "member checkout is missing {branch}; got:\n{listing}"
             );
         }
+    }
+
+    /// The contract the user asked for in one line: a project added after the
+    /// cache was made must arrive at the commit the remote has NOW, without a
+    /// pull afterwards.
+    #[test]
+    fn a_checkout_cut_from_a_refreshed_cache_has_the_newest_commit() {
+        use crate::git::test_support::run;
+        let dir = tempdir().expect("tempdir");
+        let origin = dir.path().join("origin.git");
+        let origin_str = origin.to_str().expect("path str").to_string();
+        let work = dir.path().join("work");
+        let cache_root = dir.path().join("cache");
+
+        smol::block_on(async {
+            run(&["init", "--bare", "--quiet", &origin_str], None).await;
+            std::fs::create_dir(&work).expect("mkdir work");
+            crate::git::test_support::init_seed(&work).await;
+            run(&["remote", "add", "origin", &origin_str], Some(&work)).await;
+            run(&["push", "--quiet", "origin", "--all"], Some(&work)).await;
+        });
+
+        // First add: the cache is made here, at the seed commit.
+        smol::block_on(ensure_cache(&cache_root, &origin_str, |_| {})).expect("ensure_cache");
+
+        // Someone pushes while the cache sits there — the whole point.
+        smol::block_on(async {
+            std::fs::write(work.join("LATER"), "after the cache was made\n").expect("write LATER");
+            run(&["add", "LATER"], Some(&work)).await;
+            run(&["commit", "--quiet", "-m", "later"], Some(&work)).await;
+            run(&["push", "--quiet", "origin", "--all"], Some(&work)).await;
+        });
+
+        let cache =
+            smol::block_on(ensure_fresh_cache(&cache_root, &origin_str, |_| {})).expect("fresh");
+        let target = dir.path().join("member");
+        smol::block_on(crate::git::clone_local(&cache, &target, |_| {})).expect("clone_local");
+
+        assert!(
+            target.join("LATER").exists(),
+            "the member checkout is at the stale cached commit; `git pull` right \
+             after adding a project is exactly what this must remove"
+        );
+    }
+
+    /// The fetch is an improvement on a cache that already works, so losing the
+    /// remote must not lose the ability to add the project.
+    #[test]
+    fn ensure_fresh_cache_falls_back_to_the_cached_copy_when_the_remote_is_gone() {
+        let dir = tempdir().expect("tempdir");
+        let bare = smol::block_on(test_support::make_bare_with_one_commit(dir.path()));
+        let cache_root = dir.path().join("cache");
+        let url = bare.to_str().expect("path to str").to_string();
+
+        let cached = smol::block_on(ensure_cache(&cache_root, &url, |_| {})).expect("ensure_cache");
+        // The remote disappears: an unplugged laptop, a VPN that is down, a
+        // host that has been renamed.
+        std::fs::remove_dir_all(&bare).expect("remove origin");
+
+        let mut stages = Vec::new();
+        let path = smol::block_on(ensure_fresh_cache(&cache_root, &url, |p| {
+            stages.push(p.stage)
+        }))
+        .expect("an unreachable remote must not fail the add");
+        assert_eq!(path, cached);
+        assert!(
+            path.join("HEAD").is_file(),
+            "the cached mirror must be left intact, not wiped"
+        );
+        assert!(
+            stages.iter().any(|s| s.contains("Could not reach")),
+            "the fallback has to be announced on the progress stream the UI \
+             paints, or a silently stale checkout is exactly what the user gets \
+             back; stages were {stages:?}"
+        );
+    }
+
+    /// Nothing to refresh — the clone itself is the fresh copy, and its failure
+    /// is a real failure.
+    #[test]
+    fn ensure_fresh_cache_clones_when_the_cache_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let bare = smol::block_on(test_support::make_bare_with_one_commit(dir.path()));
+        let cache_root = dir.path().join("cache");
+        let url = bare.to_str().expect("path to str").to_string();
+
+        let path = smol::block_on(ensure_fresh_cache(&cache_root, &url, |_| {})).expect("clones");
+        assert_eq!(path, cache_path(&cache_root, &url));
+        assert!(is_usable_mirror(&path), "a fresh cache must be a bare mirror");
+
+        std::fs::remove_dir_all(&bare).expect("remove origin");
+        let cache_root_2 = dir.path().join("cache2");
+        assert!(
+            smol::block_on(ensure_fresh_cache(&cache_root_2, &url, |_| {})).is_err(),
+            "with no cache to fall back on, an unreachable remote IS the failure"
+        );
     }
 
     #[test]

@@ -265,6 +265,108 @@ async fn add_member_clones_from_local_bare_repo(cx: &mut TestAppContext) {
         .unwrap_or_default();
     assert!(members.is_empty(), "members should be empty: {members:?}");
 
+    // --- 5b. A project added later arrives at the remote's CURRENT commit ---
+    //
+    // The cache was populated by the add above. Push past it, add the same
+    // catalog entry again, and the new member must contain the new file
+    // without anyone pulling. This asserts the add pipeline, not
+    // `ensure_fresh_cache` itself: `add_member` choosing `ensure_cache` again
+    // is exactly the regression, and it is invisible to a test of the helper.
+    {
+        let seed_work = work_dir.path().join("seed-work");
+        std::fs::write(seed_work.join("PUSHED_AFTER_CACHE"), "newer\n").expect("write newer file");
+        solutions::git::test_support::run(&["add", "PUSHED_AFTER_CACHE"], Some(&seed_work)).await;
+        solutions::git::test_support::run(
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "after the cache was made",
+            ],
+            Some(&seed_work),
+        )
+        .await;
+        solutions::git::test_support::run(&["push", "origin", "HEAD:master"], Some(&seed_work))
+            .await;
+    }
+
+    let resp = call_tool(
+        &mut stream,
+        50,
+        "solutions.add_member",
+        json!({"solution_id": solution_id, "catalog_id": catalog_id}),
+    )
+    .await;
+    let op_id = resp
+        .pointer("/result/structuredContent/operation_id")
+        .and_then(|v| v.as_str())
+        .expect("operation_id")
+        .to_string();
+    let mut elapsed = Duration::ZERO;
+    loop {
+        cx.executor().timer(Duration::from_millis(200)).await;
+        elapsed += Duration::from_millis(200);
+        let resp = call_tool(
+            &mut stream,
+            101,
+            "editor.get_operation",
+            json!({"operation_id": op_id}),
+        )
+        .await;
+        let status = resp
+            .pointer("/result/structuredContent/status")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_default();
+        if status == "completed" {
+            break;
+        }
+        assert_ne!(status, "failed", "second add_member failed: {resp}");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "second add_member did not finish in 30s; last status: {status}"
+        );
+    }
+
+    let resp = call_tool(
+        &mut stream,
+        51,
+        "solutions.get",
+        json!({"solution_id": solution_id}),
+    )
+    .await;
+    let members = resp
+        .pointer("/result/structuredContent/solution/members")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(members.len(), 1, "expected the re-added member: {members:?}");
+    let refreshed_id = members[0].get("id").and_then(|v| v.as_i64()).expect("id");
+    let refreshed_path = members[0]
+        .get("local_path")
+        .and_then(|v| v.as_str())
+        .expect("local_path");
+    assert!(
+        std::path::Path::new(refreshed_path)
+            .join("PUSHED_AFTER_CACHE")
+            .exists(),
+        "the member was cut from the stale cache: adding a project has to fetch \
+         the base clone first, or the user lands in a repository that is behind \
+         before they have opened a file. Checkout at {refreshed_path}",
+    );
+
+    let resp = call_tool(
+        &mut stream,
+        52,
+        "solutions.remove_member",
+        json!({"member_id": refreshed_id}),
+    )
+    .await;
+    assert!(resp.pointer("/result/structuredContent").is_some());
+
     // --- 6. catalog.clear_cache removes the on-disk cache directory ---
     // The earlier add_member populated the warm clone at
     // <cache_root>/<repo_key>/. clear_cache should report exactly that path.

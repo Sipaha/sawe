@@ -304,8 +304,13 @@ impl SolutionStore {
                     // Forward the same `tx` into both git steps so progress lines
                     // from `git clone` (which is by far the longest step) reach
                     // the pump as they're produced.
+                    // `ensure_fresh_cache`, not `ensure_cache`: the user asked
+                    // for this project now, and a checkout cut from a mirror
+                    // last fetched weeks ago is behind before they open a file.
+                    // An unreachable remote still yields a member — see that
+                    // function for why the fetch is allowed to fail.
                     let cache_tx = tx.clone();
-                    let cache_path = cache::ensure_cache(&cache_root, &remote_url, move |p| {
+                    let cache_path = cache::ensure_fresh_cache(&cache_root, &remote_url, move |p| {
                         let _ = cache_tx.try_send(p);
                     })
                     .await?;
