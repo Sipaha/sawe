@@ -830,6 +830,18 @@ pub trait PlatformTextSystem: Send + Sync {
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
     /// Get the advance width for a glyph.
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;
+    /// Whether this platform's [`Self::layout_line`] snaps each glyph's advance
+    /// to a whole pixel.
+    ///
+    /// It is not a rendering detail: consumers that build a column grid out of
+    /// [`crate::TextSystem::advance`] rather than out of a shaped line — the
+    /// editor's `em_advance`, the line wrapper, the terminal's cell width — MUST
+    /// get the same number the painter will step by, or the caret drifts away
+    /// from the glyphs it is supposed to sit between. Default `false`, which is
+    /// the unrounded behaviour every platform had before.
+    fn layout_rounds_advances(&self) -> bool {
+        false
+    }
     /// Get the glyph ID for a character.
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId>;
     /// Get raster bounds for a glyph.

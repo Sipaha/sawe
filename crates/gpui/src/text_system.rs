@@ -200,7 +200,16 @@ impl TextSystem {
         let result = self.platform_text_system.advance(font_id, glyph_id)?
             / self.units_per_em(font_id) as f32;
 
-        Ok(result * font_size)
+        let mut advance = result * font_size;
+        // Match what `layout_line` will actually paint. A platform that hints
+        // its layout rounds every glyph advance to a whole pixel, and a caller
+        // that lays a grid out of this number (the editor's column width, the
+        // line wrapper, the terminal cell) would otherwise step by the
+        // unrounded one and walk away from the text.
+        if self.platform_text_system.layout_rounds_advances() {
+            advance.width = advance.width.round();
+        }
+        Ok(advance)
     }
 
     // Consider removing this?
@@ -1202,5 +1211,107 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod advance_rounding_tests {
+    use super::*;
+    use crate::{point, size};
+    use std::borrow::Cow;
+
+    /// A platform whose `layout_line` rounds advances, with one glyph whose
+    /// advance is deliberately not a whole number of pixels at the size asked
+    /// for: 600/1000 em at 16px is 9.6.
+    struct RoundingPlatform {
+        rounds: bool,
+    }
+
+    impl PlatformTextSystem for RoundingPlatform {
+        fn add_fonts(&self, _: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            Ok(())
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn font_id(&self, _: &Font) -> Result<FontId> {
+            Ok(FontId(0))
+        }
+        fn font_metrics(&self, _: FontId) -> FontMetrics {
+            FontMetrics {
+                units_per_em: 1000,
+                ascent: 1000.,
+                descent: -200.,
+                line_gap: 0.,
+                underline_position: 0.,
+                underline_thickness: 0.,
+                cap_height: 700.,
+                x_height: 550.,
+                bounding_box: Bounds {
+                    origin: point(0., 0.),
+                    size: size(1000., 1000.),
+                },
+            }
+        }
+        fn typographic_bounds(&self, _: FontId, _: GlyphId) -> Result<Bounds<f32>> {
+            Ok(Bounds {
+                origin: point(0., 0.),
+                size: size(600., 700.),
+            })
+        }
+        fn advance(&self, _: FontId, _: GlyphId) -> Result<Size<f32>> {
+            Ok(size(600., 0.))
+        }
+        fn layout_rounds_advances(&self) -> bool {
+            self.rounds
+        }
+        fn glyph_for_char(&self, _: FontId, _: char) -> Option<GlyphId> {
+            Some(GlyphId(1))
+        }
+        fn glyph_raster_bounds(&self, _: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            unimplemented!("not reached by these tests")
+        }
+        fn rasterize_glyph(
+            &self,
+            _: &RenderGlyphParams,
+            _: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            unimplemented!("not reached by these tests")
+        }
+        fn layout_line(&self, _: &str, _: Pixels, _: &[FontRun]) -> LineLayout {
+            unimplemented!("not reached by these tests")
+        }
+        fn recommended_rendering_mode(&self, _: FontId, _: Pixels) -> TextRenderingMode {
+            TextRenderingMode::Grayscale
+        }
+    }
+
+    /// The bug this rule exists to prevent: with layout hinting on, the painter
+    /// steps by a whole pixel per glyph while every consumer that builds a
+    /// column grid out of `advance` — the editor's `em_advance`, the line
+    /// wrapper, the terminal cell — stepped by the unrounded 9.6, so the caret
+    /// walked away from the text it was supposed to sit in.
+    #[test]
+    fn advance_matches_what_a_hinting_layout_will_paint() {
+        let hinting = TextSystem::new(Arc::new(RoundingPlatform { rounds: true }));
+        let font_id = hinting.font_id(&font("test")).expect("font id");
+        assert_eq!(
+            hinting
+                .advance(font_id, px(16.), 'm')
+                .expect("advance")
+                .width,
+            px(10.),
+            "a hinting platform rounds every glyph advance, so the grid this \
+             feeds has to be the rounded one"
+        );
+
+        let plain = TextSystem::new(Arc::new(RoundingPlatform { rounds: false }));
+        let font_id = plain.font_id(&font("test")).expect("font id");
+        assert_eq!(
+            plain.advance(font_id, px(16.), 'm').expect("advance").width,
+            px(9.6),
+            "and a platform that does not round must not be rounded FOR it — \
+             that would be a second, invented grid"
+        );
     }
 }

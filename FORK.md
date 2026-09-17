@@ -4618,16 +4618,31 @@ The three numbers that follow from it:
   scheme in use sets no `LINE_SPACING`) = `ceil(18 * 1.2)` = 22px, confirmed
   against a live window. GPUI paints `round(font_size * multiplier)`, so the
   multiplier is `(18 / 13) * 1.2` = 1.662 and the painted pitch is the same 22.
-- **`cosmic_text::Hinting::Enabled`** in `gpui_wgpu/src/cosmic_text_system.rs` —
-  the fix that made the family match rather than merely share a name. Same font
+- **`cosmic_text::Hinting::Enabled`** in `gpui_wgpu/src/cosmic_text_system.rs`,
+  **paired with `PlatformTextSystem::layout_rounds_advances`** — the fix that
+  made the family match rather than merely share a name. Same font
   at the same size still did not lay out the same: cosmic-text placed every
   glyph at its exact fractional advance (7.8px for JetBrains Mono at 13) while
   IDEA snaps each to a whole 8 (`FontLayoutService.charWidth` returns an `int`).
   Measured on the two live windows: ours 7.78px per character against 8.000px,
   so by column 60 the same text was 13px adrift — a monospace grid that never
-  lined up. With hinting on both measure **8.000px**. Nothing in the suite
-  regressed (editor 822, gpui 175, ui 259, workspace 62, terminal_view 50 green),
-  which is the only reason a global layout switch was acceptable.
+  lined up. With hinting on both measure **8.000px**.
+
+  **Hinting alone is a correctness regression**, and this shipped for one build
+  before the maintainer caught it. cosmic-text rounds every glyph advance
+  (`x_advance.round()`, `shape.rs`), so the painter steps by 10px at font-size
+  16 — but the editor does not read positions out of the shaped line for its
+  column grid. It derives that from `TextSystem::advance`, the FONT's advance
+  (`0.6 * 16` = 9.6), which knows nothing about layout hinting. Caret,
+  selections, soft wrap and scrolling all kept stepping by 9.6 while the glyphs
+  stepped by 10, and the caret visibly detached from the text mid-word. The fix
+  is one rule in one place: `TextSystem::advance` rounds when the platform says
+  its layout does (`layout_rounds_advances`, default `false`, `true` only for
+  the cosmic-text system), so the grid and the painter are the same number by
+  construction rather than by coincidence. Pinned by an executed mutation.
+  Nothing else in the suite regressed (editor 822, gpui 176, ui 259, workspace
+  62, terminal_view 50, markdown 94, git_ui 434, solution_agent 921), which is
+  the only reason a global layout switch was acceptable.
 
   The maintainer's question — "how can the same font render differently, is it a
   renderer bug?" — has this as its answer: not a bug, a deliberate default that
