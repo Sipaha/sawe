@@ -89,17 +89,21 @@
   "ui_font_weight": 400,
   // The default font size for text in the UI.
   //
-  // Measured against IDEA the same way the buffer font was: IDEA's UI font is
-  // Inter at 13 (`NotRoamableUiSettings.fontSize`), and per 1000 em Inter has a
-  // cap height of 727 and an x-height of 545 against IBM Plex Sans' 698 and
-  // 516 — so matching cap height asks for 13.54 and matching x-height asks for
-  // 13.73. 13.75 covers both (cap +1.6 %, x-height +0.1 %). At the old 16 the
-  // UI text was 18 % taller than IDEA's.
-  //
   // This is also the window's rem size (`ThemeSettings::setup_ui`), so it
-  // scales row heights, icon sizes and padding with it — which is the point:
-  // matching IDEA means matching its density, not only its glyphs.
-  "ui_font_size": 13.75,
+  // scales row heights, icon sizes and padding with it — the UI's whole scale
+  // lives on this one number.
+  //
+  // It was briefly 13.75, the size at which IBM Plex Sans renders the same
+  // width as IDEA's Inter 13 (measured: "Pavel Simonov" 88.8px against a live
+  // IDEA window's 88px). That matched IDEA pixel for pixel and was still
+  // wrong, because **pixel parity is not apparent parity across monitors**:
+  // this machine runs the editor on a 1920x1080 / 598mm panel (81.5 DPI) and
+  // IDEA on a 1920x1200 / 387mm one (126 DPI), so the same pixel count is
+  // physically 1.55x smaller in IDEA. Matched in pixels, the UI read as
+  // microscopic. Unlike the buffer font, which is matched to a font the user
+  // reads inside our own window, the UI scale has no external target worth
+  // matching — it is a comfort setting on whatever display the editor is on.
+  "ui_font_size": 16,
   // The default font size for agent responses in the agent panel. Falls back to the UI font size if unset.
   "agent_ui_font_size": null,
   // The default font size for user messages in the agent panel.

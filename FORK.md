@@ -4617,19 +4617,38 @@ The three numbers that follow from it:
   `ceil(18 * 1.2)` = 22px. 1.662 is `(18 / 13) * 1.2`, IDEA's rule re-expressed
   against the em, and `round(13 * 1.662)` is the same 22. "comfortable" paints
   21 — a pixel tighter per line than the editor this is matched to.
-- `ui_font_size: 13.75`. IDEA's UI is Inter 13; per 1000 em Inter is cap 727 /
-  x-height 545 against IBM Plex Sans' 698 / 516, so cap asks 13.54 and x-height
-  asks 13.73 and 13.75 covers both (cap +1.6 %, x-height +0.1 %). At the old 16
-  the UI text was 18 % taller than IDEA's. This one is also the window's rem size
-  (`ThemeSettings::setup_ui`), so row heights, icon sizes and padding scale with
-  it — deliberately: matching IDEA means matching its density, not only its
-  glyphs. Inter itself is NOT bundled; only the size was matched.
+- `ui_font_size` stays **16**. It was briefly 13.75 — the size at which IBM Plex
+  Sans renders the same width as IDEA's Inter 13, verified against a live IDEA
+  window ("Pavel Simonov" 88.8 px predicted, 88 px measured), with UI row pitch
+  landing on 23/26 px against IDEA's 24/26. It matched pixel for pixel and was
+  still wrong, and the reason is the one measurement nobody had taken: **the two
+  windows are on different monitors.** `xrandr` — HDMI-1-0 1920x1080 over 598 mm
+  is 81.5 DPI and carries the editor; eDP-1 1920x1200 over 387 mm is 126 DPI and
+  carries IDEA. X11 renders both at scale 1, so identical pixels are physically
+  **1.55x smaller** in IDEA. Matched in pixels, the UI read as microscopic on the
+  screen it is actually looked at.
+
+  This is what separates the two settings. The buffer font is matched to a font
+  the user reads *inside our own window*, where a pixel is a pixel. The UI scale
+  has no external target worth matching — it is a comfort setting on whatever
+  display the editor happens to be on, and it also carries the window's rem size
+  (`ThemeSettings::setup_ui`), so lowering it shrinks every row, icon and padding
+  with it. Inter is not bundled; nothing about the UI is matched to IDEA now.
 
 Measured in a running editor, not on paper: painted line pitch 24 px → 22 px
 (pixel distance between ink rows in a headless screenshot), character advance
 7.78 px against IDEA's 7.80. That the family actually resolved was proved by
 difference, not by reading the setting back — forcing `buffer_font_family:
 "Lilex"` in the same probe changed 15.9 % of the text area's pixels.
+
+Then confirmed against the real thing, both windows captured on the same X
+display (`import -window <id>` reaches an obscured window under a compositor, so
+IDEA did not have to be raised): line pitch **22 px in both**, character advance
+mode **8 px in both**. The `ceil(FontMetrics.getHeight() * lineSpacing)` branch
+is the live one — `editor.text.vertical.spacing.correct.rounding` defaults to
+`false` in `util-8.jar!misc/registry.properties`, and the scheme in use (Islands
+Dark) sets no `LINE_SPACING` of its own — so 22, not the 21 the other branch
+would give.
 
 **`assets/settings/initial_user_settings.json` is part of this.** It is the
 template copied into a new profile's `settings.json` and it pinned the same
