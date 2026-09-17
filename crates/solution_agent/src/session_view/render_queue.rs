@@ -99,15 +99,30 @@ impl SolutionSessionView {
                 )
             } else {
                 MarkdownElement::new(entity, style)
-                    .on_url_click(move |url, window, cx| {
-                        if let Some(idx_str) = url.strip_prefix("spk-image://")
-                            && let Ok(idx) = idx_str.parse::<usize>()
-                            && let Some(image) = images_for_handler.get(idx).cloned()
-                        {
-                            open_image_preview(image, window, cx);
-                            return;
+                    .on_url_click({
+                        let workspace_for_handler = self.workspace.clone();
+                        move |url, window, cx| {
+                            if let Some(idx_str) = url.strip_prefix("spk-image://")
+                                && let Ok(idx) = idx_str.parse::<usize>()
+                                && let Some(image) = images_for_handler.get(idx).cloned()
+                            {
+                                open_image_preview(image, window, cx);
+                                return;
+                            }
+                            // Same route as a link anywhere else in the
+                            // conversation: a path opens in the preview window,
+                            // only a real URL reaches the browser.
+                            let roots = crate::conversation_render::link::project_roots(
+                                &workspace_for_handler,
+                                cx,
+                            );
+                            crate::conversation_render::link::open_link(
+                                url.as_ref(),
+                                &roots,
+                                window,
+                                cx,
+                            );
                         }
-                        cx.open_url(url.as_ref());
                     })
                     .into_any_element()
             };
@@ -249,15 +264,30 @@ impl SolutionSessionView {
             (Some(entity), Some(style)) => {
                 let images_for_handler = images;
                 MarkdownElement::new(entity, style)
-                    .on_url_click(move |url, window, cx| {
-                        if let Some(idx_str) = url.strip_prefix("spk-image://")
-                            && let Ok(idx) = idx_str.parse::<usize>()
-                            && let Some(image) = images_for_handler.get(idx).cloned()
-                        {
-                            open_image_preview(image, window, cx);
-                            return;
+                    .on_url_click({
+                        let workspace_for_handler = self.workspace.clone();
+                        move |url, window, cx| {
+                            if let Some(idx_str) = url.strip_prefix("spk-image://")
+                                && let Ok(idx) = idx_str.parse::<usize>()
+                                && let Some(image) = images_for_handler.get(idx).cloned()
+                            {
+                                open_image_preview(image, window, cx);
+                                return;
+                            }
+                            // Same route as a link anywhere else in the
+                            // conversation: a path opens in the preview window,
+                            // only a real URL reaches the browser.
+                            let roots = crate::conversation_render::link::project_roots(
+                                &workspace_for_handler,
+                                cx,
+                            );
+                            crate::conversation_render::link::open_link(
+                                url.as_ref(),
+                                &roots,
+                                window,
+                                cx,
+                            );
                         }
-                        cx.open_url(url.as_ref());
                     })
                     .into_any_element()
             }
