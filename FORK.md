@@ -4609,29 +4609,36 @@ still bundled.
 
 The three numbers that follow from it:
 
-- `buffer_font_size: 12.25`, **not** IDEA's own 13 — the one number here that is
-  not the obvious one. Same family at the same nominal size still did not look
-  the same, and the reason is that the two rasterizers disagree about where the
-  x-height lands. JetBrains Mono at 13 has an x-height of `0.550 x 13` = 7.15px;
-  Java2D snaps it DOWN to 7 painted rows, GPUI's swash paints it antialiased
-  across 8. Measured on the two live windows, same screen, same word
-  (`package`): **IDEA 7px of ink per x-height glyph, Sawe 8px** — 14% taller at
-  an identical setting. 12.25 is the largest size whose x-height still lands on
-  7 rows (swept 13 / 12.75 / 12.5 / 12.25 / 12 in a running editor).
-- `buffer_line_height: {custom: 1.796}`. IDEA paints
+- `buffer_font_size: 13` — IDEA's own default for the same family.
+- `buffer_line_height: {custom: 1.662}`. IDEA paints
   `ceil(FontMetrics.getHeight() * lineSpacing)`
   (`EditorView.initMetricsIfNeeded`, decompiled; the
   `editor.text.vertical.spacing.correct.rounding` key that takes the other
-  branch defaults to `false` in `util-8.jar!misc/registry.properties`) =
-  `ceil(18 * 1.2)` = 22px, confirmed against a live window. GPUI paints
-  `round(font_size * multiplier)`, so the multiplier is `22 / 12.25` = 1.796,
-  and the painted pitch is 22 — measured, not derived.
-- **What no size fixes:** the character advance. IDEA rounds each one UP from
-  7.8px to a whole 8 (`FontLayoutService.charWidth` returns an `int`); GPUI
-  keeps it fractional (`cosmic_text::Hinting::Disabled` in
-  `gpui_wgpu/src/cosmic_text_system.rs`), so ours is 7.5px at 12.25 — 6%
-  narrower. Matching the advance and matching the x-height pull in opposite
-  directions; x-height wins because that is what the eye reads as "font size".
+  branch defaults to `false` in `util-8.jar!misc/registry.properties`, and the
+  scheme in use sets no `LINE_SPACING`) = `ceil(18 * 1.2)` = 22px, confirmed
+  against a live window. GPUI paints `round(font_size * multiplier)`, so the
+  multiplier is `(18 / 13) * 1.2` = 1.662 and the painted pitch is the same 22.
+- **`cosmic_text::Hinting::Enabled`** in `gpui_wgpu/src/cosmic_text_system.rs` —
+  the fix that made the family match rather than merely share a name. Same font
+  at the same size still did not lay out the same: cosmic-text placed every
+  glyph at its exact fractional advance (7.8px for JetBrains Mono at 13) while
+  IDEA snaps each to a whole 8 (`FontLayoutService.charWidth` returns an `int`).
+  Measured on the two live windows: ours 7.78px per character against 8.000px,
+  so by column 60 the same text was 13px adrift — a monospace grid that never
+  lined up. With hinting on both measure **8.000px**. Nothing in the suite
+  regressed (editor 822, gpui 175, ui 259, workspace 62, terminal_view 50 green),
+  which is the only reason a global layout switch was acceptable.
+
+  The maintainer's question — "how can the same font render differently, is it a
+  renderer bug?" — has this as its answer: not a bug, a deliberate default that
+  suits prose and not a code grid.
+- **What still differs, and cannot be tuned away:** one pixel of ink height.
+  JetBrains Mono's x-height at 13 is `0.550 x 13` = 7.15px; Java2D's hinting
+  snaps it DOWN to 7 painted rows, swash's spreads it over 8. Hinting quantises
+  the advance too, so there is no size that closes both — 12.25 lands the
+  x-height on 7 and takes the advance to a whole 7px, a full pixel (12.5%)
+  narrower than IDEA. The advance error compounds along a line and the
+  ink-height error does not, so the grid wins.
 - `ui_font_size` stays **16**. It was briefly 13.75 — the size at which IBM Plex
   Sans renders the same width as IDEA's Inter 13, verified against a live IDEA
   window ("Pavel Simonov" 88.8 px predicted, 88 px measured), with UI row pitch
@@ -4776,8 +4783,44 @@ read-only editor, `Editor` is the deeper context, and without it Escape would hi
 open. Verified by booting the editor and checking the log carries no keymap parse
 error, since nothing in the test suite loads the shipped keymaps.
 
+**The header opens it, not the preview row.** The row under the header carries
+the command itself, which is the thing people reach for with the mouse to read
+or select — making it a button meant every stray click popped a window open
+("случайно часто стал попадать туда"). The affordance moved up to the
+`Tool: Bash` header row, which is a label nobody drags across. `MarkdownElement`
+does not stop mouse propagation, so a click on the rendered label still reaches
+the row's handler.
+
 How to apply: a surface whose whole purpose is "this does not fit here" wants a
 window, not a modal. When one is reused, the handle is the state — keep it in a
 global keyed by nothing else, and treat a failed update as "gone", never as an
 error to report. And when a view goes, grep the keymaps for its `key_context`:
-nothing else will tell you.
+nothing else will tell you. Put a click target on the row's LABEL, never on the
+row that holds the content itself.
+
+### 187. The agent composer is sized by the panel, not by the code font
+
+The compose box is an `editor::Editor`, and an `Editor` takes its size from
+`buffer_font_size`. That setting is this fork's *code* size, matched to IDEA's
+editor and retuned whenever that comparison moves (decision #184) — so every
+time the code font changed, the chat draft changed with it, and at 12.25 it was
+too small to read comfortably.
+
+It now carries a `TextStyleRefinement` pinned to `agent_ui_font_size`, which is
+exactly what `MarkdownFont::Agent` renders a *sent* user message at
+(`markdown::MarkdownStyle`). The draft and the message it becomes are the same
+size, and the composer no longer moves when the editor font is retuned.
+
+A refinement is a stored absolute value, not a live binding, so a
+`cx.observe_global::<SettingsStore>` re-applies it — without that the box keeps
+painting at whatever size it was born with for the rest of the session.
+
+`Editor::text_style_refinement()` was added (read-only) for the assertion: a host
+that overrides the size otherwise has no way to prove in a test that its override
+is the one in effect. Both halves are pinned by executed mutations — dropping the
+initial `set_text_style_refinement` and emptying the observer each fail the test
+on their own.
+
+How to apply: `buffer_font_size` means "code". Any editor that is not showing
+code — a chat draft, a commit message, a search field — needs its own size, and
+needs it re-applied on settings change.

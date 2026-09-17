@@ -130,7 +130,24 @@ impl SolutionSessionView {
             e.set_completion_provider(Some(Rc::new(SlashCommandsProvider {
                 session: session.downgrade(),
             })));
+            e.set_text_style_refinement(compose_text_style(cx));
             e
+        });
+        // The composer is an `Editor`, so without this it takes
+        // `buffer_font_size` — the CODE size, which is matched to IDEA's
+        // editor and has no business setting the size of a chat draft. What
+        // the user types here is the prose that gets sent, so it is sized like
+        // the prose it becomes. Re-applied on every settings change because a
+        // refinement is a stored absolute value, not a live binding.
+        let compose_font_subscription = cx.observe_global::<settings::SettingsStore>({
+            let compose_editor = compose_editor.clone();
+            move |_this, cx| {
+                let style = compose_text_style(cx);
+                compose_editor.update(cx, |editor, cx| {
+                    editor.set_text_style_refinement(style);
+                    cx.notify();
+                });
+            }
         });
         // Push-channel from `SolutionSession::set_acp_thread` straight
         // into `sync_thread_subscription`. Set up before moving `session`
@@ -273,6 +290,7 @@ impl SolutionSessionView {
             last_thread_entity_id: None,
             _session_event_subscription: Some(session_event_subscription),
             _store_subscription: store_subscription,
+            _compose_font_subscription: compose_font_subscription,
             image_count_so_far: 0,
             pending_send: None,
             resuming: false,
@@ -406,5 +424,24 @@ impl SolutionSessionView {
         }
         self.last_thread_entity_id = new_id;
         self.recompute_rewind_table(cx);
+    }
+}
+
+/// The compose editor's text size: the agent panel's own prose size, NOT the
+/// code buffer's.
+///
+/// `agent_ui_font_size` is what `MarkdownFont::Agent` renders a sent user
+/// message at (`markdown::MarkdownStyle`), so the draft and the message it
+/// becomes are the same size — and the composer stops moving whenever the
+/// editor font is retuned for code.
+fn compose_text_style(cx: &gpui::App) -> gpui::TextStyleRefinement {
+    gpui::TextStyleRefinement {
+        font_size: Some({
+            use settings::Settings as _;
+            theme_settings::ThemeSettings::get_global(cx)
+                .agent_ui_font_size(cx)
+                .into()
+        }),
+        ..Default::default()
     }
 }

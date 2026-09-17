@@ -29,6 +29,15 @@ impl Editor {
         self.text_style_refinement = Some(style);
     }
 
+    /// The refinement applied on top of the settings-derived text style, if the
+    /// host set one. Read-only, and it exists for assertions: a host that
+    /// overrides the size — the agent composer sizes itself off the panel
+    /// rather than off `buffer_font_size` — otherwise has no way to prove in a
+    /// test that its override is the one in effect.
+    pub fn text_style_refinement(&self) -> Option<&TextStyleRefinement> {
+        self.text_style_refinement.as_ref()
+    }
+
     /// called by the Element so we know what style we were most recently rendered with.
     pub fn set_style(&mut self, style: EditorStyle, window: &mut Window, cx: &mut Context<Self>) {
         // We intentionally do not inform the display map about the minimap style

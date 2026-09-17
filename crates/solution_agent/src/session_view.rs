@@ -418,6 +418,9 @@ pub struct SolutionSessionView {
     /// `sessions_for(&solution_id)` pass) and a false-positive notify
     /// just paints the same frame again.
     _store_subscription: Option<Subscription>,
+    /// Keeps the compose editor's text size on the agent panel's prose size
+    /// across settings changes — see `lifecycle::compose_text_style`.
+    _compose_font_subscription: Subscription,
     /// Subscription to the compose editor's `BufferEdited` events: each
     /// keystroke bumps the supervisor's idle clock (`note_user_input`) so the
     /// observer never fires a nudge while the user is mid-message.

@@ -1434,3 +1434,93 @@ async fn a_queued_compaction_prompt_paints_the_folded_chip(cx: &mut gpui::TestAp
         "…and must not be mistaken for the compaction prompt"
     );
 }
+
+/// The composer is an `Editor`, and an `Editor` takes `buffer_font_size` — the
+/// CODE size, which this fork matches to IntelliJ IDEA's editor and retunes
+/// whenever that comparison moves. A chat draft has no business following it:
+/// what the user types here is prose, it is rendered at
+/// `agent_ui_font_size` the moment it is sent, and it used to shrink every time
+/// the code font did.
+#[gpui::test]
+async fn the_compose_box_is_sized_by_the_panel_not_by_the_code_font(cx: &mut gpui::TestAppContext) {
+    use crate::store::SolutionAgentStore;
+    use gpui::UpdateGlobal as _;
+    use gpui::VisualTestContext;
+    use settings::{Settings as _, SettingsStore};
+
+    let (session_id, _thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+    let session = cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        SolutionAgentStore::global(cx)
+            .read(cx)
+            .session(session_id)
+            .unwrap()
+    });
+
+    // Deliberately far apart, and the buffer deliberately the smaller of the
+    // two: an assertion that only checked "not the default" would pass while
+    // the composer silently followed the code font.
+    let set_sizes = |ui: f32, buffer: f32, cx: &mut gpui::App| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    &format!(r#"{{ "ui_font_size": {ui}, "buffer_font_size": {buffer} }}"#),
+                    cx,
+                )
+                .expect("set_user_settings");
+        });
+    };
+    cx.update(|cx| set_sizes(20.0, 9.0, cx));
+
+    let project = cx.update(|cx| session.read(cx).project.clone().unwrap());
+    let workspace =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| workspace.root(cx).unwrap().downgrade());
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(session_id, session.clone(), workspace_weak, window, cx)
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.run_until_parked();
+
+    let composer_size = |vcx: &mut VisualTestContext| -> gpui::Pixels {
+        view_window
+            .update(vcx, |view, _window, cx| {
+                let refinement = view
+                    .compose_editor
+                    .read(cx)
+                    .text_style_refinement()
+                    .cloned()
+                    .expect("the composer overrides its text style");
+                match refinement.font_size.expect("the override carries a size") {
+                    gpui::AbsoluteLength::Pixels(px) => px,
+                    other => panic!("expected an absolute pixel size, got {other:?}"),
+                }
+            })
+            .unwrap()
+    };
+
+    let expected =
+        cx.update(|cx| theme_settings::ThemeSettings::get_global(cx).agent_ui_font_size(cx));
+    assert_eq!(
+        expected,
+        gpui::px(20.0),
+        "precondition: `agent_ui_font_size` falls back to the UI font size"
+    );
+    assert_eq!(
+        composer_size(vcx),
+        gpui::px(20.0),
+        "the composer is sized like the prose it becomes, not like the 9px code \
+         font sitting right next to it"
+    );
+
+    // A refinement is a stored absolute value, not a live binding — without the
+    // settings observer the composer would keep painting at the size it was
+    // born with.
+    cx.update(|cx| set_sizes(24.0, 9.0, cx));
+    vcx.run_until_parked();
+    assert_eq!(
+        composer_size(vcx),
+        gpui::px(24.0),
+        "and it follows the panel when the user changes the UI font size"
+    );
+}

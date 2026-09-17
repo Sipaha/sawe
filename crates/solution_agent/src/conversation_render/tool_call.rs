@@ -138,8 +138,34 @@ pub(crate) fn render_tool_call(
         .border_color(cx.theme().colors().border_variant)
         .child(
             h_flex()
+                // The header is the affordance, not the preview row below it.
+                // The row carries the command itself, which is the thing people
+                // reach for with the mouse to read or select — turning it into
+                // a button meant every stray click popped the window open.
+                // `MarkdownElement` does not stop mouse propagation, so a click
+                // on the rendered `Tool: Bash` label reaches this row too.
+                .id(("tool-header", entry_idx))
                 .gap_1p5()
                 .items_center()
+                .when_some(arg_full, |this, full| {
+                    this.cursor_pointer()
+                        .tooltip(ui::Tooltip::text("Show the full argument"))
+                        .on_click(move |_, window, cx| {
+                            // The shared preview window, not a workspace modal:
+                            // the one argument worth opening is the one too big
+                            // for the row, and a modal cannot be moved, cannot
+                            // be resized, and hides the conversation the
+                            // command belongs to.
+                            crate::preview_window::open_preview(
+                                crate::preview_window::PreviewContent::Text {
+                                    title: arg_modal_title.clone(),
+                                    body: full.clone(),
+                                },
+                                window,
+                                cx,
+                            );
+                        })
+                })
                 .child(
                     Icon::new(IconName::ToolHammer)
                         .size(IconSize::XSmall)
@@ -159,46 +185,16 @@ pub(crate) fn render_tool_call(
                     )
                 }),
         )
-        // Preview lives on its own row under the header. Saves the
-        // crammed-into-the-title-line layout where a long shell
-        // pipeline truncated mid-word and pushed the status badge off
-        // to the right; the preview now wraps naturally and the
-        // status stays glanceable.
+        // Preview lives on its own row under the header, and is deliberately
+        // NOT clickable — see the header above.
         .when_some(arg_preview, |this, preview| {
             this.child(
-                div()
-                    .id(("tool-arg-preview", entry_idx))
-                    .pl_4()
-                    .when_some(arg_full, |this, full| {
-                        // Click anywhere on the row to read the whole thing.
-                        // `Label::truncate` clips to the container width, so
-                        // even a preview that fits the 240-char cap is usually
-                        // cut on screen — the affordance has to exist for every
-                        // preview, not only the ellipsised ones.
-                        this.cursor_pointer()
-                            .tooltip(ui::Tooltip::text("Show the full argument"))
-                            .on_click(move |_, window, cx| {
-                                // The shared preview window, not a workspace
-                                // modal: the one argument worth opening is the
-                                // one too big for the row, and a modal cannot
-                                // be moved, cannot be resized, and hides the
-                                // conversation the command belongs to.
-                                crate::preview_window::open_preview(
-                                    crate::preview_window::PreviewContent::Text {
-                                        title: arg_modal_title.clone(),
-                                        body: full.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            })
-                    })
-                    .child(
-                        Label::new(SharedString::from(preview))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate(),
-                    ),
+                div().pl_4().child(
+                    Label::new(SharedString::from(preview))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                ),
             )
         });
 

@@ -548,7 +548,22 @@ impl CosmicTextSystemState {
             None,
             &mut layout_lines,
             None,
-            cosmic_text::Hinting::Disabled,
+            // Snap glyph origins to whole pixels on the X axis. Without it
+            // cosmic-text lays every glyph out at its exact fractional advance
+            // — JetBrains Mono at 13px advances 7.8px — and a monospace grid
+            // built out of 7.8px steps never lands where a hinting editor's
+            // does: measured against a live IntelliJ IDEA window on the same
+            // screen, ours ran 7.78px per character against its 8.000px, so by
+            // column 60 the same text was 13px adrift. With this on, both
+            // measure 8.000px.
+            //
+            // The cosmic-text docs warn that metrics hinting wants PHYSICAL
+            // coordinates, and gpui lays out in logical ones — so on a display
+            // with a scale factor the snapping is to logical pixels rather than
+            // device pixels. That is a coarser grid than ideal, not a wrong
+            // one, and it is the same trade every hinting text stack on a
+            // scaled display makes.
+            cosmic_text::Hinting::Enabled,
         );
 
         let Some(layout) = layout_lines.first() else {
