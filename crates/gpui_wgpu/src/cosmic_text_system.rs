@@ -582,6 +582,34 @@ impl CosmicTextSystemState {
             };
         };
 
+        // `Hinting::Enabled` above rounds every glyph advance, but `cosmic-text`
+        // builds `LayoutLine::w` out of the UNROUNDED ones (`shape.rs`:
+        // `visual_line.w` accumulates `glyph.width(font_size)`), so upstream's
+        // width falls short of the glyphs it just placed — 0.2px per character
+        // at 13px, a whole cell by column 40. That width is not decoration:
+        // `ShapedLine::x_for_index` runs out of glyphs at the end of a line and
+        // returns it as the x of the line's end, which is exactly where the
+        // caret sits while you type. It has to be the pen position after the
+        // last glyph, not a second opinion about it.
+        //
+        // The width and the glyph positions have to come from ONE frame, which
+        // is why `origin_x` exists. A right-to-left line does not start its pen
+        // at zero: cosmic-text starts it at `line_width` — the same unrounded
+        // sum — rounds THAT (`shape.rs`, `start_x` then `x.round()`) and walks
+        // left by the rounded advances, so the glyphs land on
+        // `[round(unrounded) - advances, round(unrounded)]` and the same
+        // rounding drift reappears as a box that does not contain its own ink.
+        // Normalising by the leftmost glyph puts both numbers in the frame the
+        // caller is given, `[0, width]`. For a left-to-right line the leftmost
+        // glyph is at zero and this is a no-op.
+        let width: f32 = layout.glyphs.iter().map(|glyph| glyph.w).sum();
+        let origin_x = layout
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.x)
+            .fold(f32::INFINITY, f32::min);
+        let origin_x = if origin_x.is_finite() { origin_x } else { 0.0 };
+
         let mut runs: Vec<ShapedRun> = Vec::new();
         for glyph in &layout.glyphs {
             let mut font_id = FontId(glyph.metadata);
@@ -610,7 +638,7 @@ impl CosmicTextSystemState {
 
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
-                position: point(glyph.x.into(), glyph.y.into()),
+                position: point((glyph.x - origin_x).into(), glyph.y.into()),
                 index: glyph.start,
                 is_emoji,
             };
@@ -630,7 +658,7 @@ impl CosmicTextSystemState {
 
         LineLayout {
             font_size,
-            width: layout.w.into(),
+            width: width.into(),
             ascent: layout.max_ascent.into(),
             descent: layout.max_descent.into(),
             runs,
@@ -1078,5 +1106,166 @@ mod tests {
         let covers = |_: FontId, _: char| true;
         let spans = compute_run_spans("anything", 3, 0, primary, &fb, &covers);
         assert!(spans.is_empty());
+    }
+
+    // Compile-time, like the sibling bench (`benches/layout_line.rs`): a moved
+    // or renamed asset is then a build error rather than a test failure.
+    const JETBRAINS_MONO: &[u8] =
+        include_bytes!("../../../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf");
+    const IBM_PLEX_SANS: &[u8] =
+        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+
+    /// Shapes `text` with one bundled face and returns `(glyph x positions,
+    /// line width)`, dropping the byte index [`shape_glyphs`] carries.
+    fn shape_with(family: &str, face: &'static [u8], text: &str, font_size: f32) -> (Vec<f32>, f32) {
+        let (glyphs, width) = shape_glyphs(family, face, text, font_size);
+        (glyphs.into_iter().map(|(_, x)| x).collect(), width)
+    }
+
+    /// Shapes `text` with one bundled face and returns
+    /// `((byte index, x position) per glyph, line width)`.
+    fn shape_glyphs(
+        family: &str,
+        face: &'static [u8],
+        text: &str,
+        font_size: f32,
+    ) -> (Vec<(usize, f32)>, f32) {
+        let system = CosmicTextSystem::new_without_system_fonts("");
+        system
+            .add_fonts(vec![Cow::Borrowed(face)])
+            .expect("failed to load the bundled face");
+        let font_id = system
+            .font_id(&gpui::font(family))
+            .expect("the bundled face did not load under its own family name");
+
+        let layout = system.layout_line(
+            text,
+            gpui::px(font_size),
+            &[FontRun {
+                len: text.len(),
+                font_id,
+            }],
+        );
+        let glyphs = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| (glyph.index, f32::from(glyph.position.x)))
+            .collect();
+        (glyphs, f32::from(layout.width))
+    }
+
+    /// The end-of-line caret reads `LineLayout::width` (`x_for_index` runs out
+    /// of glyphs and falls through to it), so a width that does not agree with
+    /// the glyph positions is a caret that does not sit where the text ends.
+    ///
+    /// `Hinting::Enabled` rounds every glyph advance, but `cosmic-text` builds
+    /// `LayoutLine::w` out of the UNROUNDED ones, so upstream's width trails
+    /// the painted text by the accumulated rounding — 0.2px per character at
+    /// 13px, a whole cell by column 40.
+    #[test]
+    fn line_width_agrees_with_the_hinted_glyph_positions() {
+        for font_size in [13.0, 16.0] {
+            let text = "x".repeat(60);
+            let (xs, width) = shape_with("JetBrains Mono", JETBRAINS_MONO, &text, font_size);
+
+            assert_eq!(xs.len(), 60, "expected one glyph per character");
+            let cell = xs[1] - xs[0];
+            assert_eq!(
+                cell,
+                cell.round(),
+                "hinting should put every glyph on a whole pixel at {font_size}px"
+            );
+            for (column, x) in xs.iter().enumerate() {
+                assert_eq!(
+                    *x,
+                    cell * column as f32,
+                    "glyph {column} is off the hinted grid at {font_size}px"
+                );
+            }
+
+            assert_eq!(
+                width,
+                xs[59] + cell,
+                "the caret at the end of a 60-character line at {font_size}px \
+                 must land one cell past the last glyph"
+            );
+        }
+    }
+
+    /// A proportional run has no single cell width, so the invariant has to be
+    /// stated glyph by glyph: the line's width is where the pen ends up, which
+    /// is the last glyph's position plus the last glyph's own advance.
+    ///
+    /// Shaping the final character alone is a sound way to get that advance —
+    /// kerning adjusts the LEFT glyph of a pair, so nothing that precedes the
+    /// last glyph can change it, and nothing follows it.
+    #[test]
+    fn line_width_is_the_pen_position_after_the_last_glyph() {
+        let plex = |text: &str| shape_with("IBM Plex Sans", IBM_PLEX_SANS, text, 13.0);
+
+        let text = "Bill's proportional text";
+        let (xs, width) = plex(text);
+        let (_, final_t_advance) = plex("t");
+
+        let cells: std::collections::BTreeSet<_> = xs
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).to_bits())
+            .collect();
+        assert!(
+            cells.len() > 1,
+            "this test is worthless unless the face is actually proportional"
+        );
+
+        assert_eq!(
+            width,
+            xs.last().unwrap() + final_t_advance,
+            "the width must be the pen position after the last glyph"
+        );
+    }
+
+    /// The width and the glyph positions have to describe one frame. A
+    /// right-to-left line is where they came apart: cosmic-text starts the pen
+    /// at the UNROUNDED line width and walks left by the rounded advances, so
+    /// without normalising, the leading glyph sits at a negative x and the ink
+    /// hangs outside the `[0, width]` box the caller is handed.
+    #[test]
+    fn a_right_to_left_line_is_framed_from_zero_like_any_other() {
+        // Hebrew. No bundled face covers it — these shape as `.notdef` boxes,
+        // which is exactly enough: the direction cosmic-text branches on comes
+        // from `unicode-bidi` over the TEXT, not from font coverage, and a
+        // `.notdef` carries an advance like any other glyph.
+        let (glyphs, width) = shape_glyphs(
+            "JetBrains Mono",
+            JETBRAINS_MONO,
+            "\u{5d0}\u{5d1}\u{5d2}\u{5d3}\u{5d4}",
+            13.0,
+        );
+        assert_eq!(glyphs.len(), 5, "expected one glyph per letter");
+
+        let leftmost = glyphs.iter().map(|(_, x)| *x).fold(f32::INFINITY, f32::min);
+        let rightmost = glyphs
+            .iter()
+            .map(|(_, x)| *x)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        // Guard the premise, the way the proportional test above does: with the
+        // frame normalised, an LTR line also starts at zero, so without this the
+        // test would go quietly green if it ever stopped laying out right to
+        // left. Only an RTL walk puts the FIRST character at the far end.
+        let (_, first_x) = glyphs
+            .iter()
+            .find(|(index, _)| *index == 0)
+            .expect("no glyph for the first character");
+        assert_eq!(
+            *first_x, rightmost,
+            "this test is worthless unless the layout really ran right to left"
+        );
+
+        assert_eq!(leftmost, 0.0, "the frame must start at zero");
+        assert!(
+            rightmost < width,
+            "every glyph must start inside the frame: {rightmost} against a width of {width}"
+        );
     }
 }

@@ -4647,6 +4647,44 @@ The three numbers that follow from it:
   The maintainer's question — "how can the same font render differently, is it a
   renderer bug?" — has this as its answer: not a bug, a deliberate default that
   suits prose and not a code grid.
+- **The rounding had a third consumer nobody had looked at: the line's own
+  width.** Shipped with the grid and the painter agreeing, the caret still
+  trailed the text as it was typed — worst in the agent composer, where lines
+  are long and always edited at their end. `cosmic-text` rounds every glyph
+  advance under `Hinting::Enabled` (`shape.rs`, `x_advance.round()`) but builds
+  `LayoutLine::w` out of the **unrounded** ones (`visual_line.w` accumulates
+  `glyph.width(font_size)`), so the width it reports falls short of the glyphs
+  it just placed — 0.2 px per character at 13 px, 12 px adrift by column 60,
+  measured. That width is not decoration: `ShapedLine::x_for_index` runs out of
+  glyphs at the end of a line and returns it as the x of the line's end, which
+  is exactly where the caret sits while you type, and
+  `LineWithInvisibles::x_for_index` stacks it again at every fragment boundary
+  (inlay hints, folds). `layout_line` now reports the pen position after the
+  last glyph — `layout.glyphs.iter().map(|g| g.w).sum()` — instead of taking
+  cosmic-text's second opinion about the line it just laid out. Pinned by
+  `line_width_agrees_with_the_hinted_glyph_positions`, which fails at
+  `467.99973` against `480.0` without the fix.
+
+  **A fourth number, found by review rather than by symptom: the frame a
+  right-to-left line is reported in.** Cosmic-text does not start an RTL pen at
+  zero — it starts it at `line_width`, the same unrounded sum, rounds THAT and
+  walks left by the rounded advances (`shape.rs`, `start_x` then `x.round()`),
+  so the glyphs land on `[round(unrounded) - advances, round(unrounded)]` and
+  the identical rounding drift reappears as a box that does not contain its own
+  ink — measured at `-1.0` for five Hebrew letters at 13 px. `layout_line` now
+  normalises by the leftmost glyph, so the width and the positions describe one
+  frame, `[0, width]`; for a left-to-right line the leftmost glyph is already at
+  zero and it is a no-op. Pinned by
+  `a_right_to_left_line_is_framed_from_zero_like_any_other`.
+
+  The lesson generalises past this bug: a layout switch has to be traced to
+  **every** number the layout hands out, not just the one that motivated it.
+  Enabling hinting touched four — the painted advance, `TextSystem::advance`,
+  `LineLayout::width` and the RTL frame — and each was found by a different
+  route: the first by measuring against IDEA, the second by the caret detaching,
+  the third by the caret trailing what was typed, the fourth by a reviewer
+  reading cosmic-text's RTL branch. Only the fourth was found before a user hit
+  it.
 - **What still differs, and cannot be tuned away:** one pixel of ink height.
   JetBrains Mono's x-height at 13 is `0.550 x 13` = 7.15px; Java2D's hinting
   snaps it DOWN to 7 painted rows, swash's spreads it over 8. Hinting quantises
