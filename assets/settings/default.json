@@ -47,11 +47,25 @@
   },
   // The default font size for text in the editor.
   //
-  // 13 because that is IntelliJ IDEA's own default for the same font
-  // (`FontPreferences.DEFAULT_FONT_SIZE`), and the family above is now the
-  // same family — so every glyph metric matches, including the character
-  // advance, which no choice of size could match while the families differed.
-  "buffer_font_size": 13,
+  // 12.25, not IDEA's own 13, even though the family is now the same one.
+  // Nominal size is not what the eye reads — x-height is, and the two
+  // rasterizers disagree about it. JetBrains Mono at 13 has an x-height of
+  // 0.550 x 13 = 7.15px; IDEA's Java2D snaps that DOWN to 7 painted rows,
+  // GPUI's swash paints it antialiased across 8. Measured on the two live
+  // windows, same screen, same word ("package"): IDEA 7px of ink per
+  // x-height glyph, Sawe 8px — 14% taller at the same nominal size, which is
+  // exactly the "why is the code still bigger" the user kept seeing.
+  //
+  // 12.25 is the largest size whose x-height still lands on 7 painted rows
+  // (measured in a running editor at 13, 12.75, 12.5, 12.25 and 12).
+  //
+  // What this does NOT fix is the character advance: IDEA rounds each one UP
+  // from 7.8px to a whole 8 (`FontLayoutService.charWidth` is an int), GPUI
+  // keeps it fractional (`cosmic_text::Hinting::Disabled`,
+  // crates/gpui_wgpu/src/cosmic_text_system.rs), so Sawe's is 7.5px here —
+  // 6% narrower. No size closes that AND the x-height at once; this picks
+  // the one the eye reads as "font size".
+  "buffer_font_size": 12.25,
   // The weight of the editor font in standard CSS units from 100 to 900.
   "buffer_font_weight": 400,
   // Set the buffer's line height.
@@ -65,13 +79,16 @@
   //           "custom": 2
   //         },
   //
-  // 1.662 rather than "comfortable" (1.618) because it is IDEA's own rule
-  // re-expressed against the em. IDEA paints `ceil(FontMetrics.getHeight() *
-  // lineSpacing)` (`EditorView.initMetricsIfNeeded`), which for JetBrains Mono
-  // at 13 is `ceil(18 * 1.2)` = 22px; this multiplier is `(18 / 13) * 1.2`, and
-  // `round(13 * 1.662)` is the same 22. "comfortable" would paint 21 — a pixel
-  // tighter per line than the editor this is matched against.
-  "buffer_line_height": { "custom": 1.662 },
+  // 1.796 rather than "comfortable" (1.618) because the pitch is matched to
+  // IDEA's, not to a ratio. IDEA paints `ceil(FontMetrics.getHeight() *
+  // lineSpacing)` (`EditorView.initMetricsIfNeeded`, and the
+  // `editor.text.vertical.spacing.correct.rounding` registry key that would
+  // take the other branch defaults to false), which for JetBrains Mono at 13
+  // is `ceil(18 * 1.2)` = 22px — confirmed by measuring a live IDEA window.
+  // GPUI paints `round(font_size * multiplier)` (`gpui/src/style.rs`), so
+  // 22 / 12.25 = 1.796. Verified in a running editor: 22px between ink rows,
+  // same as IDEA's.
+  "buffer_line_height": { "custom": 1.796 },
   // The name of a font to use for rendering text in the UI
   // You can set this to ".SystemUIFont" to use the system font
   // ".ZedSans" currently aliases to "IBM Plex Sans", but this may

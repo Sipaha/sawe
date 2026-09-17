@@ -4609,14 +4609,29 @@ still bundled.
 
 The three numbers that follow from it:
 
-- `buffer_font_size: 13` — IDEA's own default for the same family, so every
-  glyph metric matches by construction rather than by approximation.
-- `buffer_line_height: {custom: 1.662}` rather than `"comfortable"` (1.618).
-  IDEA paints `ceil(FontMetrics.getHeight() * lineSpacing)`
-  (`EditorView.initMetricsIfNeeded`, decompiled — not assumed), which is
-  `ceil(18 * 1.2)` = 22px. 1.662 is `(18 / 13) * 1.2`, IDEA's rule re-expressed
-  against the em, and `round(13 * 1.662)` is the same 22. "comfortable" paints
-  21 — a pixel tighter per line than the editor this is matched to.
+- `buffer_font_size: 12.25`, **not** IDEA's own 13 — the one number here that is
+  not the obvious one. Same family at the same nominal size still did not look
+  the same, and the reason is that the two rasterizers disagree about where the
+  x-height lands. JetBrains Mono at 13 has an x-height of `0.550 x 13` = 7.15px;
+  Java2D snaps it DOWN to 7 painted rows, GPUI's swash paints it antialiased
+  across 8. Measured on the two live windows, same screen, same word
+  (`package`): **IDEA 7px of ink per x-height glyph, Sawe 8px** — 14% taller at
+  an identical setting. 12.25 is the largest size whose x-height still lands on
+  7 rows (swept 13 / 12.75 / 12.5 / 12.25 / 12 in a running editor).
+- `buffer_line_height: {custom: 1.796}`. IDEA paints
+  `ceil(FontMetrics.getHeight() * lineSpacing)`
+  (`EditorView.initMetricsIfNeeded`, decompiled; the
+  `editor.text.vertical.spacing.correct.rounding` key that takes the other
+  branch defaults to `false` in `util-8.jar!misc/registry.properties`) =
+  `ceil(18 * 1.2)` = 22px, confirmed against a live window. GPUI paints
+  `round(font_size * multiplier)`, so the multiplier is `22 / 12.25` = 1.796,
+  and the painted pitch is 22 — measured, not derived.
+- **What no size fixes:** the character advance. IDEA rounds each one UP from
+  7.8px to a whole 8 (`FontLayoutService.charWidth` returns an `int`); GPUI
+  keeps it fractional (`cosmic_text::Hinting::Disabled` in
+  `gpui_wgpu/src/cosmic_text_system.rs`), so ours is 7.5px at 12.25 — 6%
+  narrower. Matching the advance and matching the x-height pull in opposite
+  directions; x-height wins because that is what the eye reads as "font size".
 - `ui_font_size` stays **16**. It was briefly 13.75 — the size at which IBM Plex
   Sans renders the same width as IDEA's Inter 13, verified against a live IDEA
   window ("Pavel Simonov" 88.8 px predicted, 88 px measured), with UI row pitch
