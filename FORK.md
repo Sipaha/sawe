@@ -4959,3 +4959,42 @@ How to apply: when a control is painted as interactive, the hook that makes it
 interactive belongs on the SHARED render path, not on the one call site whose
 bug report arrived first. And when a target can be either a URL or a path,
 decide which in a pure function that a test can drive.
+
+### 189. A commit message is code, and follows the code font
+
+Decision #187 says `buffer_font_size` means "code" and every other editor needs
+its own size. This is the case that looks like its opposite and is not: the
+Commit tab's description of the selected commit, and the editor in the Changes
+tab that writes one, **must** be the code font — same family, same size, same
+line grid.
+
+The reason is what commit messages are made of. A subject wrapped at 72
+columns, an indented body, backticked identifiers, a pasted diff or stack
+trace: all of it is written to be read on a monospace grid, and all of it is
+read *directly next to the editor*, where a pixel of difference is visible as a
+pixel of difference. The agent composer (#187) is prose the user types at a
+chat and reads back as a chat message — nothing about it is aligned to
+anything.
+
+`git_commit_buffer_font_size` already carried exactly the right mechanism:
+`ThemeSettings::git_commit_buffer_font_size` falls back to `buffer_font_size`
+when the setting is unset, and `git_commit_text_style` was already taking its
+family, features and line-height ratio from `buffer_font`. The default JSON
+pinned **12** against a `buffer_font_size` of **13**, so the description
+rendered a pixel short of the editor beside it, and would have drifted again
+the next time the code font was retuned against IDEA. The default is now
+`null`, i.e. "whatever the code is at", which also means the commit text scales
+with the editor's own zoom (`buffer_font_size(cx)` reads the `BufferFontSize`
+global) rather than sitting still while the code around it grows.
+
+*Rules out:* pinning a second number that has to be kept equal to a first one
+by hand, and treating "not a code buffer" as "not the code font" — the test is
+whether the text is *aligned to a grid and read beside code*, not whether it
+lives in a `language::Buffer`.
+
+How to apply: the invariant is pinned by
+`test_the_commit_detail_text_matches_the_code_editor`, which asserts the size,
+the family and the line height of `detail_text_style` against
+`ThemeSettings::buffer_*` rather than against a literal — a test written the
+other way would have to be edited every time the code font moves, which is the
+same trap one level up.

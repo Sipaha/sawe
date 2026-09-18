@@ -120,8 +120,15 @@
   "agent_ui_font_size": null,
   // The default font size for user messages in the agent panel.
   "agent_buffer_font_size": 12,
-  // The default font size for the commit editor in the git panel and commit modal.
-  "git_commit_buffer_font_size": 12,
+  // The font size for a commit message — the editor that writes it in the
+  // Changes tab, and the description the Commit tab shows for the commit
+  // selected in the history. `null` means "whatever the code is at", which is
+  // the point: a commit message is code-adjacent text read right next to the
+  // editor — 72-column subjects, indented bodies, backticked identifiers,
+  // pasted diffs — and a pinned number here drifts a pixel off the editor
+  // every time the code font is retuned. Following it also means the commit
+  // text scales with the editor's own zoom. Set a number to break the link.
+  "git_commit_buffer_font_size": null,
   // How much to fade out unused code.
   "unnecessary_code_fade": 0.3,
   // Active pane styling settings.

@@ -3534,6 +3534,41 @@ mod tests {
         );
     }
 
+    /// The Commit tab shows the same text the Changes tab's editor writes, and
+    /// that text is code-adjacent: subject lines wrapped at 72 columns, indented
+    /// bodies, backticked identifiers, diffs pasted into the message. It is read
+    /// next to the editor and must not be a pixel off it — which is what
+    /// `git_commit_buffer_font_size` falling back to the buffer size buys, and
+    /// what a number pinned in `default.json` silently takes away again.
+    ///
+    /// Asserted through `detail_text_style` rather than through the setting, so
+    /// the family and the line height are covered by the same test: all three
+    /// have to agree for the two tabs to look like one surface.
+    #[gpui::test]
+    fn test_the_commit_detail_text_matches_the_code_editor(cx: &mut gpui::TestAppContext) {
+        crate::git_panel::tests::init_test(cx);
+        cx.update(|cx| {
+            let settings = ThemeSettings::get_global(cx);
+            let buffer_font_size = settings.buffer_font_size(cx);
+            let style = detail_text_style(Color::Default, None, cx);
+
+            assert_eq!(
+                style.base_text_style.font_size,
+                gpui::AbsoluteLength::from(buffer_font_size),
+                "the commit description must be the code size, not a size of its own"
+            );
+            assert_eq!(
+                style.base_text_style.font_family, settings.buffer_font.family,
+                "the commit description must be the code family"
+            );
+            assert_eq!(
+                style.base_text_style.line_height,
+                (buffer_font_size * settings.buffer_line_height.value()).into(),
+                "the commit description must be on the code's line grid"
+            );
+        });
+    }
+
     /// The paint side of the folder figures: the data tests above prove the
     /// sum, this proves a real Commit tab in a real dock actually draws it —
     /// and draws the right numbers, since the selector encodes them.

@@ -149,6 +149,9 @@ pub struct ThemeSettingsContent {
     pub agent_ui_font_size: Option<FontSize>,
     /// The font size for user messages in the agent panel.
     pub agent_buffer_font_size: Option<FontSize>,
+    /// The font size for a commit message, both the editor that writes one and
+    /// the Commit tab's description of the selected commit. Falls back to the
+    /// buffer font size if unset, which is the shipped default.
     pub git_commit_buffer_font_size: Option<FontSize>,
     /// The name of a font to use for rendering in the markdown preview.
     /// Falls back to the UI font if unset.
