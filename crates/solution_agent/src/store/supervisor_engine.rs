@@ -1144,11 +1144,15 @@ impl SolutionAgentStore {
     /// to retry or a hung subprocess to reconnect: if the observer is still
     /// enabled AND `message` carries a parseable reset time, schedule an
     /// auto-resume — stay `Watching` with the watchdog gate set to
-    /// `reset + jitter(2..=15min)`, so `tick_supervisor` re-fires a judge once
-    /// the limit clears (which re-observes the idle/errored worker and nudges
-    /// it to continue); the jitter avoids hammering the wall at the exact reset
-    /// minute, and a live timer is held so the wake happens even if nothing
-    /// else ticks. Otherwise (observer off, or no reset time) fall back to a
+    /// `reset + jitter(2..=15min)`, so `tick_supervisor` wakes the WORKER once
+    /// the limit clears (its one-shot resume branch, which nudges the
+    /// idle/errored worker to continue rather than spawning a judge to
+    /// re-decide the editor's own promise — FORK.md #190); the jitter avoids
+    /// hammering the wall at the exact reset minute, and a live timer is held
+    /// so the wake happens even if nothing else ticks. The system note pushed
+    /// below is that promise in the operator's own chat, so the gate this arms
+    /// must always end in an action, never in a question.
+    /// Otherwise (observer off, or no reset time) fall back to a
     /// terminal `Stopped(Quota)`. Shared by the judge-failure path
     /// (`on_judge_failed`) and the stuck-session watchdog (`tick_stuck_sessions`).
     ///
@@ -2172,6 +2176,7 @@ impl SolutionAgentStore {
             };
             let (
                 idle_or_errored,
+                on_usage_wall,
                 last_activity_ms,
                 has_live_background_work,
                 running_started_at,
@@ -2185,6 +2190,18 @@ impl SolutionAgentStore {
                 }
                 let idle_or_errored =
                     matches!(s.state, SessionState::Idle | SessionState::Errored(_));
+                // The session is parked ON the wall itself: both wall paths
+                // (`handle_acp_event`'s fast `Error` and the stuck-turn
+                // watchdog) write claude's own limit line into `Errored`, so
+                // the state carries the evidence. Read from the state rather
+                // than from a flag set at scheduling time, because it is the
+                // condition that actually decides what a due wake should do —
+                // and it stays true across a restart, which a transient flag
+                // would not.
+                let on_usage_wall = match &s.state {
+                    SessionState::Errored(text) => crate::supervisor::is_usage_limit_error(text),
+                    _ => false,
+                };
                 let running_started_at = match s.state {
                     SessionState::Running { started_at, .. } => Some(started_at),
                     _ => None,
@@ -2205,6 +2222,7 @@ impl SolutionAgentStore {
                 let has_live_background_work = s.has_live_background_work(now);
                 (
                     idle_or_errored,
+                    on_usage_wall,
                     s.last_activity_at.timestamp_millis(),
                     has_live_background_work,
                     running_started_at,
@@ -2334,6 +2352,68 @@ impl SolutionAgentStore {
                 continue;
             }
 
+            let typing_quiet = last_user_input_ms.is_none_or(|typed| {
+                now_ms.saturating_sub(typed)
+                    >= (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000
+            });
+
+            // One-shot usage-limit resume: `apply_usage_limit_stop` told the
+            // user in the chat that "the Observer will resume the session
+            // automatically around HH:MM" and armed `next_eligible_ms` for it.
+            // That promise is the EDITOR's, and it is already decided — the
+            // wall has its own clock, the worker was cut off mid-task, and the
+            // one correct action at the reset is to put the worker back to
+            // work. So wake the WORKER here, exactly like the `wait` deadline
+            // above does, instead of spawning a judge to re-derive it.
+            //
+            // Firing a judge instead is how the promise got broken in practice:
+            // the judge reads a transcript whose last event IS the wall,
+            // reasonably concludes the session is blocked on something neither
+            // it nor the agent can move, and returns `done`/`PARK:` — parking
+            // supervision at the exact moment it was supposed to restart it.
+            // (Observed on session `xjrn2pmv`, 2026-09-19 21:11: the parking
+            // verdict's own reasoning was "автовозобновление редактором уже
+            // запланировано" — it was the auto-resume, and it cancelled itself.)
+            // It is also the worst possible moment to spend a judge's tokens:
+            // reading a full transcript is what the account just ran out of.
+            //
+            // Scoped tightly so it cannot become a poll: it needs a SCHEDULED
+            // wake that is now due (`next_eligible_ms`, consumed here — a
+            // plain idle session never enters), the worker actually sitting on
+            // the wall (`Errored` carrying claude's limit line), `Watching`
+            // (a Held/WaitingUser/Stopped session stays parked — the user's
+            // pause outranks the schedule), and the user not mid-sentence. A
+            // still-live wall re-errors the woken turn, which re-enters
+            // `apply_usage_limit_stop` and re-arms the gate at the NEW reset,
+            // so a wall that outlasts its announced reset backs off instead of
+            // being hammered once a minute.
+            if matches!(status, crate::supervisor::SupervisorStatus::Watching)
+                && on_usage_wall
+                && typing_quiet
+                && let Some(resume_at) = next_eligible_ms
+                && now_ms >= resume_at
+            {
+                if let Some(st) = self.supervisor_states.get_mut(&id) {
+                    st.next_eligible_ms = None;
+                    st.backoff_attempt = 0;
+                }
+                self.backoff_timers.remove(&id);
+                self.append_supervisor_diary_note(
+                    id,
+                    "usage-limit window elapsed; woke the worker to continue (no judge fired)",
+                    cx,
+                );
+                // Logged rather than swallowed: a resume that fails to reach
+                // the worker is the one failure mode that looks exactly like
+                // the bug this branch fixes — silence where the chat promised
+                // work would restart.
+                self.deliver_nudge_now(id, USAGE_LIMIT_RESUME_PROMPT.to_string(), cx)
+                    .detach_and_log_err(cx);
+                self.persist_supervisor_state(id, cx);
+                cx.emit(SolutionAgentStoreEvent::SessionStateChanged(id));
+                continue;
+            }
+
             // A failed active review has already consumed its crossing. Its
             // explicit retry/backoff deadline still deserves another attempt;
             // do not silently defer that recovery until the next hour.
@@ -2345,10 +2425,6 @@ impl SolutionAgentStore {
                             .flatten()
                     })
                 })
-            });
-            let typing_quiet = last_user_input_ms.is_none_or(|typed| {
-                now_ms.saturating_sub(typed)
-                    >= (crate::supervisor::IDLE_THRESHOLD_SECS as i64) * 1000
             });
             let trigger = if enabled
                 && matches!(status, crate::supervisor::SupervisorStatus::Watching)

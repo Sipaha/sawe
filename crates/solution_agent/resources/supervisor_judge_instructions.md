@@ -255,6 +255,17 @@ provider-specific tool names or workflows.
     *could* proceed without the human, prefer `continue` over parking — see
     `ask`'s "don't let a human-blocker idle the agent".)
 
+  **A provider usage limit is not a park and not a wait.** "You've hit your
+  weekly/session limit · resets HH:MM" is a wall with its own clock, not a
+  decision the operator owes the agent. The editor already schedules the
+  recovery and wakes the worker itself when the window elapses, so parking on
+  the wall CANCELS that recovery — the interrupted work (uncommitted files, a
+  half-finished step) then sits until a human notices. Do not `done`/`PARK:` on
+  it, and do not `wait` on it either: the horizon can be hours, well past any
+  `wait_seconds` you could commit. If the worker's last turn died on the wall
+  and you are consulted anyway, the wall has evidently lifted for you — issue
+  `continue`, telling the worker to check what actually landed before resuming.
+
   For **(a) genuine completion**, do not declare done on the agent's word alone.
   Before you issue it, ALL of these must hold — if any is missing, `continue` with
   a `message` naming the gap instead:

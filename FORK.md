@@ -4998,3 +4998,52 @@ the family and the line height of `detail_text_style` against
 `ThemeSettings::buffer_*` rather than against a literal — a test written the
 other way would have to be edited every time the code font moves, which is the
 same trap one level up.
+
+### 190. The editor keeps its own usage-limit promise; the judge is not asked again
+
+When claude walls a session, `apply_usage_limit_stop` writes a system note into
+the chat — "claude usage limit reached. The Observer will resume the session
+automatically around HH:MM" — and arms `next_eligible_ms` at the parsed reset
+plus 2–15 min of jitter. That note is a commitment the operator reads and then
+stops watching the screen for.
+
+The gate used to expire into an ordinary judge fire, i.e. the promise was kept
+only if an LLM independently decided to keep it. It doesn't. The judge reads a
+transcript whose last event IS the wall, concludes — reasonably — that the
+session is blocked on something neither it nor the agent can move, and returns
+`done` with the `PARK:` marker. Measured on session `xjrn2pmv` (2026-09-19):
+wall at 11:31, resume promised for 21:10, and at 21:11:37 the judge parked the
+session with the reasoning «ни агент, ни супервизор этого сдвинуть не могут …
+автовозобновление редактором уже запланировано (~21:10 local)». It *was* the
+auto-resume, and by parking it cancelled the recovery it was counting on. Eight
+uncommitted files in `citeck-migration-toolkit` sat there until the operator
+noticed by hand, hours later.
+
+So a due resume no longer spawns a judge. `tick_supervisor` wakes the WORKER
+directly with `USAGE_LIMIT_RESUME_PROMPT` — the same shape as the one-shot
+`wait` deadline (`wait_until_ms`), where the mechanism that armed the timer is
+also the thing that fires it. The branch needs all of: a scheduled wake now
+due (`next_eligible_ms`, consumed on fire, so it can never become a poll), the
+worker actually sitting in `Errored(<claude's limit line>)`, status `Watching`
+(a user's Stop/`Held`/`WaitingUser` outranks the schedule), and no typing in the
+last 60 s. Reading the wall off `SessionState` rather than a flag stamped at
+scheduling time is deliberate: it is the condition that decides what the wake
+should DO, and it survives a restart, which a transient flag would not.
+
+*Rules out:* "tell the judge this wake is the resume" — a prompt that competes
+with a transcript ending in a wall, evaluated at the exact moment the account
+has no tokens to spare for reading a 400k-token transcript. The editor knows why
+it set the timer; there is nothing to re-derive.
+
+Self-limiting rather than a retry loop: if the wall outlasts its announced
+reset, the woken turn re-errors, `handle_acp_event` re-enters
+`apply_usage_limit_stop`, and the gate re-arms at the NEW reset — one nudge per
+wall window, not one per minute. The judge instructions gained the matching
+rule for the paths that still reach a judge (a provider wall is neither a park
+nor a `wait`).
+
+How to apply: when the editor promises the operator something in the chat on a
+timer it owns, the expiry must perform the action, not consult a model about
+whether to. Guarded by
+`scheduled_usage_limit_resume_wakes_the_worker_instead_of_judging` and
+`pending_usage_limit_resume_does_not_wake_the_worker_early`.

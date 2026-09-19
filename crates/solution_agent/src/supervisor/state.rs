@@ -421,10 +421,18 @@ pub struct SupervisorState {
     pub last_fired_at: Option<i64>,
     /// Epoch-millis before which the watchdog must NOT fire a new judge for this
     /// session. Set by `on_judge_failed` on a transient backoff
-    /// (`now + BACKOFF_SCHEDULE_MINS[attempt-1] * 60_000`); cleared to `None` on a
-    /// successful verdict and whenever supervision is (re)enabled so a recovered
-    /// or freshly-enabled supervisor is never permanently gated. `tick_supervisor`
-    /// gates firing on `now_ms >= next_eligible_ms.unwrap_or(0)`.
+    /// (`now + BACKOFF_SCHEDULE_MINS[attempt-1] * 60_000`) and by
+    /// `apply_usage_limit_stop` on a usage wall (the announced reset plus
+    /// jitter); cleared to `None` on a successful verdict and whenever
+    /// supervision is (re)enabled so a recovered or freshly-enabled supervisor
+    /// is never permanently gated. `tick_supervisor` gates firing on
+    /// `now_ms >= next_eligible_ms.unwrap_or(0)`.
+    ///
+    /// What the EXPIRY does differs by what the session is parked on, and
+    /// `tick_supervisor` reads that off `SessionState` rather than off a second
+    /// field here: a session sitting in `Errored(<claude's limit line>)` gets
+    /// its worker woken directly (the editor's own promise, FORK.md #190),
+    /// anything else gets the ordinary judge fire.
     pub next_eligible_ms: Option<i64>,
     pub status: SupervisorStatus,
     /// How many times the supervisor has fired (spawned a judge) since it was

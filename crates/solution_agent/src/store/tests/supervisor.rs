@@ -4627,13 +4627,17 @@ async fn a_stale_background_agent_does_not_eat_a_scheduled_usage_limit_resume(
         st.next_eligible_ms = Some(chrono::Utc::now().timestamp_millis() - 60_000);
         store.tick_supervisor(cx);
     });
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
     assert_eq!(
-        store
-            .read_with(cx, |store, _| store.supervisor_state(id))
-            .unwrap()
-            .status,
+        st.status,
         SupervisorStatus::Watching,
         "inside the grace the dispatch may really be starting up — standing down is correct",
+    );
+    assert!(
+        st.next_eligible_ms.is_some(),
+        "standing down must leave the resume armed, not silently spend it",
     );
 
     // Same agent, still never observed, now past the grace. The reap is an hour
@@ -4650,13 +4654,152 @@ async fn a_stale_background_agent_does_not_eat_a_scheduled_usage_limit_resume(
         });
         store.tick_supervisor(cx);
     });
+    // The resume is the worker being woken, not a judge being spawned (see
+    // `scheduled_usage_limit_resume_wakes_the_worker_instead_of_judging`), so
+    // what "it happened" looks like here is the one-shot gate being spent.
     assert_eq!(
         store
             .read_with(cx, |store, _| store.supervisor_state(id))
             .unwrap()
-            .status,
-        SupervisorStatus::Judging,
+            .next_eligible_ms,
+        None,
         "a teammate nobody has ever seen must not hold a promised usage-limit resume \
          hostage until the 1-hour reaper",
     );
+}
+
+/// The scheduled usage-limit resume is the EDITOR's promise, so the editor —
+/// not a judge — must keep it. Measured on the maintainer's own session
+/// `xjrn2pmv` (2026-09-19): the weekly wall stopped the turn, the chat promised
+/// "The Observer will resume the session automatically around 21:10", and at
+/// 21:11:37 the judge that fire spawned returned `done` with `PARK:` —
+/// «сессия упёрлась в недельный лимит … вмешательство не требуется.
+/// Автовозобновление редактором уже запланировано (~21:10 local)». It WAS the
+/// auto-resume, and by parking it cancelled the very thing it was counting on.
+/// Eight uncommitted files sat there until the operator noticed by hand.
+///
+/// So a due resume on a session sitting in `Errored(<usage wall>)` wakes the
+/// WORKER directly, exactly like the one-shot `wait` deadline does, and never
+/// spawns a judge to re-decide a question the editor already answered.
+#[gpui::test]
+async fn scheduled_usage_limit_resume_wakes_the_worker_instead_of_judging(cx: &mut TestAppContext) {
+    use crate::supervisor::SupervisorStatus;
+    let (session_id, _acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            let session = store.session(session_id).unwrap();
+            session.update(cx, |s, _| {
+                s.state = crate::model::SessionState::Errored(
+                    "You've hit your weekly limit · resets 9pm (Asia/Novosibirsk)".into(),
+                );
+                s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+            });
+            arm_resume_gate(store, session_id);
+            // The announced reset has arrived.
+            store
+                .supervisor_states
+                .get_mut(&session_id)
+                .expect("state")
+                .next_eligible_ms = Some(chrono::Utc::now().timestamp_millis() - 60_000);
+            store.tick_supervisor(cx);
+        });
+    });
+    cx.executor().run_until_parked();
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            let st = store.supervisor_states.get(&session_id).expect("state");
+            assert_eq!(
+                st.status,
+                SupervisorStatus::Watching,
+                "the promised resume wakes the worker; it must not spawn a judge that can park it"
+            );
+            assert_eq!(
+                st.next_eligible_ms, None,
+                "the resume is one-shot — its gate is consumed when it fires"
+            );
+            assert!(
+                !store.judge_sessions.contains_key(&session_id),
+                "no judge is spawned for a resume the editor already decided"
+            );
+            assert!(
+                !store.backoff_timers.contains_key(&session_id),
+                "the resume wake timer is dropped once the resume happens"
+            );
+            let woken = store
+                .session(session_id)
+                .and_then(|s| s.read(cx).acp_thread().cloned())
+                .expect("live thread")
+                .read(cx)
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    acp_thread::AgentThreadEntry::UserMessage(message) => Some(
+                        message
+                            .chunks
+                            .iter()
+                            .filter_map(|chunk| match chunk {
+                                acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                woken.len(),
+                1,
+                "exactly one continuation goes to the worker, not a judge briefing: {woken:?}"
+            );
+            assert!(
+                woken[0].contains("usage limit") && woken[0].contains("reset"),
+                "the continuation must name the wall it is resuming from: {:?}",
+                woken[0]
+            );
+        });
+    });
+}
+
+/// The other half of the one-shot: a resume whose moment has NOT arrived stays
+/// parked. Without this the 5-second tick would wake the worker into a live
+/// wall over and over, which is exactly what the announced reset time exists to
+/// avoid.
+#[gpui::test]
+async fn pending_usage_limit_resume_does_not_wake_the_worker_early(cx: &mut gpui::TestAppContext) {
+    use crate::supervisor::SupervisorStatus;
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        let session = store.session(id).unwrap();
+        session.update(cx, |s, _| {
+            s.state = crate::model::SessionState::Errored(
+                "You've hit your weekly limit · resets 9pm (Asia/Novosibirsk)".into(),
+            );
+            s.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+        });
+        store.set_supervision_enabled(id, true, cx);
+        let st = store.supervisor_states.get_mut(&id).expect("state");
+        st.status = SupervisorStatus::Watching;
+        st.next_eligible_ms = Some(chrono::Utc::now().timestamp_millis() + 600_000);
+        store.tick_supervisor(cx);
+    });
+
+    let st = store
+        .read_with(cx, |store, _| store.supervisor_state(id))
+        .unwrap();
+    assert!(
+        st.next_eligible_ms.is_some(),
+        "a resume that is still in the future must stay armed"
+    );
+    assert_eq!(
+        st.status,
+        SupervisorStatus::Watching,
+        "and nothing fires before it"
+    );
+    let queued = store.read_with(cx, |store, cx| {
+        store.session(id).unwrap().read(cx).pending_messages.len()
+    });
+    assert_eq!(queued, 0, "the worker is not woken into a still-live wall");
 }

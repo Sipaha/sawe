@@ -195,6 +195,20 @@ const RECONNECT_UNANSWERED_USER_PROMPT: &str = "The editor restarted your proces
      message now; do not treat it as already handled. Check any interrupted operation before \
      repeating it, and keep the user's language, constraints, and approval requirements.";
 
+/// Continuation sent when a scheduled usage-limit resume comes due (see the
+/// one-shot resume branch in `tick_supervisor`). The wall cut the agent off
+/// wherever it happened to be — mid-edit, mid-test, with work uncommitted — and
+/// the agent has no way to know how long ago that was, so the prompt's job is to
+/// stop it from assuming the interrupted step finished. Deliberately says
+/// nothing about WHAT to work on: the transcript already holds the task, and a
+/// guess here would compete with it.
+const USAGE_LIMIT_RESUME_PROMPT: &str = "The claude usage limit that stopped your last turn has \
+     reset, so you can work again. Your previous turn was cut off part-way through — before \
+     continuing, check the real state of the work (what actually landed on disk, what is still \
+     uncommitted, whether the step you were in the middle of completed) rather than assuming it \
+     finished. Then pick up the task from there. Keep the user's language, constraints, and \
+     outstanding approval requirements.";
+
 /// Classify a `done` verdict's `reasoning`. `done` has two modes (see
 /// `supervisor_judge_instructions.md`): a genuine completion, or a PARK awaiting
 /// the operator. The judge prefixes a park's reasoning with the `PARK:` token, so
