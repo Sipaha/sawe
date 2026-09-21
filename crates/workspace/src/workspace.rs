@@ -1530,6 +1530,13 @@ pub struct Workspace {
     /// swap re-activates the final file, so the tree reveals exactly once, at the
     /// end.
     suppress_active_entry_reveal: bool,
+    /// Armed while this window is unfocused; on expiry it stops the project's
+    /// language servers. Held so that re-focusing cancels it by drop.
+    lsp_idle_unload_task: Option<Task<()>>,
+    /// Set only by the idle unload above. A server the USER stopped by hand
+    /// must not come back just because they clicked the window, so refocusing
+    /// restarts only what this flag says we took away.
+    lsp_unloaded_while_idle: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1989,6 +1996,8 @@ impl Workspace {
             _dev_container_task: None,
             deferred_save_items: Vec::new(),
             suppress_active_entry_reveal: false,
+            lsp_idle_unload_task: None,
+            lsp_unloaded_while_idle: false,
         }
     }
 
@@ -7163,6 +7172,7 @@ impl Workspace {
     }
 
     pub fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_lsp_idle_unload(window.is_window_active(), cx);
         if window.is_window_active() {
             self.update_active_view_for_followers(window, cx);
 
@@ -7191,6 +7201,69 @@ impl Workspace {
                 });
             }
         }
+    }
+
+    /// Start or cancel the countdown that unloads this window's language
+    /// servers while nobody is looking at it.
+    ///
+    /// A window the user left open holds every language server its project
+    /// started, and for a JVM server (JetBrains `kotlin-lsp`) that is gigabytes
+    /// per project — measured at 6.9 GB across five of them, one per member of
+    /// three open Solutions. Nothing else ever unloads them: the pool has no
+    /// notion of "this window has not been touched since this morning".
+    ///
+    /// Focus is the proxy for "working in this Solution" because it is the one
+    /// signal that means it without guessing. A background build or an agent
+    /// editing files does not need the server — analysis is for the person
+    /// reading the code.
+    ///
+    /// The return trip is not free (~75 s of Maven re-import for a three-member
+    /// Solution), which is why the default is measured in an hour, and why
+    /// arming happens on DEACTIVATE rather than on a generic idle timer: two
+    /// Solutions you are actually alternating between never reach it.
+    fn update_lsp_idle_unload(&mut self, window_active: bool, cx: &mut Context<Self>) {
+        if window_active {
+            self.lsp_idle_unload_task = None;
+            if std::mem::take(&mut self.lsp_unloaded_while_idle) {
+                self.project.update(cx, |project, cx| {
+                    project.lsp_store().update(cx, |lsp_store, cx| {
+                        lsp_store.restart_all_language_servers(cx);
+                    });
+                });
+            }
+            return;
+        }
+        if self.lsp_unloaded_while_idle {
+            return;
+        }
+        let minutes = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .idle_shutdown_minutes;
+        if minutes == 0 {
+            self.lsp_idle_unload_task = None;
+            return;
+        }
+        let idle_for = Duration::from_secs(minutes * 60);
+        self.lsp_idle_unload_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(idle_for).await;
+            this.update(cx, |this, cx| {
+                // Re-check rather than trust the timer: the window may have been
+                // focused and unfocused again, and a second arming would have
+                // replaced this task — but a servers-already-stopped state
+                // (the user's own `StopLanguageServer`) is invisible from here
+                // and must not be recorded as ours to restore.
+                if this.project.read(cx).lsp_store().read(cx).all_stopped() {
+                    return;
+                }
+                this.lsp_unloaded_while_idle = true;
+                this.project.update(cx, |project, cx| {
+                    project.lsp_store().update(cx, |lsp_store, cx| {
+                        lsp_store.stop_all_language_servers(cx);
+                    });
+                });
+            })
+            .ok();
+        }));
     }
 
     pub fn active_call(&self) -> Option<&dyn AnyActiveCall> {
@@ -11408,6 +11481,111 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use util::rel_path::rel_path;
+
+    /// A window nobody is looking at keeps every language server its project
+    /// started — gigabytes for a JVM server, measured at 6.9 GB across five of
+    /// them for three open Solutions. The countdown is armed by losing focus
+    /// and disarmed by regaining it, and the return trip is expensive enough
+    /// (~75 s of re-import) that arming on anything finer than focus would be
+    /// worse than not doing it at all.
+    #[gpui::test]
+    async fn an_unfocused_window_unloads_its_language_servers_and_reloads_on_focus(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .global_lsp_settings
+                    .get_or_insert_default()
+                    .idle_shutdown_minutes = Some(30);
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        cx.deactivate_window();
+        workspace.update(cx, |workspace, cx| {
+            workspace.update_lsp_idle_unload(false, cx);
+            assert!(
+                workspace.lsp_idle_unload_task.is_some(),
+                "losing focus arms the countdown"
+            );
+        });
+
+        cx.executor().advance_clock(Duration::from_secs(29 * 60));
+        cx.run_until_parked();
+        assert!(
+            !lsp_store.read_with(cx, |lsp_store, _| lsp_store.all_stopped()),
+            "a window unfocused for less than the timeout keeps its servers — \
+             switching between two Solutions must not pay a re-import"
+        );
+
+        cx.executor().advance_clock(Duration::from_secs(2 * 60));
+        cx.run_until_parked();
+        assert!(
+            lsp_store.read_with(cx, |lsp_store, _| lsp_store.all_stopped()),
+            "past the timeout the servers are unloaded"
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.update_lsp_idle_unload(true, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !lsp_store.read_with(cx, |lsp_store, _| lsp_store.all_stopped()),
+            "coming back to the window brings them straight back"
+        );
+        workspace.update(cx, |workspace, _| {
+            assert!(
+                !workspace.lsp_unloaded_while_idle,
+                "and the window stops claiming it owes a restart"
+            );
+        });
+    }
+
+    /// The user's own `StopLanguageServer` outranks the idle timer: a window
+    /// they left with the servers deliberately off must not silently restart
+    /// them the next time they click on it.
+    #[gpui::test]
+    async fn idle_unload_does_not_adopt_servers_the_user_stopped(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .global_lsp_settings
+                    .get_or_insert_default()
+                    .idle_shutdown_minutes = Some(30);
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        lsp_store.update(cx, |lsp_store, cx| lsp_store.stop_all_language_servers(cx));
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| workspace.update_lsp_idle_unload(false, cx));
+        cx.executor().advance_clock(Duration::from_secs(31 * 60));
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                !workspace.lsp_unloaded_while_idle,
+                "the timer must not take credit for a stop it did not perform"
+            );
+            workspace.update_lsp_idle_unload(true, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            lsp_store.read_with(cx, |lsp_store, _| lsp_store.all_stopped()),
+            "so refocusing leaves the user's stop in place"
+        );
+    }
 
     // This only round-trips the `set_solution_band_item`/`solution_band_item`
     // accessor pair — it asserts nothing about where the band paints relative

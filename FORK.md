@@ -5163,3 +5163,40 @@ new handlers re-enter. Guarded by
 `a_markdown_file_previews_rendered_while_other_text_stays_source` and
 `following_a_link_inside_a_document_reuses_the_same_window` (mutation-checked:
 routing the handler back through `open_link` fails the latter).
+
+### 194. A window you are not looking at gives its language servers back
+
+Measured on the maintainer's machine: five JetBrains `kotlin-lsp` JVMs,
+**6.9 GB RSS**, one per member across three open Solutions, on a box at 47/60 GB
+with 7 GB in swap. Nothing ever gave one back: a window opened this morning kept
+every server its project started for the rest of the session, whether or not
+anyone had looked at it since.
+
+`global_lsp_settings.idle_shutdown_minutes` (default 60, `0` disables) stops a
+window's servers once it has gone that long unfocused, and `Workspace` restarts
+them when it is focused again. The primitives already existed
+(`LspStore::{stop,restart}_all_language_servers`, and `all_language_servers_stopped`
+already suppressing respawn-on-buffer-open in between) — what was missing was
+anything that decided WHEN.
+
+Focus is the signal because it is the only one that means "working in this
+Solution" without guessing. A background build or an agent editing files does
+not need analysis; analysis is for the person reading the code.
+
+*Why an hours-scale default.* Coming back is not free: `Columns-Migration`'s
+three servers took 11:55:13 → 11:56:30 to re-import Maven and index, ~75 s. A
+minutes-scale timeout would make alternating between two Solutions cost a
+re-import every time, which is worse than the memory it saves. Arming on
+DEACTIVATE rather than on a generic idle timer has the same reason: a window you
+are switching between never reaches the deadline.
+
+*Rules out:* restarting whatever is stopped when the window is refocused. The
+user's own `editor::StopLanguageServer` is indistinguishable from ours in the
+store's state, so refocusing would silently undo it. The timer records what IT
+stopped (`lsp_unloaded_while_idle`) and re-checks `all_stopped()` before
+claiming a stop it did not perform.
+
+How to apply: this is the per-window half of the memory story; the per-Solution
+half (one server for a Solution instead of one per member) is decision #195.
+Guarded by `an_unfocused_window_unloads_its_language_servers_and_reloads_on_focus`
+and `idle_unload_does_not_adopt_servers_the_user_stopped`, both mutation-checked.

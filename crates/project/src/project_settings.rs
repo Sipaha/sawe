@@ -137,6 +137,10 @@ pub struct GlobalLspSettings {
 
     /// Rules for highlighting semantic tokens.
     pub semantic_token_rules: SemanticTokenRules,
+    /// Minutes a window may go unfocused before its language servers are
+    /// stopped; `0` never unloads. See the settings-content docs for why this
+    /// is an hours-scale knob.
+    pub idle_shutdown_minutes: u64,
 }
 
 impl Default for GlobalLspSettings {
@@ -146,9 +150,16 @@ impl Default for GlobalLspSettings {
             request_timeout: DEFAULT_LSP_REQUEST_TIMEOUT_SECS,
             notifications: LspNotificationSettings::default(),
             semantic_token_rules: SemanticTokenRules::default(),
+            idle_shutdown_minutes: DEFAULT_LSP_IDLE_SHUTDOWN_MINUTES,
         }
     }
 }
+
+/// An unfocused window keeps its language servers for this long. Long enough
+/// that switching between two Solutions you are actively working in never pays
+/// the re-import, short enough that a window you opened this morning and
+/// forgot does not hold a JVM all day.
+pub const DEFAULT_LSP_IDLE_SHUTDOWN_MINUTES: u64 = 60;
 
 impl GlobalLspSettings {
     /// Returns the timeout duration for LSP-related interactions, or Duration::ZERO if no timeout should be applied.
@@ -750,6 +761,12 @@ impl Settings for ProjectSettings {
                     .as_ref()
                     .unwrap()
                     .clone(),
+                idle_shutdown_minutes: content
+                    .global_lsp_settings
+                    .as_ref()
+                    .unwrap()
+                    .idle_shutdown_minutes
+                    .unwrap(),
             },
             dap: project
                 .dap

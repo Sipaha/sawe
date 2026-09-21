@@ -11432,6 +11432,14 @@ impl LspStore {
         Task::ready(())
     }
 
+    /// Whether a blanket stop is in effect — `stop_all_language_servers` was
+    /// called and no restart has cleared it. Remote projects report `false`:
+    /// the flag is local-only state and a remote host owns its own servers.
+    pub fn all_stopped(&self) -> bool {
+        self.as_local()
+            .is_some_and(|local| local.all_language_servers_stopped)
+    }
+
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
         if let Some(local) = self.as_local_mut() {
             local.all_language_servers_stopped = true;

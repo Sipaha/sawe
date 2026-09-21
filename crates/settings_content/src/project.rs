@@ -238,6 +238,19 @@ pub struct GlobalLspSettingsContent {
     pub notifications: Option<LspNotificationSettingsContent>,
     /// Rules for rendering LSP semantic tokens.
     pub semantic_token_rules: Option<SemanticTokenRules>,
+    /// Stop a window's language servers once it has gone this many minutes
+    /// without being focused, and start them again when it is focused.
+    ///
+    /// For a machine with several Solutions open at once: a JetBrains
+    /// `kotlin-lsp` holds 1–4 GB resident per project whether or not you are
+    /// looking at that window. Coming back costs a re-import (measured at ~75 s
+    /// for three Maven members), so this is deliberately an hours-scale knob,
+    /// not a minutes-scale one.
+    ///
+    /// `0` never unloads.
+    ///
+    /// Default: `60`
+    pub idle_shutdown_minutes: Option<u64>,
 }
 
 #[with_fallible_options]

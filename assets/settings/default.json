@@ -2685,6 +2685,12 @@
     //
     // Default: 120
     "request_timeout": 120,
+    // Stop a window's language servers once it has gone this many minutes
+    // without being focused, and start them again when it is focused. Aimed at
+    // several Solutions open at once, where a per-project JVM language server
+    // holds gigabytes in a window nobody is looking at. Coming back costs a
+    // re-import, so this is an hours-scale knob. 0 never unloads.
+    "idle_shutdown_minutes": 60,
     "notifications": {
       // Timeout in milliseconds for automatically dismissing language server notifications.
       // Set to 0 to disable auto-dismiss.
