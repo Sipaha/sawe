@@ -21632,6 +21632,7 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 fetch: None,
                 workspace_scope: Default::default(),
                 workspace_root_markers: Vec::new(),
+                workspace_cache_flag: None,
             },
         );
     });
@@ -21655,6 +21656,7 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 fetch: None,
                 workspace_scope: Default::default(),
                 workspace_root_markers: Vec::new(),
+                workspace_cache_flag: None,
             },
         );
     });
@@ -21678,6 +21680,7 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 fetch: None,
                 workspace_scope: Default::default(),
                 workspace_root_markers: Vec::new(),
+                workspace_cache_flag: None,
             },
         );
     });
@@ -21699,6 +21702,7 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 fetch: None,
                 workspace_scope: Default::default(),
                 workspace_root_markers: Vec::new(),
+                workspace_cache_flag: None,
             },
         );
     });
@@ -32656,6 +32660,7 @@ async fn test_inlay_hints_request_timeout(cx: &mut TestAppContext) {
                     notifications: None,
                     semantic_token_rules: None,
                     idle_shutdown_minutes: None,
+                    workspace_cache_ttl_days: None,
                 });
             });
         });
@@ -32767,6 +32772,7 @@ async fn test_inlay_hints_request_timeout(cx: &mut TestAppContext) {
                     notifications: None,
                     semantic_token_rules: None,
                     idle_shutdown_minutes: None,
+                    workspace_cache_ttl_days: None,
                 });
             });
         });

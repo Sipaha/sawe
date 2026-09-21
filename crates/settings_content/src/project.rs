@@ -214,6 +214,24 @@ pub struct LspSettings {
     /// Default: `[]`
     #[serde(default)]
     pub workspace_root_markers: Vec<String>,
+    /// Give this server a cache directory of its own INSIDE the Solution, and
+    /// pass it with this command-line flag — e.g. `"--system-path"` for the
+    /// JetBrains `kotlin-lsp`, which otherwise indexes into a shared
+    /// `~/.cache/JetBrains/IntelliJServer/workspaces/<opaque hash>`.
+    ///
+    /// The point is ownership, not location. A shared cache keyed by an opaque
+    /// hash of the folder set cannot be attributed to a project, cannot be
+    /// cleaned up when that project goes away, and grows a new multi-gigabyte
+    /// copy every time the folder set changes. Inside the Solution it is
+    /// obvious whose it is, it dies with the Solution, and the editor can
+    /// collect the stale generations itself
+    /// (`lsp.workspace_cache_ttl_days`).
+    ///
+    /// Only for servers that take a directory this way, and only in a window
+    /// that belongs to a Solution — elsewhere the server keeps its own default.
+    ///
+    /// Default: unset
+    pub workspace_cache_flag: Option<String>,
 }
 
 /// See [`LspSettings::workspace_scope`].
@@ -239,6 +257,7 @@ impl Default for LspSettings {
             fetch: None,
             workspace_scope: LspWorkspaceScope::Worktree,
             workspace_root_markers: Vec::new(),
+            workspace_cache_flag: None,
         }
     }
 }
@@ -293,6 +312,19 @@ pub struct GlobalLspSettingsContent {
     ///
     /// Default: `60`
     pub idle_shutdown_minutes: Option<u64>,
+    /// Days a Solution-private language-server cache may go untouched before
+    /// the editor deletes it (see `lsp.<name>.workspace_cache_flag`).
+    ///
+    /// These caches are keyed by the exact set of folders the server was given,
+    /// so adding or removing a member of the Solution strands the previous
+    /// one — measured at 0.4 GB to 2.5 GB apiece. The live cache is written to
+    /// continuously, so age is a safe signal; the window only has to be wider
+    /// than the longest stretch you might leave a Solution alone.
+    ///
+    /// `0` never collects.
+    ///
+    /// Default: `14`
+    pub workspace_cache_ttl_days: Option<u64>,
 }
 
 #[with_fallible_options]

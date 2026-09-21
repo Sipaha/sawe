@@ -31,6 +31,8 @@ pub use environment::ProjectEnvironmentEvent;
 use git::repository::{RepoPath, get_git_committer};
 use git_store::{Repository, RepositoryId};
 pub mod search_history;
+pub mod lsp_workspace_cache;
+pub mod solution_roots;
 pub mod yarn;
 
 use dap::inline_value::{InlineValueLocation, VariableLookupKind, VariableScope};

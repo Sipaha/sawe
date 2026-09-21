@@ -5301,3 +5301,75 @@ by nine tests in `util::orphan_registry` (mutation-checked: dropping the
 start-time comparison, the boot-id check, the owner-liveness check, the
 registration's `Drop`, or the group-leader guard each fails its own test; the
 last one kills the harness).
+
+### 197. A language server's index lives inside the Solution it indexes
+
+The JetBrains `kotlin-lsp` writes 0.4–2.5 GB per project into
+`~/.cache/JetBrains/IntelliJServer/workspaces/<hash>`, where the hash comes
+from the exact set of workspace folders it was given. Measured on this machine:
+13 such directories, 13 GB, and nothing on disk saying which project any of them
+belongs to — the only way to find out is `strings` on the serialised workspace
+model. Decision #195 made it worse in one specific way: giving a Solution ONE
+server changes the folder set, so every per-member index built before it is
+stranded, forever, unreferenced.
+
+The server takes `--system-path <dir>` — the flag JetBrains' own `bin/warmup.py`
+uses — and honours it completely: a probe run moved logs, `system/` and the
+whole `workspaces/<hash>` tree into the given directory and touched the global
+cache not at all. So `lsp.<name>.workspace_cache_flag` names that flag, and the
+editor hands the server
+`<solution>/.sawe/lsp/<server>/<generation>`.
+
+Ownership was the point, not location. Inside the Solution the index is
+attributable by its path, it dies when the Solution is deleted, and — because
+the generation key is OURS, an FNV-1a of the sorted roots rather than the
+vendor's opaque hash — a stranded index is a sibling directory with an old
+`last-used` stamp instead of an anonymous entry in a shared cache. Each
+generation also carries a `roots.txt`, so the answer to "what is this 2 GB
+directory" is in the directory. `lsp.workspace_cache_ttl_days` (default 14)
+collects the ones nothing has asked for.
+
+Freshness is a stamp we write at server start, not the age of the server's own
+files: a stat per generation against walking a multi-gigabyte tree. That makes
+one case wrong on its own — a Solution left open longer than the TTL has a stale
+stamp on a LIVE index — so generations handed out during this run are held in a
+process-wide set the collector skips unconditionally. A generation stops being
+live exactly when the editor that started its server goes away, which is the
+same lifetime.
+
+`project` cannot ask which Solution a worktree belongs to: the dependency edge
+runs `solutions → project`. So the roots travel the way
+`solutions::store`'s branch-protection snapshot already travels — the owner
+pushes them into a plain static in the lower crate
+(`project::solution_roots`), refreshed on the same store events. The longest
+matching root wins, because `solutions.root` is user-configurable and a shorter
+prefix would otherwise claim a nested Solution's worktrees.
+
+*Rules out:* expressing this in `lsp.<name>.binary.arguments`. Settings resolve
+per worktree and per relative path, with no Solution tier, so they cannot name a
+directory relative to the Solution root; and that field REPLACES the adapter's
+arguments, so a user who sets it for an unrelated reason would silently drop
+`--stdio`. The flag is appended after the override for the same reason.
+
+*Rules out:* collecting inside the vendor's layout. `workspaces/<hash>` is
+theirs, `system/` beside it is live, and the hash is computed in
+ZKM-obfuscated code — a collector that had to tell those apart would be
+guessing. Our own generation directory means we only ever delete something we
+created.
+
+*Rules out:* doing this for every server. `rust-analyzer` and `gopls` keep
+nothing worth relocating, and a server outside any Solution — a plain folder
+window — keeps its own default cache rather than being denied one.
+
+How to apply: a server that writes gigabytes somewhere global and lets you say
+where gets `workspace_cache_flag` in `assets/settings/default.json`, and
+nothing else. Verified end to end against the real `intellij-server`: one
+process for a two-member Solution, launched with
+`--system-path <solution>/.sawe/lsp/kotlin-lsp/c9a398eb…`, 146 MB of index
+inside the Solution, zero new directories under `~/.cache/JetBrains`; then a
+member removed, the old generation backdated, and the restart collected it with
+`lsp workspace cache: collecting …, unused for 40 days`. Guarded by nine tests
+in `project::lsp_workspace_cache` and one in `project::solution_roots`
+(mutation-checked: the in-use set, the generation key, its root separator, the
+TTL switch, the unstamped-generation skip, the argument append and the
+longest-prefix match each fail their own test).

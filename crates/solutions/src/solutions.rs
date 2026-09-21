@@ -37,7 +37,7 @@ pub use remote_url::normalize_remote_url;
 pub use settings::{BranchProtectionMember, BranchProtectionSettings, SolutionsSettings};
 pub use store::{
     SolutionStore, SolutionStoreEvent, install_global_for_test,
-    refresh_active_solution_for_branch_protection,
+    refresh_active_solution_for_branch_protection, refresh_solution_roots,
 };
 pub use tabs_snapshot::{SolutionTabsSnapshot, TabSnapshots};
 
@@ -59,12 +59,17 @@ pub fn init(cx: &mut App) {
     // synchronously inside `SolutionsSettings::from_settings`; the
     // active-Solution half follows `ActiveSolutionChanged`.
     refresh_active_solution_for_branch_protection(cx);
+    // Same lifecycle, different consumer: the project layer needs to know which
+    // Solution a worktree sits in, to give a Solution-scoped language server a
+    // cache directory that belongs to the Solution rather than to one member.
+    refresh_solution_roots(cx);
     if let Some(store) = SolutionStore::try_global(cx) {
         cx.subscribe(
             &store,
             |_store, event: &SolutionStoreEvent, cx| match event {
                 SolutionStoreEvent::ActiveSolutionChanged(_) | SolutionStoreEvent::Changed => {
                     refresh_active_solution_for_branch_protection(cx);
+                    refresh_solution_roots(cx);
                 }
                 _ => {}
             },

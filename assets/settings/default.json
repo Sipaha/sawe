@@ -2674,8 +2674,15 @@
     // so give it ONE instance for the whole Solution. The markers keep it out
     // of members that are not JVM projects, which it would otherwise import,
     // find nothing in, and index `node_modules` on the way through.
+    // Its index goes inside the Solution (`<solution>/.sawe/lsp/kotlin-lsp/`)
+    // rather than into the shared `~/.cache/JetBrains/IntelliJServer`, where it
+    // is keyed by an opaque hash of the folder set: unattributable, never
+    // collected, and a fresh multi-gigabyte copy every time the Solution gains
+    // or loses a member. `--system-path` is the flag JetBrains' own warmup
+    // tooling uses, and it moves the whole tree (logs, indexes, workspaces).
     "kotlin-lsp": {
       "workspace_scope": "project",
+      "workspace_cache_flag": "--system-path",
       "workspace_root_markers": [
         "pom.xml",
         "build.gradle",
@@ -2709,6 +2716,12 @@
     // holds gigabytes in a window nobody is looking at. Coming back costs a
     // re-import, so this is an hours-scale knob. 0 never unloads.
     "idle_shutdown_minutes": 60,
+    // Days a Solution-private language-server cache (see
+    // `lsp.<name>.workspace_cache_flag`) may go untouched before the editor
+    // deletes it. These are keyed by the exact folder set, so changing a
+    // Solution's membership strands the previous one — gigabytes apiece.
+    // 0 never collects.
+    "workspace_cache_ttl_days": 14,
     "notifications": {
       // Timeout in milliseconds for automatically dismissing language server notifications.
       // Set to 0 to disable auto-dismiss.

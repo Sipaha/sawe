@@ -141,6 +141,9 @@ pub struct GlobalLspSettings {
     /// stopped; `0` never unloads. See the settings-content docs for why this
     /// is an hours-scale knob.
     pub idle_shutdown_minutes: u64,
+    /// Days a Solution-private language-server cache may go untouched before it
+    /// is deleted; `0` never collects.
+    pub workspace_cache_ttl_days: u64,
 }
 
 impl Default for GlobalLspSettings {
@@ -151,6 +154,7 @@ impl Default for GlobalLspSettings {
             notifications: LspNotificationSettings::default(),
             semantic_token_rules: SemanticTokenRules::default(),
             idle_shutdown_minutes: DEFAULT_LSP_IDLE_SHUTDOWN_MINUTES,
+            workspace_cache_ttl_days: DEFAULT_LSP_WORKSPACE_CACHE_TTL_DAYS,
         }
     }
 }
@@ -160,6 +164,11 @@ impl Default for GlobalLspSettings {
 /// the re-import, short enough that a window you opened this morning and
 /// forgot does not hold a JVM all day.
 pub const DEFAULT_LSP_IDLE_SHUTDOWN_MINUTES: u64 = 60;
+
+/// A Solution-private language-server cache survives this long untouched.
+/// Two weeks is longer than a holiday and shorter than the interval at which a
+/// stranded 2 GB index stops being worth keeping "just in case".
+pub const DEFAULT_LSP_WORKSPACE_CACHE_TTL_DAYS: u64 = 14;
 
 impl GlobalLspSettings {
     /// Returns the timeout duration for LSP-related interactions, or Duration::ZERO if no timeout should be applied.
@@ -766,6 +775,12 @@ impl Settings for ProjectSettings {
                     .as_ref()
                     .unwrap()
                     .idle_shutdown_minutes
+                    .unwrap(),
+                workspace_cache_ttl_days: content
+                    .global_lsp_settings
+                    .as_ref()
+                    .unwrap()
+                    .workspace_cache_ttl_days
                     .unwrap(),
             },
             dap: project

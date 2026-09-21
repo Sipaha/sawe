@@ -28,6 +28,7 @@ use self::document_colors::DocumentColorData;
 use self::document_links::DocumentLinksData;
 use self::document_symbols::DocumentSymbolsData;
 use self::inlay_hints::BufferInlayHints;
+use crate::lsp_workspace_cache;
 use crate::{
     CodeAction, Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource,
     CoreCompletion, Hover, InlayHint, InlayId, LocationLink, LspAction, LspPullDiagnostics,
@@ -532,16 +533,6 @@ impl LocalLspStore {
         let update_binary_status = wait_until_worktree_trust.is_none();
 
         let workspace_root_markers = settings.workspace_root_markers.clone();
-        let binary = self.get_language_server_binary(
-            worktree_abs_path.clone(),
-            adapter.clone(),
-            settings,
-            toolchain.clone(),
-            delegate.clone(),
-            true,
-            wait_until_worktree_trust,
-            cx,
-        );
         let pending_workspace_folders = Arc::<Mutex<BTreeSet<Uri>>>::default();
         // A project-scoped server has to be told about EVERY root it will be
         // asked about, up front. `workspace/didChangeWorkspaceFolders` is not a
@@ -571,6 +562,46 @@ impl LocalLspStore {
             }
         }
 
+        // Same root set, second consumer: a server told to keep its index in a
+        // directory of our choosing gets one inside the Solution, keyed on
+        // exactly these roots. Resolved here rather than in the background task
+        // below because `solution_root_for` reads a snapshot the App thread
+        // owns, and because the roots are only assembled at this point.
+        let workspace_cache_request = settings.workspace_cache_flag.clone().and_then(|flag| {
+            let solution_root = crate::solution_roots::solution_root_for(&worktree_abs_path)?;
+            let roots: Vec<PathBuf> = {
+                let folders = pending_workspace_folders.lock();
+                if folders.is_empty() {
+                    vec![worktree_abs_path.to_path_buf()]
+                } else {
+                    folders
+                        .iter()
+                        .filter_map(|uri| uri.to_file_path().ok())
+                        .collect()
+                }
+            };
+            Some(lsp_workspace_cache::WorkspaceCacheRequest {
+                flag,
+                solution_root,
+                server_name: adapter.name.0.to_string(),
+                roots,
+                ttl_days: ProjectSettings::get_global(cx)
+                    .global_lsp_settings
+                    .workspace_cache_ttl_days,
+            })
+        });
+
+        let binary = self.get_language_server_binary(
+            worktree_abs_path.clone(),
+            adapter.clone(),
+            settings,
+            toolchain.clone(),
+            delegate.clone(),
+            true,
+            wait_until_worktree_trust,
+            workspace_cache_request,
+            cx,
+        );
         let pending_server = cx.spawn({
             let adapter = adapter.clone();
             let server_name = adapter.name.clone();
@@ -780,6 +811,7 @@ impl LocalLspStore {
         delegate: Arc<dyn LspAdapterDelegate>,
         allow_binary_download: bool,
         wait_until_worktree_trust: Option<watch::Receiver<bool>>,
+        workspace_cache: Option<lsp_workspace_cache::WorkspaceCacheRequest>,
         cx: &mut App,
     ) -> Task<Result<LanguageServerBinary>> {
         if let Some(settings) = &settings.binary
@@ -811,15 +843,18 @@ impl LocalLspStore {
                 let mut env = delegate.shell_env().await;
                 env.extend(settings.env.unwrap_or_default());
 
+                let mut arguments: Vec<std::ffi::OsString> = settings
+                    .arguments
+                    .unwrap_or_default()
+                    .iter()
+                    .map(Into::into)
+                    .collect();
+                lsp_workspace_cache::append_argument(&mut arguments, workspace_cache);
+
                 Ok(LanguageServerBinary {
                     path: delegate.resolve_relative_path(path),
                     env: Some(env),
-                    arguments: settings
-                        .arguments
-                        .unwrap_or_default()
-                        .iter()
-                        .map(Into::into)
-                        .collect(),
+                    arguments,
                 })
             });
         }
@@ -942,6 +977,10 @@ impl LocalLspStore {
                     shell_env.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
                 }
             }
+            // After the user's override, not before: `binary.arguments` REPLACES
+            // the adapter's arguments, so anything appended earlier would be
+            // silently dropped by a user who set them for an unrelated reason.
+            lsp_workspace_cache::append_argument(&mut binary.arguments, workspace_cache);
 
             binary.env = Some(shell_env);
             Ok(binary)

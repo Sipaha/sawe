@@ -497,6 +497,25 @@ pub fn refresh_active_solution_for_branch_protection(cx: &App) {
     set_active_solution_for_branch_protection(active);
 }
 
+/// Publish every Solution root into `project::solution_roots`, so the project
+/// layer can tell which Solution a worktree belongs to without depending on
+/// this crate. Same shape and same reason as
+/// [`refresh_active_solution_for_branch_protection`]: a snapshot the owner
+/// pushes down, because the dependency edge only runs one way.
+pub fn refresh_solution_roots(cx: &App) {
+    let roots = SolutionStore::try_global(cx)
+        .map(|store| {
+            store
+                .read(cx)
+                .solutions()
+                .iter()
+                .map(|solution| solution.root.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    project::solution_roots::set_solution_roots(roots);
+}
+
 /// A store holding exactly one solution with one member, both rooted at the
 /// caller's (real, on-disk) paths — the fixture the rename tests need, since
 /// a rename touches the filesystem and cannot run against the synthetic temp
