@@ -5127,3 +5127,39 @@ operation needs an explicit answer to "who ends it when the editor goes", and
 `Drop` is not that answer. Guarded by
 `app_quit_reaps_live_agent_subprocesses` (mutation-checked: dropping the
 `on_app_quit` registration fails it).
+
+### 193. A markdown file previews rendered, and following a link stays in one window
+
+The preview window (decision #186) showed every file as source in a read-only
+editor. For the files it is actually used on — a report or a plan doc the agent
+just wrote and linked — that is showing the reader the markup they asked to be
+spared: `#`, backticks and pipe tables instead of headings, code and a table.
+`PreviewContent::Markdown` renders it with `MarkdownElement` under
+`MarkdownFont::Preview` (the markdown-preview font settings — this window is
+showing a file, not a chat message).
+
+Routing is by EXTENSION (`.md` / `.markdown`), not by sniffing the bytes: prose
+with a stray `#` in it is indistinguishable from markdown, and a wrong guess on
+a non-markdown file would swallow its formatting. A wrong guess this way can
+only come from a misnamed file.
+
+**Rendering it introduced the first link a preview ever had, and that link broke
+#186's one-window guarantee.** `open_preview` retargets via
+`WindowHandle::update`, and a click handler on rendered content runs INSIDE that
+same window's update — so the call is re-entrant and fails, which is
+indistinguishable from the window having been closed, which is
+`open_preview`'s cue to open a new one. Measured: one extra window per followed
+link. `open_link_within_preview` `cx.defer`s the retarget out of the current
+update, and `open_preview_from_app` is the entry point that needs no `Window`
+(it costs only a fallback to the primary display when a NEW window is opened).
+
+Relative links resolve against the **document's own directory**, not the
+conversation's worktrees: `./NOTES.md` in a report points at the report's
+neighbour, and the roots that `open_link` uses in the chat are the wrong
+question here.
+
+How to apply: before making previously-inert content interactive, check what its
+new handlers re-enter. Guarded by
+`a_markdown_file_previews_rendered_while_other_text_stays_source` and
+`following_a_link_inside_a_document_reuses_the_same_window` (mutation-checked:
+routing the handler back through `open_link` fails the latter).

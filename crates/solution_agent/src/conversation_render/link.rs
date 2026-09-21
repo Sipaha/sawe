@@ -164,14 +164,35 @@ pub(crate) fn project_roots(workspace: &WeakEntity<Workspace>, cx: &App) -> Vec<
 pub(crate) fn open_link(url: &str, roots: &[PathBuf], window: &mut Window, cx: &mut App) {
     match resolve_link(url, roots, &|path| path.is_file()) {
         LinkTarget::External(url) => cx.open_url(&url),
-        LinkTarget::File(path) => open_file_preview(&path, url, window, cx),
+        LinkTarget::File(path) => {
+            crate::preview_window::open_preview(preview_content(&path, url), window, cx)
+        }
+        LinkTarget::Dead => {}
+    }
+}
+
+/// [`open_link`] for a link inside the preview window's own rendered document.
+///
+/// Retargeting that window means `WindowHandle::update`, and this handler is
+/// already running inside that very update — the call fails, which
+/// `open_preview` cannot tell apart from "the user closed it", so it opened a
+/// SECOND preview window per followed link. `cx.defer` lands the retarget after
+/// the current update instead. (Nothing before this could reach it: a preview
+/// used to be plain text, with no link to click.)
+pub(crate) fn open_link_within_preview(url: &str, roots: &[PathBuf], cx: &mut App) {
+    match resolve_link(url, roots, &|path| path.is_file()) {
+        LinkTarget::External(url) => cx.open_url(&url),
+        LinkTarget::File(path) => {
+            let content = preview_content(&path, url);
+            cx.defer(move |cx| crate::preview_window::open_preview_from_app(content, cx));
+        }
         LinkTarget::Dead => {}
     }
 }
 
 /// `label` is the link as it was written, which is what the user recognises —
 /// `docs/audit.md` rather than the absolute path it resolved to.
-fn open_file_preview(path: &Path, label: &str, window: &mut Window, cx: &mut App) {
+fn preview_content(path: &Path, label: &str) -> crate::preview_window::PreviewContent {
     let body = match std::fs::read(path) {
         Ok(bytes) => preview_body(bytes),
         Err(err) => {
@@ -182,14 +203,34 @@ fn open_file_preview(path: &Path, label: &str, window: &mut Window, cx: &mut App
             format!("Could not read {}:\n\n{err:#}", path.display())
         }
     };
-    crate::preview_window::open_preview(
+    let title = SharedString::from(label.to_string());
+    if is_markdown(path) {
+        crate::preview_window::PreviewContent::Markdown {
+            title,
+            source: SharedString::from(body),
+            base_dir: path.parent().map(Path::to_path_buf),
+        }
+    } else {
         crate::preview_window::PreviewContent::Text {
-            title: SharedString::from(label.to_string()),
+            title,
             body: SharedString::from(body),
-        },
-        window,
-        cx,
-    );
+        }
+    }
+}
+
+/// Extensions the preview renders instead of showing as source.
+///
+/// Extension-only on purpose: the alternative is sniffing the bytes, and the
+/// documents this exists for (a report the agent just wrote, a plan doc) are
+/// indistinguishable from prose with the odd `#` in it. A wrong guess on a
+/// non-markdown file would swallow its formatting; a wrong guess here can only
+/// come from a misnamed file.
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        })
 }
 
 #[cfg(test)]

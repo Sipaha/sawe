@@ -18,9 +18,10 @@ use std::sync::Arc;
 use gpui::AnyElement;
 use gpui::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, Global, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Window, WindowHandle,
-    div, px,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement as _,
+    Styled, Window, WindowHandle, div, px,
 };
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use ui::prelude::*;
 use ui::{CopyButton, IconButton, IconName, Label, LabelSize, Tooltip};
 
@@ -35,13 +36,27 @@ pub(crate) enum PreviewContent {
         title: SharedString,
         body: SharedString,
     },
+    /// A markdown document, shown RENDERED. A report the agent wrote is
+    /// written to be read as prose — headings, lists, links, fenced code — and
+    /// showing it as its own source is showing the reader the thing they asked
+    /// to be spared.
+    Markdown {
+        title: SharedString,
+        source: SharedString,
+        /// Directory the document was read from. Relative links inside a
+        /// document point at its neighbours, not at the conversation's
+        /// worktrees, so they are resolved from here.
+        base_dir: Option<std::path::PathBuf>,
+    },
 }
 
 impl PreviewContent {
     fn window_title(&self) -> SharedString {
         match self {
             PreviewContent::Image(_) => "Image preview".into(),
-            PreviewContent::Text { title, .. } => title.clone(),
+            PreviewContent::Text { title, .. } | PreviewContent::Markdown { title, .. } => {
+                title.clone()
+            }
         }
     }
 }
@@ -57,6 +72,20 @@ impl Global for OpenPreview {}
 
 /// Show `content` in the preview window, opening it if it is not already up.
 pub(crate) fn open_preview(content: PreviewContent, window: &mut Window, cx: &mut App) {
+    open_preview_inner(content, Some(window), cx)
+}
+
+/// [`open_preview`] for a caller that has no `Window` of its own — a link in a
+/// rendered document, whose click handler runs INSIDE the preview window's
+/// update and therefore has to `cx.defer` out of it before retargeting.
+///
+/// The `Window` is only ever used to pick the display a NEW window is centred
+/// on, so dropping it costs a fallback to the primary display, not a feature.
+pub(crate) fn open_preview_from_app(content: PreviewContent, cx: &mut App) {
+    open_preview_inner(content, None, cx)
+}
+
+fn open_preview_inner(content: PreviewContent, window: Option<&mut Window>, cx: &mut App) {
     let title = content.window_title();
     let existing = cx.try_global::<OpenPreview>().and_then(|g| g.0);
 
@@ -88,7 +117,7 @@ pub(crate) fn open_preview(content: PreviewContent, window: &mut Window, cx: &mu
     };
 
     let display_size = window
-        .display(cx)
+        .and_then(|window| window.display(cx))
         .or_else(|| cx.primary_display())
         .map(|d| d.bounds().size)
         .unwrap_or(gpui::Size {
@@ -130,6 +159,9 @@ pub(crate) struct PreviewWindow {
     /// label so the text can be selected piecewise — copying the whole thing is
     /// one button, but "just the file path out of the command" is not.
     editor: Option<Entity<editor::Editor>>,
+    /// Present only while `content` is `Markdown`. Parsing is the entity's job,
+    /// so it is built once per content swap rather than per frame.
+    markdown: Option<Entity<Markdown>>,
     focus_handle: FocusHandle,
 }
 
@@ -141,6 +173,7 @@ impl PreviewWindow {
                 body: SharedString::default(),
             },
             editor: None,
+            markdown: None,
             focus_handle: cx.focus_handle(),
         };
         this.set_content(content, window, cx);
@@ -153,8 +186,20 @@ impl PreviewWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.markdown = match &content {
+            PreviewContent::Markdown { source, .. } => {
+                // `try_global`, not `global`: a fenced block loses only its
+                // syntax colours without the registry, which is not worth
+                // panicking a render pass over in a harness that has no
+                // `AppState`.
+                let languages =
+                    workspace::AppState::try_global(cx).map(|state| state.languages.clone());
+                Some(cx.new(|cx| Markdown::new(source.clone(), languages, None, cx)))
+            }
+            PreviewContent::Image(_) | PreviewContent::Text { .. } => None,
+        };
         self.editor = match &content {
-            PreviewContent::Image(_) => None,
+            PreviewContent::Image(_) | PreviewContent::Markdown { .. } => None,
             PreviewContent::Text { body, .. } => Some(cx.new(|cx| {
                 let mut editor = editor::Editor::multi_line(window, cx);
                 editor.set_show_gutter(false, cx);
@@ -179,16 +224,22 @@ impl Focusable for PreviewWindow {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.editor {
             Some(editor) => editor.focus_handle(cx),
+            // Markdown has no editor to focus, so the window keeps its own
+            // handle — which also keeps Escape on the `PreviewWindow` key
+            // context instead of the deeper `Editor` one.
             None => self.focus_handle.clone(),
         }
     }
 }
 
 impl Render for PreviewWindow {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.content.window_title();
         let copyable = match &self.content {
             PreviewContent::Text { body, .. } => Some(body.clone()),
+            // The markdown SOURCE, not the rendering: what a copy is for here
+            // is pasting the document somewhere else that also renders it.
+            PreviewContent::Markdown { source, .. } => Some(source.clone()),
             PreviewContent::Image(_) => None,
         };
 
@@ -250,6 +301,39 @@ impl Render for PreviewWindow {
             // `set_content` builds the editor for every `Text`, so this is
             // unreachable; an empty body beats an `unwrap` in a render pass.
             (PreviewContent::Text { .. }, None) => div().flex_1().into_any_element(),
+            (PreviewContent::Markdown { base_dir, .. }, _) => match &self.markdown {
+                Some(markdown) => {
+                    // `MarkdownFont::Preview` is the document face (the
+                    // markdown-preview font settings), not the chat's — this
+                    // window is showing a file, not a message.
+                    let style = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
+                    let roots: Vec<std::path::PathBuf> = base_dir.iter().cloned().collect();
+                    div()
+                        .id("preview-markdown")
+                        .flex_1()
+                        .min_h_0()
+                        .p_3()
+                        .overflow_y_scroll()
+                        .child(
+                            MarkdownElement::new(markdown.clone(), style).on_url_click(
+                                move |url, _window, cx| {
+                                    // A relative link in a document points at
+                                    // its neighbours, so the document's own
+                                    // directory is the root it resolves
+                                    // against; anything else falls through to
+                                    // the browser.
+                                    crate::conversation_render::link::open_link_within_preview(
+                                        url.as_ref(),
+                                        &roots,
+                                        cx,
+                                    );
+                                },
+                            ),
+                        )
+                        .into_any_element()
+                }
+                None => div().flex_1().into_any_element(),
+            },
         };
 
         div()
@@ -351,6 +435,140 @@ mod tests {
                 );
             })
             .expect("the window is still open");
+    }
+
+    /// A report the agent wrote is prose, and showing it as its own source is
+    /// showing the reader the markup they asked to be spared. The routing is by
+    /// EXTENSION, so the negative half matters as much: identical bytes under a
+    /// non-markdown name must still open as source.
+    #[gpui::test]
+    async fn a_markdown_file_previews_rendered_while_other_text_stays_source(
+        cx: &mut TestAppContext,
+    ) {
+        let (_solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = "# Findings\n\n- one\n- two\n";
+        let document = dir.path().join("REVIEW.md");
+        std::fs::write(&document, body).expect("write the document");
+        let plain = dir.path().join("REVIEW.txt");
+        std::fs::write(&plain, body).expect("write the plain file");
+
+        let open = |path: &std::path::Path, cx: &mut gpui::VisualTestContext| {
+            let url = path.to_string_lossy().into_owned();
+            workspace.update_in(cx, |_, window, cx| {
+                crate::conversation_render::link::open_link(&url, &[], window, cx);
+            });
+            cx.run_until_parked();
+        };
+
+        open(&document, cx);
+        let handle = cx
+            .update(|_, cx| cx.global::<OpenPreview>().0)
+            .expect("the document opened a preview");
+        handle
+            .update(cx, |preview, _, _| {
+                assert!(
+                    matches!(preview.content, PreviewContent::Markdown { .. }),
+                    "a .md file has to reach the window as markdown, not as text"
+                );
+                assert!(
+                    preview.markdown.is_some(),
+                    "and it needs a parsed document to render"
+                );
+                assert!(
+                    preview.editor.is_none(),
+                    "the read-only source editor is what this replaces"
+                );
+            })
+            .expect("the window is open");
+
+        open(&plain, cx);
+        handle
+            .update(cx, |preview, _, _| {
+                assert!(
+                    matches!(preview.content, PreviewContent::Text { .. }),
+                    "the same bytes under a .txt name are not a document"
+                );
+                assert!(preview.markdown.is_none());
+                assert!(preview.editor.is_some());
+            })
+            .expect("the window is still open");
+    }
+
+    /// A link inside a rendered document is clicked from INSIDE the preview
+    /// window's own update, so retargeting it is a re-entrant
+    /// `WindowHandle::update` — which fails, and a failed update is how
+    /// `open_preview` detects a window the user closed. Unguarded, every
+    /// followed link opened another window: decision #186's stacking, back.
+    #[gpui::test]
+    async fn following_a_link_inside_a_document_reuses_the_same_window(cx: &mut TestAppContext) {
+        let (_solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("FIRST.md");
+        let second = dir.path().join("SECOND.md");
+        std::fs::write(&first, "# First\n\n[next](./SECOND.md)\n").expect("write");
+        std::fs::write(&second, "# Second\n").expect("write");
+
+        let url = first.to_string_lossy().into_owned();
+        workspace.update_in(cx, |_, window, cx| {
+            crate::conversation_render::link::open_link(&url, &[], window, cx);
+        });
+        cx.run_until_parked();
+        let with_preview = cx.update(|_, cx| cx.windows().len());
+        let handle = cx
+            .update(|_, cx| cx.global::<OpenPreview>().0)
+            .expect("the document opened a preview");
+
+        // Exactly what the rendered link's click handler does, from exactly
+        // where it does it.
+        let roots = vec![dir.path().to_path_buf()];
+        handle
+            .update(cx, |_, _, cx| {
+                crate::conversation_render::link::open_link_within_preview(
+                    "./SECOND.md",
+                    &roots,
+                    cx,
+                );
+            })
+            .expect("the window is open");
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_, cx| cx.windows().len()),
+            with_preview,
+            "following a link must retarget the preview, not stack another one"
+        );
+        assert_eq!(
+            cx.update(|_, cx| cx.global::<OpenPreview>().0),
+            Some(handle),
+            "and it has to be the same window"
+        );
+        handle
+            .update(cx, |preview, _, _| match &preview.content {
+                PreviewContent::Markdown { title, source, .. } => {
+                    assert!(source.contains("# Second"), "the linked document is shown");
+                    assert_eq!(title.as_ref(), "./SECOND.md");
+                }
+                PreviewContent::Text { title, .. } => {
+                    panic!("expected the linked markdown, got text titled {title:?}")
+                }
+                PreviewContent::Image(_) => panic!("expected the linked markdown, got an image"),
+            })
+            .expect("the window is open");
     }
 
     /// A handle to a closed window is indistinguishable from a live one until
