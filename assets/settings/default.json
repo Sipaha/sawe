@@ -2666,6 +2666,24 @@
     //         }
     //     }
     // }
+    //
+    // The JetBrains Kotlin language server is one JVM holding 1-4 GB per
+    // project it analyses, and a Solution mounts every member repository as its
+    // own worktree — five members meant five JVMs over one project group.
+    // It takes several roots at `initialize` and indexes them all (measured),
+    // so give it ONE instance for the whole Solution. The markers keep it out
+    // of members that are not JVM projects, which it would otherwise import,
+    // find nothing in, and index `node_modules` on the way through.
+    "kotlin-lsp": {
+      "workspace_scope": "project",
+      "workspace_root_markers": [
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+      ],
+    },
   },
   // DAP Specific settings.
   "dap": {

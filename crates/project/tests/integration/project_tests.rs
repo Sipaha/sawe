@@ -1388,6 +1388,171 @@ async fn test_fallback_to_single_worktree_tasks(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn the_default_scope_still_starts_one_server_per_worktree(cx: &mut gpui::TestAppContext) {
+    // The counterweight to `project_scoped_server_covers_every_member_worktree`:
+    // sharing is opt-in per server, because a server that resolves paths
+    // against a single root (`rust-analyzer`, `gopls`) is broken by it.
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/member-a"), json!({ "a.rs": "" })).await;
+    fs.insert_tree(path!("/member-b"), json!({ "b.rs": "" })).await;
+
+    let project = Project::test(
+        fs.clone(),
+        [path!("/member-a").as_ref(), path!("/member-b").as_ref()],
+        cx,
+    )
+    .await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let _fake = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "the-server",
+            ..Default::default()
+        },
+    );
+
+    async fn server_ids_for(
+        project: &gpui::Entity<Project>,
+        path: &str,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Vec<LanguageServerId>, project::lsp_store::OpenLspBufferHandle) {
+        let (buffer, handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path, cx)
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+        let ids = project.update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                buffer.update(cx, |buffer, cx| {
+                    lsp_store
+                        .running_language_servers_for_local_buffer(buffer, cx)
+                        .map(|(_, server)| server.server_id())
+                        .collect::<Vec<_>>()
+                })
+            })
+        });
+        (ids, handle)
+    }
+
+    let (from_a, _a) = server_ids_for(&project, path!("/member-a/a.rs"), cx).await;
+    let (from_b, _b) = server_ids_for(&project, path!("/member-b/b.rs"), cx).await;
+    assert_eq!(from_a.len(), 1);
+    assert_eq!(from_b.len(), 1);
+    assert_ne!(
+        from_a[0], from_b[0],
+        "without an explicit workspace_scope each worktree keeps its own server"
+    );
+}
+
+#[gpui::test]
+async fn project_scoped_server_covers_every_member_worktree(cx: &mut gpui::TestAppContext) {
+    // A Solution is ONE project whose worktrees are its member repositories.
+    // Upstream starts a language server per worktree, so five members meant
+    // five JetBrains `kotlin-lsp` JVMs (6.9 GB measured) over one project
+    // group. `workspace_scope: "project"` collapses them into one instance
+    // that is handed every qualifying member root at `initialize` — which is
+    // the only point that server reads them at.
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/member-a"),
+        json!({ "pom.xml": "", "a.rs": "" }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/member-b"),
+        json!({ "pom.xml": "", "b.rs": "" }),
+    )
+    .await;
+    // Not a JVM project: the markers must keep it out, or the server imports a
+    // front-end repository and indexes `node_modules` on the way.
+    fs.insert_tree(path!("/member-c"), json!({ "package.json": "", "c.rs": "" }))
+        .await;
+
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |settings, cx| {
+            settings.update_user_settings(cx, |settings| {
+                settings.project.lsp.0.insert(
+                    "the-server".into(),
+                    settings::LspSettings {
+                        workspace_scope: settings::LspWorkspaceScope::Project,
+                        workspace_root_markers: vec!["pom.xml".to_string()],
+                        ..Default::default()
+                    },
+                );
+            });
+        })
+    });
+
+    let project = Project::test(
+        fs.clone(),
+        [
+            path!("/member-a").as_ref(),
+            path!("/member-b").as_ref(),
+            path!("/member-c").as_ref(),
+        ],
+        cx,
+    )
+    .await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let _fake = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "the-server",
+            ..Default::default()
+        },
+    );
+
+    async fn servers_for(
+        project: &gpui::Entity<Project>,
+        path: &str,
+        cx: &mut gpui::TestAppContext,
+    ) -> Vec<Arc<lsp::LanguageServer>> {
+        let (buffer, _handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path, cx)
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+        project.update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                buffer.update(cx, |buffer, cx| {
+                    lsp_store
+                        .running_language_servers_for_local_buffer(buffer, cx)
+                        .map(|(_, server)| server.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+        })
+    }
+
+    let from_a = servers_for(&project, path!("/member-a/a.rs"), cx).await;
+    let from_b = servers_for(&project, path!("/member-b/b.rs"), cx).await;
+    assert_eq!(from_a.len(), 1, "member A is served");
+    assert_eq!(from_b.len(), 1, "member B is served");
+    assert_eq!(
+        from_a[0].server_id(),
+        from_b[0].server_id(),
+        "two members of one Solution must share ONE server, not start a second"
+    );
+    assert_eq!(
+        from_a[0].workspace_folders(),
+        BTreeSet::from_iter([
+            Uri::from_file_path(path!("/member-a")).unwrap(),
+            Uri::from_file_path(path!("/member-b")).unwrap(),
+        ]),
+        "both JVM members are in the folder set the server was initialized with, \
+         and the non-JVM member is not"
+    );
+}
+
+#[gpui::test]
 async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
     cx: &mut gpui::TestAppContext,
 ) {

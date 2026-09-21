@@ -187,6 +187,46 @@ pub struct LspSettings {
     #[serde(default = "default_true")]
     pub enable_lsp_tasks: bool,
     pub fetch: Option<FetchSettings>,
+    /// How many worktrees one instance of this server covers.
+    ///
+    /// `worktree` (the default) starts one server per worktree. `project`
+    /// starts ONE for the whole project and hands it every qualifying worktree
+    /// root as a workspace folder — and since a Solution window is one project
+    /// whose worktrees are its member repositories, `project` means "one server
+    /// for the whole Solution".
+    ///
+    /// Only for servers that genuinely understand several roots at once. A
+    /// JetBrains `kotlin-lsp` does (one JVM covering N Maven repos instead of N
+    /// JVMs, measured at 5783 MB against 7800 MB for two); `rust-analyzer` and
+    /// `gopls` do not and must stay on `worktree`.
+    ///
+    /// Default: `worktree`
+    #[serde(default)]
+    pub workspace_scope: LspWorkspaceScope,
+    /// With `workspace_scope: "project"`, only worktrees whose ROOT holds one
+    /// of these files are handed to the server. Empty means every visible
+    /// worktree.
+    ///
+    /// This is what keeps a Kotlin server out of the front-end repository that
+    /// happens to share the Solution: it would import it, find nothing, and
+    /// index `node_modules` on the way.
+    ///
+    /// Default: `[]`
+    #[serde(default)]
+    pub workspace_root_markers: Vec<String>,
+}
+
+/// See [`LspSettings::workspace_scope`].
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LspWorkspaceScope {
+    /// One server per worktree.
+    #[default]
+    Worktree,
+    /// One server for every qualifying worktree in the project.
+    Project,
 }
 
 impl Default for LspSettings {
@@ -197,6 +237,8 @@ impl Default for LspSettings {
             settings: None,
             enable_lsp_tasks: true,
             fetch: None,
+            workspace_scope: LspWorkspaceScope::Worktree,
+            workspace_root_markers: Vec::new(),
         }
     }
 }

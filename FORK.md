@@ -5200,3 +5200,52 @@ How to apply: this is the per-window half of the memory story; the per-Solution
 half (one server for a Solution instead of one per member) is decision #195.
 Guarded by `an_unfocused_window_unloads_its_language_servers_and_reloads_on_focus`
 and `idle_unload_does_not_adopt_servers_the_user_stopped`, both mutation-checked.
+
+### 195. One language server for a Solution, not one per member
+
+A Solution mounts every member repository as its own worktree, and upstream keys
+a language server by worktree. So a five-member Solution ran five JetBrains
+`kotlin-lsp` JVMs over what the user thinks of as one project — measured at
+**6.9 GB RSS** across three open Solutions, `Columns-Migration` alone
+contributing three.
+
+`LanguageServerSeed.worktree_id` is now a `LanguageServerScope`:
+`Worktree(id)` (default, upstream behaviour) or `Project`. `LspStore` is per
+`Project` and a Solution window is one `Project`, so `Project` scope is exactly
+"one server for this Solution" with no new plumbing between crates. Opt-in per
+server via `lsp.<name>.workspace_scope`; `kotlin-lsp` ships `"project"`.
+
+**Why the roots are all passed at `initialize` and not added later.** The
+server advertises `workspaceFolders: { supported: true, changeNotifications:
+true }` and has **no handler for `workspace/didChangeWorkspaceFolders`** — the
+notification appears only in its protocol classes, never in a handler (method
+references survive its string obfuscation, so this is a reliable read). A folder
+added afterwards is silently ignored and its files get no analysis. So a
+project-scoped server's `pending_workspace_folders` is seeded from every
+qualifying visible worktree before the process starts.
+
+`lsp.<name>.workspace_root_markers` decides "qualifying" (for `kotlin-lsp`:
+`pom.xml` and the four Gradle files). Without it the Kotlin server would be
+handed the front-end member of a mixed Solution, import it, find nothing, and
+index `node_modules` on the way through. Empty means every visible worktree.
+
+Measured payoff on two real members: 3681 MB + 4119 MB as two servers against
+**5783 MB as one** — the saving is the fixed JVM/platform floor, not the index,
+so it is roughly one JVM per member beyond the first.
+
+*Rules out:* one server for ALL Solutions. The server's on-disk index is keyed
+by the FOLDER SET (a two-folder probe created a fresh 1.1 GB
+`~/.cache/JetBrains/IntelliJServer/workspaces/<hash>`), so a set that changes
+every time a window opens or closes would re-index constantly; and one heap with
+`-Xmx2048m` would have to hold every project at once.
+
+*Rules out:* inferring the scope from the server's advertised capabilities. This
+server's advertisement is wrong in exactly the place it matters.
+
+How to apply: `scope.covers()` — not an equality on a worktree id — is the
+question every call site should ask of a seed. The two that need ONE worktree
+anyway (workspace symbols, building an `LspAdapterDelegate`) go through
+`LspStore::anchor_worktree`, which documents why any single pick is safe there.
+Guarded by `project_scoped_server_covers_every_member_worktree` (mutation-checked)
+and `the_default_scope_still_starts_one_server_per_worktree`, which is the
+counterweight: `rust-analyzer` and `gopls` are broken by sharing.

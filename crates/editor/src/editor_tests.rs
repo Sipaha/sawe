@@ -21630,6 +21630,8 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 })),
                 enable_lsp_tasks: false,
                 fetch: None,
+                workspace_scope: Default::default(),
+                workspace_root_markers: Vec::new(),
             },
         );
     });
@@ -21651,6 +21653,8 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 })),
                 enable_lsp_tasks: false,
                 fetch: None,
+                workspace_scope: Default::default(),
+                workspace_root_markers: Vec::new(),
             },
         );
     });
@@ -21672,6 +21676,8 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 })),
                 enable_lsp_tasks: false,
                 fetch: None,
+                workspace_scope: Default::default(),
+                workspace_root_markers: Vec::new(),
             },
         );
     });
@@ -21691,6 +21697,8 @@ async fn test_language_server_restart_due_to_settings_change(cx: &mut TestAppCon
                 initialization_options: None,
                 enable_lsp_tasks: false,
                 fetch: None,
+                workspace_scope: Default::default(),
+                workspace_root_markers: Vec::new(),
             },
         );
     });

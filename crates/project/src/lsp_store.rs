@@ -264,9 +264,63 @@ struct LanguageServerSeedSettings {
     initialization_options: Option<serde_json::Value>,
 }
 
+/// Which worktrees one language server instance covers.
+///
+/// Upstream keys a server by worktree, full stop. A Solution mounts every
+/// member repository as its own worktree, so a five-member Solution ran five
+/// JetBrains `kotlin-lsp` JVMs over one project group — 6.9 GB measured, where
+/// one server covering the same roots costs the fixed JVM floor once.
+/// `LspStore` is per `Project` and a Solution window is one `Project`, so
+/// `Project` scope is exactly "one server for this Solution".
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum LanguageServerScope {
+    Worktree(WorktreeId),
+    Project,
+}
+
+impl LanguageServerScope {
+    /// The worktree this server belongs to, for the callers that need ONE —
+    /// status rows, `LanguageServerAdded`, the delegate a request is built
+    /// against. `None` for a project-scoped server, whose callers have to pick
+    /// an anchor instead (see `LocalLspStore::anchor_worktree`).
+    fn worktree(&self) -> Option<WorktreeId> {
+        match self {
+            Self::Worktree(id) => Some(*id),
+            Self::Project => None,
+        }
+    }
+
+    /// Whether this server answers for files in `worktree_id`.
+    fn covers(&self, worktree_id: WorktreeId) -> bool {
+        match self {
+            Self::Worktree(id) => *id == worktree_id,
+            Self::Project => true,
+        }
+    }
+
+    /// Pick the scope a server started from `settings` should run under.
+    fn from_settings(settings: &LspSettings, worktree_id: WorktreeId) -> Self {
+        match settings.workspace_scope {
+            settings::LspWorkspaceScope::Project => Self::Project,
+            settings::LspWorkspaceScope::Worktree => Self::Worktree(worktree_id),
+        }
+    }
+
+    /// Re-point a WORKTREE-scoped scope at another worktree, for the
+    /// invisible-worktree reuse path. A project-scoped server already covers
+    /// every worktree, so re-keying it would split one server into two entries
+    /// pointing at the same process.
+    fn rekeyed_to(self, worktree_id: WorktreeId) -> Self {
+        match self {
+            Self::Worktree(_) => Self::Worktree(worktree_id),
+            Self::Project => Self::Project,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct LanguageServerSeed {
-    worktree_id: WorktreeId,
+    scope: LanguageServerScope,
     name: LanguageServerName,
     toolchain: Option<Toolchain>,
     settings: LanguageServerSeedSettings,
@@ -370,7 +424,10 @@ impl LocalLspStore {
         cx: &mut App,
     ) -> LanguageServerId {
         let key = LanguageServerSeed {
-            worktree_id: worktree_handle.read(cx).id(),
+            scope: LanguageServerScope::from_settings(
+                &disposition.settings,
+                worktree_handle.read(cx).id(),
+            ),
             name: disposition.server_name.clone(),
             settings: LanguageServerSeedSettings {
                 binary: disposition.settings.binary.clone(),
@@ -474,6 +531,7 @@ impl LocalLspStore {
             });
         let update_binary_status = wait_until_worktree_trust.is_none();
 
+        let workspace_root_markers = settings.workspace_root_markers.clone();
         let binary = self.get_language_server_binary(
             worktree_abs_path.clone(),
             adapter.clone(),
@@ -485,6 +543,33 @@ impl LocalLspStore {
             cx,
         );
         let pending_workspace_folders = Arc::<Mutex<BTreeSet<Uri>>>::default();
+        // A project-scoped server has to be told about EVERY root it will be
+        // asked about, up front. `workspace/didChangeWorkspaceFolders` is not a
+        // dependable way to add one later: the JetBrains `kotlin-lsp` this
+        // exists for advertises `changeNotifications: true` and has no handler
+        // for the notification at all (verified against its own bytecode — the
+        // method appears only in the protocol classes), so a folder added
+        // afterwards is silently ignored and its files get no analysis. Seeding
+        // them here puts them in `initialize`, which the server does read.
+        if key.scope == LanguageServerScope::Project {
+            let markers = &workspace_root_markers;
+            let mut folders = pending_workspace_folders.lock();
+            for worktree in self.worktree_store.read(cx).visible_worktrees(cx) {
+                let worktree = worktree.read(cx);
+                if !markers.is_empty()
+                    && !markers.iter().any(|marker| {
+                        RelPath::unix(marker)
+                            .ok()
+                            .is_some_and(|marker| worktree.entry_for_path(&marker).is_some())
+                    })
+                {
+                    continue;
+                }
+                if let Ok(uri) = Uri::from_file_path(worktree.abs_path().as_ref()) {
+                    folders.insert(uri);
+                }
+            }
+        }
 
         let pending_server = cx.spawn({
             let adapter = adapter.clone();
@@ -1424,7 +1509,7 @@ impl LocalLspStore {
         self.language_server_ids
             .iter()
             .filter_map(move |(seed, state)| {
-                if seed.worktree_id != worktree_id {
+                if !seed.scope.covers(worktree_id) {
                     return None;
                 }
 
@@ -2844,7 +2929,7 @@ impl LocalLspStore {
         else {
             return;
         };
-        origin_seed.worktree_id = worktree_id;
+        origin_seed.scope = origin_seed.scope.rekeyed_to(worktree_id);
         self.language_server_ids
             .entry(origin_seed)
             .or_insert_with(|| UnifiedLanguageServer {
@@ -3675,7 +3760,11 @@ impl LocalLspStore {
         let mut servers_to_remove = BTreeSet::default();
         let mut servers_to_preserve = HashSet::default();
         for (seed, state) in &self.language_server_ids {
-            if seed.worktree_id == id_to_remove {
+            // A project-scoped server still serves the worktrees that remain,
+            // so losing one of its roots must not take it down. It keeps the
+            // departed folder in its workspace-folder set until it restarts,
+            // which costs a stale index entry and nothing else.
+            if seed.scope.worktree() == Some(id_to_remove) {
                 servers_to_remove.insert(state.id);
             } else {
                 servers_to_preserve.insert(state.id);
@@ -3683,7 +3772,8 @@ impl LocalLspStore {
         }
         servers_to_remove.retain(|server_id| !servers_to_preserve.contains(server_id));
         self.language_server_ids.retain(|seed, state| {
-            seed.worktree_id != id_to_remove && !servers_to_remove.contains(&state.id)
+            seed.scope.worktree() != Some(id_to_remove)
+                && !servers_to_remove.contains(&state.id)
         });
         self.lsp_tree.instances.remove(&id_to_remove);
         for server_id_to_remove in &servers_to_remove {
@@ -5585,7 +5675,10 @@ impl LspStore {
                             let path = &disposition.path;
                             let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
                             let key = LanguageServerSeed {
-                                worktree_id,
+                                scope: LanguageServerScope::from_settings(
+                                    &disposition.settings,
+                                    worktree_id,
+                                ),
                                 name: disposition.server_name.clone(),
                                 settings: LanguageServerSeedSettings {
                                     binary: disposition.settings.binary.clone(),
@@ -8016,11 +8109,7 @@ impl LspStore {
                 .get_request_timeout();
 
             for (seed, state) in local.language_server_ids.iter() {
-                let Some(worktree_handle) = self
-                    .worktree_store
-                    .read(cx)
-                    .worktree_for_id(seed.worktree_id, cx)
-                else {
+                let Some(worktree_handle) = self.anchor_worktree(seed, cx) else {
                     continue;
                 };
 
@@ -8423,10 +8512,7 @@ impl LspStore {
                         .language_server_ids
                         .iter()
                         .filter_map(|(seed, state)| {
-                            let worktree = lsp_store
-                                .worktree_store
-                                .read(cx)
-                                .worktree_for_id(seed.worktree_id, cx);
+                            let worktree = lsp_store.anchor_worktree(seed, cx);
                             let delegate: Arc<dyn LspAdapterDelegate> =
                                 worktree.map(|worktree| {
                                     LocalLspAdapterDelegate::new(
@@ -9019,7 +9105,7 @@ impl LspStore {
             })
         } else if let Some(local) = self.as_local() {
             let is_valid = local.language_server_ids.iter().any(|(seed, state)| {
-                seed.worktree_id == symbol.source_worktree_id
+                seed.scope.covers(symbol.source_worktree_id)
                     && state.id == symbol.source_language_server_id
                     && symbol.language_server_name == seed.name
             });
@@ -10256,7 +10342,7 @@ impl LspStore {
             local
                 .language_server_ids
                 .keys()
-                .any(|seed| seed.worktree_id == worktree_id)
+                .any(|seed| seed.scope.covers(worktree_id))
         })
     }
 
@@ -11432,6 +11518,27 @@ impl LspStore {
         Task::ready(())
     }
 
+    /// The worktree a call site builds ONE delegate / anchor against for
+    /// `seed`'s server.
+    ///
+    /// A worktree-scoped server has exactly one and this is that. A
+    /// project-scoped server answers for several, so any single pick is a
+    /// convention rather than a fact; the first visible worktree is the stable
+    /// one. Safe for both callers: the workspace-symbol path only uses it for
+    /// `source_worktree_id`, and the validity check that later reads that id
+    /// (`open_local_buffer_for_symbol`) goes through `scope.covers`, which a
+    /// project-scoped seed satisfies for every worktree; the symbol's real path
+    /// is resolved by `find_worktree` over the whole store. The other caller
+    /// builds an `LspAdapterDelegate`, whose contents (language registry,
+    /// environment, http client, fs) are project-wide anyway.
+    fn anchor_worktree(&self, seed: &LanguageServerSeed, cx: &App) -> Option<Entity<Worktree>> {
+        let worktree_store = self.worktree_store.read(cx);
+        match seed.scope.worktree() {
+            Some(worktree_id) => worktree_store.worktree_for_id(worktree_id, cx),
+            None => worktree_store.visible_worktrees(cx).next(),
+        }
+    }
+
     /// Whether a blanket stop is in effect — `stop_all_language_servers` was
     /// called and no restart has cleared it. Remote projects report `false`:
     /// the flag is local-only state and a remote host owns its own servers.
@@ -11983,7 +12090,7 @@ impl LspStore {
                 pending_work: Default::default(),
                 has_pending_diagnostic_updates: false,
                 progress_tokens: Default::default(),
-                worktree: Some(key.worktree_id),
+                worktree: key.scope.worktree(),
                 binary: Some(language_server.binary().clone()),
                 configuration: Some(language_server.configuration().clone()),
                 workspace_folders: language_server.workspace_folders(),
@@ -11994,7 +12101,7 @@ impl LspStore {
         cx.emit(LspStoreEvent::LanguageServerAdded(
             server_id,
             language_server.name(),
-            Some(key.worktree_id),
+            key.scope.worktree(),
         ));
 
         let server_capabilities = language_server.capabilities();
@@ -12005,7 +12112,7 @@ impl LspStore {
                     server: Some(proto::LanguageServer {
                         id: server_id.to_proto(),
                         name: language_server.name().to_string(),
-                        worktree_id: Some(key.worktree_id.to_proto()),
+                        worktree_id: key.scope.worktree().map(|id| id.to_proto()),
                         language_name: Some(language_name.to_proto()),
                     }),
                     capabilities: serde_json::to_string(&server_capabilities)
@@ -12018,11 +12125,14 @@ impl LspStore {
 
         // Tell the language server about every open buffer in the worktree that matches the language.
         // Also check for buffers in worktrees that reused this server
-        let mut worktrees_using_server = vec![key.worktree_id];
+        // A project-scoped server starts with no single home worktree; the
+        // scan below is what collects the ones it actually answers for.
+        let mut worktrees_using_server: Vec<WorktreeId> =
+            key.scope.worktree().into_iter().collect();
         if let Some(local) = self.as_local() {
             // Find all worktrees that have this server in their language server tree
             for (worktree_id, servers) in &local.lsp_tree.instances {
-                if *worktree_id != key.worktree_id {
+                if !worktrees_using_server.contains(worktree_id) {
                     for server_map in servers.roots.values() {
                         if server_map
                             .values()
@@ -12312,7 +12422,7 @@ impl LspStore {
         let mut language_server_ids = local
             .language_server_ids
             .iter()
-            .filter_map(|(seed, v)| seed.worktree_id.eq(&worktree_id).then(|| v.id))
+            .filter_map(|(seed, v)| seed.scope.covers(worktree_id).then(|| v.id))
             .collect::<Vec<_>>();
         language_server_ids.sort_unstable();
         language_server_ids.dedup();
