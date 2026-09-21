@@ -122,20 +122,47 @@ pub(crate) fn queue_timestamp_prefix(at: chrono::DateTime<Utc>) -> String {
     )
 }
 
-/// Flatten a content-block bundle into a single human-readable string the
-/// native backend can hand to the agent as `additionalContext` (text-only).
-/// Text blocks are concatenated verbatim. Each image block renders as a
-/// pointer to its saved inbox file (so the agent can `Read` the actual pixels
-/// mid-turn) — `image_paths` is indexed by image-occurrence order; a missing /
-/// `None` entry (no path, or the save failed) falls back to the pixel-losing
-/// `[image #N]` placeholder. Passing `&[]` is the placeholder-only behaviour.
-/// Other variants are silently dropped — the side channel is text-only.
-pub(crate) fn inject_text_from_blocks_with_image_paths(
-    blocks: &[acp::ContentBlock],
+/// Flatten the bundles one hook pull drained into a single human-readable
+/// string the native backend can hand to the agent as `additionalContext`
+/// (text-only). Within a bundle, text blocks are concatenated verbatim; each
+/// image block renders as a pointer to its saved inbox file (so the agent can
+/// `Read` the actual pixels mid-turn) — `image_paths` is indexed by
+/// image-occurrence order across the whole drain; a missing / `None` entry (no
+/// path, or the save failed) falls back to the pixel-losing `[image #N]`
+/// placeholder. Passing `&[]` is the placeholder-only behaviour. Other
+/// variants are silently dropped — the side channel is text-only.
+///
+/// Bundles themselves are joined by a BLANK LINE rather than concatenated,
+/// because each one is a distinct send and flattening them lost that seam: a human
+/// follow-up with a supervisor Observer nudge queued behind it reached the
+/// agent as `…крутится?[12:57:53] Your context is getting large…` — one
+/// sentence running into another speaker's, with only the stamp to mark the
+/// join. `image_idx` runs across bundles because `image_paths` is indexed by
+/// image-occurrence order over the whole drain.
+pub(crate) fn inject_text_from_bundles_with_image_paths(
+    bundles: &[Vec<acp::ContentBlock>],
     image_paths: &[Option<std::path::PathBuf>],
 ) -> String {
     let mut out = String::new();
     let mut image_idx = 0usize;
+    for blocks in bundles {
+        while out.ends_with(char::is_whitespace) {
+            out.pop();
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        append_blocks_text(&mut out, blocks, image_paths, &mut image_idx);
+    }
+    out.trim().to_string()
+}
+
+fn append_blocks_text(
+    out: &mut String,
+    blocks: &[acp::ContentBlock],
+    image_paths: &[Option<std::path::PathBuf>],
+    image_idx: &mut usize,
+) {
     for block in blocks {
         match block {
             acp::ContentBlock::Text(t) => {
@@ -152,19 +179,18 @@ pub(crate) fn inject_text_from_blocks_with_image_paths(
                 if !out.is_empty() && !out.ends_with(char::is_whitespace) {
                     out.push('\n');
                 }
-                match image_paths.get(image_idx).and_then(|p| p.as_ref()) {
+                match image_paths.get(*image_idx).and_then(|p| p.as_ref()) {
                     Some(path) => out.push_str(&format!(
                         "[The user attached an image, saved to {}. Use the Read tool to view it.]",
                         path.display()
                     )),
-                    None => out.push_str(&format!("[image #{}]", image_idx + 1)),
+                    None => out.push_str(&format!("[image #{}]", *image_idx + 1)),
                 }
-                image_idx += 1;
+                *image_idx += 1;
             }
             _ => {}
         }
     }
-    out.trim().to_string()
 }
 
 /// Write a queued image attachment to `dir` so a mid-turn follow-up can hand
@@ -1397,8 +1423,49 @@ mod tests {
             acp::ContentBlock::Text(acp::TextContent::new("hello".to_string())),
         ];
         assert_eq!(
-            inject_text_from_blocks_with_image_paths(&blocks, &[]),
+            inject_text_from_bundles_with_image_paths(&[blocks], &[]),
             "[10:39:12] hello"
+        );
+    }
+
+    #[test]
+    fn inject_text_separates_distinct_bundles_with_a_blank_line() {
+        // Regression: a human follow-up and the supervisor Observer nudge
+        // queued behind it drain in the SAME hook pull as two bundles, and
+        // used to reach the agent as one run-on line —
+        // "…forge крутится?[12:57:53] Your context is getting large…".
+        let user = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("[12:52:40] ".to_string())),
+            acp::ContentBlock::Text(acp::TextContent::new(
+                "а что у нас сейчас в forge крутится?".to_string(),
+            )),
+        ];
+        let observer = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("[12:57:53] ".to_string())),
+            acp::ContentBlock::Text(acp::TextContent::new(
+                "Your context is getting large.".to_string(),
+            )),
+        ];
+        assert_eq!(
+            inject_text_from_bundles_with_image_paths(&[user, observer], &[]),
+            "[12:52:40] а что у нас сейчас в forge крутится?\n\n\
+             [12:57:53] Your context is getting large."
+        );
+    }
+
+    #[test]
+    fn inject_text_numbers_images_across_bundles() {
+        // `image_paths` is indexed by image-occurrence order over the WHOLE
+        // drain, so the counter must not restart per bundle.
+        let image = || {
+            acp::ContentBlock::Image(acp::ImageContent::new(
+                String::new(),
+                "image/png".to_string(),
+            ))
+        };
+        assert_eq!(
+            inject_text_from_bundles_with_image_paths(&[vec![image()], vec![image()]], &[]),
+            "[image #1]\n\n[image #2]"
         );
     }
 }

@@ -5047,3 +5047,41 @@ timer it owns, the expiry must perform the action, not consult a model about
 whether to. Guarded by
 `scheduled_usage_limit_resume_wakes_the_worker_instead_of_judging` and
 `pending_usage_limit_resume_does_not_wake_the_worker_early`.
+
+### 191. One queue bundle is one bubble — a drained pull must not fuse two senders
+
+`take_pending_for_delivery` drains every bundle whose `QueueTarget` matches the
+firing hook, and it used to flatten them into one `Vec<ContentBlock>`: one
+agent-facing string, one `push_user_message_entry`. Two facts make that lossy.
+The bundle boundary is the only record that two *separate sends* happened (the
+queue already coalesces consecutive same-origin follow-ups INTO a bundle, and
+deliberately separates them with `"\n\n"` when it does), and
+`render_user_message` decides the bubble's **speaker** from the entry's chunks —
+`is_observer_nudge_blocks` is an ANY over them, so one marked block claims the
+whole entry for the Observer.
+
+So a human follow-up with a supervisor Observer nudge queued behind it — routine,
+since `send_supervisor_nudge` enqueues with `MessageOrigin::Internal` while the
+human's is `User`, which correctly keeps them two bundles — arrived as ONE
+"Observer · to the agent" plaque reading
+«а что у нас сейчас в forge крутится?[12:57:53] Your context is getting large…».
+The operator's own question was attributed to the Observer and run into its text
+with no separator; the agent got the same two sentences glued. Observed live on
+session `xjrn2pmv`, entry 229 (2026-09-21).
+
+Now the drain keeps `Vec<Vec<ContentBlock>>`. The agent-facing text joins bundles
+with a blank line (`inject_text_from_bundles_with_image_paths`, image ordinals
+still counted across the whole drain because `image_paths` is indexed that way),
+and the timeline pushes one `UserMessage` per bundle, so each bubble carries only
+its own sender's chunks.
+
+*Rules out:* "strip the marker when the entry is mixed" and "render per chunk" —
+both keep the fusion and then try to undo it downstream, where the send boundary
+is already gone. The boundary is data the queue has; spend it rather than
+reconstruct it.
+
+How to apply: anything that merges queued sends must ask whether the merge
+erases an attribution the render layer reads back out of the merged blob. Guarded
+by `take_pending_keeps_user_and_observer_sends_apart` (asserts two entries AND
+that only the second is observer-marked — mutation-checked: flattening the push
+fails it) and `inject_text_separates_distinct_bundles_with_a_blank_line`.

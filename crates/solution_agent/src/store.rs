@@ -2937,8 +2937,19 @@ impl SolutionAgentStore {
         // 17:48:09 — the second such false reconnect in six minutes.
         session.update(cx, |s, _| s.last_activity_at = Utc::now());
         let peer_allowed = self.peer_recipient_ready(session_id, cx).is_ok();
-        let combined: Vec<acp::ContentBlock> = session.update(cx, |s, _| {
-            let mut taken: Vec<acp::ContentBlock> = Vec::new();
+        // One `Vec` per drained bundle, NOT one flat list. A single hook pull
+        // often drains several bundles — a human follow-up with a supervisor
+        // Observer nudge queued behind it — and flattening them lost the seam
+        // between two distinct sends in both directions. The agent-facing text
+        // ran one speaker's sentence into the other's, and the timeline pushed
+        // ONE `UserMessage` whose chunks carried the nudge's
+        // `spk_observer_nudge` marker, so `conversation_render` painted the
+        // human's own question inside the "Observer · to the agent" plaque
+        // («сообщение обсервера … сливается с моим сообщением»). Keeping the
+        // bundles apart gives the agent a blank line between sends and the
+        // conversation one bubble per send, attributed to whoever sent it.
+        let taken_bundles: Vec<Vec<acp::ContentBlock>> = session.update(cx, |s, _| {
+            let mut taken: Vec<Vec<acp::ContentBlock>> = Vec::new();
             let mut kept: std::collections::VecDeque<crate::model::PendingBundle> =
                 std::collections::VecDeque::with_capacity(s.pending_messages.len());
             for bundle in s.pending_messages.drain(..) {
@@ -2958,7 +2969,7 @@ impl SolutionAgentStore {
                     && !defer_image
                     && (bundle.origin != crate::model::MessageOrigin::Peer || peer_allowed)
                 {
-                    taken.extend(bundle.blocks);
+                    taken.push(bundle.blocks);
                 } else {
                     kept.push_back(bundle);
                 }
@@ -2966,7 +2977,7 @@ impl SolutionAgentStore {
             s.pending_messages = kept;
             taken
         });
-        if combined.is_empty() {
+        if taken_bundles.is_empty() {
             if queue_len > 0 {
                 // The queue is non-empty yet this hook drained nothing: every
                 // bundle is addressed to somebody else (a teammate's hook, or the
@@ -2989,14 +3000,15 @@ impl SolutionAgentStore {
         // no images in `combined` (they were deferred above), so this collapses
         // to plain text.
         let mut image_paths: Vec<Option<std::path::PathBuf>> = Vec::new();
-        if combined
+        if taken_bundles
             .iter()
+            .flatten()
             .any(|b| matches!(b, acp::ContentBlock::Image(_)))
         {
             // Resolve the inbox dir only when a bundle actually carries an
             // image (the common text-only path pays nothing).
             let dir = self.session_inbox_dir(session_id, cx);
-            for block in &combined {
+            for block in taken_bundles.iter().flatten() {
                 if let acp::ContentBlock::Image(img) = block {
                     image_paths.push(queue::save_inbox_image(&dir, image_paths.len(), img));
                 }
@@ -3023,9 +3035,9 @@ impl SolutionAgentStore {
                 }
             }
         }
-        // Computed before the timeline push so `combined` can be moved into it
-        // (no clone) below. Prepend the hint only at end-of-turn.
-        let body = queue::inject_text_from_blocks_with_image_paths(&combined, &image_paths);
+        // Computed before the timeline push so `taken_bundles` can be moved
+        // into it (no clone) below. Prepend the hint only at end-of-turn.
+        let body = queue::inject_text_from_bundles_with_image_paths(&taken_bundles, &image_paths);
         let text = if is_end_of_turn {
             format!("{}\n\n{}", queue::QUEUE_HINT_LINE, body)
         } else {
@@ -3045,7 +3057,13 @@ impl SolutionAgentStore {
             && let Some(thread) = session.read(cx).acp_thread().cloned()
         {
             thread.update(cx, |thread, cx| {
-                thread.push_user_message_entry(None, combined, cx);
+                // One entry per bundle: two separate sends must not fuse into
+                // one bubble, because the render picks the bubble's speaker
+                // from the chunks (any `spk_observer_nudge` marker turns the
+                // whole entry into an Observer plaque).
+                for blocks in taken_bundles {
+                    thread.push_user_message_entry(None, blocks, cx);
+                }
             });
         }
         self.mark_queue_changed(session_id, cx);

@@ -1287,6 +1287,79 @@ async fn take_pending_for_delivery_drains_pushes_and_formats(cx: &mut TestAppCon
     );
 }
 
+/// A human follow-up and an Observer nudge queued behind it are two SENDS, and
+/// one hook pull drains both. They must stay two bubbles: fusing them into one
+/// `UserMessage` put the human's own question inside the "Observer · to the
+/// agent" plaque (the render picks the speaker from the chunks, and any
+/// `spk_observer_nudge` marker claims the whole entry), and ran the two texts
+/// together in the agent-facing prompt.
+#[gpui::test]
+async fn take_pending_keeps_user_and_observer_sends_apart(cx: &mut TestAppContext) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    let entries_before = cx.update(|cx| thread.read(cx).entries().len());
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.session(session_id).unwrap().update(cx, |s, _| {
+                s.state = SessionState::Running {
+                    started_at: std::time::Instant::now(),
+                    notified: false,
+                };
+            });
+            store
+                .send_message(session_id, "what is running in forge?".to_string(), cx)
+                .detach_and_log_err(cx);
+            store
+                .send_supervisor_nudge(session_id, "Your context is getting large.".to_string(), cx)
+                .detach_and_log_err(cx);
+        });
+    });
+
+    let text = cx
+        .update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.take_pending_for_delivery(session_id, None, false, cx)
+            })
+        })
+        .expect("both sends are pending");
+    let forge_end = text
+        .find("what is running in forge?")
+        .expect("user send delivered")
+        + "what is running in forge?".len();
+    let nudge_start = text
+        .find("Your context is getting large.")
+        .expect("observer send delivered");
+    assert!(
+        text[forge_end..nudge_start].contains("\n\n"),
+        "distinct sends are separated by a blank line, got {text:?}"
+    );
+
+    cx.update(|cx| {
+        let entries = thread.read(cx).entries();
+        assert_eq!(
+            entries.len(),
+            entries_before + 2,
+            "one timeline entry per send"
+        );
+        let observer_flags: Vec<bool> = entries[entries_before..]
+            .iter()
+            .map(|entry| match entry {
+                acp_thread::AgentThreadEntry::UserMessage(message) => {
+                    acp_thread::is_observer_nudge_blocks(&message.chunks)
+                }
+                other => panic!("expected user messages, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            observer_flags,
+            vec![false, true],
+            "the human's bubble stays the human's; only the nudge is the Observer's"
+        );
+    });
+}
+
 /// Pure contract tests for the routing predicates — cheap, no GPUI needed.
 #[test]
 fn queue_target_matches_hook_routes_by_agent_id() {
