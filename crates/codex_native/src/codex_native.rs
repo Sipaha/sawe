@@ -344,6 +344,19 @@ impl AgentConnection for CodexConnection {
         self.sessions.borrow_mut().remove(id);
         Task::ready(Ok(()))
     }
+
+    /// Dropping the `Session` kills its app-server process (`Drop for Session`),
+    /// which is why this clears the map rather than killing by hand.
+    fn kill_all_sessions(&self) {
+        let sessions = std::mem::take(&mut *self.sessions.borrow_mut());
+        if !sessions.is_empty() {
+            log::info!(
+                "reaping {} live codex app-server process(es) before the editor exits",
+                sessions.len()
+            );
+        }
+        drop(sessions);
+    }
     fn auth_methods(&self) -> &[acp::AuthMethod] {
         &[]
     }

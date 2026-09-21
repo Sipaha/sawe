@@ -73,6 +73,18 @@ impl SubprocessPool {
         self.entries.remove(key);
     }
 
+    /// Every connection that finished spawning. `Pending` is deliberately
+    /// skipped: its `Shared<Task>` can only be resolved by the foreground
+    /// executor, and the one caller (app quit) runs in a window where the
+    /// foreground executor is blocked — see
+    /// `SolutionAgentStore::reap_agent_subprocesses_on_quit`.
+    pub fn ready_connections(&self) -> impl Iterator<Item = &Rc<dyn AgentConnection>> {
+        self.entries.values().filter_map(|entry| match &entry.state {
+            SpawnState::Ready(connection) => Some(connection),
+            SpawnState::Pending(_) | SpawnState::Failed(_) => None,
+        })
+    }
+
     #[allow(dead_code)]
     pub fn keys_for_solution<'a>(
         &'a self,

@@ -2696,6 +2696,20 @@ impl AgentConnection for ClaudeNativeConnection {
         Task::ready(Ok(()))
     }
 
+    fn kill_all_sessions(&self) {
+        let sessions: Vec<_> = self.sessions.borrow_mut().drain().collect();
+        if sessions.is_empty() {
+            return;
+        }
+        log::info!(
+            "reaping {} live claude subprocess(es) before the editor exits",
+            sessions.len()
+        );
+        for (_, mut session) in sessions {
+            session.process.kill().log_err();
+        }
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
     }

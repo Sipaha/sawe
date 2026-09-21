@@ -47,6 +47,24 @@ pub struct MockConnection {
     // `restart_agent_keeps_the_session_and_its_history`) depend on the mock
     // refusing to resume, so this must stay off unless a test asks for it.
     supports_resume: bool,
+    /// Sessions the store believes this connection still owns. A real
+    /// connection keeps its subprocess handles here; the mock keeps only the
+    /// ids, which is enough to assert that the app-quit reaper asked for them.
+    live_sessions: Arc<parking_lot::Mutex<Vec<agent_client_protocol::schema::SessionId>>>,
+    reaped: Arc<AtomicUsize>,
+}
+
+impl MockConnection {
+    /// Ids handed out by `new_session` and not yet closed or reaped.
+    pub fn live_sessions(&self) -> Vec<agent_client_protocol::schema::SessionId> {
+        self.live_sessions.lock().clone()
+    }
+
+    /// How many times `kill_all_sessions` ran — a reaper that is registered but
+    /// never fires looks identical to one that fires on an empty pool.
+    pub fn reap_count(&self) -> usize {
+        self.reaped.load(Ordering::SeqCst)
+    }
 }
 
 impl MockConnection {
@@ -66,6 +84,8 @@ impl MockConnection {
             prompt_gate: parking_lot::Mutex::new(prompt_gate),
             cancel_count: cancel_count.unwrap_or_else(|| Arc::new(AtomicUsize::new(0))),
             supports_resume,
+            live_sessions: Default::default(),
+            reaped: Default::default(),
         }
     }
 
@@ -125,6 +145,7 @@ impl acp_thread::AgentConnection for MockConnection {
         let n = self.next_session.get();
         self.next_session.set(n + 1);
         let session_id = agent_client_protocol::schema::SessionId::new(format!("mock-{n}"));
+        self.live_sessions.lock().push(session_id.clone());
         let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
         let connection: Rc<dyn acp_thread::AgentConnection> = self;
         let thread = cx.new(|cx| {
@@ -149,6 +170,21 @@ impl acp_thread::AgentConnection for MockConnection {
     /// has to reconstruct the cold prefix from the DB itself.
     fn supports_resume_session(&self) -> bool {
         self.supports_resume
+    }
+    fn supports_close_session(&self) -> bool {
+        true
+    }
+    fn close_session(
+        self: Rc<Self>,
+        session_id: &agent_client_protocol::schema::SessionId,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        self.live_sessions.lock().retain(|id| id != session_id);
+        Task::ready(Ok(()))
+    }
+    fn kill_all_sessions(&self) {
+        self.live_sessions.lock().clear();
+        self.reaped.fetch_add(1, Ordering::SeqCst);
     }
     fn resume_session(
         self: Rc<Self>,

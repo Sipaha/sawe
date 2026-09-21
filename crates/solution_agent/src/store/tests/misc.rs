@@ -11,6 +11,69 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Quitting the editor must END the agents, not orphan them.
+///
+/// An agent subprocess is `setsid`'d out of the editor's process group so that
+/// killing it takes its own children with it — which also means the OS will not
+/// take it down when the editor goes. Left running, `claude` keeps executing its
+/// interrupted turn in the worktree the next editor run reopens that same
+/// session in: two writers, one checkout (observed on session `xjrn2pmv`,
+/// 2026-09-21, pid 2922105 outliving the 11:54:37 restart by an hour and a half).
+///
+/// The reaper must also do its work SYNCHRONOUSLY. `App::shutdown` blocks the
+/// main thread on the quit observers' futures with the foreground session marked
+/// blocked, which `TestScheduler` models — so `set_block_on_ticks(0..=0)` here is
+/// the assertion that the kill did not need a single foreground tick.
+#[gpui::test]
+async fn app_quit_reaps_live_agent_subprocesses(cx: &mut TestAppContext) {
+    let (_solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let registry = Arc::new(AdapterRegistry::new());
+    cx.update(|cx| SolutionAgentStore::init_global(cx, registry));
+
+    let connection = Rc::new(MockConnection::new());
+    let _thread = cx
+        .update(|cx| {
+            acp_thread::AgentConnection::new_session(
+                connection.clone(),
+                project,
+                util::path_list::PathList::default(),
+                cx,
+            )
+        })
+        .await
+        .expect("mock session");
+    assert_eq!(
+        connection.live_sessions().len(),
+        1,
+        "fixture: the connection owns a live session when the editor quits"
+    );
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, _| {
+            store.pool_pretend_session_added(
+                (SolutionId(1), SharedString::from("mock-agent")),
+                connection.clone(),
+            );
+        });
+    });
+
+    cx.executor().set_block_on_ticks(0..=0);
+    cx.quit();
+
+    assert_eq!(
+        connection.reap_count(),
+        1,
+        "the app-quit observer has to actually run — a hook that is never \
+         registered looks exactly like one that found nothing to reap"
+    );
+    assert!(
+        connection.live_sessions().is_empty(),
+        "and it has to leave no session behind: each one is a live subprocess \
+         that outlives the editor"
+    );
+}
+
 #[gpui::test]
 async fn pool_release_arms_60s_shutdown_then_drops(cx: &mut TestAppContext) {
     let registry = Arc::new(AdapterRegistry::new());

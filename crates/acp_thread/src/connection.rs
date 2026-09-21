@@ -171,6 +171,21 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Closing sessions is not supported")))
     }
 
+    /// Reap every session this connection still owns, **synchronously**.
+    ///
+    /// For app quit, where neither a `Task` nor a `Drop` can be relied on. GPUI
+    /// blocks the main thread on the quit observers' futures and the foreground
+    /// executor makes no progress for that whole window, so anything spawned
+    /// here would simply be dropped; and an agent subprocess is deliberately
+    /// `setsid`'d out of the editor's process group
+    /// ([`util::process::Child::spawn`]), so the OS will not take it down with
+    /// the editor either. Left alone it keeps executing its interrupted turn —
+    /// against the same worktree the next editor run reopens the session in.
+    ///
+    /// Default is a no-op: an agent that owns no local process has nothing to
+    /// reap, and a remote one cannot be reaped from here anyway.
+    fn kill_all_sessions(&self) {}
+
     /// Whether this agent supports resuming existing sessions without loading history.
     fn supports_resume_session(&self) -> bool {
         false

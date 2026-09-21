@@ -5085,3 +5085,45 @@ erases an attribution the render layer reads back out of the merged blob. Guarde
 by `take_pending_keeps_user_and_observer_sends_apart` (asserts two entries AND
 that only the second is observer-marked — mutation-checked: flattening the push
 fails it) and `inject_text_separates_distinct_bundles_with_a_blank_line`.
+
+### 192. Quitting the editor ends the agents; nothing else can
+
+An agent subprocess is spawned through `util::process::Child::spawn`, which
+`setsid`s it into its own process group. That is deliberate and load-bearing —
+it is what lets `killpg` reap the agent's own children (its Bash tools, their
+builds) — but it also means the OS does not take the agent down with the editor.
+`Drop for ClaudeProcess` covers every in-process drop path, and GPUI's shutdown
+never drops the store.
+
+So the editor had no way to end an agent, and quitting orphaned it. An orphan is
+not idle: `claude` was started on a session id it goes on executing against, so
+it keeps editing files, running builds and committing in the worktree the NEXT
+editor run reopens that same session in. Observed 2026-09-21 on session
+`xjrn2pmv`: the subprocess (pid 2922105) outlived the 11:54:37 restart and was
+still writing to `citeck-forge` at 13:21, next to the new run's process for the
+same session. The agent diagnosed it as compaction leaving a process behind;
+`rotate_context` does reap its own (`close_session` → `killpg`), and the pid
+ordering settles it — 2922105 predates the editor process (3078649) that was
+supposed to have spawned it, pids being monotonic in this boot.
+
+`AgentConnection::kill_all_sessions` (default no-op) is now called for every
+pooled connection from an `on_app_quit` observer. The asymmetry that hid this is
+worth naming: language servers — the one comparable subprocess population — have
+had this hook since `LspStore` was written, which is why the same restart reaped
+every `intellij-server` and left the agents running.
+
+*Rules out:* doing it in a `Task`. `App::shutdown` blocks the main thread on the
+observers' futures with the FOREGROUND session marked blocked, so nothing
+spawned in the observer is ever polled — the kill runs in the observer body and
+the returned future is only the "nothing to await" marker. Also rules out
+relying on `Drop`: reaching it needs the very shutdown path that does not run.
+
+Still open: a CRASHED or `SIGKILL`ed editor orphans agents exactly as before.
+Covering that needs a durable pid registry reaped at startup (verify
+`/proc/<pid>` start-time before killing, or a recycled pid gets shot).
+
+How to apply: a subprocess this fork spawns and expects to outlive a single
+operation needs an explicit answer to "who ends it when the editor goes", and
+`Drop` is not that answer. Guarded by
+`app_quit_reaps_live_agent_subprocesses` (mutation-checked: dropping the
+`on_app_quit` registration fails it).

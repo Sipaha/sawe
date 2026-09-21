@@ -525,10 +525,12 @@ pub struct SolutionAgentStore {
     /// notifications do NOT trigger resync on the client.
     metrics_emitter: MetricsEmitter,
     _solution_subscription: Option<Subscription>,
-    /// Keeps the app-quit observer registered for the store's lifetime. See
+    /// Keeps the app-quit observers registered for the store's lifetime. See
     /// [`Self::flush_persist_chains_on_quit`] for why quitting needs a hook at
-    /// all and why that hook can only await BACKGROUND work.
-    _quit_subscription: Subscription,
+    /// all and why that hook can only await BACKGROUND work, and
+    /// [`Self::reap_agent_subprocesses_on_quit`] for the one that must finish
+    /// its work SYNCHRONOUSLY for the same reason.
+    _quit_subscriptions: Vec<Subscription>,
     /// 0.2 Hz (every 5s) healthcheck loop that drives `tick_background_agents`.
     /// Held so the timer cancels when the store is dropped.
     _bg_agents_tick: Option<Task<()>>,
@@ -1170,7 +1172,10 @@ impl SolutionAgentStore {
             teammate_watchers: TeammateWatchers::new(),
             metrics_emitter: MetricsEmitter::new(),
             _solution_subscription: solution_subscription,
-            _quit_subscription: cx.on_app_quit(Self::flush_persist_chains_on_quit),
+            _quit_subscriptions: vec![
+                cx.on_app_quit(Self::flush_persist_chains_on_quit),
+                cx.on_app_quit(Self::reap_agent_subprocesses_on_quit),
+            ],
             _bg_agents_tick: Some(bg_agents_tick),
             supervisor_states: HashMap::new(),
             judge_sessions: HashMap::new(),
@@ -4630,6 +4635,41 @@ impl SolutionAgentStore {
             .entry(session_id)
             .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
             .clone()
+    }
+
+    /// Kill every live agent subprocess before the editor exits.
+    ///
+    /// Without this, quitting the editor ORPHANS the agents rather than ending
+    /// them, and an orphan is not idle: `claude` is resumed on its own session
+    /// id and goes on executing the interrupted turn — editing files, running
+    /// builds, committing — in the worktree the next editor run reopens that
+    /// same session in. Two writers, one checkout. Observed on 2026-09-21:
+    /// session `xjrn2pmv`'s subprocess (pid 2922105) outlived the editor
+    /// restart at 11:54:37 and was still writing to `citeck-forge` at 13:21,
+    /// alongside the new run's process for the same session.
+    ///
+    /// Nothing else covers it. The subprocess is `setsid`'d out of the editor's
+    /// process group on purpose ([`util::process::Child::spawn`]) so that
+    /// `killpg` can reap ITS children, which also means the OS will not take it
+    /// down with us. `Drop for ClaudeProcess` reaps every in-process drop path,
+    /// but GPUI's shutdown never drops the store. And the language servers, the
+    /// one comparable subprocess population, have had exactly this hook since
+    /// `LspStore` was written — which is why a restart reaped them and left the
+    /// agents running.
+    ///
+    /// Synchronous by necessity, not by preference: `App::shutdown` blocks the
+    /// main thread on the observers' futures with the FOREGROUND session marked
+    /// blocked, so a `Task` spawned here would never be polled. Killing runs in
+    /// the observer body; the returned future is only the "nothing to await"
+    /// marker. Registered with `on_app_quit`.
+    fn reap_agent_subprocesses_on_quit(
+        &mut self,
+        _cx: &mut Context<Self>,
+    ) -> impl Future<Output = ()> + use<> {
+        for connection in self.pool.lock().ready_connections() {
+            connection.kill_all_sessions();
+        }
+        async {}
     }
 
     /// Await every retained entry-row write chain, so quitting the editor does
