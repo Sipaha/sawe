@@ -5118,9 +5118,8 @@ spawned in the observer is ever polled — the kill runs in the observer body an
 the returned future is only the "nothing to await" marker. Also rules out
 relying on `Drop`: reaching it needs the very shutdown path that does not run.
 
-Still open: a CRASHED or `SIGKILL`ed editor orphans agents exactly as before.
-Covering that needs a durable pid registry reaped at startup (verify
-`/proc/<pid>` start-time before killing, or a recycled pid gets shot).
+A CRASHED or `SIGKILL`ed editor orphaned them exactly as before; that half is
+decision #196.
 
 How to apply: a subprocess this fork spawns and expects to outlive a single
 operation needs an explicit answer to "who ends it when the editor goes", and
@@ -5249,3 +5248,56 @@ anyway (workspace symbols, building an `LspAdapterDelegate`) go through
 Guarded by `project_scoped_server_covers_every_member_worktree` (mutation-checked)
 and `the_default_scope_still_starts_one_server_per_worktree`, which is the
 counterweight: `rust-analyzer` and `gopls` are broken by sharing.
+
+### 196. A crashed editor's agents are killed by the next one, off a pid registry
+
+Decision #192 ends the agents on a clean quit. It cannot cover a crash: nothing
+runs in the editor when it is `SIGKILL`ed, and the agent is `setsid`'d into its
+own process group precisely so the OS will not take it down with us. So the
+reaping moves to the only process guaranteed to run afterwards — the next
+editor.
+
+Each tracked spawn writes an empty marker file under
+`~/.spk/sawe/state/orphan-registry/<boot>.<editor pid>.<editor start>/<child
+pid>.<child start>` and removes it when the `Child` is dropped, which every
+in-process path does and a crash cannot. Startup sweeps the directory before
+registering its own: a run whose owner is still alive is skipped whole, a run
+from an earlier boot is deleted without signalling anything, and anything left
+is `killpg`ed.
+
+Three facts carry the safety argument, and the whole design exists to make them
+true rather than likely:
+
+- **A recycled pid is not shot.** The name carries the process start time
+  (`/proc/<pid>/stat` field 22, ticks since boot). Same pid, different start
+  time, means the process we recorded is already gone.
+- **A reboot cannot cause a mis-kill.** Start times are only comparable within
+  one boot, so the run directory carries `/proc/sys/kernel/random/boot_id` and a
+  foreign boot is deleted, never signalled.
+- **`killpg` cannot reach the editor's own group.** It fires only when the
+  recorded pid is its own group leader, which a `setsid`'d spawn always is; for
+  anything else the fallback is a lone `kill`. Without that check the sweep
+  signals the group it is running in — which is exactly what the mutated build
+  did to its own test harness.
+
+The user chose this over a watchdog process holding a pipe to the editor and
+`killpg`ing on EOF. The watchdog reaps immediately; the registry leaves an
+orphan running until the next launch. That is the cost, and it is bounded by
+how long the editor stays down, against one fewer process and no IPC protocol.
+
+*Rules out:* `PR_SET_PDEATHSIG`. It is tied to the parent *thread*, and gpui
+spawns from a thread pool, so it fires when that thread exits rather than when
+the editor does; and it signals only `claude`, leaving the builds and Bash tools
+in its group orphaned — strictly worse than today.
+
+Linux only, deliberately: the identity check IS the safety argument and it is
+built on `/proc`. Elsewhere the module degrades to a no-op, because signalling
+pids on a guess is worse than not reaping.
+
+How to apply: `util::process::Child::spawn_tracked` instead of `spawn`, for a
+subprocess that would keep working if the editor vanished. Short-lived helpers
+stay on `spawn` — two file operations for a window too small to matter. Guarded
+by nine tests in `util::orphan_registry` (mutation-checked: dropping the
+start-time comparison, the boot-id check, the owner-liveness check, the
+registration's `Drop`, or the group-leader guard each fails its own test; the
+last one kills the harness).

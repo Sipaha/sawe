@@ -830,7 +830,20 @@ impl AcpConnection {
         }) {
             child.current_dir(cwd);
         }
-        let mut child = Child::spawn(child, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
+        // Tracked so a crashed editor does not leave it running; see
+        // `util::orphan_registry`. The label is the binary name only — argv can
+        // carry tokens and the registry is a plain file.
+        let agent_label = std::path::Path::new(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "external agent".to_string());
+        let mut child = Child::spawn_tracked(
+            child,
+            Stdio::piped(),
+            Stdio::piped(),
+            Stdio::piped(),
+            &agent_label,
+        )?;
 
         let stdout = child.stdout.take().context("Failed to take stdout")?;
         let stdin = child.stdin.take().context("Failed to take stdin")?;

@@ -3,6 +3,7 @@ pub mod command;
 pub mod disambiguate;
 pub mod fs;
 pub mod markdown;
+pub mod orphan_registry;
 pub mod path_list;
 pub mod paths;
 pub mod process;

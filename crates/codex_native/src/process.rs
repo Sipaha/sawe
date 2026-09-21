@@ -44,8 +44,16 @@ impl Process {
     pub fn spawn(directory: &Path, cx: &App) -> Result<Self> {
         let mut command = Command::new("codex");
         command.args(["app-server"]).current_dir(directory);
-        let mut child = Child::spawn(command, Stdio::piped(), Stdio::piped(), Stdio::piped())
-            .context("Could not start Codex. Install the Codex CLI and ensure `codex` is on PATH, then run `codex login` in a terminal.")?;
+        // Tracked so a crashed editor does not leave it running; see
+        // `util::orphan_registry`.
+        let mut child = Child::spawn_tracked(
+            command,
+            Stdio::piped(),
+            Stdio::piped(),
+            Stdio::piped(),
+            "codex app-server",
+        )
+        .context("Could not start Codex. Install the Codex CLI and ensure `codex` is on PATH, then run `codex login` in a terminal.")?;
         let stdout = child.stdout.take().context("Codex stdout missing")?;
         let mut stdin = child.stdin.take().context("Codex stdin missing")?;
         let stderr = child.stderr.take().context("Codex stderr missing")?;

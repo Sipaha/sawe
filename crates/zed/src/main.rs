@@ -841,6 +841,24 @@ fn main() {
     }
     ztracing::init();
 
+    // Kill the agent subprocesses a previous run left behind, then start
+    // recording this run's own (FORK.md #196). A clean quit reaps its agents
+    // through `on_app_quit`; a crash or `SIGKILL` cannot, and an orphaned
+    // `claude` goes on executing its interrupted turn in the worktree the next
+    // run reopens the same session in. Ordered sweep-then-init so this run's
+    // own directory is never a candidate for its own sweep, and placed before
+    // the single-instance hand-off because a run that hands off and exits still
+    // owes the sweep — the hand-off target may be the very editor that crashed.
+    // Directories belonging to a still-running editor are skipped; see
+    // `util::orphan_registry` for why that check cannot misfire.
+    //
+    // After the log file is opened, unlike the cleanups above: "killed the
+    // agent your last session left running" is the one line a user will come
+    // looking for, and anything logged before `init_output_file` is written
+    // nowhere.
+    util::orphan_registry::reap_orphans(paths::orphan_registry_dir());
+    util::orphan_registry::init(paths::orphan_registry_dir());
+
     let version = option_env!("ZED_BUILD_ID");
     let app_commit_sha =
         option_env!("ZED_COMMIT_SHA").map(|commit_sha| AppCommitSha::new(commit_sha.to_string()));

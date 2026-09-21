@@ -72,11 +72,15 @@ pub enum CriticalStderr {
 
 impl ClaudeProcess {
     pub fn spawn(spec: ClaudeCommandSpec, cx: &App) -> Result<Self> {
-        let mut child = Child::spawn(
+        // Tracked, not plain `spawn`: this process outlives a crash of the
+        // editor (see the `Drop` note below and `util::orphan_registry`), and an
+        // orphan resumed on its own session id keeps editing the worktree.
+        let mut child = Child::spawn_tracked(
             spec.to_std_command(),
             Stdio::piped(),
             Stdio::piped(),
             Stdio::piped(),
+            "claude",
         )?;
 
         let stdout = child.stdout.take().context("claude stdout missing")?;

@@ -197,6 +197,14 @@ pub fn state_dir() -> &'static PathBuf {
     STATE_DIR.get_or_init(|| base_dir().join("state"))
 }
 
+/// Where a run records the long-lived subprocesses it owns, so the next run can
+/// kill whatever a crash left behind. See `util::orphan_registry` for the
+/// layout and for why the sweep cannot hit a live run's processes.
+pub fn orphan_registry_dir() -> &'static PathBuf {
+    static ORPHAN_REGISTRY_DIR: OnceLock<PathBuf> = OnceLock::new();
+    ORPHAN_REGISTRY_DIR.get_or_init(|| state_dir().join("orphan-registry"))
+}
+
 /// Returns the path to the temp / cache directory used by Sawe.
 pub fn temp_dir() -> &'static PathBuf {
     static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
