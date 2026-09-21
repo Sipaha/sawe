@@ -2948,8 +2948,8 @@ impl SolutionAgentStore {
         // («сообщение обсервера … сливается с моим сообщением»). Keeping the
         // bundles apart gives the agent a blank line between sends and the
         // conversation one bubble per send, attributed to whoever sent it.
-        let taken_bundles: Vec<Vec<acp::ContentBlock>> = session.update(cx, |s, _| {
-            let mut taken: Vec<Vec<acp::ContentBlock>> = Vec::new();
+        let taken_bundles: Vec<crate::model::PendingBundle> = session.update(cx, |s, _| {
+            let mut taken: Vec<crate::model::PendingBundle> = Vec::new();
             let mut kept: std::collections::VecDeque<crate::model::PendingBundle> =
                 std::collections::VecDeque::with_capacity(s.pending_messages.len());
             for bundle in s.pending_messages.drain(..) {
@@ -2969,7 +2969,7 @@ impl SolutionAgentStore {
                     && !defer_image
                     && (bundle.origin != crate::model::MessageOrigin::Peer || peer_allowed)
                 {
-                    taken.push(bundle.blocks);
+                    taken.push(bundle);
                 } else {
                     kept.push_back(bundle);
                 }
@@ -3002,13 +3002,13 @@ impl SolutionAgentStore {
         let mut image_paths: Vec<Option<std::path::PathBuf>> = Vec::new();
         if taken_bundles
             .iter()
-            .flatten()
+            .flat_map(|bundle| &bundle.blocks)
             .any(|b| matches!(b, acp::ContentBlock::Image(_)))
         {
             // Resolve the inbox dir only when a bundle actually carries an
             // image (the common text-only path pays nothing).
             let dir = self.session_inbox_dir(session_id, cx);
-            for block in taken_bundles.iter().flatten() {
+            for block in taken_bundles.iter().flat_map(|bundle| &bundle.blocks) {
                 if let acp::ContentBlock::Image(img) = block {
                     image_paths.push(queue::save_inbox_image(&dir, image_paths.len(), img));
                 }
@@ -3061,8 +3061,8 @@ impl SolutionAgentStore {
                 // one bubble, because the render picks the bubble's speaker
                 // from the chunks (any `spk_observer_nudge` marker turns the
                 // whole entry into an Observer plaque).
-                for blocks in taken_bundles {
-                    thread.push_user_message_entry(None, blocks, cx);
+                for bundle in taken_bundles {
+                    thread.push_user_message_entry(None, bundle.blocks, cx);
                 }
             });
         }

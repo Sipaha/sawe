@@ -1335,6 +1335,19 @@ async fn take_pending_keeps_user_and_observer_sends_apart(cx: &mut TestAppContex
         text[forge_end..nudge_start].contains("\n\n"),
         "distinct sends are separated by a blank line, got {text:?}"
     );
+    // The agent must be able to tell the two senders apart in the ONE string
+    // it receives — a nudge in the user's voice is how the editor's supervisor
+    // gets mistaken for the user's own decision.
+    let user_label = text
+        .find(crate::store::queue::USER_ATTRIBUTION)
+        .expect("the human's send is named when the pull is mixed");
+    let observer_label = text
+        .find(crate::store::queue::OBSERVER_ATTRIBUTION)
+        .expect("the Observer names itself");
+    assert!(
+        user_label < forge_end && forge_end < observer_label && observer_label < nudge_start,
+        "each header sits directly above the send it names, got {text:?}"
+    );
 
     cx.update(|cx| {
         let entries = thread.read(cx).entries();

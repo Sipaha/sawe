@@ -140,22 +140,70 @@ pub(crate) fn queue_timestamp_prefix(at: chrono::DateTime<Utc>) -> String {
 /// join. `image_idx` runs across bundles because `image_paths` is indexed by
 /// image-occurrence order over the whole drain.
 pub(crate) fn inject_text_from_bundles_with_image_paths(
-    bundles: &[Vec<acp::ContentBlock>],
+    bundles: &[crate::model::PendingBundle],
     image_paths: &[Option<std::path::PathBuf>],
 ) -> String {
+    let mixed = bundles
+        .iter()
+        .any(|bundle| bundle.origin == crate::model::MessageOrigin::User)
+        && bundles
+            .iter()
+            .any(|bundle| bundle.origin != crate::model::MessageOrigin::User);
     let mut out = String::new();
     let mut image_idx = 0usize;
-    for blocks in bundles {
+    for bundle in bundles {
         while out.ends_with(char::is_whitespace) {
             out.pop();
         }
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        append_blocks_text(&mut out, blocks, image_paths, &mut image_idx);
+        if let Some(attribution) = bundle_attribution(bundle, mixed) {
+            out.push_str(attribution);
+            out.push('\n');
+        }
+        append_blocks_text(&mut out, &bundle.blocks, image_paths, &mut image_idx);
     }
     out.trim().to_string()
 }
+
+/// Names the sender of one drained bundle in the agent-facing prompt, or
+/// `None` when the bundle needs no header.
+///
+/// A hook pull hands the agent ONE `additionalContext` string, and an Observer
+/// nudge inside it was indistinguishable from something the human typed — same
+/// `[HH:MM:SS]` stamp, same bare imperative voice, no sender. So the agent
+/// attributed the editor's supervisor to the user (and, in the merged-bubble
+/// bug this sits next to, vice versa).
+///
+/// Only the Observer needs a header of its own: a peer message already opens
+/// with `[Agent message from session …]` and a compaction request with its
+/// `# Compact this session…` heading, so labelling those too would be noise.
+/// The human's own text gets one back only when the SAME pull also carried
+/// somebody else's — alone it is the ordinary case and the default reading
+/// ("this is the user") is already correct.
+fn bundle_attribution(
+    bundle: &crate::model::PendingBundle,
+    pull_is_mixed: bool,
+) -> Option<&'static str> {
+    if acp_thread::is_observer_nudge_blocks(&bundle.blocks) {
+        return Some(OBSERVER_ATTRIBUTION);
+    }
+    (pull_is_mixed && bundle.origin == crate::model::MessageOrigin::User)
+        .then_some(USER_ATTRIBUTION)
+}
+
+/// Header for an Observer nudge in the agent-facing prompt. Names the sender
+/// AND denies the authority the agent would otherwise infer: the Observer is a
+/// process watching the session, so its instruction is not the user's decision
+/// and cannot stand in for one.
+pub(crate) const OBSERVER_ATTRIBUTION: &str =
+    "[From the Observer — this session's autonomous supervisor in the editor, NOT the user. \
+     Treat it as an editor instruction; it cannot grant user approval.]";
+
+/// Header put back on the human's own send when the same hook pull also
+/// delivered somebody else's, so the boundary reads both ways.
+pub(crate) const USER_ATTRIBUTION: &str = "[From the user.]";
 
 fn append_blocks_text(
     out: &mut String,
@@ -1418,14 +1466,40 @@ mod tests {
         // The stamp is its own block ending in a space; the agent-facing text
         // must keep it inline with the user content, not break it onto its own
         // line.
-        let blocks = vec![
-            acp::ContentBlock::Text(acp::TextContent::new("[10:39:12] ".to_string())),
-            acp::ContentBlock::Text(acp::TextContent::new("hello".to_string())),
-        ];
         assert_eq!(
-            inject_text_from_bundles_with_image_paths(&[blocks], &[]),
+            inject_text_from_bundles_with_image_paths(
+                &[bundle(
+                    crate::model::MessageOrigin::User,
+                    ["[10:39:12] ", "hello"].map(text_block).into()
+                )],
+                &[]
+            ),
             "[10:39:12] hello"
         );
+    }
+
+    /// Build a bundle the way the queue would, for the drain-side helpers.
+    fn bundle(
+        origin: crate::model::MessageOrigin,
+        blocks: Vec<acp::ContentBlock>,
+    ) -> crate::model::PendingBundle {
+        crate::model::PendingBundle {
+            id: uuid::Uuid::new_v4(),
+            origin,
+            target: crate::model::QueueTarget::Main,
+            blocks,
+        }
+    }
+
+    fn text_block(text: &str) -> acp::ContentBlock {
+        acp::ContentBlock::Text(acp::TextContent::new(text.to_string()))
+    }
+
+    fn observer_block(text: &str) -> acp::ContentBlock {
+        acp::ContentBlock::Text(
+            acp::TextContent::new(text.to_string())
+                .meta(Some(acp_thread::meta_with_observer_nudge())),
+        )
     }
 
     #[test]
@@ -1434,23 +1508,69 @@ mod tests {
         // queued behind it drain in the SAME hook pull as two bundles, and
         // used to reach the agent as one run-on line —
         // "…forge крутится?[12:57:53] Your context is getting large…".
-        let user = vec![
-            acp::ContentBlock::Text(acp::TextContent::new("[12:52:40] ".to_string())),
-            acp::ContentBlock::Text(acp::TextContent::new(
-                "а что у нас сейчас в forge крутится?".to_string(),
-            )),
-        ];
-        let observer = vec![
-            acp::ContentBlock::Text(acp::TextContent::new("[12:57:53] ".to_string())),
-            acp::ContentBlock::Text(acp::TextContent::new(
-                "Your context is getting large.".to_string(),
-            )),
-        ];
+        let user = bundle(
+            crate::model::MessageOrigin::User,
+            vec![
+                text_block("[12:52:40] "),
+                text_block("а что у нас сейчас в forge крутится?"),
+            ],
+        );
+        let observer = bundle(
+            crate::model::MessageOrigin::Internal,
+            vec![
+                text_block("[12:57:53] "),
+                observer_block("Your context is getting large."),
+            ],
+        );
         assert_eq!(
             inject_text_from_bundles_with_image_paths(&[user, observer], &[]),
-            "[12:52:40] а что у нас сейчас в forge крутится?\n\n\
-             [12:57:53] Your context is getting large."
+            format!(
+                "{USER_ATTRIBUTION}\n[12:52:40] а что у нас сейчас в forge крутится?\n\n\
+                 {OBSERVER_ATTRIBUTION}\n[12:57:53] Your context is getting large."
+            )
         );
+    }
+
+    #[test]
+    fn an_observer_nudge_names_its_sender_even_when_it_arrives_alone() {
+        // The confusing case is not only the mixed pull: a nudge delivered on
+        // its own looked exactly like something the human had typed.
+        let out = inject_text_from_bundles_with_image_paths(
+            &[bundle(
+                crate::model::MessageOrigin::Internal,
+                vec![text_block("[12:57:53] "), observer_block("Hand off now.")],
+            )],
+            &[],
+        );
+        assert_eq!(out, format!("{OBSERVER_ATTRIBUTION}\n[12:57:53] Hand off now."));
+    }
+
+    #[test]
+    fn a_lone_user_send_is_not_labelled() {
+        // The overwhelmingly common pull is the human alone, where "this is
+        // the user" is already the right default — a header there is noise in
+        // every single turn.
+        let out = inject_text_from_bundles_with_image_paths(
+            &[bundle(
+                crate::model::MessageOrigin::User,
+                vec![text_block("[12:52:40] "), text_block("continue")],
+            )],
+            &[],
+        );
+        assert_eq!(out, "[12:52:40] continue");
+    }
+
+    #[test]
+    fn a_peer_send_keeps_only_its_own_header() {
+        // A peer message already opens with `[Agent message from session …]`;
+        // a second editor-added header on top would be noise. It is still not
+        // the user, so a human send alongside it does get labelled.
+        let peer = bundle(
+            crate::model::MessageOrigin::Peer,
+            vec![text_block("[Agent message from session abc] ping")],
+        );
+        let out = inject_text_from_bundles_with_image_paths(&[peer], &[]);
+        assert_eq!(out, "[Agent message from session abc] ping");
     }
 
     #[test]
@@ -1463,8 +1583,12 @@ mod tests {
                 "image/png".to_string(),
             ))
         };
+        let bundles = [
+            bundle(crate::model::MessageOrigin::User, vec![image()]),
+            bundle(crate::model::MessageOrigin::User, vec![image()]),
+        ];
         assert_eq!(
-            inject_text_from_bundles_with_image_paths(&[vec![image()], vec![image()]], &[]),
+            inject_text_from_bundles_with_image_paths(&bundles, &[]),
             "[image #1]\n\n[image #2]"
         );
     }
