@@ -1387,6 +1387,30 @@ async fn test_fallback_to_single_worktree_tasks(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// The shipped default is the whole point of decision #195 and it is addressed
+/// by a STRING. A typo in the server name would leave every Solution on one
+/// JVM per member and look exactly like the feature working.
+#[gpui::test]
+async fn the_shipped_default_puts_kotlin_lsp_on_project_scope(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let kotlin = cx.update(|cx| {
+        <project::project_settings::ProjectSettings as settings::Settings>::get_global(cx)
+            .lsp
+            .get(&LanguageServerName::new_static("kotlin-lsp"))
+            .cloned()
+    });
+    let kotlin = kotlin.expect(
+        "default.json must carry an `lsp` entry under exactly this name — it is \
+         what the running server is looked up by",
+    );
+    assert_eq!(kotlin.workspace_scope, settings::LspWorkspaceScope::Project);
+    assert!(
+        kotlin.workspace_root_markers.contains(&"pom.xml".to_string()),
+        "and the markers that keep it out of non-JVM members, got {:?}",
+        kotlin.workspace_root_markers,
+    );
+}
+
 #[gpui::test]
 async fn the_default_scope_still_starts_one_server_per_worktree(cx: &mut gpui::TestAppContext) {
     // The counterweight to `project_scoped_server_covers_every_member_worktree`:
