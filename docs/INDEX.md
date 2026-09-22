@@ -54,6 +54,7 @@ can read them.
 
 | Date | Status | Plan |
 |---|---|---|
+| 2026-09-22 | in progress | [Integrate current upstream Zed](plans/2026-09-22-upstream-main-integration.md) |
 | 2026-09-22 | complete | [Git panel refresh correctness](plans/2026-09-22-git-panel-refresh.md) |
 | 2026-09-11 | complete | [`plans/2026-09-11-permission-menu-default.md`](plans/2026-09-11-permission-menu-default.md) — descriptive permission choices and a remembered default for new chats. |
 | 2026-09-11 | complete | [`plans/2026-09-11-agent-approval-controls.md`](plans/2026-09-11-agent-approval-controls.md) — readable approvals, per-session native permissions and peer inspection. |
