@@ -251,13 +251,17 @@ one in `gpui_linux`'s `set_appearance` predates the merge on both sides).
 
 ## Audited and found clean
 
-- **CI workflows**: all 49 are gated. The merge *strengthened* this — jobs that
-  our main disabled implicitly via `if: github.repository_owner == 'zed-industries'`
-  now carry an explicit `if: false # sawe: upstream automation is disabled`.
-  Every newly added workflow (guild_*, triage_queue_board,
-  slack_notify_community_automation_failure, community_pr_cleanup,
-  maintainer_edits_nudge) is gated and kept, per FORK.md #118's
-  keep-and-disable policy for the other 41.
+- **CI workflows**: every workflow is gated. The merge *strengthened* this — jobs
+  that our main disabled implicitly via
+  `if: github.repository_owner == 'zed-industries'` now carry an explicit
+  `if: false # sawe: upstream automation is disabled`.
+  The eight newly added community/guild process workflows (guild_*,
+  `triage_queue_board`, `slack_notify_community_automation_failure`,
+  `community_pr_cleanup`, `maintainer_edits_nudge`) were gated on arrival and then
+  **deleted** on the maintainer's instruction, together with the three scripts they
+  alone used; see FORK.md #201 for why that pack is the exception to #118's
+  keep-and-disable default. The tree now holds 40 workflow files — 39 hard-disabled
+  by 107 job guards, with `run_tests.yml` narrowed to `workflow_dispatch:`.
 - **Network**: no new unconditional outbound request. Telemetry
   (`send_event`, `flush_events_inner`), Sentry (`upload_panic`,
   `upload_minidump`, `upload_build_timings`) and the cloud LLM provider are

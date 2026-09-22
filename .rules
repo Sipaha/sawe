@@ -140,7 +140,7 @@ history rewrites still need an explicit go-ahead.
 | Native cloud LLM | `CloudLanguageModelProvider::new` wrapped in `if false`; "Zed Agent" entry hidden in agent panel |
 | `zeta` (edit prediction) | `EditPredictionProvider::Zed` arm returns `None`; default `provider:"none"` |
 | Sentry uploads | `upload_panic`/`upload_minidump`/`upload_build_timings` all early-return; local panic logs preserved |
-| CI workflows | 41 workflows hard-disabled (`if: false`); `run_tests.yml` is `workflow_dispatch:` only |
+| CI workflows | 39 of 40 workflows hard-disabled (`if: false # sawe: upstream automation is disabled`, 107 job guards); `run_tests.yml` is `workflow_dispatch:` only |
 | `agent_ui::AgentPanel` dock + Welcome agent card | `initialize_agent_panel` not called from `crates/zed/src/zed.rs::initialize_panels`; `crates/workspace/src/welcome.rs::render_agent_card` gated off via `false &&`. `agent_ui::init` still runs (inline_assistant / rules_library / context_server modal depend on it) — only the user-facing panel surface is hidden. Fork uses `solution_agent` for AI. |
 
 ## What's kept

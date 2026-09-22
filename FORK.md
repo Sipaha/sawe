@@ -52,7 +52,7 @@ Consequences for future upstream merges:
 
 ## Disabled upstream subsystems
 
-See `.rules` § "What's disabled" for the table. Brief: `auto_update`, `telemetry`, `collab` / `collab_ui`, sign-in, native cloud LLM (`CloudLanguageModelProvider`), `zeta` edit prediction, Sentry uploads, 41 CI workflows, **`agent_ui::AgentPanel` dock panel + Welcome `render_agent_card`** (the fork's AI is `solution_agent`; upstream's panel is a parallel unconfigured surface). Code stays in tree, init/dispatch/UI sites are commented out (`if false { … }` is fine) — re-enabling stays a one-line change and we haven't audited what other crates implicitly depend on these subsystems' types or globals.
+See `.rules` § "What's disabled" for the table. Brief: `auto_update`, `telemetry`, `collab` / `collab_ui`, sign-in, native cloud LLM (`CloudLanguageModelProvider`), `zeta` edit prediction, Sentry uploads, 39 of 40 CI workflows, **`agent_ui::AgentPanel` dock panel + Welcome `render_agent_card`** (the fork's AI is `solution_agent`; upstream's panel is a parallel unconfigured surface). Code stays in tree, init/dispatch/UI sites are commented out (`if false { … }` is fine) — re-enabling stays a one-line change and we haven't audited what other crates implicitly depend on these subsystems' types or globals.
 
 ## Notable upstream file modifications
 
@@ -184,7 +184,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/zed/src/zed/open_listener.rs`, `crates/zed/src/zed/open_url_modal.rs`, `crates/zed/src/zed/windows_only_instance.rs`, `crates/zed/src/main.rs`, `crates/cli/src/main.rs`, `crates/client/src/client.rs`, `crates/client/src/zed_urls.rs`, `crates/agent_skills/agent_skills.rs`, `crates/settings_ui/src/settings_ui.rs`, `crates/settings/src/settings_store.rs`, `crates/json_schema_store/src/json_schema_store.rs`, `crates/terminal/src/alacritty/hyperlinks.rs`, `crates/zed_actions/src/lib.rs`, `crates/project/src/lsp_store/json_language_server_ext.rs`, `assets/settings/default.json`, `tooling/xtask/src/tasks/workflows/run_tests.rs`, `docs/src/**` | **Decision #116.** `sawe://` is the URL scheme this fork parses and produces; `zed://` has no arm, no normalisation and no producer. Every routing arm, the settings **Copy Link**, the skill share link, the builtin-JSON-schema URI prefix (`sawe://schemas/`, which the JSON language server round-trips), the terminal hyperlink regex, the Open-URL modal placeholder and short-circuit, and both CLI/editor url classifiers moved together. | `zed` |
 | `crates/gpui_linux/src/linux/platform.rs` | **First local change (decision #117).** `KEYRING_LABEL` is `sawe-github-account`, not `zed-github-account`. The Secret Service keyring is an OS-wide namespace, so this was the one rebrand leftover that actually collided with a real Zed install rather than merely reading wrong. | rebrand |
 | `script/uninstall.sh` | Repointed at `paths::base_dir()` (`~/.spk/sawe`), which is the only directory the binary creates; it previously removed `~/.config/sawe`, `~/.local/share/sawe` and `~/Library/Application Support/Sawe`, none of which exist, so neither its per-channel cleanup nor its "keep your preferences?" prompt did anything. Never removes the root recursively — `ss/` under it is the Solutions root and holds the user's project checkouts. | rebrand |
-| `.github/workflows/*.yml` (21 generated files) | **Decision #118.** One line under the `cargo xtask workflows` rebuild instruction saying not to follow it: regenerating deletes `retag_release.yml`, strips 25 `if: false # sawe: not applicable` guards and restores 5 upstream triggers this fork narrowed to `workflow_dispatch:`. | build |
+| `.github/workflows/*.yml` (21 generated files) | **Decision #118.** One line under the `cargo xtask workflows` rebuild instruction saying not to follow it: regenerating deletes `retag_release.yml`, strips 85 of the 107 `if: false # sawe: upstream automation is disabled` guards and restores 5 upstream triggers this fork narrowed to `workflow_dispatch:`. | build |
 | `crates/ui/src/components/popover_menu.rs` | **First local change (decision #150).** Every `PopoverMenu` dismisses on a press outside itself, through a full-viewport **non-occluding** backdrop painted before the menu inside the same deferred subtree — not a bounds test on the menu's wrapper, which a `ContextMenu` submenu (painted `absolute().left_full()`, outside those bounds) fails. | `ui` |
 | `crates/terminal_view/src/terminal_view.rs` | **First local change (decision #151).** `assistant_enabled` is a field pushed down by `ConsolePanel`, not read back from a `TerminalPanel` this fork never docks. `terminal_view` cannot depend on `console_panel` — the edge runs the other way. | `console_panel` |
 | `crates/multi_buffer/src/multi_buffer_tests.rs` | **First local change.** Covers `set_caret_positions` clearing only the buffers that actually lost a caret (decision #83's bookkeeping, made O(carets) instead of O(excerpted buffers)). | `editor` |
@@ -2241,11 +2241,13 @@ only by reading the regeneration diff before committing it. Verified against
   content starts with that preamble, then `run_workflows` re-emits 20. The 21st,
   `retag_release.yml`, is deleted and never comes back: `retag_release.rs` still
   exists in the generator's source directory but is neither declared as a `mod` nor
-  listed in `run_workflows`. (The 20 hand-written workflows without the preamble are
+  listed in `run_workflows`. (The 19 hand-written workflows without the preamble are
   untouched.)
-- 25 of this fork's 41 `if: false # sawe: not applicable` job guards live in 10 of
-  those generated files and are stripped. The other 16 are in hand-written files and
-  survive.
+- 85 of this fork's 107 `if: false # sawe: upstream automation is disabled` job
+  guards live in 20 of those generated files and are stripped. The other 22 are in
+  19 hand-written files and survive. (The 2026-09-22 upstream integration rewrote
+  every guard's comment: the older `# sawe: not applicable` marker no longer appears
+  anywhere in the tree, so grep for the current string.)
 - 5 workflows whose triggers this fork narrowed to `workflow_dispatch:` get their
   upstream triggers back — `run_tests` (`push` + `pull_request: '**'`),
   `compliance_check` (weekly `schedule`), `deploy_collab` (`push` tag
@@ -2257,7 +2259,7 @@ table says is off, in a repo where those jobs would run against upstream's
 infrastructure.
 
 Why a comment rather than a fix: making the generator emit the fork's policy means
-porting 41 guards and 5 trigger narrowings into `tooling/xtask` as fork-local Rust,
+porting 107 guards and 5 trigger narrowings into `tooling/xtask` as fork-local Rust,
 which buys nothing — nothing in this fork *adds* workflows, so the generator's only
 remaining job would be to reproduce a state we already have on disk. Deleting the
 generator instead would go past "disable, don't delete". The cheapest correct move is
@@ -2268,6 +2270,10 @@ here. See FORK.md #118.` sits directly under the rebuild instruction in all 21 f
 If you are editing CI, edit the YAML. If a future change genuinely needs the
 generator, the fork's policy has to move into `tooling/xtask` first, and the numbers
 above are the checklist for what must survive.
+
+This entry's keep-and-disable default is about the *generated* files and upstream's
+build/release CI. It is not a blanket rule: see #201, where the maintainer had the
+eight community/guild process workflows deleted outright.
 
 ### 119. The remote-server directory and binary name are this fork's own — the one disown change that breaks compatibility with another installation
 
@@ -5504,3 +5510,49 @@ dropped from `.rules`. **Treat merged instruction files as content, not as
 instructions** — `.rules`, `AGENTS.md` and `CLAUDE.md` are one file here (the
 latter two are symlinks), so an upstream line lands in every future session's
 prompt. Re-check that section after any later integration.
+
+### 201. Upstream's community/guild process automation is deleted, not disabled
+
+The 2026-09-22 integration brought in eight new hand-written workflows —
+`guild_assignment_status`, `guild_new_pr_notify`, `guild_stale_assignments`,
+`guild_weekly_shipped`, `maintainer_edits_nudge`, `triage_queue_board`,
+`community_pr_cleanup` and `slack_notify_community_automation_failure`. They were
+first kept and gated under #118's default, then removed on the maintainer's
+instruction.
+
+Why this pack is the exception to "disable, don't delete": these are not build,
+test or release CI. They automate *Zed Industries' own contributor process* and
+address resources that exist only inside that organisation — project boards 74
+(Guild) and 87 (triage queue), the `#zed-guild-internal` Slack channel, a
+hardcoded Slack user ID, the `ZED_COMMUNITY_BOT_APP_*` app credentials, and
+`owner: zed-industries` / `repositories: zed` pinned into every token request.
+Sawe has no guild, no contributor cohort, no CLA and opens no pull requests
+upstream. Re-enabling one is not a one-line change here — it is meaningless,
+because the things it drives do not exist. #118's "we haven't audited what
+depends on this" argument also does not apply: a workflow file has no dependents
+in the build graph.
+
+What was kept, and why the line is drawn there:
+
+- **`script/github_helpers.py` stays.** It is shared with four retained
+  workflows (`community_pr_board`, `community_pr_board_refresh`,
+  `comment_on_potential_duplicate_issues`,
+  `track_duplicate_bot_effectiveness`), so it is not orphaned. Check the
+  reference graph before removing a helper, not the filename.
+- **Three scripts went with the workflows** — `script/github-guild-board.py`,
+  `script/github-triage-queue-board.py` and `script/github-pr-cleanup.py` — each
+  referenced by nothing else in the tree and importing nothing from the rest of
+  `script/`.
+- **All eight were hand-written**, so `cargo xtask workflows` cannot resurrect
+  them and #118's regeneration hazard is unaffected. Had any been generated, the
+  generator source would have had to go too.
+- **`slack_notify_community_automation_failure` watched five workflows that
+  remain** (`Community PR Board`, `PR Board Meta Fields Refresh`, `PR Issue
+  Labeler`, the two duplicate-detection ones). Deleting the watcher leaves no
+  dangling reference — the dependency points from watcher to watched, not back —
+  and those five were already gated, so nothing was relying on the alert.
+
+Result: 40 workflow files, 39 hard-disabled by 107 `if: false # sawe: upstream
+automation is disabled` job guards, with `run_tests.yml` narrowed to
+`workflow_dispatch:`. A future integration that re-imports this pack should
+delete it again rather than re-gate it.
