@@ -325,11 +325,11 @@ pub struct RepositorySnapshot {
     pub branch: Option<Branch>,
     pub branch_list: Arc<[Branch]>,
     pub branch_list_error: Option<SharedString>,
-    /// Tag names (unsorted), refreshed by the status scan so graph views
-    /// pick up tag create/delete done from outside the editor (CLI,
+    /// Tag names and object IDs, refreshed by the status scan so graph views
+    /// pick up tag creation, deletion and movement done from outside the editor (CLI,
     /// agents, the `editor.git.tag_*` MCP tools — none of which go
     /// through `Repository::tag_at_sha` / `delete_tag`).
-    pub tag_list: Arc<[SharedString]>,
+    pub tag_refs: Arc<[(SharedString, Oid)]>,
     pub head_commit: Option<CommitDetails>,
     pub scan_id: u64,
     pub merge: MergeDetails,
@@ -2000,6 +2000,7 @@ impl GitStore {
                 cx.emit(GitStoreEvent::ActiveRepositoryChanged(None));
             }
             self.repositories.remove(&id);
+            cx.emit(GitStoreEvent::RepositoryRemoved(id));
             if let Some(updates_tx) = updates_tx.as_ref() {
                 updates_tx
                     .unbounded_send(DownstreamUpdate::RemoveRepository(id))
@@ -4641,7 +4642,7 @@ impl RepositorySnapshot {
             branch: None,
             branch_list: Arc::from([]),
             branch_list_error: None,
-            tag_list: Arc::from([]),
+            tag_refs: Arc::from([]),
             head_commit: None,
             scan_id: 0,
             merge: Default::default(),
@@ -9293,7 +9294,7 @@ impl Repository {
                 let stash_entries = backend.stash_entries().await?;
                 let changed_path_statuses = cx
                     .background_spawn(async move {
-                        let mut changed_paths =
+                        let changed_paths =
                             changed_paths.into_iter().flatten().collect::<BTreeSet<_>>();
                         let changed_paths_vec = changed_paths.iter().cloned().collect::<Vec<_>>();
 
@@ -9320,7 +9321,6 @@ impl Repository {
                         for (repo_path, status) in &*statuses.entries {
                             let current_diff_stat = diff_stats.get(repo_path).copied();
 
-                            changed_paths.remove(repo_path);
                             if cursor.seek_forward(&PathTarget::Path(repo_path), Bias::Left)
                                 && cursor.item().is_some_and(|entry| {
                                     entry.status == *status && entry.diff_stat == current_diff_stat
@@ -9335,11 +9335,26 @@ impl Repository {
                                 diff_stat: current_diff_stat,
                             }));
                         }
+                        let current_paths = statuses
+                            .entries
+                            .iter()
+                            .map(|(path, _)| path)
+                            .collect::<HashSet<_>>();
+                        // A watcher path can name a directory, including the repo
+                        // root. Every old status below it was part of this query.
                         let mut cursor = prev_statuses.cursor::<PathProgress>(());
-                        for path in changed_paths.into_iter() {
-                            if cursor.seek_forward(&PathTarget::Path(&path), Bias::Left) {
-                                changed_path_statuses
-                                    .push(Edit::Remove(PathKey(path.as_ref().clone())));
+                        for path in GitStore::coalesce_repo_paths(changed_paths_vec) {
+                            cursor.seek_forward(&PathTarget::Path(&path), Bias::Left);
+                            while let Some(entry) = cursor.item() {
+                                if !entry.repo_path.starts_with(&path) {
+                                    break;
+                                }
+                                if !current_paths.contains(&entry.repo_path) {
+                                    changed_path_statuses.push(Edit::Remove(PathKey(
+                                        entry.repo_path.as_ref().clone(),
+                                    )));
+                                }
+                                cursor.next();
                             }
                         }
                         anyhow::Ok(changed_path_statuses)
@@ -10211,6 +10226,162 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_directory_status_refresh_removes_clean_descendants(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {}, "src": {"clean.rs": "clean", "dirty.rs": "dirty"},
+                "outside.rs": "outside"
+            }),
+        )
+        .await;
+        let modified = git::status::StatusCode::Modified.worktree();
+        fs.set_status_for_repo(
+            Path::new("/project/.git"),
+            &[
+                ("src/clean.rs", modified),
+                ("src/dirty.rs", modified),
+                ("outside.rs", modified),
+            ],
+        );
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(repository.read_with(cx, |repo, _| repo.status().count()), 3);
+        // Suppress a full scan: this exercises the watcher's partial-directory path.
+        fs.with_git_state(Path::new("/project/.git"), false, |state| {
+            state
+                .index_contents
+                .insert(repo_path("src/clean.rs"), "clean".into());
+            state
+                .head_contents
+                .insert(repo_path("src/clean.rs"), "clean".into());
+        })
+        .unwrap();
+        repository.update(cx, |repo, cx| {
+            repo.paths_changed(repo_paths(&["src"]), None, cx)
+        });
+        cx.run_until_parked();
+        let paths = repository.read_with(cx, |repo, _| {
+            repo.status()
+                .map(|entry| entry.repo_path)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(paths, repo_paths(&["outside.rs", "src/dirty.rs"]));
+        fs.with_git_state(Path::new("/project/.git"), false, |state| {
+            for (path, content) in [("src/dirty.rs", "dirty"), ("outside.rs", "outside")] {
+                state.index_contents.insert(repo_path(path), content.into());
+                state.head_contents.insert(repo_path(path), content.into());
+            }
+        })
+        .unwrap();
+        repository.update(cx, |repo, cx| {
+            repo.paths_changed(repo_paths(&[""]), None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(repository.read_with(cx, |repo, _| repo.status().count()), 0);
+    }
+
+    #[gpui::test]
+    async fn test_moving_existing_tag_emits_ref_change(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({".git": {}})).await;
+        let first = "1111111111111111111111111111111111111111";
+        let second = "2222222222222222222222222222222222222222";
+        fs.with_git_state(Path::new("/project/.git"), false, |state| {
+            state
+                .tags_pointing_at
+                .insert(first.into(), vec!["v1".into()]);
+        })
+        .unwrap();
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = cx
+            .read(|cx| project.read(cx).active_repository(cx))
+            .unwrap();
+        cx.run_until_parked();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&repository, move |_, event: &RepositoryEvent, _| {
+                events.lock().push(event.clone());
+            })
+        });
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.tags_pointing_at.clear();
+            state
+                .tags_pointing_at
+                .insert(second.into(), vec!["v1".into()]);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(events.lock().contains(&RepositoryEvent::TagListChanged));
+        repository.read_with(cx, |repository, _| {
+            assert_eq!(
+                repository.tag_refs.as_ref(),
+                &[("v1".into(), second.parse().unwrap())]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_removing_inactive_local_repository_emits_event(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({".git": {}, "nested": {".git": {}}}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let store = project.read_with(cx, |project, _| project.git_store().clone());
+        let (active, removed) = store.read_with(cx, |store, cx| {
+            let outer = store
+                .repositories()
+                .values()
+                .find(|repo| {
+                    repo.read(cx).work_directory_abs_path.as_ref() == Path::new("/project")
+                })
+                .unwrap()
+                .clone();
+            let nested = store
+                .repositories()
+                .values()
+                .find(|repo| {
+                    repo.read(cx).work_directory_abs_path.as_ref() == Path::new("/project/nested")
+                })
+                .unwrap()
+                .read(cx)
+                .id;
+            (outer, nested)
+        });
+        active.update(cx, |repo, cx| repo.set_as_active_repository(cx));
+        let removals = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let removals = removals.clone();
+            cx.subscribe(&store, move |_, event: &GitStoreEvent, _| {
+                if let GitStoreEvent::RepositoryRemoved(id) = event {
+                    removals.lock().push(*id);
+                }
+            })
+        });
+        fs.remove_dir(
+            Path::new("/project/nested/.git"),
+            fs::RemoveOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        assert!(!store.read_with(cx, |store, _| store.repositories().contains_key(&removed)));
+        assert_eq!(*removals.lock(), vec![removed]);
+    }
+
+    #[gpui::test]
     async fn test_a_failing_tag_scan_does_not_blank_the_branch_list(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -10259,7 +10430,7 @@ mod tests {
                 "a failing tag scan must not blank the branch list"
             );
             assert!(
-                repository.tag_list.is_empty(),
+                repository.tag_refs.is_empty(),
                 "only the field whose query failed degrades"
             );
         });
@@ -10797,7 +10968,7 @@ async fn compute_snapshot(
                     async { backend.branches().await.log_err().unwrap_or_default() },
                     async move { head_commit_future.await.log_err().flatten() },
                     async { backend.worktrees().await.log_err().unwrap_or_default() },
-                    async { backend.tag_names().await.log_err().unwrap_or_default() },
+                    async { backend.tag_refs().await.log_err().unwrap_or_default() },
                 )
                 .await
             }
@@ -10811,7 +10982,7 @@ async fn compute_snapshot(
     } = branches;
     let branch = branches.iter().find(|branch| branch.is_head).cloned();
     let branch_list: Arc<[Branch]> = branches.into();
-    let tag_list: Arc<[SharedString]> = tag_names.into();
+    let tag_refs: Arc<[(SharedString, Oid)]> = tag_names.into();
 
     let linked_worktrees: Arc<[GitWorktree]> = all_worktrees
         .into_iter()
@@ -10828,7 +10999,7 @@ async fn compute_snapshot(
             branch != this.snapshot.branch || head_commit != this.snapshot.head_commit;
         let branch_list_changed = *branch_list != *this.snapshot.branch_list;
         let branch_list_error_changed = branch_list_error != this.snapshot.branch_list_error;
-        let tag_list_changed = *tag_list != *this.snapshot.tag_list;
+        let tag_list_changed = *tag_refs != *this.snapshot.tag_refs;
         let worktrees_changed = *linked_worktrees != *this.snapshot.linked_worktrees;
 
         this.snapshot = RepositorySnapshot {
@@ -10837,7 +11008,7 @@ async fn compute_snapshot(
             branch,
             branch_list: branch_list.clone(),
             branch_list_error,
-            tag_list: tag_list.clone(),
+            tag_refs: tag_refs.clone(),
             head_commit,
             remote_origin_url,
             remote_upstream_url,

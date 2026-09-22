@@ -1645,9 +1645,34 @@ impl GitPanel {
         }
     }
 
+    pub(super) fn refresh_commit_tab_containment(
+        &mut self,
+        repository_id: RepositoryId,
+        tags_changed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.commit_tab.as_mut() else {
+            return;
+        };
+        if state.selection.repository.read(cx).id != repository_id
+            || state.selection.shas.len() != 1
+        {
+            return;
+        }
+        let repository = state.selection.repository.clone();
+        let sha = state.selection.shas[0];
+        if tags_changed {
+            state.tags = LoadState::Idle;
+        }
+        // Reachability can change without changing decorations on this commit
+        // (for example, a branch created on one of its descendants).
+        self.load_commit_tab_containment(sha, &repository, cx);
+        cx.notify();
+    }
+
     /// Load the branches containing the commit into the open Commit tab, after
     /// [`BRANCHES_CONTAINING_DEBOUNCE`] — and the tags pointing at it too, but
-    /// only for a selection that carries no decorations to derive them from.
+    /// when decorations cannot answer them or a tag event invalidated them.
     ///
     /// **The tag half is the exception now, not the other half of a pair.**
     /// Git's `%D` already lists every tag pointing at the commit and the graph
@@ -1681,12 +1706,14 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         let target = (repository.entity_id(), sha);
-        // Only the selection that has no decorations at all still costs a
-        // `git tag --points-at`; everything else already knows its tags.
-        let query_tags = self
-            .commit_tab
-            .as_ref()
-            .is_some_and(|state| matches!(state.tags, LoadState::Idle | LoadState::Failed(_)));
+        // Replacing this task cancels its unfinished tag query too. Reissue
+        // Loading as well as invalidated results, or tags never settle.
+        let query_tags = self.commit_tab.as_ref().is_some_and(|state| {
+            matches!(
+                state.tags,
+                LoadState::Idle | LoadState::Loading | LoadState::Failed(_)
+            )
+        });
         let repository = repository.downgrade();
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -4738,7 +4765,8 @@ ships-with-and-then-some-more-of-it";
         let (panel, repository, fs, mut cx) = commit_tab_panel(cx).await;
         let cx = &mut cx;
         let sha = "823a3f8a";
-        fs.with_git_state(util::path!("/project/.git").as_ref(), true, |state| {
+        // This tests initial decoration reuse, without an external ref-change event.
+        fs.with_git_state(util::path!("/project/.git").as_ref(), false, |state| {
             state
                 .tags_pointing_at
                 .insert(oid(sha).to_string(), vec!["asked-git".into()]);
@@ -5075,6 +5103,48 @@ ships-with-and-then-some-more-of-it";
     /// [`GitRepository::tags_pointing_at`] from seeded state and leaves
     /// `tags_containing` on the trait's empty default, so a loader that asked
     /// the containment question would leave the row empty.
+    #[gpui::test]
+    async fn test_ref_refresh_during_containment_load_finishes_tags(cx: &mut gpui::TestAppContext) {
+        let (panel, repository, _fs, mut cx) = commit_tab_panel(cx).await;
+        let cx = &mut cx;
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                CommitSelection {
+                    repository: repository.clone(),
+                    shas: vec!["823a3f8a".parse().unwrap()],
+                    refs: Default::default(),
+                },
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        repository.update(cx, |_, cx| cx.emit(RepositoryEvent::BranchListChanged));
+        cx.executor().run_until_parked();
+        cx.executor().advance_clock(BRANCHES_CONTAINING_DEBOUNCE);
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(
+                panel.commit_tab.as_ref().unwrap().tags,
+                LoadState::Loaded(_)
+            ));
+        });
+        panel.update(cx, |panel, _| {
+            panel.commit_tab.as_mut().unwrap().tags = LoadState::Loaded(vec!["deleted-tag".into()]);
+        });
+        repository.update(cx, |_, cx| cx.emit(RepositoryEvent::TagListChanged));
+        cx.executor().run_until_parked();
+        cx.executor().advance_clock(BRANCHES_CONTAINING_DEBOUNCE);
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let LoadState::Loaded(tags) = &panel.commit_tab.as_ref().unwrap().tags else {
+                panic!("tag refresh did not settle");
+            };
+            assert!(tags.is_empty());
+        });
+    }
+
     #[gpui::test]
     async fn test_the_tag_row_loads_the_tags_pointing_at_the_commit(cx: &mut gpui::TestAppContext) {
         let (panel, repository, fs, mut cx) = commit_tab_panel(cx).await;

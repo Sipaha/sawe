@@ -85,7 +85,12 @@ impl GitGraphPanel {
         let mut subscriptions =
             vec![
                 cx.subscribe_in(&git_store, window, |this, _git_store, event, window, cx| {
-                    if let GitStoreEvent::ActiveRepositoryChanged(_) = event {
+                    if matches!(
+                        event,
+                        GitStoreEvent::ActiveRepositoryChanged(_)
+                            | GitStoreEvent::RepositoryAdded
+                            | GitStoreEvent::RepositoryRemoved(_)
+                    ) {
                         this.refresh_active_repo(window, cx);
                     }
                 }),
@@ -142,8 +147,11 @@ impl GitGraphPanel {
 
     fn resolve_active_repo_id(&self, cx: &App) -> Option<RepositoryId> {
         let project = self.workspace.upgrade()?.read(cx).project().clone();
-        let repo = solutions::active_member_repository(&project, cx)
-            .or_else(|| project.read(cx).active_repository(cx))?;
+        let repo = if solutions::active_member_context(&project, cx).is_some() {
+            solutions::active_member_repository(&project, cx)
+        } else {
+            project.read(cx).active_repository(cx)
+        }?;
         Some(repo.read(cx).id)
     }
 
@@ -896,6 +904,81 @@ mod tests {
         cx.run_until_parked();
     }
 
+    #[gpui::test]
+    async fn member_repository_discovery_and_removal_retarget_the_graph(cx: &mut TestAppContext) {
+        let (solution, root) = cx.update(|cx| {
+            let store = solutions::SolutionStore::for_test(std::path::PathBuf::new(), cx);
+            let solution = store.update(cx, |store, cx| {
+                store.create_for_test_minimal("graph-discovery", cx)
+            });
+            let root = store.read(cx).solutions().last().unwrap().root.clone();
+            solutions::install_global_for_test(store, cx);
+            (solution, root)
+        });
+        let (_window, panel, _band, fs) = bootstrap_with_logs(cx, &[2, 2]).await;
+        let (first, second) = panel.read_with(cx, |panel, cx| {
+            let repositories = panel.git_store.read(cx).repositories();
+            let first = repositories
+                .values()
+                .find(|repo| {
+                    repo.read(cx).work_directory_abs_path.as_ref() == root.join("repo-0").as_path()
+                })
+                .unwrap()
+                .clone();
+            let second = repositories
+                .values()
+                .find(|repo| {
+                    repo.read(cx).work_directory_abs_path.as_ref() == root.join("repo-1").as_path()
+                })
+                .unwrap()
+                .read(cx)
+                .id;
+            (first, second)
+        });
+        first.update(cx, |repo, cx| repo.set_as_active_repository(cx));
+        cx.update(|cx| {
+            solutions::SolutionStore::global(cx).update(cx, |store, cx| {
+                store.test_add_member_with_path(solution, "first", root.join("repo-0"));
+                let member =
+                    store.test_add_member_with_path(solution, "second", root.join("repo-1"));
+                store.set_active_member(solution, member, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            panel.read_with(cx, |panel, _| panel.active_repo_id),
+            Some(second)
+        );
+        fs::Fs::remove_dir(
+            fs.as_ref(),
+            root.join("repo-1/.git").as_path(),
+            fs::RemoveOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.graph.is_none()),
+            "a member without git must not display another member's history"
+        );
+        fs.insert_tree(&root.join("repo-1/.git"), serde_json::json!({}))
+            .await;
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            let id = panel
+                .active_repo_id
+                .expect("newly discovered member repository");
+            let repo = panel.git_store.read(cx).repositories().get(&id).unwrap();
+            assert_eq!(
+                repo.read(cx).work_directory_abs_path.as_ref(),
+                root.join("repo-1").as_path()
+            );
+        });
+    }
+
     /// The repository the panel is NOT currently pointed at.
     fn repository_other_than_active(
         panel: &Entity<GitGraphPanel>,
@@ -992,6 +1075,17 @@ mod tests {
             SolutionAgentStore::init_global(cx, std::sync::Arc::new(AdapterRegistry::new()));
         });
 
+        let repository_root = cx.read(|cx| {
+            solutions::SolutionStore::try_global(cx)
+                .and_then(|store| {
+                    store
+                        .read(cx)
+                        .solutions()
+                        .last()
+                        .map(|solution| solution.root.clone())
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("/"))
+        });
         let fs = FakeFs::new(cx.executor());
         let mut roots = Vec::new();
         if repository_count == 0 {
@@ -999,7 +1093,7 @@ mod tests {
             roots.push(std::path::PathBuf::from("/root"));
         } else {
             for index in 0..repository_count {
-                let root = std::path::PathBuf::from(format!("/repo-{index}"));
+                let root = repository_root.join(format!("repo-{index}"));
                 fs.insert_tree(
                     &root,
                     serde_json::json!({".git": {}, "file.txt": "content"}),
@@ -1010,7 +1104,7 @@ mod tests {
         }
         for (index, commit_count) in commit_counts.iter().enumerate() {
             fs.set_graph_commits(
-                &std::path::PathBuf::from(format!("/repo-{index}/.git")),
+                &repository_root.join(format!("repo-{index}/.git")),
                 commit_chain(index, *commit_count),
             );
         }

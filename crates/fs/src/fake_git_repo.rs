@@ -1198,21 +1198,18 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
-    fn tag_names(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+    fn tag_refs(&self) -> BoxFuture<'_, Result<Vec<(SharedString, Oid)>>> {
         self.with_state_async(false, move |state| {
             if let Some(message) = &state.simulated_tag_names_error {
                 anyhow::bail!("{message}");
             }
-            let mut names: Vec<SharedString> = state
-                .tags_pointing_at
-                .values()
-                .flatten()
-                .cloned()
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            names.sort();
-            Ok(names)
+            let mut refs = Vec::new();
+            for (sha, names) in &state.tags_pointing_at {
+                let oid = sha.parse::<Oid>()?;
+                refs.extend(names.iter().cloned().map(|name| (name, oid)));
+            }
+            refs.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(refs)
         })
     }
 

@@ -1259,11 +1259,17 @@ impl GitPanel {
                 window,
                 move |this, _git_store, event, window, cx| match event {
                     GitStoreEvent::RepositoryUpdated(
-                        _,
+                        repository_id,
                         RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
-                        true,
-                    )
-                    | GitStoreEvent::RepositoryAdded
+                        _,
+                    ) if this
+                        .active_repository
+                        .as_ref()
+                        .is_some_and(|repository| repository.read(cx).id == *repository_id) =>
+                    {
+                        this.schedule_update(window, cx);
+                    }
+                    GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::RepositoryRemoved(_)
                     | GitStoreEvent::GlobalConfigurationUpdated
                     | GitStoreEvent::ActiveRepositoryChanged(_) => {
@@ -1275,6 +1281,18 @@ impl GitPanel {
                                 workspace.show_error(format!("{error}"), cx);
                             })
                             .ok();
+                    }
+                    GitStoreEvent::RepositoryUpdated(
+                        repository_id,
+                        event @ (RepositoryEvent::BranchListChanged
+                        | RepositoryEvent::TagListChanged),
+                        _,
+                    ) => {
+                        this.refresh_commit_tab_containment(
+                            *repository_id,
+                            matches!(event, RepositoryEvent::TagListChanged),
+                            cx,
+                        );
                     }
                     GitStoreEvent::RepositoryUpdated(_, _, _) => {}
                     GitStoreEvent::JobsUpdated | GitStoreEvent::ConflictsUpdated => {}
@@ -4403,13 +4421,13 @@ impl GitPanel {
 
     fn schedule_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = cx.entity().downgrade();
-        self.reopen_commit_buffer(window, cx);
         self.update_visible_entries_task = cx.spawn_in(window, async move |_, cx| {
             cx.background_executor().timer(UPDATE_DEBOUNCE).await;
             if let Some(git_panel) = handle.upgrade() {
                 git_panel
                     .update_in(cx, |git_panel, window, cx| {
                         git_panel.update_visible_entries(window, cx);
+                        git_panel.reopen_commit_buffer(window, cx);
                     })
                     .ok();
             }
@@ -4420,6 +4438,7 @@ impl GitPanel {
         let Some(active_repo) = self.active_repository.as_ref() else {
             return;
         };
+        let repository_id = active_repo.entity_id();
         let load_buffer = active_repo.update(cx, |active_repo, cx| {
             let project = self.project.read(cx);
             active_repo.open_commit_buffer(
@@ -4435,6 +4454,11 @@ impl GitPanel {
             let template = load_template.await?;
 
             git_panel.update_in(cx, |git_panel, window, cx| {
+                if git_panel.active_repository.as_ref().map(Entity::entity_id)
+                    != Some(repository_id)
+                {
+                    return;
+                }
                 git_panel.commit_template = template;
                 if buffer.read(cx).text().trim().is_empty() {
                     let template_text = git_panel
@@ -4471,6 +4495,7 @@ impl GitPanel {
                         )
                     });
                 }
+                cx.notify();
             })
         })
         .detach_and_log_err(cx);
@@ -10140,6 +10165,105 @@ mod tests {
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         let repository = repo_with_work_directory(&project, &member_root, &mut cx);
         (panel, repository, cx)
+    }
+
+    #[gpui::test]
+    async fn test_changes_refresh_for_member_without_global_active_flag(cx: &mut TestAppContext) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+        cx.executor().run_until_parked();
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _| panel.changes_count = usize::MAX);
+        cx.update(|_, cx| {
+            let git_store = panel.read(cx).project.read(cx).git_store().clone();
+            git_store.update(cx, |_, cx| {
+                cx.emit(GitStoreEvent::RepositoryUpdated(
+                    repository.read(cx).id,
+                    RepositoryEvent::StatusesChanged,
+                    false,
+                ));
+            });
+        });
+        cx.executor().run_until_parked();
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| assert_ne!(panel.changes_count, usize::MAX));
+    }
+
+    #[gpui::test]
+    async fn test_commit_buffer_follows_repository_switch(cx: &mut TestAppContext) {
+        let (panel, outer, inner, mut cx) = commit_tab_fixture_with_two_repositories(cx).await;
+        let cx = &mut cx;
+        cx.executor().run_until_parked();
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.executor().run_until_parked();
+        let project = panel.read_with(cx, |panel, _| panel.project.clone());
+        let load_buffer = |repository: &Entity<Repository>, cx: &mut VisualTestContext| {
+            repository.update(cx, |repository, cx| {
+                repository.open_commit_buffer(None, project.read(cx).buffer_store().clone(), cx)
+            })
+        };
+        let outer_buffer = load_buffer(&outer, cx).await.unwrap();
+        let inner_buffer = load_buffer(&inner, cx).await.unwrap();
+        assert_ne!(outer_buffer, inner_buffer);
+        cx.update(|_, cx| {
+            solutions::set_active_member_repository(&project, &inner, cx);
+        });
+        cx.executor().run_until_parked();
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_repository.as_ref(), Some(&inner));
+            assert_eq!(panel.commit_message_buffer(cx), inner_buffer);
+        });
+        // A previous repository's in-flight load must not replace the new buffer.
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_repository(Some(outer.clone()), window, cx);
+            panel.reopen_commit_buffer(window, cx);
+            panel.set_active_repository(Some(inner.clone()), window, cx);
+        });
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.commit_message_buffer(cx), inner_buffer)
+        });
+    }
+
+    #[gpui::test]
+    async fn test_commit_containment_refreshes_without_changed_decorations(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, repository, mut cx) = commit_tab_fixture(cx).await;
+        let cx = &mut cx;
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.show_commit_selection(
+                commit_selection(&repository, vec![test_sha("823a3f8a")]),
+                CommitSelectionSource::UserGesture,
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+        cx.executor()
+            .advance_clock(commit_tab::BRANCHES_CONTAINING_DEBOUNCE);
+        cx.executor().run_until_parked();
+        panel.update(cx, |panel, _| {
+            panel.commit_tab.as_mut().unwrap().branches =
+                commit_tab::LoadState::Loaded(vec!["deleted-branch".into()]);
+        });
+        repository.update(cx, |_, cx| cx.emit(RepositoryEvent::BranchListChanged));
+        cx.executor().run_until_parked();
+        cx.executor()
+            .advance_clock(commit_tab::BRANCHES_CONTAINING_DEBOUNCE);
+        cx.executor().run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let commit_tab::LoadState::Loaded(branches) =
+                &panel.commit_tab.as_ref().unwrap().branches
+            else {
+                panic!("containment refresh did not settle");
+            };
+            assert!(!branches.iter().any(|branch| branch == "deleted-branch"));
+        });
     }
 
     fn test_sha(hex: &str) -> Oid {

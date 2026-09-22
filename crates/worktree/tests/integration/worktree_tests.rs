@@ -4400,6 +4400,88 @@ async fn test_dot_git_dir_event_does_not_suppress_children(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[gpui::test]
+async fn test_native_watcher_tracks_existing_and_new_ref_directories(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    let directory = TempTree::new(json!({".git": {}}));
+    for path in ["refs/heads/main", "refs/tags/v1"] {
+        std::fs::write(directory.path().join(".git").join(path), "first\n").unwrap();
+    }
+    let tree = Worktree::local(
+        directory.path(),
+        true,
+        Arc::new(RealFs::new(None, cx.executor())),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    tree.flush_fs_events(cx).await;
+    let updates = Rc::new(Cell::new(0));
+    let _subscription = cx.update(|cx| {
+        let updates = updates.clone();
+        cx.subscribe(&tree, move |_, event: &Event, _| {
+            if matches!(event, Event::UpdatedGitRepositories(_)) {
+                updates.set(updates.get() + 1);
+            }
+        })
+    });
+    for path in [
+        "refs/tags/v1",
+        "refs/heads/main",
+        "refs/heads/new/nested/topic",
+        "refs/heads/new/nested/topic",
+    ] {
+        let path = directory.path().join(".git").join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let before = updates.get();
+        std::fs::write(&path, format!("update {before}\n")).unwrap();
+        wait_for_condition(cx, |_| updates.get() > before).await;
+        // Drain before the next write so a delayed directory-create event
+        // cannot accidentally satisfy the assertion for the subsequent edit.
+        tree.flush_fs_events(cx).await;
+    }
+    std::fs::remove_dir_all(directory.path().join(".git/refs/heads/new")).unwrap();
+    tree.flush_fs_events(cx).await;
+    let topic = directory.path().join(".git/refs/heads/new/nested/topic");
+    std::fs::create_dir_all(topic.parent().unwrap()).unwrap();
+    std::fs::write(&topic, "recreated\n").unwrap();
+    tree.flush_fs_events(cx).await;
+    let before = updates.get();
+    std::fs::write(&topic, "moved after recreation\n").unwrap();
+    wait_for_condition(cx, |_| updates.get() > before).await;
+    let storage = TempTree::new(json!({}));
+    let held = storage.path().join("held-git");
+    std::fs::rename(directory.path().join(".git"), &held).unwrap();
+    wait_for_condition(cx, |cx| {
+        tree.read_with(cx, |tree, _| {
+            tree.as_local().unwrap().repositories().is_empty()
+        })
+    })
+    .await;
+    std::fs::rename(&held, directory.path().join(".git")).unwrap();
+    wait_for_condition(cx, |cx| {
+        tree.read_with(cx, |tree, _| {
+            tree.as_local().unwrap().repositories().len() == 1
+        })
+    })
+    .await;
+    tree.flush_fs_events(cx).await;
+    let before = updates.get();
+    std::fs::write(
+        directory.path().join(".git/HEAD"),
+        "ref: refs/heads/restored\n",
+    )
+    .unwrap();
+    wait_for_condition(cx, |_| updates.get() > before).await;
+}
+
 fn drain_git_repo_updates(events: &mut futures::channel::mpsc::UnboundedReceiver<Event>) -> bool {
     let mut found = false;
     while let Ok(event) = events.try_recv() {

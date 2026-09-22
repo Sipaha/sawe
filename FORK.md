@@ -119,6 +119,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/git/src/blame.rs` | `Blame::for_path_at_revision` + a `BlameTarget` enum, so `git blame` can annotate a commit-ish instead of only working-tree content piped on stdin (decision #58). **(decision #135)** Also `display_author` + `UNKNOWN_AUTHOR`, the shortened author name the blame gutter draws — it lives here because both the renderer (`git_ui`) and the gutter's width reservation (`editor`) have to agree on it. | `editor` (diff-pane blame, blame gutter width) / `git_ui` (blame gutter) |
 | `crates/fs/src/fake_git_repo.rs` + `crates/fs/src/fs.rs` | `FakeGitRepositoryState::blames_at_revision` + `FakeFs::set_blame_at_revision_for_repo`, the test double for the revision-aware blame call. | `editor` (diff-pane blame) |
 | `crates/fs/src/fs_watcher.rs` | `unwatch` swallows `notify::ErrorKind::WatchNotFound` and `PathNotFound` as benign races (the watched path was already removed from underneath us — `git worktree remove`, `rm -rf`, tempdir teardown — and the kernel-side watch was invalidated before our bookkeeping caught up). Logs at debug instead of propagating, so one removed directory tree doesn't flood the log with one ERROR per nested subdir's unwatch attempt. | general robustness |
+| `crates/worktree/src/worktree.rs` + `crates/worktree/tests/integration/worktree_tests.rs` | Watch loose-ref directory trees on native non-recursive watchers, including namespaces created after opening the repository. Native filesystem regression coverage. | Git refresh (#199) |
 | `crates/project/src/git_store.rs` | Adds `Repository::branches_containing` / `tags_containing` / `tags_pointing_at` / `load_commit_diff_against_parent` job-dispatch helpers. Adds `Repository::refresh_branches` + the shared `rescan_branches` helper (extracted from the tail of `Repository::push`) so a push that bypasses `Repository::push` can still republish ahead/behind and drop the cached graph log. | `git_ui` (S-DET) |
 | `crates/settings_content/src/settings_content.rs` | Adds `CommitViewSettingsContent` (avatars, lazy threshold, mention parsing) + nested field on `GitPanelSettingsContent`. Also adds `SolutionAgentSettingsContent { ephemeral }` (S-AI-MSG ephemeral-pool sizing). Adds `RunConfigSettingsContent { toolbar }` + nested `run_config` field on `SettingsContent` (S-RUN). | `git_ui` (S-DET) / `solution_agent` (S-AI-MSG) / `run_config` (S-RUN) |
 | `crates/settings/src/vscode_import.rs` | Add `solution_agent: None` field initializer to keep VS Code import in lockstep with the new `SettingsContent.solution_agent` field. Adds `run_config: None` for the same reason (S-RUN). | `solution_agent` (S-AI-MSG) / `run_config` (S-RUN) |
@@ -5423,3 +5424,43 @@ logos paint and that a row is taller than a single-label entry, and the tab test
 session per provider and asserts each mark lands **inside its own pill** while the pill keeps
 `ButtonSize::Default`'s height. Verified live on the headless binary: status bar 36px tall,
 tab pills 26px, both marks on the strip, and the picker painting the two-line rows.
+
+
+### 199. Git refresh follows the displayed repository and complete query scope
+
+Changes and the history graph can describe a Solution member while GitStore's
+active repository follows a buffer in another member. Status updates must match
+the panel's repository ID, not the store event's `is_active` flag. The graph
+also observes repository discovery/removal, and a member without a repository
+must show no history rather than fall back to another member. Local repository
+removal now emits the same `RepositoryRemoved` event as the remote path.
+
+The Changes refresh resolves its repository before reopening its commit-message
+buffer; asynchronous completions verify that the repository is still current
+and notify the panel after replacing the editor. The Commit tab re-queries
+containing branches on ref changes independently of its commit decorations:
+a branch can move onto a descendant without changing any chip on the selected
+commit. A replacement containment task must reissue an unfinished tag query,
+and tag events invalidate loaded tag results too.
+
+Partial status requests can name directories after watcher-path coalescing.
+Reconciliation removes missing old statuses below every queried prefix,
+including the repository root, while preserving unrelated statuses. Removing
+only the exact requested path left already-clean descendants in Changes.
+
+Linux/FreeBSD filesystem watchers are non-recursive. Watching `.git` alone
+misses loose-ref changes below `refs/heads`, `refs/remotes` and `refs/tags`.
+Worktree now registers existing ref directories under both the common and
+per-worktree Git directories, and recursively registers new ref namespaces
+when their directory events arrive. A bare `.git` Changed event is ignored
+only while that repository is already known: a renamed-back `.git` must be
+rediscovered, with its metadata-root watches renewed. Reftable directories get the same dynamic
+registration. Symlink directories are not followed. This was caught by the
+native UI probe: a tag move accompanied by a branch/index operation refreshed,
+but the same tag move on its own did not.
+
+Status scans compare tag names **and object IDs**, so externally moving an
+existing lightweight or annotated tag invalidates the history cache. Names
+alone detect creation/deletion but cannot detect `git tag -f`.
+
+Regression coverage and verification: [Git panel refresh plan](docs/plans/2026-09-22-git-panel-refresh.md).

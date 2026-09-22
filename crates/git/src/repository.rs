@@ -949,11 +949,9 @@ pub trait GitRepository: Send + Sync {
         future::ready(Ok(Vec::new())).boxed()
     }
 
-    /// Cheap unsorted tag-name list (`git for-each-ref refs/tags`) — no
-    /// annotated-tag peeling, no date sort. Used by the status scan to
-    /// notice tag create/delete from outside the editor (CLI / agents /
-    /// the `editor.git.tag_*` MCP tools) so graph views can refresh.
-    fn tag_names(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+    /// Tag names and object IDs, without peeling or date sorting. Tracking
+    /// the object ID also detects externally moved or replaced tags.
+    fn tag_refs(&self) -> BoxFuture<'_, Result<Vec<(SharedString, Oid)>>> {
         future::ready(Ok(Vec::new())).boxed()
     }
 
@@ -2479,13 +2477,17 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
-    fn tag_names(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+    fn tag_refs(&self) -> BoxFuture<'_, Result<Vec<(SharedString, Oid)>>> {
         let git_binary = self.git_binary();
         self.executor
             .spawn(async move {
                 let git = git_binary;
                 let output = git
-                    .build_command(&["for-each-ref", "--format=%(refname:short)", "refs/tags"])
+                    .build_command(&[
+                        "for-each-ref",
+                        "--format=%(refname:strip=2) %(objectname)",
+                        "refs/tags",
+                    ])
                     .output()
                     .await?;
                 anyhow::ensure!(
@@ -2493,11 +2495,16 @@ impl GitRepository for RealGitRepository {
                     "Failed to run `git for-each-ref refs/tags`:\n{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                Ok(String::from_utf8_lossy(&output.stdout)
+                String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .filter(|l| !l.trim().is_empty())
-                    .map(|l| SharedString::from(l.to_string()))
-                    .collect())
+                    .map(|line| {
+                        let (name, oid) = line
+                            .split_once(' ')
+                            .ok_or_else(|| anyhow!("Invalid tag ref: {line}"))?;
+                        Ok((SharedString::from(name.to_owned()), oid.parse()?))
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
             .boxed()
     }
@@ -5599,6 +5606,47 @@ mod tests {
     /// tagged release must answer with nothing. `git tag --contains` — the
     /// query this method was split off from — would answer with that release
     /// and every later one, which is exactly the bug the split fixes.
+    #[gpui::test]
+    async fn test_tag_refs_track_lightweight_and_annotated_tag_moves(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let file = repo_dir.path().join("file.txt");
+        fs::write(&file, "one").unwrap();
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "first"]);
+        git_command(repo_dir.path(), ["tag", "light"]);
+        git_command(repo_dir.path(), ["tag", "-a", "annotated", "-m", "first"]);
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let before = repository.tag_refs().await.unwrap();
+        assert_eq!(before.len(), 2);
+        fs::write(&file, "two").unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "second"]);
+        git_command(repo_dir.path(), ["tag", "-f", "light"]);
+        git_command(
+            repo_dir.path(),
+            ["tag", "-f", "-a", "annotated", "-m", "second"],
+        );
+        let after = repository.tag_refs().await.unwrap();
+        for ((old_name, old_oid), (name, oid)) in before.iter().zip(&after) {
+            assert_eq!(name, old_name);
+            assert_ne!(oid, old_oid);
+            assert_eq!(
+                *oid,
+                git_rev_parse(repo_dir.path(), &format!("refs/tags/{name}"))
+                    .parse()
+                    .unwrap()
+            );
+        }
+    }
+
     #[gpui::test]
     async fn test_tags_pointing_at_lists_only_the_tags_on_the_commit(cx: &mut TestAppContext) {
         disable_git_global_config();

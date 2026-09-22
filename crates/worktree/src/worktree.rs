@@ -3305,6 +3305,12 @@ impl BackgroundScannerState {
 
         let (repository_dir_abs_path, common_dir_abs_path) =
             discover_git_paths(&dot_git_abs_path, fs).await;
+        // A discovered repository may replace a removed directory whose
+        // registration survived the native watch. Renew those root watches.
+        watcher.remove(&common_dir_abs_path).log_err();
+        if repository_dir_abs_path != common_dir_abs_path {
+            watcher.remove(&repository_dir_abs_path).log_err();
+        }
         watcher
             .add(&common_dir_abs_path)
             .context("failed to add common directory to watcher")
@@ -3314,14 +3320,18 @@ impl BackgroundScannerState {
             .context("failed to add repository directory to watcher")
             .log_err();
 
-        // On Linux and FreeBSD, the native watcher is non-recursive, so subdirectories inside `.git` need explicit watching.
-        // For repos using the reftable backend, watch the `.git/reftable` directory so that ref changes are detected.
-        let reftable_path = common_dir_abs_path.join("reftable");
-        if fs.is_dir(&reftable_path).await {
-            watcher
-                .add(&reftable_path)
-                .context("failed to add reftable directory to watcher")
-                .log_err();
+        // Native Linux/FreeBSD watches are not recursive. Loose refs live
+        // below refs/, and updating them need not touch HEAD or index.
+        let mut git_directories = vec![&common_dir_abs_path];
+        if repository_dir_abs_path != common_dir_abs_path {
+            git_directories.push(&repository_dir_abs_path);
+        }
+        for git_directory in git_directories {
+            for name in ["refs", "reftable"] {
+                watch_git_ref_directory(fs, watcher, git_directory.join(name))
+                    .await
+                    .log_err();
+            }
         }
 
         let work_directory_id = work_dir_entry.id;
@@ -3343,6 +3353,32 @@ impl BackgroundScannerState {
         log::trace!("inserting new local git repository");
         Ok(local_repository)
     }
+}
+
+async fn watch_git_ref_directory(fs: &dyn Fs, watcher: &dyn Watcher, path: PathBuf) -> Result<()> {
+    if !cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        return Ok(());
+    }
+    let mut pending = vec![path];
+    while let Some(path) = pending.pop() {
+        let Some(metadata) = fs.metadata(&path).await? else {
+            continue;
+        };
+        if !metadata.is_dir || metadata.is_symlink {
+            continue;
+        }
+        // Deleting a directory removes its native watch. A stale registration
+        // must not make add() skip the replacement directory at the same path.
+        watcher.remove(&path)?;
+        watcher
+            .add(&path)
+            .with_context(|| format!("watching git refs at {}", path.display()))?;
+        let mut children = fs.read_dir(&path).await?;
+        while let Some(child) = children.next().await {
+            pending.push(child?);
+        }
+    }
+    Ok(())
 }
 
 async fn is_dot_git(path: &Path, fs: &dyn Fs) -> bool {
@@ -4458,7 +4494,12 @@ impl BackgroundScanner {
                         .any(|skipped_git_subdir| path_in_git_dir.starts_with(skipped_git_subdir));
                     let is_dot_git = path_in_git_dir == Path::new("")
                         && matches!(event.kind, Some(PathEventKind::Changed))
-                        && self.fs.is_dir(&dot_git_abs_path).await;
+                        && self.fs.is_dir(&dot_git_abs_path).await
+                        && snapshot.git_repositories.values().any(|repository| {
+                            repository.dot_git_abs_path.as_ref() == dot_git_abs_path
+                                || repository.repository_dir_abs_path.as_ref() == dot_git_abs_path
+                                || repository.common_dir_abs_path.as_ref() == dot_git_abs_path
+                        });
                     if is_ignored {
                         log::debug!(
                             "ignoring event {abs_path:?} as it's in the .git directory among skipped files or directories"
@@ -4473,6 +4514,28 @@ impl BackgroundScanner {
                         );
                         skip_ix(&mut ranges_to_drop, ix);
                         continue;
+                    }
+
+                    let is_ref_event = path_in_git_dir.starts_with("refs")
+                        || path_in_git_dir.starts_with("reftable")
+                        || snapshot.git_repositories.values().any(|repository| {
+                            abs_path
+                                .as_path()
+                                .strip_prefix(&repository.repository_dir_abs_path)
+                                .is_ok_and(|relative| {
+                                    relative.starts_with("refs") || relative.starts_with("reftable")
+                                })
+                        });
+                    if is_ref_event {
+                        // A new branch namespace can contain further directories
+                        // created before its parent watch was installed.
+                        watch_git_ref_directory(
+                            self.fs.as_ref(),
+                            self.watcher.as_ref(),
+                            abs_path.as_path().to_owned(),
+                        )
+                        .await
+                        .log_err();
                     }
 
                     if !dot_git_abs_paths.contains(&dot_git_abs_path) {
