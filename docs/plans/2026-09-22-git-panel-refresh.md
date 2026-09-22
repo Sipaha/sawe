@@ -84,3 +84,31 @@ The final `cargo build --bin sawe --profile release-fast` completed successfully
 (20m 07s). Both debug and release-fast binaries contain the final fixes. The
 maintainer's running editor was left open; the updated binary takes effect on
 its next launch.
+
+## Upstream comparison (2026-09-22)
+
+Compared the current upstream main at
+[`b54cc1d0acc8fe3f7581721ee1195516e7581f9d`](https://github.com/zed-industries/zed/commit/b54cc1d0acc8fe3f7581721ee1195516e7581f9d)
+and the latest stable release
+[`v1.20.2`](https://github.com/zed-industries/zed/releases/tag/v1.20.2)
+(published September 17) against the inherited v1.7.2 code. This was a source
+and commit-history audit, not an execution of upstream Zed's tests or UI.
+
+The following fixes are present in both current main and v1.20.2:
+
+| Inherited mechanism | Upstream change |
+|---|---|
+| Commit buffer opened before updating the active repository; detached stale loads | [June 27, bfe0d7c8f696 / #58180](https://github.com/zed-industries/zed/commit/bfe0d7c8f696669dded40df535840621d4756a88): resolve the repository first and retain a cancellable reopen task. |
+| Partial directory refresh retains clean descendants | [June 29, 33473c1cd3b6 / #59934](https://github.com/zed-industries/zed/commit/33473c1cd3b6555145e12e39590c6790077088a1): reconcile old statuses below each queried prefix. |
+| Native non-recursive watchers miss loose refs | [July 10, 2b9b3c7ea212 / #60660](https://github.com/zed-industries/zed/commit/2b9b3c7ea21293c9f271d993503e6d8dba2c6891): watch refs directories, including newly-created namespaces. |
+| Bare .git Changed events are unconditionally discarded | [July 23, 137c981cb03b / #59876](https://github.com/zed-industries/zed/commit/137c981cb03b38034ce727f4055f7423c051627f): reload Git state for standalone bare events; #61636 subsequently excludes events explained by ignored siblings. |
+
+The local `for id in removed_ids` path still removes repository entities without
+emitting `RepositoryRemoved` in both inspected versions (main git_store.rs,
+lines 2723-2735). The remaining emitter is in the remote removal handler.
+That establishes the code-level omission, not that current upstream UI has the
+same visible failure as our Solution-scoped panels.
+
+Our Solution-member routing, separate Commit tab, and tag-name-only invalidation
+were fork-specific changes. Their defects must not be attributed to current
+upstream. No upstream changes were merged or cherry-picked during this audit.
