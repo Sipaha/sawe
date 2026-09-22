@@ -69,13 +69,34 @@ scoped target dir `sawe/target/upstream-1.98` still exist and were used for all
 integration checks. They are no longer needed for ordinary work and can be
 deleted to reclaim space.
 
+## Post-landing cleanup (done 2026-09-22)
+
+- **Upstream's eight community/guild process workflows were deleted**, with the
+  three scripts they alone used. FORK.md #201 records why that pack is the
+  exception to #118's keep-and-disable default, and what was kept
+  (`script/github_helpers.py`, shared with four retained workflows).
+- **All four integration worktrees were removed** with `git worktree remove`
+  (`.worktrees/` is gone, `.git/worktrees` is empty, `git worktree prune` finds
+  nothing stale). Before removal, each was checked against `main`: none was
+  mid-merge or mid-rebase, and every line the three resolution branches held
+  that `main` lacked was intermediate scaffolding `main` had already superseded
+  — the duplicated `state.pending_scroll = None;` in `gpui`'s list, an
+  `#[ignore]` `main` no longer needs, a dead `init_test_with_git_ui` helper whose
+  two upstream tests `main` had already ported into `crates/git_graph`, and
+  upstream's project-panel `ProjectEmptyState`, which this fork has never had
+  (it renders its own in `crates/sidebar`). Branch
+  `integration/zed-main-2026-09-22` was deleted (it pointed at the merge commit
+  itself).
+
 ## Outstanding
 
 Nothing from this task. Two optional follow-ups, neither blocking:
 
-- The integration worktree `.worktrees/zed-main-2026-09-22` and the three
-  resolution worktrees (`zed-shell-resolution`, `zed-core-resolution`,
-  `zed-git-resolution`) are still registered. Remove them with
-  `git worktree remove` once you are satisfied with the landed result.
+- The three resolution branches — `integration/zed-shell-resolution`,
+  `integration/zed-core-resolution`, `integration/zed-git-resolution` — still
+  exist as refs. Their worktrees are gone and their content is superseded by the
+  merge, verified as above; they are kept only as a per-slice record of how each
+  conflict group was resolved. Delete them whenever that record stops being
+  useful.
 - `.verification/upstream-2026-09-22/` holds the isolated editor profile,
   screenshots and fixtures used to verify this merge. Safe to delete.
