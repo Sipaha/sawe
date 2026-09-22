@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 const SPKE_DIR: &str = "spke";
 const OP_LOCK_FILE: &str = "op.lock";
+const INDEX_LOCK_FILE: &str = "index.lock";
 
 /// Reason the repo is busy. Surfaced through [`RepoBusyError`] so callers can
 /// show a useful message ("Repository busy: cherry_pick in progress").
@@ -55,7 +56,7 @@ pub fn acquire(repo_path: &Path, op_name: &'static str) -> Result<RepoLock, Repo
         reason: BusyReason::OtherOp(format!("locating .git: {err}")),
     })?;
 
-    if dot_git.join(crate::INDEX_LOCK).exists() {
+    if dot_git.join(INDEX_LOCK_FILE).exists() {
         return Err(RepoBusyError {
             reason: BusyReason::ExternalGit,
         });
@@ -237,7 +238,7 @@ mod tests {
     fn external_git_lock_blocks_acquire() {
         let dir = tempdir().expect("tempdir");
         init_repo(dir.path());
-        std::fs::write(dir.path().join(".git").join(crate::INDEX_LOCK), "").expect("write");
+        std::fs::write(dir.path().join(".git").join(INDEX_LOCK_FILE), "").expect("write");
         match acquire(dir.path(), "op") {
             Err(RepoBusyError {
                 reason: BusyReason::ExternalGit,

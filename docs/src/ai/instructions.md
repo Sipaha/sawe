@@ -5,6 +5,10 @@ description: Configure always-on personal and project instructions for Zed Agent
 
 # Instructions
 
+> **Note:** This page describes inherited upstream Zed interfaces. Sawe uses
+> [Native AI Sessions](./native-sessions.md) in the Solution band; its upstream
+> Agent Panel and cloud-agent sign-in are disabled.
+
 Instructions are always-on context for the Zed Agent. Use instructions for persistent guidance that should apply to every relevant agent interaction.
 
 Use [Skills](./skills.md) instead when you want reusable task instructions that can be invoked by name.
@@ -41,14 +45,14 @@ Project instructions override personal `AGENTS.md` when they conflict.
 
 ## Instruction File Support {#support}
 
-| File                              | Zed Agent                                              | External Agents       | Terminal Threads                 |
-| --------------------------------- | ------------------------------------------------------ | --------------------- | -------------------------------- |
-| `~/.spk/sawe/config/AGENTS.md`    | Loaded as personal instructions                        | Not generally used    | Not used unless the CLI reads it |
-| Project `AGENTS.md`               | Loaded as project instructions                         | Depends on the agent  | Depends on the CLI               |
-| `CLAUDE.md`                       | Loaded as compatible project instructions by Zed Agent | Claude reads natively | Claude Code CLI reads natively   |
-| `.github/copilot-instructions.md` | Loaded as compatible project instructions by Zed Agent | Depends on the agent  | Depends on the CLI               |
+| File                              | [Zed Agent](./zed-agent.md)                            | [External Agents](./external-agents.md) | Terminal Threads                 |
+| --------------------------------- | ------------------------------------------------------ | --------------------------------------- | -------------------------------- |
+| `~/.spk/sawe/config/AGENTS.md`    | Loaded as personal instructions                        | Not generally used                      | Not used unless the CLI reads it |
+| Project `AGENTS.md`               | Loaded as project instructions                         | Depends on the agent                    | Depends on the CLI               |
+| `CLAUDE.md`                       | Loaded as compatible project instructions by Zed Agent | Claude reads natively                   | Claude Code CLI reads natively   |
+| `.github/copilot-instructions.md` | Loaded as compatible project instructions by Zed Agent | Depends on the agent                    | Depends on the CLI               |
 
-External Agents and Terminal Threads may read their own native instruction files directly. Do not assume Zed's instruction loader controls those agents.
+External Agents and [Terminal Threads](./terminal-threads.md) may read their own native instruction files directly. Do not assume Zed's instruction loader controls those agents.
 
 ## Instructions vs. Skills {#instructions-vs-skills}
 

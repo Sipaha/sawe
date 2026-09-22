@@ -34,21 +34,31 @@ pub fn askpass_delegate(
 ) -> AskPassDelegate {
     let operation = operation.into();
     let window = window.window_handle();
-    AskPassDelegate::new(&mut cx.to_async(), move |prompt, tx, cx| {
-        let shown = window.update(cx, |_, window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                workspace.toggle_modal(window, cx, |window, cx| {
-                    AskPassModal::new(operation.clone(), prompt.into(), tx, window, cx)
-                });
-            })
-        });
-        // Both failures say the same thing: the window or the workspace
-        // went away before git asked for credentials, so nobody can
-        // answer. That leaves the git subprocess blocked until it gives
-        // up on its own, which is worth a line in the log rather than
-        // silence.
-        if let Err(error) = shown.and_then(|inner| inner) {
-            log::warn!("askpass prompt for `{operation}` could not be shown: {error}");
-        }
-    })
+    AskPassDelegate::new_with_cancellation(
+        &mut cx.to_async(),
+        move |prompt, tx, cancellation, cx| {
+            let shown = window.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        AskPassModal::new(
+                            operation.clone(),
+                            prompt.into(),
+                            tx,
+                            cancellation,
+                            window,
+                            cx,
+                        )
+                    });
+                })
+            });
+            // Both failures say the same thing: the window or the workspace
+            // went away before git asked for credentials, so nobody can
+            // answer. That leaves the git subprocess blocked until it gives
+            // up on its own, which is worth a line in the log rather than
+            // silence.
+            if let Err(error) = shown.and_then(|inner| inner) {
+                log::warn!("askpass prompt for `{operation}` could not be shown: {error}");
+            }
+        },
+    )
 }

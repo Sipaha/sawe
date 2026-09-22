@@ -1,9 +1,9 @@
-[build]
+[target.'cfg(all())']
 # v0 mangling scheme provides more detailed backtraces around closures
 rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
-# sccache: dedupe rustc artifacts across worktrees + parallel checkouts.
-# Required: `cargo install sccache --locked`.
-# Disable for one invocation: `RUSTC_WRAPPER= cargo build`.
+
+[build]
+# Share cached compilation across local worktrees.
 rustc-wrapper = "sccache"
 
 [alias]

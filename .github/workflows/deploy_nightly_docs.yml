@@ -6,9 +6,10 @@ on:
   push:
     branches:
     - main
+permissions: {}
 jobs:
   deploy_docs:
-    if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
+    if: false # sawe: upstream automation is disabled
     permissions:
       contents: read
     uses: zed-industries/zed/.github/workflows/deploy_docs.yml@3f16f7b9082f8828e4d6ae207d2349b1ef932517

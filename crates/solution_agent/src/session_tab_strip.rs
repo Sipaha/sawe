@@ -608,8 +608,8 @@ impl SessionTabStrip {
             // the label still gets the same room it had before the logo
             // arrived rather than paying for it out of its own truncation
             // budget.
-            .min_w(rems_from_px(104.))
-            .max_w(rems_from_px(194.))
+            .min_w(rems_from_px(104_f32))
+            .max_w(rems_from_px(194_f32))
             .rounded_sm()
             .when_some(background, |this, bg| this.bg(bg))
             .border_b_2()
@@ -1652,7 +1652,7 @@ mod tests {
             id: id_a,
             solution_id,
             agent_id: SharedString::from("claude-acp"),
-            acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+            acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
             title: SharedString::from("session A"),
             created_at: now,
             last_activity_at: now,
@@ -1669,14 +1669,14 @@ mod tests {
         };
         let meta_b = crate::model::SolutionSessionMetadata {
             id: id_b,
-            acp_session_id: agent_client_protocol::schema::SessionId::new("acp-b"),
+            acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-b"),
             title: SharedString::from("session B"),
             ..meta_a.clone()
         };
         // A sub-agent: persisted and hydrated, but never pinned into the strip.
         let meta_child = crate::model::SolutionSessionMetadata {
             id: id_child,
-            acp_session_id: agent_client_protocol::schema::SessionId::new("acp-child"),
+            acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-child"),
             title: SharedString::from("child of A"),
             parent_session_id: Some(id_a),
             ..meta_a.clone()

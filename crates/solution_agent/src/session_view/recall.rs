@@ -5,7 +5,7 @@
 //! conditions don't match, the handler does NOT call `stop_propagation`
 //! and the editor's default cursor-up behavior runs as usual.
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use gpui::{Context, Focusable, SharedString, Window};
 
 use super::{PendingImage, SolutionSessionView};

@@ -269,7 +269,7 @@ fn close_workspaces_under_root_in(
             // Close those individually; reserve `remove_project_group` for
             // unique non-empty keys.
             if group_key.path_list().paths().is_empty() {
-                mw.close_workspace(&ws, window, cx)
+                mw.remove([ws], workspace::RemovalIntent::CloseProject, window, cx)
             } else {
                 mw.remove_project_group(&group_key, window, cx)
             }
@@ -656,8 +656,8 @@ fn close_solution_workspaces_in(
 
     // Snapshot every workspace's project-group key alongside the
     // workspace itself. For a workspace that still has worktrees we close
-    // via `remove_project_group` (instead of `close_workspace`) so the
-    // lingering group entry doesn't survive the close — `remove_workspace`'s
+    // via `remove_project_group` (instead of removing only one workspace) so the
+    // lingering group entry doesn't survive the close — `remove`'s
     // fallback walks neighbouring groups and cheerfully respawns a workspace
     // from the previously-closed solution's path list, leaving the user with
     // a "ghost" tab for a solution they explicitly closed seconds ago.
@@ -682,7 +682,7 @@ fn close_solution_workspaces_in(
                 // project-group entry for an empty key, so the ghost-respawn
                 // concern that motivates `remove_project_group` doesn't apply.
                 // Close just this workspace.
-                mw.close_workspace(&ws, window, cx)
+                mw.remove([ws], workspace::RemovalIntent::CloseProject, window, cx)
             } else {
                 // Non-empty keys are unique per solution (each member lives
                 // under its own solution root / git identity), so removing the

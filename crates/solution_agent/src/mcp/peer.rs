@@ -326,11 +326,13 @@ mod tests {
         });
     }
 
-    fn queued_text(blocks: &[agent_client_protocol::schema::ContentBlock]) -> String {
+    fn queued_text(blocks: &[agent_client_protocol::schema::v1::ContentBlock]) -> String {
         blocks
             .iter()
             .filter_map(|block| match block {
-                agent_client_protocol::schema::ContentBlock::Text(text) => Some(text.text.as_str()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(text) => {
+                    Some(text.text.as_str())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()

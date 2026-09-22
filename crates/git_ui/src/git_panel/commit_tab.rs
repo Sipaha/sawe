@@ -15,7 +15,7 @@
 use super::*;
 
 use crate::commit_refs;
-use git::repository::{CommitDetails, CommitDiff, CommitFile};
+use git::repository::CommitDetails;
 use git::status::{StatusCode, TrackedStatus};
 use gpui::{
     AnyElement, ClipboardItem, EntityId, FontWeight, StyleRefinement, TextRun, TextStyleRefinement,
@@ -23,6 +23,7 @@ use gpui::{
 };
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
+use project::git_store::{CommitDiff, CommitFile};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -1609,7 +1610,7 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         let diff = repository.update(cx, |repository, _| {
-            repository.load_commit_diff(sha.to_string())
+            repository.load_commit_diff(sha.to_string(), false)
         });
         let target = (repository.entity_id(), sha);
         let task = cx.spawn(async move |this, cx| {
@@ -3304,6 +3305,7 @@ mod tests {
     #[test]
     fn test_compute_diff_stats_counts_each_file_and_sums_to_the_total() {
         let diff = CommitDiff {
+            is_shallow_boundary: false,
             files: vec![
                 // Replaces a line and appends one: both columns non-zero.
                 commit_file(
@@ -3374,12 +3376,14 @@ mod tests {
     fn test_changed_file_entries_carry_their_figures() {
         let loaded = LoadedCommitDiff {
             stats: compute_diff_stats(&CommitDiff {
+                is_shallow_boundary: false,
                 files: vec![
                     commit_file("src/lib.rs", Some("a\n"), Some("a\nb\n"), false),
                     commit_file("assets/icon.png", Some(""), Some(""), true),
                 ],
             }),
             diff: CommitDiff {
+                is_shallow_boundary: false,
                 files: vec![
                     commit_file("src/lib.rs", Some("a\n"), Some("a\nb\n"), false),
                     commit_file("assets/icon.png", Some(""), Some(""), true),
@@ -3524,6 +3528,7 @@ mod tests {
     fn test_the_diff_stats_setting_reaches_the_directory_rows_too() {
         let loaded = LoadedCommitDiff {
             stats: compute_diff_stats(&CommitDiff {
+                is_shallow_boundary: false,
                 files: vec![commit_file(
                     "src/lib.rs",
                     Some("a\n"),
@@ -3532,6 +3537,7 @@ mod tests {
                 )],
             }),
             diff: CommitDiff {
+                is_shallow_boundary: false,
                 files: vec![commit_file(
                     "src/lib.rs",
                     Some("a\n"),
@@ -3607,6 +3613,7 @@ mod tests {
             std::path::Path::new(util::path!("/project/.git")),
             sha,
             CommitDiff {
+                is_shallow_boundary: false,
                 files: vec![
                     commit_file(
                         "src/mixed.rs",
@@ -3787,6 +3794,7 @@ mod tests {
             std::path::Path::new(util::path!("/project/.git")),
             sha,
             CommitDiff {
+                is_shallow_boundary: false,
                 files: ["a.rs", "b.rs"]
                     .into_iter()
                     .map(|path| CommitFile {
@@ -4461,7 +4469,7 @@ ships-with-and-then-some-more-of-it";
         workspace.update_in(cx, |workspace, window, cx| {
             let position = panel.read(cx).position(window, cx);
             workspace.dock_at_position(position).update(cx, |dock, cx| {
-                dock.resize_active_panel(Some(width), None, window, cx);
+                dock.resize_panel_sizes(Some(width), None, window, cx);
             });
         });
         cx.run_until_parked();
@@ -4603,6 +4611,7 @@ ships-with-and-then-some-more-of-it";
             std::path::Path::new(util::path!("/project/.git")),
             &oid(sha).to_string(),
             CommitDiff {
+                is_shallow_boundary: false,
                 files: ["src/a.rs", "src/b.rs"]
                     .into_iter()
                     .map(|path| CommitFile {

@@ -10,7 +10,7 @@ use acp_thread::{
     AcpThread, AgentThreadEntry, ContentBlock, PermissionOptions, SelectedPermissionOutcome,
     SelectedPermissionParams, ToolCall, ToolCallContent, ToolCallStatus, UserMessageId,
 };
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use base64::Engine;
 use chrono::TimeZone as _;
 use gpui::{
@@ -378,7 +378,7 @@ fn user_message_id_to_string(id: &UserMessageId) -> String {
 fn resolve_user_message_id(thread: &AcpThread, target: &str) -> Option<UserMessageId> {
     thread.entries().iter().find_map(|entry| match entry {
         AgentThreadEntry::UserMessage(message) => {
-            let id = message.id.as_ref()?;
+            let id = message.client_id.as_ref()?;
             (user_message_id_to_string(id) == target).then(|| id.clone())
         }
         _ => None,

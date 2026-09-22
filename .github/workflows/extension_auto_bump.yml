@@ -3,10 +3,19 @@
 # sawe: do NOT run that -- this file is hand-maintained here. See FORK.md #118.
 name: extension_auto_bump
 on:
-  workflow_dispatch:
+  push:
+    branches:
+    - main
+    paths:
+    - extensions/**
+    - '!extensions/test-extension/**'
+    - '!extensions/workflows/**'
+    - '!extensions/*.md'
+permissions:
+  contents: read
 jobs:
   detect_changed_extensions:
-    if: false # sawe: not applicable
+    if: false # sawe: upstream automation is disabled
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::checkout_repo
@@ -48,7 +57,7 @@ jobs:
   bump_extension_versions:
     needs:
     - detect_changed_extensions
-    if: false # sawe: not applicable
+    if: false # sawe: upstream automation is disabled
     permissions:
       actions: write
       contents: write

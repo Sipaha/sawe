@@ -1,6 +1,6 @@
 //! Native approval choices. Session grants use Codex's own approval cache;
 //! they do not write global rules or grant unrestricted session permissions.
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use serde_json::Value;
 
 #[derive(Clone, Copy)]

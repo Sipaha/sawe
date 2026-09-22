@@ -1144,7 +1144,7 @@ impl BranchesPopup {
                                     .gap_1p5()
                                     .when(is_protected, |this| {
                                         this.child(
-                                            Icon::new(IconName::LockOutlined)
+                                            Icon::new(IconName::Lock)
                                                 .color(Color::Muted)
                                                 .size(IconSize::XSmall),
                                         )

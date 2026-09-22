@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::store::tests::create_session_with_thread;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 
 use context_server::listener::McpServerTool;
 use context_server::types::ToolResponseContent;

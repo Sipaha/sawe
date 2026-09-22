@@ -1,6 +1,6 @@
 //! Shared read-only DTO types + conversion helpers for the `solution_agent`
 //! MCP tools. Relocated verbatim from the former monolithic `mcp.rs`.
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use gpui::App;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

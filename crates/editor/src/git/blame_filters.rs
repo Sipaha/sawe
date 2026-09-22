@@ -99,6 +99,7 @@ mod tests {
     fn entry(email: &str, author: &str) -> BlameEntry {
         BlameEntry {
             sha: zero_oid(),
+            boundary: false,
             range: 0..1,
             original_line_number: 1,
             author: Some(author.to_string()),
@@ -160,6 +161,7 @@ mod tests {
         filter.toggle("a@b.com");
         let entry_no_email = BlameEntry {
             sha: zero_oid(),
+            boundary: false,
             range: 0..1,
             original_line_number: 1,
             author: Some("X".to_string()),

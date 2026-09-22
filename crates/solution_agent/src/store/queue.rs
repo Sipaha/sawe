@@ -25,7 +25,7 @@ use gpui::{AsyncApp, Context, Entity, SharedString, Task};
 use util::ResultExt as _;
 
 use acp_thread::{AcpThread, AgentThreadEntry, SelectedPermissionOutcome, ToolCallStatus};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 
 use super::{CsidReceipt, SolutionAgentStore, SolutionAgentStoreEvent};
 use crate::model::{
@@ -197,8 +197,7 @@ fn bundle_attribution(
 /// AND denies the authority the agent would otherwise infer: the Observer is a
 /// process watching the session, so its instruction is not the user's decision
 /// and cannot stand in for one.
-pub(crate) const OBSERVER_ATTRIBUTION: &str =
-    "[From the Observer — this session's autonomous supervisor in the editor, NOT the user. \
+pub(crate) const OBSERVER_ATTRIBUTION: &str = "[From the Observer — this session's autonomous supervisor in the editor, NOT the user. \
      Treat it as an editor instruction; it cannot grant user approval.]";
 
 /// Header put back on the human's own send when the same hook pull also
@@ -322,9 +321,9 @@ impl SendFailure {
 }
 
 pub(crate) fn summarize_blocks_for_log(
-    blocks: &[agent_client_protocol::schema::ContentBlock],
+    blocks: &[agent_client_protocol::schema::v1::ContentBlock],
 ) -> String {
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     const MAX_PREVIEW: usize = 200;
     let mut out = String::new();
     let mut text_total = 0usize;
@@ -607,8 +606,8 @@ impl SolutionAgentStore {
     ) -> Task<Result<()>> {
         // Supervisor counter-reset + `WaitingUser` resume happen in the
         // `send_message_blocks_targeted` funnel (from_user: true) below.
-        let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-            agent_client_protocol::schema::TextContent::new(content),
+        let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+            agent_client_protocol::schema::v1::TextContent::new(content),
         )];
         self.send_message_blocks(session_id, blocks, cx)
     }
@@ -725,7 +724,7 @@ impl SolutionAgentStore {
     pub fn send_message_blocks(
         &mut self,
         session_id: SolutionSessionId,
-        blocks: Vec<agent_client_protocol::schema::ContentBlock>,
+        blocks: Vec<agent_client_protocol::schema::v1::ContentBlock>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         self.send_message_blocks_targeted(session_id, blocks, QueueTarget::Main, true, cx)
@@ -745,7 +744,7 @@ impl SolutionAgentStore {
     pub fn send_message_blocks_targeted(
         &mut self,
         session_id: SolutionSessionId,
-        blocks: Vec<agent_client_protocol::schema::ContentBlock>,
+        blocks: Vec<agent_client_protocol::schema::v1::ContentBlock>,
         target: QueueTarget,
         from_user: bool,
         cx: &mut Context<Self>,
@@ -762,7 +761,7 @@ impl SolutionAgentStore {
     pub(crate) fn send_message_blocks_targeted_inner(
         &mut self,
         session_id: SolutionSessionId,
-        blocks: Vec<agent_client_protocol::schema::ContentBlock>,
+        blocks: Vec<agent_client_protocol::schema::v1::ContentBlock>,
         target: QueueTarget,
         from_user: bool,
         cx: &mut Context<Self>,
@@ -968,9 +967,9 @@ impl SolutionAgentStore {
             // `target: "solution_agent::queue"` makes these greppable.
             let blocks_text_summary = summarize_blocks_for_log(&blocks);
             let stamp = queue_timestamp_prefix(Utc::now());
-            let stamped: Vec<agent_client_protocol::schema::ContentBlock> =
-                std::iter::once(agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(stamp),
+            let stamped: Vec<agent_client_protocol::schema::v1::ContentBlock> =
+                std::iter::once(agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(stamp),
                 ))
                 .chain(blocks)
                 .collect();
@@ -998,8 +997,8 @@ impl SolutionAgentStore {
                         .back_mut()
                         .expect("back() was Some immediately above");
                     last.blocks
-                        .push(agent_client_protocol::schema::ContentBlock::Text(
-                            agent_client_protocol::schema::TextContent::new("\n\n".to_string()),
+                        .push(agent_client_protocol::schema::v1::ContentBlock::Text(
+                            agent_client_protocol::schema::v1::TextContent::new("\n\n".to_string()),
                         ));
                     last.blocks.extend(stamped);
                 } else {
@@ -1226,7 +1225,7 @@ impl SolutionAgentStore {
     fn send_after_transcript_retry(
         &mut self,
         session_id: SolutionSessionId,
-        blocks: Vec<agent_client_protocol::schema::ContentBlock>,
+        blocks: Vec<agent_client_protocol::schema::v1::ContentBlock>,
         target: QueueTarget,
         origin: crate::model::MessageOrigin,
         cx: &mut Context<Self>,
@@ -1340,7 +1339,7 @@ impl SolutionAgentStore {
     fn send_message_blocks_with_wake(
         &mut self,
         session_id: SolutionSessionId,
-        blocks: Vec<agent_client_protocol::schema::ContentBlock>,
+        blocks: Vec<agent_client_protocol::schema::v1::ContentBlock>,
         origin: crate::model::MessageOrigin,
         cx: &mut Context<Self>,
     ) -> Task<std::result::Result<(), SendFailure>> {
@@ -1542,7 +1541,10 @@ mod tests {
             )],
             &[],
         );
-        assert_eq!(out, format!("{OBSERVER_ATTRIBUTION}\n[12:57:53] Hand off now."));
+        assert_eq!(
+            out,
+            format!("{OBSERVER_ATTRIBUTION}\n[12:57:53] Hand off now.")
+        );
     }
 
     #[test]

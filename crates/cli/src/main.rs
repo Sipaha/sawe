@@ -7,8 +7,12 @@
     allow(dead_code)
 )]
 
+mod completions;
+
+use crate::completions::Shell;
+
 use anyhow::{Context as _, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use cli::{CliRequest, CliResponse, IpcHandshake, ipc::IpcOneShotServer};
 use parking_lot::Mutex;
 use std::{
@@ -125,11 +129,12 @@ struct Args {
         not(any(target_os = "windows", target_os = "macos")),
         doc = "`$XDG_DATA_HOME/zed`."
     )]
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     user_data_dir: Option<String>,
     /// The paths to open in Zed (space-separated).
     ///
     /// Use `path:line:column` syntax to open a file at the given line and column.
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::AnyPath)]
     paths_with_position: Vec<String>,
     /// Print Zed's version and the app path.
     #[arg(short, long)]
@@ -167,8 +172,11 @@ struct Args {
     dev_container: bool,
     /// Pairs of file paths to diff. Can be specified multiple times.
     /// When directories are provided, recurses into them and shows all changed files in a single multi-diff view.
-    #[arg(long, action = clap::ArgAction::Append, num_args = 2, value_names = ["OLD_PATH", "NEW_PATH"])]
+    #[arg(long, action = clap::ArgAction::Append, num_args = 2, value_names = ["OLD_PATH", "NEW_PATH"], value_hint = clap::ValueHint::AnyPath)]
     diff: Vec<String>,
+    /// Generate shell completions for Sawe
+    #[arg(long, value_names = ["SHELL"])]
+    completions: Option<Shell>,
     /// Uninstall Zed from user system
     #[cfg(all(
         any(target_os = "linux", target_os = "macos"),
@@ -228,6 +236,13 @@ fn parse_path_with_position(argument_str: &str) -> anyhow::Result<String> {
         }),
     }
     .map(|path_with_pos| path_with_pos.to_string(&|path| path.to_string_lossy().into_owned()))
+}
+
+/// Returns whether a `--diff` argument refers to an existing path, allowing a
+/// trailing `:line:column` suffix (parsed later by the Zed side, matching how
+/// regular `zed path:line:column` arguments are handled).
+fn diff_path_exists(diff_path: &str) -> bool {
+    Path::new(diff_path).exists() || PathWithPosition::parse_str(diff_path).path.exists()
 }
 
 fn expand_directory_diff_pairs(
@@ -591,6 +606,20 @@ fn run() -> Result<()> {
 
     let app = Detect::detect(args.zed.as_deref()).context("Bundle detection")?;
 
+    if let Some(shell) = &args.completions {
+        let file_path = std::env::current_exe()?;
+        let file_name = file_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or("--completions expects a UTF-8 name for cli bin")
+            .map_err(anyhow::Error::msg)?;
+        let mut cmd = Args::command();
+        cmd.set_bin_name(file_name);
+        cmd.build();
+        crate::completions::main(&cmd, shell);
+        return Ok(());
+    }
+
     if args.version {
         println!("{}", app.zed_version_string());
         return Ok(());
@@ -698,7 +727,7 @@ fn run() -> Result<()> {
         let right = parse_path_with_position(&path[1])?;
         for diff_path in [&left, &right] {
             anyhow::ensure!(
-                Path::new(diff_path).exists(),
+                diff_path_exists(diff_path),
                 "--diff path does not exist: {diff_path}"
             );
         }
@@ -957,7 +986,7 @@ mod linux {
 
                 // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
                 // ./zed is for the target directory in development builds.
-                let possible_locations = ["../libexec/sawe-bin", "../lib/sawe/sawe-bin", "./zed"];
+                let possible_locations = ["../libexec/sawe-bin", "../lib/sawe/sawe-bin", "./sawe"];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -1075,12 +1104,25 @@ mod linux {
 #[cfg(target_os = "linux")]
 mod flatpak {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::{env, process};
 
     const EXTRA_LIB_ENV_NAME: &str = "ZED_FLATPAK_LIB_PATH";
     const NO_ESCAPE_ENV_NAME: &str = "ZED_FLATPAK_NO_ESCAPE";
+
+    fn restart_cli_args(flatpak_dir: &Path, invocation_args: &[OsString]) -> Vec<OsString> {
+        let mut args = Vec::with_capacity(invocation_args.len() + 2);
+
+        if !invocation_args.iter().any(|arg| arg == "--zed") {
+            // Positional paths consume all following arguments, so launcher options must precede them.
+            args.push("--zed".into());
+            args.push(flatpak_dir.join("libexec").join("sawe-bin").into());
+        }
+
+        args.extend_from_slice(invocation_args);
+        args
+    }
 
     /// Adds bundled libraries to LD_LIBRARY_PATH if running under flatpak
     pub fn ld_extra_libs() {
@@ -1112,16 +1154,8 @@ mod flatpak {
             );
             args.push(flatpak_dir.join("bin").join("zed").into());
 
-            let mut is_app_location_set = false;
-            for arg in &env::args_os().collect::<Vec<_>>()[1..] {
-                args.push(arg.clone());
-                is_app_location_set |= arg == "--zed";
-            }
-
-            if !is_app_location_set {
-                args.push("--zed".into());
-                args.push(flatpak_dir.join("libexec").join("sawe-bin").into());
-            }
+            let invocation_args = env::args_os().skip(1).collect::<Vec<_>>();
+            args.extend(restart_cli_args(&flatpak_dir, &invocation_args));
 
             let error = exec::execvp("/usr/bin/flatpak-spawn", args);
             eprintln!("failed restart cli on host: {:?}", error);
@@ -1176,6 +1210,31 @@ mod flatpak {
             .filter(|(key, _)| xdg_keys.contains(&key.as_str()))
             .map(|(key, val)| format!("--env=FLATPAK_{}={}", key, val).into())
             .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use clap::Parser as _;
+
+        use super::*;
+
+        #[test]
+        fn test_restart_cli_args() {
+            let flatpak_dir = Path::new("/flatpak");
+            let args = restart_cli_args(flatpak_dir, &["project".into()]);
+            let parsed =
+                crate::Args::try_parse_from(std::iter::once(OsString::from("zed")).chain(args))
+                    .unwrap();
+
+            assert_eq!(parsed.zed, Some(flatpak_dir.join("libexec/sawe-bin")));
+            assert_eq!(parsed.paths_with_position, ["project"]);
+
+            let invocation_args = ["--zed".into(), "/custom/zed-editor".into()];
+            assert_eq!(
+                restart_cli_args(flatpak_dir, &invocation_args),
+                invocation_args
+            );
+        }
     }
 }
 
@@ -1290,9 +1349,9 @@ mod windows {
                 let cli = std::env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // ../sawe.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
+                // ../sawe.exe is the standard, lib/sawe is for MSYS2, ./sawe.exe is for the target
                 // directory in development builds.
-                let possible_locations = ["../sawe.exe", "../lib/sawe/sawe-bin.exe", "./zed.exe"];
+                let possible_locations = ["../sawe.exe", "../lib/sawe/sawe-bin.exe", "./sawe.exe"];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))

@@ -80,14 +80,14 @@ impl SolutionPickerDropdown {
             SolutionPickerDelegate::new(workspace, multi_workspace, cx.entity().downgrade(), cx);
         let picker = cx.new(|cx| {
             Picker::list(delegate, window, cx)
-                // `modal(true)` would wrap the list in `elevation_3`, a
+                // The default modal presentation would wrap the list in `elevation_3`, a
                 // modal shell stacked inside the popover this view already
                 // paints, and would make the search editor losing focus
                 // dismiss the popover. `PopoverMenu` already dismisses on
                 // an outside mouse-down.
-                .modal(false)
+                .embedded()
                 .show_scrollbar(true)
-                .max_height(Some(px(LIST_MAX_HEIGHT).into()))
+                .max_height(rems(LIST_MAX_HEIGHT / f32::from(window.rem_size())))
         });
 
         // Refresh the closed-solutions list whenever the store mutates
@@ -332,6 +332,10 @@ fn closed_solution_rows(
 }
 
 impl PickerDelegate for SolutionPickerDelegate {
+    fn name() -> &'static str {
+        "SaweSolutionDropdown"
+    }
+
     type ListItem = ListItem;
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
@@ -412,7 +416,7 @@ impl PickerDelegate for SolutionPickerDelegate {
         editor: &Arc<dyn ErasedEditor>,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
-    ) -> Div {
+    ) -> Option<Div> {
         // Compact search row. The h_flex carries fixed height + the
         // editor's background/border — the picker's single-line editor
         // paints on a transparent background, so without this wrapper the
@@ -421,28 +425,30 @@ impl PickerDelegate for SolutionPickerDelegate {
         // which the default `render_editor` supplies and which guarantees
         // the EditorElement gets a non-zero height even when the popover's
         // max height clamps the column.
-        v_flex()
-            .child(
-                h_flex()
-                    .m_1p5()
-                    .px_2()
-                    .h_7()
-                    .gap_1p5()
-                    .flex_none()
-                    .items_center()
-                    .overflow_hidden()
-                    .rounded_sm()
-                    .bg(cx.theme().colors().editor_background)
-                    .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(div().flex_1().min_w_0().child(editor.render(window, cx)))
-                    .child(
-                        Icon::new(IconName::MagnifyingGlass)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(Divider::horizontal())
+        Some(
+            v_flex()
+                .child(
+                    h_flex()
+                        .m_1p5()
+                        .px_2()
+                        .h_7()
+                        .gap_1p5()
+                        .flex_none()
+                        .items_center()
+                        .overflow_hidden()
+                        .rounded_sm()
+                        .bg(cx.theme().colors().editor_background)
+                        .border_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(div().flex_1().min_w_0().child(editor.render(window, cx)))
+                        .child(
+                            Icon::new(IconName::MagnifyingGlass)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(Divider::horizontal()),
+        )
     }
 
     fn render_match(

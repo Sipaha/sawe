@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use acp_thread::{AgentThreadEntry, ToolCallContent};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use chrono::TimeZone as _;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, DragMoveEvent, Empty, Entity, EntityId,

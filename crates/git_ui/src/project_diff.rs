@@ -29,7 +29,7 @@ use project::{
     ConflictSet, Project, ProjectPath,
     git_store::{
         Repository,
-        branch_diff::{self, BranchDiffEvent, DiffBase},
+        diff_buffer_list::{self as branch_diff, BranchDiffEvent, DiffBase},
     },
 };
 use settings::{Settings, SettingsStore};
@@ -39,7 +39,6 @@ use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
     CommonAnimationExt as _, DiffStat, Divider, KeyBinding, PopoverMenu, Tooltip, prelude::*,
-    vertical_divider,
 };
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
@@ -70,6 +69,23 @@ actions!(
     ]
 );
 
+// Preserve the action name consumed by upstream split staged/branch views.
+pub use BranchDiff as DeployBranchDiff;
+
+fn new_diff_buffer_list(
+    base: DiffBase,
+    project: Entity<Project>,
+    _window: &mut Window,
+    cx: &mut Context<branch_diff::DiffBufferList>,
+) -> branch_diff::DiffBufferList {
+    let repository = if solutions::active_member_context(&project, cx).is_some() {
+        solutions::active_member_repository(&project, cx)
+    } else {
+        project.read(cx).active_repository(cx)
+    };
+    branch_diff::DiffBufferList::new(base, project.read(cx).git_store().clone(), repository, cx)
+}
+
 struct BufferSubscriptions {
     _diff: Entity<BufferDiff>,
     _diff_subscription: Subscription,
@@ -80,7 +96,7 @@ struct BufferSubscriptions {
 pub struct ProjectDiff {
     project: Entity<Project>,
     multibuffer: Entity<MultiBuffer>,
-    branch_diff: Entity<branch_diff::BranchDiff>,
+    branch_diff: Entity<branch_diff::DiffBufferList>,
     editor: Entity<SplittableEditor>,
     buffer_subscriptions: HashMap<Arc<RelPath>, BufferSubscriptions>,
     workspace: WeakEntity<Workspace>,
@@ -185,7 +201,7 @@ impl ProjectDiff {
         let selected_branch = workspace.active_item_as::<Self>(cx).and_then(|item| {
             match item.read(cx).diff_base(cx) {
                 DiffBase::Merge { base_ref } => Some(base_ref.clone()),
-                DiffBase::Head => None,
+                DiffBase::Head | DiffBase::Index | DiffBase::Staged => None,
             }
         });
         let workspace_handle = workspace.weak_handle();
@@ -459,12 +475,7 @@ impl ProjectDiff {
         window
             .spawn(cx, async move |cx| {
                 let branch_diff = cx.new_window_entity(|window, cx| {
-                    branch_diff::BranchDiff::new(
-                        DiffBase::Merge { base_ref },
-                        project.clone(),
-                        window,
-                        cx,
-                    )
+                    new_diff_buffer_list(DiffBase::Merge { base_ref }, project.clone(), window, cx)
                 })?;
                 let project_diff = cx.new_window_entity(|window, cx| {
                     Self::new_impl(branch_diff, project, workspace_handle.clone(), window, cx)
@@ -501,7 +512,7 @@ impl ProjectDiff {
                 .context("Could not determine default branch")?;
 
             let branch_diff = cx.new_window_entity(|window, cx| {
-                let mut branch_diff = branch_diff::BranchDiff::new(
+                let mut branch_diff = new_diff_buffer_list(
                     DiffBase::Merge {
                         base_ref: main_branch,
                     },
@@ -528,12 +539,8 @@ impl ProjectDiff {
     ) -> Task<Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
             let branch_diff = cx.new_window_entity(|window, cx| {
-                let mut branch_diff = branch_diff::BranchDiff::new(
-                    DiffBase::Merge { base_ref },
-                    project.clone(),
-                    window,
-                    cx,
-                );
+                let mut branch_diff =
+                    new_diff_buffer_list(DiffBase::Merge { base_ref }, project.clone(), window, cx);
                 branch_diff.set_repo(Some(repo.clone()), cx);
                 branch_diff
             })?;
@@ -550,12 +557,12 @@ impl ProjectDiff {
         cx: &mut Context<Self>,
     ) -> Self {
         let branch_diff =
-            cx.new(|cx| branch_diff::BranchDiff::new(DiffBase::Head, project.clone(), window, cx));
+            cx.new(|cx| new_diff_buffer_list(DiffBase::Head, project.clone(), window, cx));
         Self::new_impl(branch_diff, project, workspace, window, cx)
     }
 
     fn new_impl(
-        branch_diff: Entity<branch_diff::BranchDiff>,
+        branch_diff: Entity<branch_diff::DiffBufferList>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
         window: &mut Window,
@@ -592,7 +599,7 @@ impl ProjectDiff {
             );
             match branch_diff.read(cx).diff_base() {
                 // The left pane holds each file's content at HEAD.
-                DiffBase::Head => diff_display_editor
+                DiffBase::Head | DiffBase::Index | DiffBase::Staged => diff_display_editor
                     .set_blame_base(Some(DiffBlameBase::RhsFilesAt("HEAD".into())), cx),
                 // The left pane holds the content at the merge base of the
                 // target ref and HEAD. `git blame` takes a single commit-ish
@@ -604,7 +611,7 @@ impl ProjectDiff {
                 editor.set_show_diff_review_button(true, cx);
 
                 match branch_diff.read(cx).diff_base() {
-                    DiffBase::Head => {
+                    DiffBase::Head | DiffBase::Index | DiffBase::Staged => {
                         editor.register_addon(GitPanelAddon {
                             workspace: workspace.downgrade(),
                         });
@@ -642,7 +649,9 @@ impl ProjectDiff {
                 BranchDiffEvent::DiffBaseChanged => {
                     this.pending_scroll.take();
                     let blame_base = match this.branch_diff.read(cx).diff_base() {
-                        DiffBase::Head => Some(DiffBlameBase::RhsFilesAt("HEAD".into())),
+                        DiffBase::Head | DiffBase::Index | DiffBase::Staged => {
+                            Some(DiffBlameBase::RhsFilesAt("HEAD".into()))
+                        }
                         DiffBase::Merge { .. } => None,
                     };
                     this.editor.update(cx, |editor, cx| {
@@ -889,8 +898,7 @@ impl ProjectDiff {
                         cx,
                     );
                 }
-                buffer_diff::BufferDiffEvent::BaseTextChanged
-                | buffer_diff::BufferDiffEvent::HunksStagedOrUnstaged(_) => {}
+                buffer_diff::BufferDiffEvent::BaseTextChanged => {}
             }
         });
         let conflict_set_subscription = cx.subscribe_in(&conflict_set, window, {
@@ -1079,7 +1087,13 @@ impl ProjectDiff {
         let mut buffers_to_fold = Vec::new();
 
         for (path_key, entry) in entries {
-            if let Some((buffer, diff, conflict_set)) = entry.load.await.log_err() {
+            if let Some(loaded) = entry.load.await.log_err() {
+                let buffer = loaded.display_buffer;
+                let diff = loaded.diff;
+                let conflict_set = match loaded.conflict_set {
+                    Some(conflicts) => conflicts,
+                    None => cx.new(|cx| ConflictSet::new(buffer.read(cx).remote_id(), false, cx)),
+                };
                 // We might be lagging behind enough that all future entry.load futures are no longer pending.
                 // If that is the case, this task will never yield, starving the foreground thread of execution time.
                 yield_now().await;
@@ -1199,7 +1213,7 @@ impl Item for ProjectDiff {
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         match self.diff_base(cx) {
-            DiffBase::Head => Some("Project Diff".into()),
+            DiffBase::Head | DiffBase::Index | DiffBase::Staged => Some("Project Diff".into()),
             DiffBase::Merge { .. } => Some("Branch Diff".into()),
         }
     }
@@ -1216,7 +1230,7 @@ impl Item for ProjectDiff {
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.branch_diff.read(cx).diff_base() {
-            DiffBase::Head => "Uncommitted Changes".into(),
+            DiffBase::Head | DiffBase::Index | DiffBase::Staged => "Uncommitted Changes".into(),
             DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
         }
     }
@@ -1474,8 +1488,8 @@ impl SerializableItem for ProjectDiff {
             let diff_base = db.get_diff_base(item_id, workspace_id)?;
 
             let diff = cx.update(|window, cx| {
-                let branch_diff = cx
-                    .new(|cx| branch_diff::BranchDiff::new(diff_base, project.clone(), window, cx));
+                let branch_diff =
+                    cx.new(|cx| new_diff_buffer_list(diff_base, project.clone(), window, cx));
                 let workspace = workspace.upgrade().context("workspace gone")?;
                 anyhow::Ok(
                     cx.new(|cx| ProjectDiff::new_impl(branch_diff, project, workspace, window, cx)),
@@ -1491,7 +1505,6 @@ impl SerializableItem for ProjectDiff {
         workspace: &mut Workspace,
         item_id: workspace::ItemId,
         _closing: bool,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         let workspace_id = workspace.database_id()?;
@@ -1511,14 +1524,14 @@ impl SerializableItem for ProjectDiff {
     }
 }
 
-mod persistence {
+pub(crate) mod persistence {
 
     use anyhow::Context as _;
     use db::{
         sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
         sqlez_macros::sql,
     };
-    use project::git_store::branch_diff::DiffBase;
+    use project::git_store::diff_buffer_list::DiffBase;
     use workspace::{ItemId, WorkspaceDb, WorkspaceId};
 
     pub struct ProjectDiffDb(ThreadSafeConnection);
@@ -1698,7 +1711,7 @@ impl Render for ProjectDiffToolbar {
             )
             // "Send Review to Agent" button (only shown when there are review comments)
             .when(review_count > 0, |el| {
-                el.child(vertical_divider()).child(
+                el.child(Divider::vertical()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
                         cx.listener(|this, _, window, cx| {
                             this.dispatch_action(&SendReviewToAgent, window, cx)
@@ -1714,7 +1727,10 @@ impl Render for ProjectDiffToolbar {
     }
 }
 
-fn render_send_review_to_agent_button(review_count: usize, focus_handle: &FocusHandle) -> Button {
+pub(crate) fn render_send_review_to_agent_button(
+    review_count: usize,
+    focus_handle: &FocusHandle,
+) -> Button {
     Button::new(
         "send-review",
         format!("Send Review to Agent ({})", review_count),
@@ -1899,7 +1915,7 @@ impl Render for BranchDiffToolbar {
                 )
             })
             .when(review_count > 0, |this| {
-                this.child(vertical_divider()).child(
+                this.child(Divider::vertical()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
                         cx.listener(|this, _, window, cx| {
                             this.dispatch_action(&SendReviewToAgent, window, cx)
@@ -1918,7 +1934,7 @@ impl Render for BranchDiffToolbar {
 }
 
 struct BranchDiffAddon {
-    branch_diff: Entity<branch_diff::BranchDiff>,
+    branch_diff: Entity<branch_diff::DiffBufferList>,
 }
 
 impl Addon for BranchDiffAddon {
@@ -2854,6 +2870,15 @@ mod tests {
     #[gpui::test]
     async fn test_branch_diff(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    let git_panel = settings.git_panel.get_or_insert_default();
+                    git_panel.sort_by_path = Some(false);
+                    git_panel.tree_view = Some(false);
+                });
+            });
+        });
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -2896,12 +2921,30 @@ mod tests {
 
         let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
 
+        // HEAD discovery moves a.txt from the untracked group to the tracked
+        // group, replacing its PathKey. The cursor resolves to the surviving
+        // b.txt excerpt instead of jumping to the newly inserted a.txt excerpt.
         assert_state_with_diff(
             &editor,
             cx,
             &"
                 - A
-                + ˇC
+                + C
+                + ˇnew
+                + created-in-head"
+                .unindent(),
+        );
+
+        // Anchor::Min means the first displayed position, including the deleted
+        // base line in a unified diff; it does not skip to the first insertion.
+        // Verify explicit navigation independently of refresh anchor repair.
+        diff.update_in(cx, |diff, window, cx| diff.move_to_beginning(window, cx));
+        assert_state_with_diff(
+            &editor,
+            cx,
+            &"
+                - ˇA
+                + C
                 + new
                 + created-in-head"
                 .unindent(),
@@ -3000,13 +3043,15 @@ mod tests {
             let active_item = workspace.active_item_as::<ProjectDiff>(cx).unwrap();
             let active_base_ref = match active_item.read(cx).diff_base(cx) {
                 DiffBase::Merge { base_ref } => base_ref.to_string(),
-                DiffBase::Head => panic!("expected active item to be a branch diff"),
+                DiffBase::Head | DiffBase::Index | DiffBase::Staged => {
+                    panic!("expected active item to be a branch diff")
+                }
             };
             let base_refs = workspace
                 .items_of_type::<ProjectDiff>(cx)
                 .filter_map(|item| match item.read(cx).diff_base(cx) {
                     DiffBase::Merge { base_ref } => Some(base_ref.to_string()),
-                    DiffBase::Head => None,
+                    DiffBase::Head | DiffBase::Index | DiffBase::Staged => None,
                 })
                 .collect::<Vec<_>>();
             (active_base_ref, base_refs)

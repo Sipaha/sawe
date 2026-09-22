@@ -39,8 +39,8 @@ const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
     ("zbus", log::LevelFilter::Warn),
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     ("naga::back::spv::writer", log::LevelFilter::Warn),
-    // usvg prints a lot of warnings on rendering an SVG with partial errors, which
-    // can happen a lot with the SVG preview
+    // usvg and its CSS parser print a lot of warnings on rendering an SVG with
+    // partial errors, which can happen a lot with the SVG preview.
     ("usvg::parser", log::LevelFilter::Error),
     // "unable to remove watch descriptor from inotify: … EINVAL" once per watch
     // the kernel already dropped because its file was deleted. notify logs it at
@@ -50,6 +50,8 @@ const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
     // problem is WARN or above and survives this.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     ("notify::inotify", log::LevelFilter::Warn),
+    ("simplecss::selector", log::LevelFilter::Error),
+    ("pet", log::LevelFilter::Warn),
 ];
 
 pub fn init_env_filter(filter: env_config::EnvFilter) {

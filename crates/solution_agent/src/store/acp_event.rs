@@ -344,8 +344,10 @@ impl SolutionAgentStore {
                             })
                         })
                         .unwrap_or(false);
-                    let cancelled =
-                        matches!(reason, agent_client_protocol::schema::StopReason::Cancelled);
+                    let cancelled = matches!(
+                        reason,
+                        agent_client_protocol::schema::v1::StopReason::Cancelled
+                    );
                     if cancelled && let Some(session) = self.session(session_id) {
                         if session.update(cx, |session, _| session.clear_compaction_request()) {
                             self.mark_queue_changed(session_id, cx);

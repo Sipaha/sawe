@@ -107,10 +107,11 @@ Zed requires a Vulkan 1.3 driver and the following desktop portals:
 ### Windows
 
 Zed supports the following Windows releases:
-| Version | Zed Status |
-| ------------------------- | ------------------- |
-| Windows 11, version 22H2 and later | Supported |
-| Windows 10, version 1903 and later | Supported |
+
+| Version                            | Zed Status |
+| ---------------------------------- | ---------- |
+| Windows 11, version 22H2 and later | Supported  |
+| Windows 10, version 1903 and later | Supported  |
 
 A 64-bit operating system is required to run Zed.
 

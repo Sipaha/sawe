@@ -344,7 +344,7 @@ fn build_show_submenu(menu: ContextMenu, ctx: CommitContext) -> ContextMenu {
         window
             .spawn(cx, async move |cx| {
                 let diff = match repository
-                    .update(cx, |repo, _| repo.load_commit_diff(sha_string))
+                    .update(cx, |repo, _| repo.load_commit_diff(sha_string, false))
                     .await
                 {
                     Ok(Ok(diff)) => diff,

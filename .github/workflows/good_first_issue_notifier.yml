@@ -3,9 +3,12 @@ name: Good First Issue Notifier
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   handle-good-first-issue:
-    if: false # sawe: not applicable
+    if: false # sawe: upstream automation is disabled
     runs-on: namespace-profile-2x4-ubuntu-2404
 
     steps:

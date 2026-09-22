@@ -1,35 +1,40 @@
 ---
 title: Windows & Projects
-description: "How Zed handles multiple projects in windows, including the threads sidebar and options for opening in new windows."
+description: "Work with Solution members, preserve layouts, and open projects in separate windows."
 ---
 
 # Windows & Projects
 
-Zed lets you work on multiple projects in a single window. Projects appear in the threads sidebar on the left, and you can switch between them while keeping your context intact.
-
-Use **Panel Layout > Agentic** from the user menu in the title bar (or the {#action workspace::UseAgenticLayout} action) to keep the Threads Sidebar and Agent Panel together on the left. Use **Panel Layout > Classic** (or {#action workspace::UseClassicLayout}) to restore the editor-oriented layout.
-
-## How Projects Open
-
-By default, when you open a folder in Zed, it opens as a new project in your current window's threads sidebar rather than creating a new window. This keeps related work together and preserves your agent threads and layout.
-
-| Action             | Result                                    |
-| ------------------ | ----------------------------------------- |
-| File > Open        | Opens in current window (threads sidebar) |
-| File > Open Recent | Opens in current window (threads sidebar) |
-| Drag folder to Zed | Opens in current window (threads sidebar) |
-| `zed ~/project`    | Opens in current window (threads sidebar) |
+Sawe groups related repositories into **Solutions**. Each Solution has member
+projects and its own native AI sessions. Solution tabs appear in the title bar;
+use the `+` button to open another Solution or create one.
 
 ## Working with Multiple Projects
 
-When you have multiple projects open:
+Use the project toolbar below the title bar to switch the active member. The
+project tree, Git operations, run configurations, and default file-finder scope
+follow the active member. Editor tabs and pane layouts are restored for each
+member when you switch back.
 
-- Click a project header to collapse or expand its threads; Cmd+click (macOS) or Ctrl+click (Linux/Windows) to switch to that project
-- Each project has its own file tree, git state, and search scope
-- Agent threads are tied to their project context
-- Your workspace layout (splits, tabs) is preserved per project
+The Solution band below the editor hosts the active Claude or Codex session
+beside terminal, Git history, or debugger utilities. Switching Solution tabs
+preserves each Solution's dock state. The upstream Agent Panel and Threads
+Sidebar are disabled in Sawe.
 
-Think of projects in the threads sidebar like browser tabs, but for repositories.
+Solution checkouts live under `~/.spk/sawe/ss` on every platform. This directory
+contains project files, not disposable application state.
+
+## How Projects Open
+
+Open an ordinary folder with **File > Open** or the CLI:
+
+```sh
+sawe ~/projects/my-app
+```
+
+Use the Solution controls to add catalog projects or create an empty member
+project within a Solution. Adding a folder as an editor root does not register it
+as a Solution member.
 
 ## Opening in a New Window
 
@@ -47,7 +52,7 @@ When using File > Open Recent ({#kb projects::OpenRecent}):
 Use the `-n` flag to force a new window:
 
 ```sh
-zed -n ~/projects/other-project
+sawe -n ~/projects/other-project
 ```
 
 Other CLI options for controlling window behavior:
@@ -55,7 +60,7 @@ Other CLI options for controlling window behavior:
 | Flag            | Behavior                                           |
 | --------------- | -------------------------------------------------- |
 | `-n`, `--new`   | Always open in a new window                        |
-| `-a`, `--add`   | Add to the current window's threads sidebar        |
+| `-a`, `--add`   | Add to the current window                          |
 | `-r`, `--reuse` | Replace the current project in the existing window |
 
 See [CLI Reference](./reference/cli.md) for full details.
@@ -72,23 +77,23 @@ You can change the default CLI behavior with the `cli_default_open_behavior` set
 
 Options:
 
-- `existing_window` (default): Open folders in the current window's threads sidebar
+- `existing_window` (default): Open folders in the current window
 - `new_window`: Open folders in a new window
 
 This setting affects CLI and double-click behavior, not the File > Open menu.
 
 ## Adding Folders to a Project
 
-If you want to add a folder to your current project (not as a separate project in the threads sidebar), you have several options:
+If you want to add a folder to your current project (without registering a Solution member), you have several options:
 
 - **File menu**: File > Add Folder to Project
-- **Project panel**: Right-click in the project panel and choose "Add Folders to Project"
+- **[Project panel](./project-panel.md)**: Right-click in the project panel and choose "Add Folders to Project"
 - **Open Recent**: Select a recent project and click the "Add Folder to this Project" button
 
 This adds the folder as an additional root in your current project's file tree, similar to VS Code's multi-root workspaces.
 
 ## See Also
 
-- [Threads Sidebar](./ai/parallel-agents.md#threads-sidebar): Managing threads across projects
+- [Native AI Sessions](./ai/native-sessions.md): Claude and Codex in a Solution
 - [Getting Started](./getting-started.md): Essential commands and setup
 - [VS Code Migration](./migrate/vs-code.md): How Zed's project model differs from VS Code

@@ -475,10 +475,16 @@ fn build_tls_server_config(cert: &ServerCert) -> Result<ServerConfig> {
     let key_der = PrivateKeyDer::try_from(cert.key_der.clone())
         .map_err(|err| anyhow!("invalid private key: {err}"))?;
 
-    let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .map_err(|err| anyhow!("with_single_cert: {err}"))?;
+    // The editor links clients using both Rustls providers; select ours per
+    // server config instead of relying on feature-based global inference.
+    let config = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .context("selecting TLS protocol versions")?
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_der], key_der)
+    .map_err(|err| anyhow!("with_single_cert: {err}"))?;
     Ok(config)
 }
 

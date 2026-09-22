@@ -401,7 +401,7 @@ impl McpServerTool for DeleteFileTool {
                     .ok_or_else(|| anyhow::anyhow!("path_not_in_worktree: {}", input.path))?;
                 let entry_id = entry.id;
                 project
-                    .delete_entry(entry_id, false, cx)
+                    .delete_entry(entry_id, cx)
                     .ok_or_else(|| anyhow::anyhow!("delete_entry returned no task"))
             })
         })?;

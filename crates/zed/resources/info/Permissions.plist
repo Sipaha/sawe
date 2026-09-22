@@ -22,3 +22,5 @@
 <string>An application in Sawe wants to use speech recognition.</string>
 <key>NSRemindersUsageDescription</key>
 <string>An application in Sawe wants to use your reminders.</string>
+<key>NSAutoFillRequiresTextContentTypeForOneTimeCodeOnMac</key>
+<true/>

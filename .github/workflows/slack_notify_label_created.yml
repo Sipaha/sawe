@@ -4,12 +4,12 @@ on:
   label:
     types: [created]
 
+permissions:
+  contents: read
+
 jobs:
   notify-slack:
-    if: >-
-      github.repository_owner == 'zed-industries'
-      && (startsWith(github.event.label.name, 'area:')
-          || startsWith(github.event.label.name, 'platform:'))
+    if: false # sawe: upstream automation is disabled
     runs-on: namespace-profile-2x4-ubuntu-2404
 
     steps:

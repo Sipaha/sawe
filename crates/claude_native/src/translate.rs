@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 
 use crate::protocol::{ConversationMessage, OutputMessage, ResultMessage, StreamEvent, Usage};
 

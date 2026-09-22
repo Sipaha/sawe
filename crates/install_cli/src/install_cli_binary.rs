@@ -138,10 +138,10 @@ fn refusal_message(link_path: &Path, reason: &str) -> String {
 /// link behind. The looser test is still an exact structural one
 /// ([`is_a_sawe_cli_path`]); anything it does not recognise is refused by name
 /// and left untouched.
-async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<PathBuf> {
+async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<Option<PathBuf>> {
     let mut replacing_stale = false;
     match inspect_link_path(cli_path, link_path).await {
-        LinkPathState::AlreadyOurs => return Ok(link_path.into()),
+        LinkPathState::AlreadyOurs => return Ok(Some(link_path.into())),
         LinkPathState::Foreign(reason) => anyhow::bail!(refusal_message(link_path, &reason)),
         LinkPathState::StaleOurs(_) => {
             // Unlinking is confined to this branch, where the entry has been
@@ -160,7 +160,7 @@ async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<PathBuf> {
         .log_err()
         .is_some()
     {
-        return Ok(link_path.into());
+        return Ok(Some(link_path.into()));
     }
 
     // The symlink could not be created, so use osascript with admin privileges
@@ -178,7 +178,7 @@ async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<PathBuf> {
     } else {
         String::new()
     };
-    let status = smol::process::Command::new("/usr/bin/osascript")
+    let output = smol::process::Command::new("/usr/bin/osascript")
         .args([
             "-e",
             &format!(
@@ -193,15 +193,28 @@ async fn install_symlink(cli_path: &Path, link_path: &Path) -> Result<PathBuf> {
             ),
         ])
         .stdout(smol::process::Stdio::inherit())
-        .stderr(smol::process::Stdio::inherit())
         .output()
-        .await?
-        .status;
-    anyhow::ensure!(status.success(), OSASCRIPT_ERROR);
-    Ok(link_path.into())
+        .await?;
+    osascript_install_result(output.status.success(), &output.stderr, link_path)
 }
 
-async fn install_script(cx: &AsyncApp) -> Result<PathBuf> {
+/// A dismissed administrator prompt is not an installation failure.
+fn osascript_install_result(
+    success: bool,
+    stderr: &[u8],
+    link_path: &Path,
+) -> Result<Option<PathBuf>> {
+    if success {
+        return Ok(Some(link_path.into()));
+    }
+    let stderr = String::from_utf8_lossy(stderr);
+    if stderr.contains("User canceled") || stderr.contains("-128") {
+        return Ok(None);
+    }
+    anyhow::bail!("{OSASCRIPT_ERROR}: {}", stderr.trim())
+}
+
+async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
     let cli_path = cx.update(|cx| cx.path_for_auxiliary_executable("cli"))?;
     install_symlink(&cli_path, Path::new(CLI_LINK_PATH)).await
 }
@@ -226,9 +239,12 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
             cx.background_spawn(prompt).detach();
             return Ok(());
         }
-        let path = install_script(cx.deref())
+        let Some(path) = install_script(cx.deref())
             .await
-            .context(SYMLINK_ERROR_CONTEXT)?;
+            .context(SYMLINK_ERROR_CONTEXT)?
+        else {
+            return Ok(());
+        };
 
         workspace.update_in(cx, |workspace, _, cx| {
             struct InstalledSaweCli;
@@ -251,6 +267,21 @@ mod tests {
     use super::*;
     use gpui::Action as _;
     use std::fs;
+
+    #[test]
+    fn administrator_prompt_cancellation_is_not_an_error() {
+        let path = Path::new(CLI_LINK_PATH);
+        assert_eq!(
+            osascript_install_result(false, b"User canceled. (-128)", path).unwrap(),
+            None
+        );
+        assert_eq!(
+            osascript_install_result(true, b"", path).unwrap(),
+            Some(path.into())
+        );
+        let error = osascript_install_result(false, b"Not authorized", path).unwrap_err();
+        assert!(error.to_string().contains("Not authorized"));
+    }
 
     /// Both a locked-identifier guard (CLAUDE.md §3 names the CLI binary `sawe`)
     /// and the reason this fork may not clobber whatever is already at the path:
@@ -337,7 +368,7 @@ mod tests {
         let installed =
             smol::block_on(install_symlink(&cli_path, &link_path)).expect("install should succeed");
 
-        assert_eq!(installed, link_path);
+        assert_eq!(installed.as_ref(), Some(&link_path));
         assert_eq!(fs::read_link(&link_path).expect("read_link"), cli_path);
     }
 
@@ -352,7 +383,7 @@ mod tests {
         let installed =
             smol::block_on(install_symlink(&cli_path, &link_path)).expect("install should succeed");
 
-        assert_eq!(installed, link_path);
+        assert_eq!(installed.as_ref(), Some(&link_path));
         assert_eq!(fs::read_link(&link_path).expect("read_link"), cli_path);
     }
 
@@ -456,7 +487,7 @@ mod tests {
         let installed = smol::block_on(install_symlink(&cli_path, &link_path))
             .expect("a link we created is ours to re-point");
 
-        assert_eq!(installed, link_path);
+        assert_eq!(installed.as_ref(), Some(&link_path));
         assert_eq!(fs::read_link(&link_path).expect("read_link"), cli_path);
     }
 

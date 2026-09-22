@@ -2,11 +2,11 @@ use editor::{EditorSettings, ui_scrollbar_settings_from_raw};
 use gpui::Pixels;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{RegisterSetting, Settings, StatusStyle};
-use ui::{
-    px,
-    scrollbars::{ScrollbarVisibility, ShowScrollbar},
+use settings::{
+    FolderIndicator, GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, IntoGpui,
+    RegisterSetting, Settings, StatusStyle,
 };
+use ui::scrollbars::{ScrollbarVisibility, ShowScrollbar};
 use workspace::dock::DockPosition;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -51,10 +51,12 @@ pub struct GitPanelSettings {
     pub default_width: Pixels,
     pub status_style: StatusStyle,
     pub file_icons: bool,
-    pub folder_icons: bool,
+    pub folder_indicator: FolderIndicator,
     pub scrollbar: ScrollbarSettings,
     pub fallback_branch_name: String,
     pub sort_by_path: bool,
+    pub sort_by: GitPanelSortBy,
+    pub group_by: GitPanelGroupBy,
     pub collapse_untracked_diff: bool,
     pub tree_view: bool,
     pub diff_stats: bool,
@@ -66,6 +68,7 @@ pub struct GitPanelSettings {
     pub show_at_revision: ShowAtRevisionSettings,
     pub run_pre_commit_hooks_in_panel: bool,
     pub commit_explanations: CommitExplanationsSettings,
+    pub entry_primary_click_action: GitPanelClickBehavior,
 }
 
 #[derive(Default)]
@@ -94,10 +97,10 @@ impl Settings for GitPanelSettings {
         Self {
             button: git_panel.button.unwrap(),
             dock: git_panel.dock.unwrap().into(),
-            default_width: px(git_panel.default_width.unwrap()),
+            default_width: git_panel.default_width.unwrap().into_gpui(),
             status_style: git_panel.status_style.unwrap(),
             file_icons: git_panel.file_icons.unwrap(),
-            folder_icons: git_panel.folder_icons.unwrap(),
+            folder_indicator: git_panel.folder_indicator.unwrap(),
             scrollbar: ScrollbarSettings {
                 show: git_panel
                     .scrollbar
@@ -106,7 +109,9 @@ impl Settings for GitPanelSettings {
                     .map(ui_scrollbar_settings_from_raw),
             },
             fallback_branch_name: git_panel.fallback_branch_name.unwrap(),
-            sort_by_path: git_panel.sort_by_path.unwrap(),
+            sort_by_path: git_panel.sort_by_path.unwrap_or(true),
+            sort_by: git_panel.sort_by.unwrap(),
+            group_by: git_panel.group_by.unwrap(),
             collapse_untracked_diff: git_panel.collapse_untracked_diff.unwrap(),
             tree_view: git_panel.tree_view.unwrap(),
             diff_stats: git_panel.diff_stats.unwrap(),
@@ -144,6 +149,7 @@ impl Settings for GitPanelSettings {
                         .unwrap_or(crate::commit_view::ai_explain::DEFAULT_CACHE_TTL_DAYS),
                 }
             },
+            entry_primary_click_action: git_panel.entry_primary_click_action.unwrap(),
         }
     }
 }

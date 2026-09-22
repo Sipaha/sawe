@@ -185,13 +185,13 @@ async fn drive_turn(
         for entry in thread.entries() {
             if let acp_thread::AgentThreadEntry::AssistantMessage(message) = entry {
                 for chunk in &message.chunks {
-                    if let acp_thread::AssistantMessageChunk::Message { block } = chunk {
+                    if let acp_thread::AssistantMessageChunk::Message { block, .. } = chunk {
                         let s = block.to_markdown(cx);
                         if !s.is_empty() {
                             if !out.is_empty() {
                                 out.push('\n');
                             }
-                            out.push_str(s);
+                            out.push_str(&s);
                         }
                     }
                 }
@@ -382,8 +382,8 @@ mod tests {
         cx.update(|cx| {
             acp_thread.update(cx, |thread, cx| {
                 let _ = thread.handle_session_update(
-                    agent_client_protocol::schema::SessionUpdate::AgentMessageChunk(
-                        agent_client_protocol::schema::ContentChunk::new(
+                    agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                        agent_client_protocol::schema::v1::ContentChunk::new(
                             "fix: handle empty diff".into(),
                         ),
                     ),

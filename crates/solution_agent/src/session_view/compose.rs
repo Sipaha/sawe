@@ -3,7 +3,7 @@
 //! Relocated verbatim from the view root as `impl SolutionSessionView`
 //! methods; `self`/fields stay owned by the struct.
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, Context, Focusable, FollowMode, SharedString, Window};
 
 use super::{SolutionSessionView, retain_images_with_live_placeholder};

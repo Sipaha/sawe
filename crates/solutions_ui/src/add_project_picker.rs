@@ -33,13 +33,13 @@ impl AddProjectPicker {
         let delegate = AddProjectDelegate::new(solution_id, cx.entity().downgrade(), cx);
         let picker = cx.new(|cx| {
             Picker::list(delegate, window, cx)
-                // `modal(true)` would stack an `elevation_3` shell inside
+                // The default modal presentation would stack an `elevation_3` shell inside
                 // the popover this view already paints, and would make the
                 // search editor losing focus dismiss the popover.
                 // `PopoverMenu` already dismisses on an outside mouse-down.
-                .modal(false)
+                .embedded()
                 .show_scrollbar(true)
-                .max_height(Some(rems(LIST_MAX_HEIGHT_REMS).into()))
+                .max_height(rems(LIST_MAX_HEIGHT_REMS))
         });
         Self { picker }
     }
@@ -168,6 +168,10 @@ impl AddProjectDelegate {
 }
 
 impl PickerDelegate for AddProjectDelegate {
+    fn name() -> &'static str {
+        "SaweAddProject"
+    }
+
     type ListItem = ListItem;
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {

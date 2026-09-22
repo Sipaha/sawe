@@ -233,7 +233,16 @@ fn check_member(
                 ),
             )
         })?;
-        if let Some((line, marker)) = first_test_marker(&source) {
+        let marker = first_test_marker(&source).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "parsing {}: {error}",
+                    display_path(workspace_root, &source_path)
+                ),
+            )
+        })?;
+        if let Some((line, marker)) = marker {
             offenders.push(format!(
                 "{}:{line} ({marker})",
                 display_path(workspace_root, &source_path)
@@ -307,75 +316,78 @@ fn collect_rust_sources(
     Ok(())
 }
 
-/// The first line of `source` that introduces test code, as a 1-based line
-/// number and the marker that matched.
+/// The first attribute that introduces test code, with its 1-based source line.
 ///
-/// Only lines whose trimmed form *opens an attribute* are considered. A real
-/// parse would cost a `syn` dependency in a build script, and matching test
-/// markers anywhere on a line instead produces a steady drip of false positives
-/// on ordinary code: a trailing comment, a string literal, or a line like
-/// `if line.contains("cfg(test)")` — which occurs in this very file. Rustfmt
-/// puts attributes on their own lines throughout this workspace, and a
-/// multi-line attribute is rejoined before it is examined, so the restriction
-/// costs no recall here.
-///
-/// What it still misses, by construction: an attribute that only *appears* to
-/// open one because it sits inside a raw string or a `/* */` block; an
-/// unrecognised harness attribute (`#[rstest]`, `#[quickcheck]` — none are used
-/// in this workspace) outside any `cfg(test)`; and `#[cfg(not(not(test)))]`,
-/// since the negation stack does not fold double negation. It can also
-/// over-reach in one contrived way: a trailing comment holding an unbalanced
-/// `(` keeps [`join_attribute`] swallowing the lines that follow, so
-/// `#[cfg(unix)] // (` above `let a = test;` reports a hit. None of these
-/// shapes occurs in this workspace.
-pub fn first_test_marker(source: &str) -> Option<(usize, &'static str)> {
-    let lines = source.lines().collect::<Vec<_>>();
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if !(trimmed.starts_with("#[") || trimmed.starts_with("#![")) {
-            continue;
-        }
+/// Tokenization excludes comments and string literals. Traverse ordinary Rust
+/// groups (including inline modules and function bodies), but keep macro token
+/// bodies opaque: `parse_quote! { #[test] ... }` describes generated code, not
+/// this crate's tests. Attributes on macro invocations themselves still count.
+/// Like any check without macro expansion, this cannot determine whether an
+/// invocation generates tests in its caller; those should use `#[cfg(test)]`.
+/// Unknown harness attributes and doubly-negated cfg predicates retain the
+/// existing scanner's limitations. Lexing failures are errors, never clearance.
+pub fn first_test_marker(
+    source: &str,
+) -> Result<Option<(usize, &'static str)>, proc_macro2::LexError> {
+    source.parse().map(scan_tokens)
+}
 
-        let attribute = join_attribute(&lines, index);
-        if cfg_predicate(&attribute).is_some_and(predicate_enables_only_under_test) {
-            return Some((index + 1, "a #[cfg(test)] attribute"));
+fn scan_tokens(stream: proc_macro2::TokenStream) -> Option<(usize, &'static str)> {
+    use proc_macro2::{Delimiter, TokenTree};
+
+    let tokens = stream.into_iter().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if let TokenTree::Punct(punct) = token {
+            if punct.as_char() == '#' {
+                let mut attribute_index = index + 1;
+                if matches!(tokens.get(attribute_index), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                {
+                    attribute_index += 1;
+                }
+                if let Some(TokenTree::Group(group)) = tokens.get(attribute_index)
+                    && group.delimiter() == Delimiter::Bracket
+                {
+                    let attribute = format!("#[{}]", group.stream());
+                    let line = punct.span().start().line;
+                    if cfg_predicate(&attribute).is_some_and(predicate_enables_only_under_test) {
+                        return Some((line, "a #[cfg(test)] attribute"));
+                    }
+                    if is_test_attribute(&attribute) {
+                        return Some((line, "a #[test] attribute"));
+                    }
+                    index = attribute_index + 1;
+                    continue;
+                }
+            }
+            // Both path::macro!(...) and macro_rules! name { ... } carry
+            // opaque tokens. Do not confuse unary !(...) with an invocation.
+            if punct.as_char() == '!'
+                && index > 0
+                && let TokenTree::Ident(name) = &tokens[index - 1]
+            {
+                let body_index = if name == "macro_rules"
+                    && matches!(tokens.get(index + 1), Some(TokenTree::Ident(_)))
+                {
+                    index + 2
+                } else {
+                    index + 1
+                };
+                if matches!(tokens.get(body_index), Some(TokenTree::Group(_))) {
+                    index = body_index + 1;
+                    continue;
+                }
+            }
         }
-        if is_test_attribute(&attribute) {
-            return Some((index + 1, "a #[test] attribute"));
+        if let TokenTree::Group(group) = token
+            && let Some(marker) = scan_tokens(group.stream())
+        {
+            return Some(marker);
         }
+        index += 1;
     }
     None
-}
-
-/// How many lines a single attribute may span before the join gives up.
-const MAX_ATTRIBUTE_LINES: usize = 32;
-
-/// Rejoins an attribute that rustfmt wrapped over several lines, so that
-/// `#[cfg(any(\n    test,\n    unix\n))]` is examined as one string.
-fn join_attribute(lines: &[&str], start: usize) -> String {
-    let mut attribute = String::new();
-    for line in lines.iter().skip(start).take(MAX_ATTRIBUTE_LINES) {
-        if !attribute.is_empty() {
-            attribute.push(' ');
-        }
-        attribute.push_str(line.trim());
-        if bracket_depth(&attribute) == 0 {
-            break;
-        }
-    }
-    attribute
-}
-
-fn bracket_depth(text: &str) -> i32 {
-    let mut depth = 0;
-    for byte in text.bytes() {
-        match byte {
-            b'[' | b'(' => depth += 1,
-            b']' | b')' => depth -= 1,
-            _ => {}
-        }
-    }
-    depth
 }
 
 /// The predicate of a `#[cfg(…)]` / `#[cfg_attr(…)]` attribute, if `attribute`
@@ -452,10 +464,11 @@ fn is_test_attribute(attribute: &str) -> bool {
         return false;
     };
     let path = rest
-        .split(['(', ']', ','])
+        .split(['(', ']', ',', '='])
         .next()
         .unwrap_or_default()
         .trim();
+    let path = path.split_whitespace().collect::<String>();
     path == "test" || path.ends_with("::test")
 }
 
@@ -519,6 +532,10 @@ fn unsupported_target_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_test_marker(source: &str) -> Option<(usize, &'static str)> {
+        super::first_test_marker(source).expect("test source tokenizes")
+    }
 
     #[test]
     fn detects_test_markers() {
@@ -590,14 +607,67 @@ mod tests {
     /// The false positives that an unrestricted line scan produced, including
     /// one from this file itself.
     #[test]
+    fn ignores_test_markers_in_documentation_attributes() {
+        assert_eq!(
+            first_test_marker("/// Use `#[gpui::test]` for tests.\nfn item() {}"),
+            None
+        );
+        assert_eq!(
+            first_test_marker(r#"#[doc = "Example #[tokio::test]"] fn item() {}"#),
+            None
+        );
+    }
+
+    #[test]
     fn ignores_test_markers_outside_attributes() {
         assert_eq!(
-            first_test_marker("        if line.contains(\"cfg(test)\") {\n"),
+            first_test_marker("        if line.contains(\"cfg(test)\") {}\n"),
             None
         );
         assert_eq!(first_test_marker("let x = 1; // see cfg(test)\n"), None);
         assert_eq!(first_test_marker("let s = \"cfg(test)\";\n"), None);
         assert_eq!(first_test_marker("/** doc\n * #[cfg(test)]\n */\n"), None);
+    }
+
+    #[test]
+    fn macro_templates_are_not_tests_but_caller_attributes_still_are() {
+        let templates = r##"fn generate() {
+    let generated = syn::parse_quote! {
+        #[test]
+        fn #name() { #body }
+    };
+    quote::quote!(#[cfg(test)] mod generated {});
+    tokens![#[gpui::test] fn generated() {}];
+}
+macro_rules! generated_test {
+    () => { #[test] fn generated() {} };
+}
+"##;
+        assert_eq!(first_test_marker(templates), None);
+        let with_real_test = format!("{templates}mod nested {{ #[gpui::test] fn actual() {{}} }}");
+        assert_eq!(
+            first_test_marker(&with_real_test),
+            Some((templates.lines().count() + 1, "a #[test] attribute"))
+        );
+        assert_eq!(
+            first_test_marker("#[cfg(test)] generate_tests! {}"),
+            Some((1, "a #[cfg(test)] attribute"))
+        );
+    }
+
+    #[test]
+    fn ignores_raw_strings_and_nested_comments_without_losing_following_tests() {
+        let source = r##"const SOURCE: &str = r#"
+#[test]
+fn example() {}
+"#;
+/* nested /* #[test] */
+#[cfg(test)]
+*/
+#[test] fn actual() {}
+"##;
+        assert_eq!(first_test_marker(source), Some((8, "a #[test] attribute")));
+        assert!(super::first_test_marker("fn broken() {").is_err());
     }
 
     /// `test = false` and `doctest = false` differ by three characters, and a

@@ -6,7 +6,7 @@
 //! `cold_persistence::PersistedEntryV2` once Phases 2-3 land.
 
 use acp_thread::{AgentThreadEntry, AssistantMessageChunk, UserMessageId};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, SharedString};
 use serde::{Deserialize, Serialize};
 
@@ -174,6 +174,8 @@ pub struct PlanItem {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum CompactionStatus {
+    Failed,
+    Other(String),
     InProgress,
     Completed,
     Canceled,
@@ -189,8 +191,8 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
         AgentThreadEntry::UserMessage(msg) => (
             None,
             SessionEntryKind::UserMessage {
-                id: msg.id.as_ref().map(user_message_id_to_string),
-                content_md: msg.content.to_markdown(cx).to_string(),
+                id: msg.client_id.as_ref().map(user_message_id_to_string),
+                content_md: msg.content.to_markdown(cx),
                 chunks: msg.chunks.clone(),
             },
         ),
@@ -199,11 +201,11 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
                 .chunks
                 .iter()
                 .map(|chunk| match chunk {
-                    AssistantMessageChunk::Message { block } => {
-                        AssistantChunk::Message(block.to_markdown(cx).to_string())
+                    AssistantMessageChunk::Message { block, .. } => {
+                        AssistantChunk::Message(block.to_markdown(cx))
                     }
-                    AssistantMessageChunk::Thought { block } => {
-                        AssistantChunk::Thought(block.to_markdown(cx).to_string())
+                    AssistantMessageChunk::Thought { block, .. } => {
+                        AssistantChunk::Thought(block.to_markdown(cx))
                     }
                 })
                 .collect();
@@ -264,12 +266,33 @@ pub fn to_session_entry(entry: &AgentThreadEntry, cx: &App) -> SessionEntry {
             None,
             SessionEntryKind::ContextCompaction {
                 id: c.id.0.to_string(),
-                status: match c.status {
+                status: match &c.status {
+                    acp_thread::ContextCompactionStatus::Failed => CompactionStatus::Failed,
+                    acp_thread::ContextCompactionStatus::Other(status) => {
+                        CompactionStatus::Other(status.to_string())
+                    }
                     acp_thread::ContextCompactionStatus::InProgress => CompactionStatus::InProgress,
                     acp_thread::ContextCompactionStatus::Completed => CompactionStatus::Completed,
                     acp_thread::ContextCompactionStatus::Canceled => CompactionStatus::Canceled,
                 },
-                summary_md: c.summary.as_ref().map(|m| m.read(cx).source().to_string()),
+                summary_md: {
+                    let mut parts = c
+                        .summary
+                        .iter()
+                        .map(|block| block.to_markdown(cx).to_string())
+                        .collect::<Vec<_>>();
+                    if let Some(error) = &c.error {
+                        parts.push(error.read(cx).source().to_string());
+                    }
+                    (!parts.is_empty()).then(|| parts.join("\n\n"))
+                },
+            },
+        ),
+        AgentThreadEntry::Elicitation(_) => (
+            None,
+            SessionEntryKind::System {
+                level: SystemEntryLevel::Info,
+                text_md: "Agent requested additional input.".to_string(),
             },
         ),
         AgentThreadEntry::SystemNote(note) => (
@@ -358,7 +381,7 @@ fn user_message_id_to_string(id: &UserMessageId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     use gpui::{AppContext as _, TestAppContext};
 
     fn sample_tool() -> SessionEntry {
@@ -406,6 +429,9 @@ mod tests {
                 subagent_session_info: None,
                 subagent_id: None,
                 sandbox_authorization_details: None,
+                sandbox_fallback_authorization_details: None,
+                sandbox_not_applied: None,
+                title: None,
                 status_started_at: None,
             });
             match to_session_entry(&call, cx).kind {
@@ -423,10 +449,13 @@ mod tests {
         use acp_thread::{AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock};
         cx.update(|cx| {
             let user = AgentThreadEntry::UserMessage(acp_thread::UserMessage {
-                id: None,
+                protocol_id: None,
+                is_optimistic: false,
+                client_id: None,
                 content: ContentBlock::Markdown {
                     markdown: cx.new(|cx| markdown::Markdown::new("hello".into(), None, None, cx)),
-                },
+                }
+                .into(),
                 chunks: Vec::new(),
                 checkpoint: None,
                 indented: false,
@@ -439,10 +468,12 @@ mod tests {
 
             let assistant = AgentThreadEntry::AssistantMessage(AssistantMessage {
                 chunks: vec![AssistantMessageChunk::Message {
+                    id: None,
                     block: ContentBlock::Markdown {
                         markdown: cx
                             .new(|cx| markdown::Markdown::new("hi there".into(), None, None, cx)),
-                    },
+                    }
+                    .into(),
                 }],
                 indented: false,
                 is_subagent_output: false,
@@ -478,6 +509,9 @@ mod tests {
                 subagent_session_info: None,
                 subagent_id: Some("toolu_p".into()),
                 sandbox_authorization_details: None,
+                sandbox_fallback_authorization_details: None,
+                sandbox_not_applied: None,
+                title: None,
                 status_started_at: None,
             });
             let entry = to_session_entry(&call, cx);
@@ -515,9 +549,11 @@ mod tests {
             let compaction = AgentThreadEntry::ContextCompaction(ContextCompaction {
                 id: ContextCompactionId("cc_1".into()),
                 status: ContextCompactionStatus::Completed,
-                summary: Some(
-                    cx.new(|cx| markdown::Markdown::new("summary".into(), None, None, cx)),
-                ),
+                error: None,
+                summary: vec![acp_thread::ContentBlock::Markdown {
+                    markdown: cx
+                        .new(|cx| markdown::Markdown::new("summary".into(), None, None, cx)),
+                }],
             });
             match to_session_entry(&compaction, cx).kind {
                 SessionEntryKind::ContextCompaction {
@@ -537,10 +573,12 @@ mod tests {
         cx.update(|cx| {
             let entry = AgentThreadEntry::AssistantMessage(AssistantMessage {
                 chunks: vec![AssistantMessageChunk::Message {
+                    id: None,
                     block: ContentBlock::Markdown {
                         markdown: cx
                             .new(|cx| markdown::Markdown::new("**bold**".into(), None, None, cx)),
-                    },
+                    }
+                    .into(),
                 }],
                 indented: false,
                 is_subagent_output: false,

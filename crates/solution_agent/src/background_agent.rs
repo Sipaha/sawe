@@ -26,7 +26,7 @@ use acp_thread::{
     AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock, ToolCall,
     ToolCallStatus, UserMessage,
 };
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
 use gpui::{App, AppContext, SharedString};
 use markdown::Markdown;
@@ -672,10 +672,13 @@ fn jsonl_user_to_entries(value: &Value, out: &mut Vec<AgentThreadEntry>, cx: &mu
             continue;
         }
         out.push(AgentThreadEntry::UserMessage(UserMessage {
-            id: None,
+            protocol_id: None,
+            is_optimistic: false,
+            client_id: None,
             content: ContentBlock::Markdown {
                 markdown: cx.new(|cx| Markdown::new(text.to_string().into(), None, None, cx)),
-            },
+            }
+            .into(),
             chunks: Vec::new(),
             checkpoint: None,
             indented: false,
@@ -741,10 +744,12 @@ fn jsonl_assistant_to_entries(
                     flush_pending_assistant_text(&mut pending_text, out, cx);
                     out.push(AgentThreadEntry::AssistantMessage(AssistantMessage {
                         chunks: vec![AssistantMessageChunk::Thought {
+                            id: None,
                             block: ContentBlock::Markdown {
                                 markdown: cx
                                     .new(|cx| Markdown::new(thought.into(), None, None, cx)),
-                            },
+                            }
+                            .into(),
                         }],
                         indented: false,
                         is_subagent_output: false,
@@ -792,6 +797,9 @@ fn jsonl_assistant_to_entries(
                     subagent_session_info: None,
                     subagent_id: None,
                     sandbox_authorization_details: None,
+                    sandbox_fallback_authorization_details: None,
+                    sandbox_not_applied: None,
+                    title: None,
                     status_started_at: None,
                 }));
             }
@@ -812,9 +820,11 @@ fn flush_pending_assistant_text(
     let text = std::mem::take(pending);
     out.push(AgentThreadEntry::AssistantMessage(AssistantMessage {
         chunks: vec![AssistantMessageChunk::Message {
+            id: None,
             block: ContentBlock::Markdown {
                 markdown: cx.new(|cx| Markdown::new(text.into(), None, None, cx)),
-            },
+            }
+            .into(),
         }],
         indented: false,
         is_subagent_output: false,
@@ -1231,6 +1241,7 @@ mod tests {
                 acp_thread::AgentThreadEntry::ToolCall(_) => "tool_call",
                 acp_thread::AgentThreadEntry::CompletedPlan(_) => "plan",
                 acp_thread::AgentThreadEntry::ContextCompaction(_) => "compaction",
+                acp_thread::AgentThreadEntry::Elicitation(_) => "elicitation",
                 acp_thread::AgentThreadEntry::SystemNote(_) => "system",
             })
             .collect();

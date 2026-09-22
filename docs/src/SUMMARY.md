@@ -3,6 +3,7 @@
 # Welcome
 
 - [Getting Started](./getting-started.md)
+- [Native AI Sessions](./ai/native-sessions.md)
 - [Installation](./installation.md)
   - [Update](./update.md)
   - [Uninstall](./uninstall.md)
@@ -56,6 +57,7 @@
   - [Agent Profiles](./ai/agent-profiles.md)
   - [Tools](./ai/tools.md)
     - [Tool Permissions](./ai/tool-permissions.md)
+    - [Agent Sandboxing](./ai/sandboxing.md)
     - [Model Context Protocol](./ai/mcp.md)
   - [Skills](./ai/skills.md)
   - [Instructions](./ai/instructions.md)
@@ -182,7 +184,7 @@
 - [Vue](./languages/vue.md)
 - [XML](./languages/xml.md)
 - [YAML](./languages/yaml.md)
-- [Yara](./languages/yara.md)
+- [YARA](./languages/yara.md)
 - [Yarn](./languages/yarn.md)
 - [Zig](./languages/zig.md)
 
@@ -191,6 +193,12 @@
 - [Overview](./extensions.md)
 - [Installing Extensions](./extensions/installing-extensions.md)
 - [Developing Extensions](./extensions/developing-extensions.md)
+- [Publishing Your Extension](./extensions/publishing/overview.md)
+  - [License Requirements](./extensions/publishing/license-requirements.md)
+  - [Publishing Prerequisites](./extensions/publishing/prerequisites.md)
+  - [Publishing Guide](./extensions/publishing/publishing-guide.md)
+  - [Updating an Extension](./extensions/publishing/updating-and-maintenance.md)
+  - [Frequently Asked Questions](./extensions/publishing/faq.md)
 - [Extension Capabilities](./extensions/capabilities.md)
 - [Language Extensions](./extensions/languages.md)
 - [Debugger Extensions](./extensions/debugger-extensions.md)

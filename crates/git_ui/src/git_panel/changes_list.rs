@@ -920,7 +920,7 @@ impl GitPanel {
         let settings = GitPanelSettings::get_global(cx);
         // Same lookup and the same (default) icon size the project panel uses
         // for directories, so the two trees show identical folder glyphs.
-        let folder_icon = if settings.folder_icons {
+        let folder_icon = if settings.folder_indicator.shows_icon() {
             FileIcons::get_folder_icon(entry.expanded, entry.key.path.as_std_path(), cx)
         } else {
             None
@@ -1173,7 +1173,7 @@ mod tests {
             cx.read(|cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
         let project_path = ProjectPath {
             worktree_id,
-            path: RelPath::unix("src/a/foo.rs").unwrap().into_arc(),
+            path: RelPath::from_unix_str("src/a/foo.rs").unwrap().into_arc(),
         };
 
         panel.update_in(cx, |panel, window, cx| {
@@ -1365,12 +1365,12 @@ mod tests {
                     format!("{}dir {}", "  ".repeat(dir.depth), dir.name)
                 }
                 GitListEntry::Status(status) => {
-                    status.repo_path.display(PathStyle::Posix).to_string()
+                    status.repo_path.display(PathStyle::Unix).to_string()
                 }
                 GitListEntry::TreeStatus(status) => format!(
                     "{}{}",
                     "  ".repeat(status.depth),
-                    status.entry.display_name(PathStyle::Posix)
+                    status.entry.display_name(PathStyle::Unix)
                 ),
             })
             .collect()

@@ -255,7 +255,10 @@ impl Render for WelcomeWindow {
                                 h_flex()
                                     .gap_4()
                                     .items_center()
-                                    .child(Vector::square(VectorName::SpkLogo, rems_from_px(45.)))
+                                    .child(Vector::square(
+                                        VectorName::SpkLogo,
+                                        rems_from_px(45_f32),
+                                    ))
                                     .child(
                                         v_flex().child(Headline::new("Welcome to Sawe")).child(
                                             Label::new("The editor for what's next")

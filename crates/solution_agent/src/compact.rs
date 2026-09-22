@@ -178,14 +178,16 @@ fn compact_unavailable_reason(session_id: SolutionSessionId, cx: &App) -> Result
     Ok(None)
 }
 
-pub(crate) fn is_compaction_blocks(blocks: &[agent_client_protocol::schema::ContentBlock]) -> bool {
-    blocks.iter().any(|block| matches!(block, agent_client_protocol::schema::ContentBlock::Text(text) if text.text.starts_with(COMPACT_PROMPT_HEADING)))
+pub(crate) fn is_compaction_blocks(
+    blocks: &[agent_client_protocol::schema::v1::ContentBlock],
+) -> bool {
+    blocks.iter().any(|block| matches!(block, agent_client_protocol::schema::v1::ContentBlock::Text(text) if text.text.starts_with(COMPACT_PROMPT_HEADING)))
 }
 
 /// An old wake/retry must not deliver a cancelled request into a new context.
 pub(crate) fn compaction_matches_pending(
     session: &crate::model::SolutionSession,
-    blocks: &[agent_client_protocol::schema::ContentBlock],
+    blocks: &[agent_client_protocol::schema::v1::ContentBlock],
 ) -> bool {
     let Some(request) = session.pending_compaction else {
         return false;
@@ -194,7 +196,7 @@ pub(crate) fn compaction_matches_pending(
     blocks
         .iter()
         .filter_map(|block| match block {
-            agent_client_protocol::schema::ContentBlock::Text(text)
+            agent_client_protocol::schema::v1::ContentBlock::Text(text)
                 if text.text.starts_with(COMPACT_PROMPT_HEADING) =>
             {
                 Some(&text.text)
@@ -261,8 +263,8 @@ pub(crate) fn start_compact_for_session(
             request
         });
         let rendered = format!("{rendered}\n\n<!-- Sawe compaction request: {request} -->");
-        let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-            agent_client_protocol::schema::TextContent::new(rendered),
+        let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+            agent_client_protocol::schema::v1::TextContent::new(rendered),
         )];
         let send = store.send_message_blocks_targeted(
             session_id,
@@ -1049,7 +1051,7 @@ mod tests {
             assert_eq!(session.read(cx).context_count, 1);
             thread.update(cx, |_thread, cx| {
                 cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                    agent_client_protocol::schema::StopReason::EndTurn,
+                    agent_client_protocol::schema::v1::StopReason::EndTurn,
                 ))
             });
         });
@@ -1308,7 +1310,7 @@ mod note_tests {
                 .iter()
                 .flat_map(|bundle| bundle.blocks.iter())
                 .filter_map(|block| match block {
-                    agent_client_protocol::schema::ContentBlock::Text(text) => {
+                    agent_client_protocol::schema::v1::ContentBlock::Text(text) => {
                         Some(text.text.clone())
                     }
                     _ => None,

@@ -79,7 +79,7 @@ impl SolutionTabStrip {
 
         // Re-render whenever the multi-workspace's open list or active
         // workspace changes. `MultiWorkspace::activate` /
-        // `retain_active_workspace` / `close_workspace` all call
+        // `retain_active_workspace` / `remove` all call
         // `cx.notify()`, so a plain `observe` is enough — no event types
         // to filter on.
         if let Some(mw) = multi_workspace.upgrade() {

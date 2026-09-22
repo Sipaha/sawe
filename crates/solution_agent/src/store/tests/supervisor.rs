@@ -303,8 +303,8 @@ async fn stuck_usage_limit_wall_stops_without_reconnect(cx: &mut TestAppContext)
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "You've hit your session limit".to_string(),
                     ),
                 ),
@@ -386,8 +386,8 @@ async fn error_arm_supervised_wall_schedules_resume(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
                             .to_string(),
                     ),
@@ -442,8 +442,8 @@ async fn error_arm_unsupervised_wall_surfaces_text_without_resume(cx: &mut TestA
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "You've hit your session limit".to_string(),
                     ),
                 ),
@@ -502,8 +502,8 @@ async fn error_arm_stale_wall_behind_user_message_is_not_reclassified(cx: &mut T
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "You've hit your session limit · resets 8:20pm (Asia/Novosibirsk)"
                             .to_string(),
                     ),
@@ -513,8 +513,8 @@ async fn error_arm_stale_wall_behind_user_message_is_not_reclassified(cx: &mut T
             );
             t.push_user_content_block(
                 None,
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("continue".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("continue".to_string()),
                 ),
                 cx,
             );
@@ -2853,7 +2853,7 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
                 .iter()
                 .flat_map(|bundle| bundle.blocks.iter())
                 .filter_map(|block| match block {
-                    agent_client_protocol::schema::ContentBlock::Text(text) => {
+                    agent_client_protocol::schema::v1::ContentBlock::Text(text) => {
                         Some(text.text.clone())
                     }
                     _ => None,
@@ -3374,7 +3374,7 @@ async fn agent_completion_clears_parked_wait(cx: &mut gpui::TestAppContext) {
         let thread = session.read(cx).acp_thread().cloned().unwrap();
         thread.update(cx, |_t, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
             ));
         });
     });
@@ -3623,8 +3623,8 @@ async fn agent_activity_clears_usage_limit_gate_on_external_reset(cx: &mut TestA
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "Continuing the build…".to_string(),
                     ),
                 ),
@@ -3665,8 +3665,8 @@ async fn agent_wall_message_keeps_usage_limit_gate(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "You've hit your session limit · resets 8:20pm".to_string(),
                     ),
                 ),

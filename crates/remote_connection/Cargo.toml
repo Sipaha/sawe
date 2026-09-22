@@ -10,6 +10,7 @@ workspace = true
 
 [lib]
 path = "src/remote_connection.rs"
+doctest = false
 
 [features]
 default = []
@@ -39,6 +40,10 @@ workspace.workspace = true
 # Without both, `cargo {test,clippy} -p remote_connection --all-targets` does not
 # compile at all.
 [dev-dependencies]
+editor.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+theme.workspace = true
 project = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
 

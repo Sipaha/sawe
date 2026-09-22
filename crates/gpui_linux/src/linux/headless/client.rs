@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use calloop::{EventLoop, LoopHandle};
-use util::ResultExt;
+use gpui_util::ResultExt;
 
 use crate::linux::headless::HeadlessDisplay;
 use crate::linux::{LinuxClient, LinuxCommon, LinuxKeyboardLayout};
@@ -92,7 +92,7 @@ impl HeadlessClient {
     pub(crate) fn new() -> Self {
         let event_loop = EventLoop::try_new().unwrap();
 
-        let (common, main_receiver) = LinuxCommon::new(event_loop.get_signal());
+        let (common, main_receiver, power_receiver) = LinuxCommon::new(event_loop.get_signal());
 
         let handle = event_loop.handle();
 
@@ -130,6 +130,14 @@ impl HeadlessClient {
             .expect("Failed to register headless refresh timer");
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(HeadlessDisplay::new());
+
+        handle
+            .insert_source(power_receiver, |event, _, client: &mut HeadlessClient| {
+                if let calloop::channel::Event::Msg(event) = event {
+                    client.with_common(|common| common.handle_system_power_event(event));
+                }
+            })
+            .ok();
 
         HeadlessClient(Rc::new(RefCell::new(HeadlessClientState {
             event_loop: Some(event_loop),
@@ -196,12 +204,8 @@ impl LinuxClient for HeadlessClient {
     }
 
     fn display(&self, id: DisplayId) -> Option<Rc<dyn PlatformDisplay>> {
-        let state = self.0.borrow();
-        if state.display.id() == id {
-            Some(state.display.clone())
-        } else {
-            None
-        }
+        let display = self.0.borrow().display.clone();
+        (display.id() == id).then_some(display)
     }
 
     #[cfg(feature = "screen-capture")]
@@ -370,12 +374,14 @@ mod tests {
             titlebar: None,
             kind: WindowKind::Normal,
             is_movable: false,
+            app_owns_titlebar_drag: false,
             is_resizable: false,
             is_minimizable: false,
             focus: false,
             show: false,
             icon: None,
             display_id: None,
+            app_id: None,
             window_min_size: None,
         }
     }

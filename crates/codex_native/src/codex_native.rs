@@ -4,9 +4,9 @@ mod steering;
 mod translate;
 pub use steering::SteerOutcome;
 
-use acp_thread::{AcpThread, AgentConnection, AuthorizationKind, PermissionOptions, UserMessageId};
+use acp_thread::{AcpThread, AgentConnection, AuthorizationKind, PermissionOptions};
 use action_log::ActionLog;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_servers::{AgentServer, AgentServerDelegate, mcp_servers_for_project};
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{StreamExt as _, channel::oneshot};
@@ -377,7 +377,6 @@ impl AgentConnection for CodexConnection {
     }
     fn prompt(
         &self,
-        _: UserMessageId,
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {

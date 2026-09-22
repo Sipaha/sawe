@@ -6,9 +6,11 @@ env:
   CARGO_TERM_COLOR: always
 on:
   workflow_dispatch: {}
+permissions:
+  contents: read
 jobs:
   scheduled_compliance_check:
-    if: false # sawe: not applicable
+    if: false # sawe: upstream automation is disabled
     runs-on: namespace-profile-2x4-ubuntu-2404
     steps:
     - name: steps::checkout_repo

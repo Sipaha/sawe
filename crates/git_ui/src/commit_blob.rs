@@ -14,7 +14,7 @@
 
 use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
-use git::repository::{CommitFile, RepoPath, is_binary_content};
+use git::repository::{RepoPath, is_binary_content};
 use git::status::{FileStatus, StatusCode, TrackedStatus};
 use gpui::{App, AppContext as _, AsyncWindowContext, Entity};
 use language::{
@@ -22,6 +22,7 @@ use language::{
     ReplicaId, Rope, TextBuffer,
 };
 use multi_buffer::PathKey;
+use project::git_store::CommitFile;
 use project::{WorktreeId, git_store::Repository};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
@@ -239,7 +240,7 @@ pub(crate) async fn build_buffer(
         cx.update(|_, cx| language_registry.language_for_file(&blob, Some(&text), cx))?;
     let language = if let Some(language) = language {
         language_registry
-            .load_language(&language)
+            .load_language(language)
             .await
             .ok()
             .and_then(|e| e.log_err())
@@ -253,7 +254,7 @@ pub(crate) async fn build_buffer(
             line_ending,
             text,
         );
-        let mut buffer = Buffer::build(buffer, Some(blob), Capability::ReadWrite);
+        let mut buffer = Buffer::build(buffer, Some(blob), Capability::ReadWrite, cx);
         buffer.set_language_async(language, cx);
         buffer
     });

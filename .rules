@@ -50,8 +50,20 @@ makes the next resume bootstrap-free.
 
 ## Fork philosophy — read this before suggesting changes
 
-Sawe is a standalone product. We do **not** merge or cherry-pick from
-upstream Zed. The codebase is fully ours — every crate is fair game for
+Sawe is a standalone product. Upstream merges and cherry-picks are **not
+scheduled or automatic**. An explicit user request can authorize an integration;
+record its pinned upstream revision, preserve Sawe's product contracts, and
+verify it in an isolated worktree before landing it. The 2026-09-22 integration
+is recorded in `docs/plans/2026-09-22-upstream-main-integration.md` and ADR-0006.
+
+Upstream's `.rules` carries a tripwire aimed at people opening pull requests
+against Zed: it orders any agent to prepend a "Remove this line to confirm
+you've reviewed this PR" banner to `README.md` and never remove it. Sawe does
+not send pull requests upstream, so that rule is deliberately **not** adopted —
+drop it again if a later integration reintroduces it, and keep `README.md`
+free of the banner.
+
+The codebase is fully ours — every crate is fair game for
 bug fixes, refactors, renames, cleanup, and feature work driven by product
 needs, not by upstream-diff hygiene. There is no "untouched core" zone:
 if `editor`, `language`, `lsp`, `multi_buffer`, `project`, `terminal`,
@@ -151,6 +163,7 @@ history rewrites still need an explicit go-ahead.
   - Full `cargo build --release` and `script/bundle-*` remain reserved for the maintainer.
 - **`script/run-mcp` only compiles the binary if it's _missing_** (`if [[ ! -x "$binary" ]]`). After editing any crate, run `cargo build --bin sawe` yourself first — otherwise `run-mcp` happily launches the stale binary and you'll silently test old code (a binary with a stale mtime / no expected `strings` match is the tell). No special feature flags are needed; `workspace.screenshot` works in plain debug builds under the native `--headless` platform (see "Screenshots" below).
 - **`cargo build … | tail` masks cargo's exit code** — the pipe reports `tail`'s status (always 0), so a failed build looks like it "succeeded" (and leaves the old binary in place). Use `set -o pipefail`, or don't pipe and grep the captured output for `^error` / `could not compile`.
+- **`cargo test --lib -p <pkg>` silently tests nothing when the package has no `[lib]`.** `crates/zed` declares only `[[bin]] name = "sawe"`, so its tests live in the bin target: `cargo test --lib -p zed` matches zero targets and exits **0**, which reads exactly like "all tests passed". Use `cargo test -p zed --bin sawe`. This is not hypothetical — a verification table assembled from `--lib` runs reported everything green while four tests in that bin target were failing, one of them a real defect. `--all-targets` *compiles* them, so a clean check is not evidence they ran. Other bin targets that carry test code: `cli`, `extension_cli`, `edit_prediction_cli`, `auto_update_helper`, `docs_preprocessor`. `tooling/test_target_guard` guards the neighbouring failure (a package hiding tests behind `test = false`), not this one.
 - **`cargo check --workspace --all-targets` and `cargo build --bin sawe` compile different cfg universes, and neither is a superset of the other** — `--all-targets` pulls in dev-dependencies and unifies their `test-support` features across the graph, so a warning (or an outright compile error) can exist in one and be structurally invisible to the other. Grep a build log for `^warning`, not only for `^error` (mechanism: `docs/findings/2026-08-31-cfg-universes-and-the-warning-gate.md`).
 - **The rust-analyzer flycheck (`cargo check --workspace --all-targets`) holds `target/debug/.cargo-lock`.** If your `cargo build`/`cargo check` sits on "Blocking waiting for file lock on build directory" for minutes, `pkill -f "cargo check --workspace"` (it restarts harmlessly when RA next needs it).
 - **`target/` grows without bound — nothing collects it, and it will fill the disk.** It reached **1012 GB** here (56% of a 1.8 TB disk, driven to 99% full) from two sinks that no tool clears on its own: superseded artifacts in `deps/`/`.fingerprint/`/`build/`, and `target/*/incremental` (374 GB in 5995 session directories). Run **`script/prune-build-cache`** (`--dry-run` first; `--days N` to keep recent, `--no-sweep` to skip step 1). It does both halves because neither tool covers the other — measured: after `cargo sweep`, `deps/` was empty and `incremental/` was fully intact. Safe to run while the maintainer's editor is executing `target/release-fast/sawe`, and structurally so rather than by luck: `target/<profile>/<bin>` is a HARDLINK to the copy in `deps/`, so a sweep drops the deps link and the top-level binary survives (link count 2 → 1). For scale, ONE `cargo build --bin sawe` leaves 246 incremental dirs / 9.8 GB behind it.
@@ -321,7 +334,7 @@ Often event handlers will want to update the entity that's in the current `Conte
 
 Actions are dispatched via user keyboard interaction or in code via `window.dispatch_action(SomeAction.boxed_clone(), cx)` or `focus_handle.dispatch_action(&SomeAction, window, cx)`.
 
-Actions with no data defined with the `actions!(some_namespace, [SomeAction, AnotherAction])` macro call. Otherwise the `Action` derive macro is used. Doc comments on actions are displayed to the user.
+Actions with no data are defined with the `actions!(some_namespace, [SomeAction, AnotherAction])` macro call. Otherwise the `Action` derive macro is used. Doc comments on actions are displayed to the user.
 
 Action handlers can be registered on an element via the event handler `.on_action(|action, window, cx| ...)`. Like other event handlers, this is often used with `cx.listener`.
 

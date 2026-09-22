@@ -905,6 +905,28 @@ impl GraphData {
 }
 
 pub fn init(cx: &mut App) {
+    git_ui_core::set_file_history_opener(
+        |workspace, path, window, cx| {
+            let git_store = workspace.project().read(cx).git_store().clone();
+            let Some((repo, repo_path)) = git_store
+                .read(cx)
+                .repository_and_path_for_project_path(path, cx)
+            else {
+                return;
+            };
+            let id = repo.read(cx).id;
+            open_or_reuse_graph(
+                workspace,
+                id,
+                git_store,
+                LogSource::Path(repo_path),
+                None,
+                window,
+                cx,
+            );
+        },
+        cx,
+    );
     workspace::register_serializable_item::<GitGraph>(cx);
     mcp::register(cx);
 
@@ -4057,10 +4079,12 @@ impl Render for GitGraph {
                                             .child(commits_table)
                                             .child(render_redistributable_columns_resize_handles(
                                                 &self.column_widths,
+                                                None,
                                                 window,
                                                 cx,
                                             )),
                                         self.column_widths.clone(),
+                                        None,
                                     )),
                             )
                             // Last child, so the DAG paints on top of the
@@ -4415,7 +4439,6 @@ impl workspace::SerializableItem for GitGraph {
         workspace: &mut Workspace,
         item_id: workspace::ItemId,
         _closing: bool,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<gpui::Result<()>>> {
         let workspace_id = workspace.database_id()?;
@@ -9597,10 +9620,10 @@ mod tests {
 
         let item_id = workspace::ItemId::from(4242_u64);
         let persist = |cx: &mut gpui::VisualTestContext| {
-            let save = workspace.update_in(cx, |workspace, window, cx| {
+            let save = workspace.update_in(cx, |workspace, _window, cx| {
                 git_graph.update(cx, |graph, cx| {
                     <GitGraph as workspace::SerializableItem>::serialize(
-                        graph, workspace, item_id, false, window, cx,
+                        graph, workspace, item_id, false, cx,
                     )
                 })
             });

@@ -107,7 +107,7 @@ impl NewProcessModal {
                         let delegate =
                             DebugDelegate::new(debug_panel.downgrade(), task_store.clone());
                         Picker::list(delegate, window, cx)
-                            .modal(false)
+                            .embedded()
                             .list_measure_all()
                     });
 
@@ -1070,10 +1070,10 @@ impl DebugDelegate {
 
                     match path.components().next_back() {
                         Some(name) if name == local_settings_folder_name() => {
-                            path.push(RelPath::unix("debug.json").unwrap());
+                            path.push(RelPath::from_unix_str("debug.json").unwrap());
                         }
                         Some(".vscode") => {
-                            path.push(RelPath::unix("launch.json").unwrap());
+                            path.push(RelPath::from_unix_str("launch.json").unwrap());
                         }
                         _ => {}
                     }
@@ -1166,7 +1166,9 @@ impl DebugDelegate {
                         id: _,
                         directory_in_worktree: dir,
                         id_base: _,
-                    } => dir.ends_with(RelPath::unix(local_settings_folder_name()).unwrap()),
+                    } => {
+                        dir.ends_with(RelPath::from_unix_str(local_settings_folder_name()).unwrap())
+                    }
                     _ => false,
                 });
 
@@ -1187,7 +1189,8 @@ impl DebugDelegate {
                                     id_base: _,
                                 } => {
                                     !(hide_vscode
-                                        && dir.ends_with(RelPath::unix(".vscode").unwrap()))
+                                        && dir
+                                            .ends_with(RelPath::from_unix_str(".vscode").unwrap()))
                                 }
                                 _ => true,
                             })
@@ -1207,6 +1210,10 @@ impl DebugDelegate {
 
 impl PickerDelegate for DebugDelegate {
     type ListItem = ui::ListItem;
+
+    fn name() -> &'static str {
+        "debug scenario picker"
+    }
 
     fn match_count(&self) -> usize {
         self.matches.len()
@@ -1614,7 +1621,7 @@ pub(crate) fn resolve_path(path: &mut String) {
         *path = format!(
             "$ZED_WORKTREE_ROOT{}{}",
             std::path::MAIN_SEPARATOR,
-            &strip_path
+            strip_path
         );
     };
 }

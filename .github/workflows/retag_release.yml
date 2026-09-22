@@ -11,7 +11,7 @@ on:
         type: string
 jobs:
   run_retag_release:
-    if: false # sawe: not applicable
+    if: false # sawe: upstream automation is disabled
     runs-on: namespace-profile-16x32-ubuntu-2204
     steps:
     - id: generate-token

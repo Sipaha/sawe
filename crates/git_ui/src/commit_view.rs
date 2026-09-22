@@ -21,7 +21,7 @@ use editor::{
     multibuffer_context_lines,
 };
 use futures_lite::future::yield_now;
-use git::repository::{CommitDetails, CommitDiff, RepoPath};
+use git::repository::{CommitDetails, RepoPath};
 use git::status::FileStatus;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
@@ -33,6 +33,7 @@ use gpui::{
     Styled, Task, WeakEntity, Window, actions,
 };
 use language::Capability;
+use project::git_store::CommitDiff;
 use project::{Project, ProjectPath, git_store::Repository};
 use settings::{DiffViewStyle, Settings};
 use std::{
@@ -113,6 +114,7 @@ pub fn init(cx: &mut App) {
 }
 
 pub struct CommitView {
+    is_shallow_boundary: bool,
     commit: CommitDetails,
     editor: Entity<SplittableEditor>,
     stash: Option<usize>,
@@ -135,7 +137,7 @@ pub struct CommitView {
     selected_parent_index: usize,
     /// Cached commit diff (for the currently selected merge-parent index)
     /// — used by the affected-files component.
-    diff_files: Vec<git::repository::CommitFile>,
+    diff_files: Vec<project::git_store::CommitFile>,
     affected_files: CommitAffectedFiles,
     contains_panel: CommitContainsPanel,
     /// Whether this view is the standalone-tab variant. Drives the
@@ -247,7 +249,9 @@ impl CommitView {
         cx: &mut App,
     ) {
         let commit_diff = repo
-            .update(cx, |repo, _| repo.load_commit_diff(commit_sha.clone()))
+            .update(cx, |repo, _| {
+                repo.load_commit_diff(commit_sha.clone(), false)
+            })
             .ok();
         let commit_details = repo
             .update(cx, |repo, _| repo.show(commit_sha.clone()))
@@ -427,6 +431,7 @@ impl CommitView {
         // A two-commit comparison has no commit of its own to describe, so it
         // renders only the diff editor — no metadata panel (see `render`) and
         // no commit-message excerpt.
+        let is_shallow_boundary = commit_diff.is_shallow_boundary;
         let compact = compare_range.is_some();
         let language_registry = project.read(cx).languages().clone();
         let multibuffer = cx.new(|cx| {
@@ -569,6 +574,7 @@ impl CommitView {
         let affected_files = CommitAffectedFiles::new(lazy_threshold, window, cx);
 
         let mut view = Self {
+            is_shallow_boundary,
             commit,
             editor,
             multibuffer,
@@ -602,6 +608,44 @@ impl CommitView {
             view.spawn_load_metadata(sha_for_meta, repository, cx);
         }
         view
+    }
+
+    fn fetch_full_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repository = self.repository.clone();
+        let askpass = crate::handlers::askpass::askpass_delegate(
+            self.workspace.clone(),
+            "git fetch --unshallow",
+            window,
+            cx,
+        );
+        let fetch = repository.update(cx, |repo, cx| repo.fetch_unshallow(askpass, cx));
+        let sha = self.commit.sha.to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            fetch.await??;
+            let diff = repository
+                .update(cx, |repo, _| repo.load_commit_diff(sha, false))
+                .await??;
+            this.update_in(cx, |view, window, cx| {
+                let Some(workspace_entity) = view.workspace.upgrade() else {
+                    return;
+                };
+                *view = Self::new(
+                    view.commit.clone(),
+                    diff,
+                    repository,
+                    view.project.clone(),
+                    workspace_entity,
+                    view.workspace.clone(),
+                    view.stash,
+                    None,
+                    window,
+                    cx,
+                );
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(self.workspace.clone(), window, cx);
     }
 
     fn spawn_load_metadata(
@@ -1314,6 +1358,7 @@ impl Item for CommitView {
             });
             let affected_files = CommitAffectedFiles::new(lazy_threshold, window, cx);
             Self {
+                is_shallow_boundary: self.is_shallow_boundary,
                 editor,
                 multibuffer: self.multibuffer.clone(),
                 commit: self.commit.clone(),
@@ -1364,6 +1409,13 @@ impl Render for CommitView {
         }
 
         base.child(self.render_metadata_panel(window, cx))
+            .when(self.is_shallow_boundary, |this| {
+                this.child(v_flex().p_4().gap_2()
+                    .child(Label::new("This commit is at the shallow history boundary. Fetch its parents to view the diff.").color(Color::Muted))
+                    .child(Button::new("fetch-full-history", "Fetch full history")
+                        .disabled(matches!(self.repository.read(cx).unshallow_state(), project::git_store::UnshallowState::InProgress))
+                        .on_click(cx.listener(|view, _, window, cx| view.fetch_full_history(window, cx)))))
+            })
             .when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
                 |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
@@ -1550,9 +1602,10 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git::repository::{CommitFile, repo_path};
+    use git::repository::repo_path;
     use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
+    use project::git_store::CommitFile;
     use settings::SettingsStore;
     use std::path::Path;
     use util::path;
@@ -1597,6 +1650,7 @@ mod tests {
             path!("/project/.git").as_ref(),
             HEAD_SHA,
             CommitDiff {
+                is_shallow_boundary: false,
                 files: vec![CommitFile {
                     path: repo_path("a.rs"),
                     old_text: Some("one\n".to_string()),
@@ -1663,7 +1717,10 @@ mod tests {
                 let view = cx.new(|cx| {
                     CommitView::new(
                         commit_details(HEAD_SHA),
-                        CommitDiff { files: Vec::new() },
+                        CommitDiff {
+                            is_shallow_boundary: false,
+                            files: Vec::new(),
+                        },
                         context.repository.clone(),
                         project,
                         workspace_entity,

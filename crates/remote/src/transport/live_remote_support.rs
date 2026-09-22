@@ -178,6 +178,7 @@ impl RemoteClientDelegate for SilentDelegate {
         &self,
         prompt: String,
         _tx: oneshot::Sender<EncryptedPassword>,
+        _cancellation: oneshot::Receiver<()>,
         _cx: &mut AsyncApp,
     ) {
         panic!("the live tests authenticate with a key; asked for a password: {prompt}")

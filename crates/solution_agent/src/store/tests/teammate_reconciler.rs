@@ -44,7 +44,7 @@ async fn subagent_inprogress_task_registers_tab(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_task_1",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Loop agent 1"),
                     Some("general-purpose"),
                 ),
@@ -82,7 +82,7 @@ async fn subagent_terminal_status_removes_tab(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_task_2",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Worker A"),
                     None,
                 ),
@@ -100,7 +100,7 @@ async fn subagent_terminal_status_removes_tab(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_task_2",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::Completed,
+                    agent_client_protocol::schema::v1::ToolCallStatus::Completed,
                     Some("Worker A"),
                     None,
                 ),
@@ -148,7 +148,7 @@ async fn tool_completion_entry_updated_refreshes_silence_clock(cx: &mut TestAppC
                 make_task_tool_call(
                     "toolu_slow_cmd",
                     "Bash",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("until grep -qE '^(ok|FAIL)' out"),
                     None,
                 ),
@@ -176,7 +176,7 @@ async fn tool_completion_entry_updated_refreshes_silence_clock(cx: &mut TestAppC
                 make_task_tool_call(
                     "toolu_slow_cmd",
                     "Bash",
-                    agent_client_protocol::schema::ToolCallStatus::Completed,
+                    agent_client_protocol::schema::v1::ToolCallStatus::Completed,
                     Some("until grep -qE '^(ok|FAIL)' out"),
                     None,
                 ),
@@ -213,7 +213,7 @@ async fn subagent_label_falls_back_to_subagent_type(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_long_abcd",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     None,
                     Some("general-purpose"),
                 ),
@@ -249,7 +249,7 @@ async fn subagent_label_defaults_to_agent_short_id(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_xy12",
                     "Agent",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     None,
                     None,
                 ),
@@ -281,7 +281,7 @@ async fn non_task_tool_call_does_not_register_tab(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_bash_1",
                     "Bash",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("ignored"),
                     None,
                 ),
@@ -327,7 +327,7 @@ async fn subagent_registration_captures_all_labels(cx: &mut TestAppContext) {
                     make_task_tool_call(
                         id,
                         "Task",
-                        agent_client_protocol::schema::ToolCallStatus::InProgress,
+                        agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                         Some(label),
                         None,
                     ),
@@ -376,7 +376,7 @@ async fn duplicate_inprogress_does_not_re_register(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_dup",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Original"),
                     None,
                 ),
@@ -396,7 +396,7 @@ async fn duplicate_inprogress_does_not_re_register(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_dup",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Renamed"),
                     None,
                 ),
@@ -441,7 +441,7 @@ async fn subagent_failed_status_also_removes_tab(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_fail",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Doomed"),
                     None,
                 ),
@@ -458,7 +458,7 @@ async fn subagent_failed_status_also_removes_tab(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_fail",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::Failed,
+                    agent_client_protocol::schema::v1::ToolCallStatus::Failed,
                     Some("Doomed"),
                     None,
                 ),
@@ -484,7 +484,7 @@ async fn subagent_failed_status_also_removes_tab(cx: &mut TestAppContext) {
 async fn agent_terminal_with_parseable_raw_output_registers_background_agent(
     cx: &mut TestAppContext,
 ) {
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
     let bg_counter = Rc::new(std::cell::RefCell::new(0usize));
@@ -594,8 +594,8 @@ fn make_bash_bg_tool_call(
     command: &str,
     run_in_background: bool,
     raw_output: Option<&str>,
-) -> agent_client_protocol::schema::ToolCall {
-    use agent_client_protocol::schema as acp;
+) -> agent_client_protocol::schema::v1::ToolCall {
+    use agent_client_protocol::schema::v1 as acp;
     let mut raw_input = serde_json::Map::new();
     raw_input.insert("command".into(), serde_json::Value::String(command.into()));
     raw_input.insert(
@@ -873,7 +873,7 @@ async fn kill_shell_terminal_marks_shell_killed(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
-            use agent_client_protocol::schema as acp;
+            use agent_client_protocol::schema::v1 as acp;
             let mut raw_input = serde_json::Map::new();
             raw_input.insert(
                 "shell_id".into(),
@@ -922,7 +922,7 @@ async fn task_stop_terminal_marks_shell_killed(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
-            use agent_client_protocol::schema as acp;
+            use agent_client_protocol::schema::v1 as acp;
             let mut raw_input = serde_json::Map::new();
             raw_input.insert(
                 "task_id".into(),
@@ -977,7 +977,7 @@ async fn task_stop_on_exited_shell_keeps_exit_status(cx: &mut TestAppContext) {
 
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
-            use agent_client_protocol::schema as acp;
+            use agent_client_protocol::schema::v1 as acp;
             let mut raw_input = serde_json::Map::new();
             raw_input.insert(
                 "task_id".into(),
@@ -1029,8 +1029,8 @@ async fn task_notification_user_message_marks_shell_exited(cx: &mut TestAppConte
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(NOTIFICATION.to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(NOTIFICATION.to_string()),
                 ),
                 cx,
             );
@@ -1069,8 +1069,8 @@ async fn task_notification_unknown_shell_is_noop(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(NOTIFICATION.to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(NOTIFICATION.to_string()),
                 ),
                 cx,
             );
@@ -1554,7 +1554,7 @@ async fn subagent_stop_hook_closes_teammate_stream(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn subagent_stop_before_registration_buffers_then_closes(cx: &mut TestAppContext) {
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
     let bg_id = crate::background_agent::BackgroundAgentId::new("b11122233344455566");
     let parent_toolu = SharedString::from("toolu_Y");
@@ -1757,7 +1757,7 @@ fn reconcile_toolcall_entry(
     tool_name: &str,
     status: crate::session_entry::ToolStatus,
 ) -> crate::session_entry::SessionEntry {
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     crate::session_entry::SessionEntry {
         created_ms: 1_700_000_000_000,
         mod_seq: 1,
@@ -3067,7 +3067,7 @@ fn scan_parent_jsonl_flips_running_shell_to_exited(cx: &mut TestAppContext) {
                     session_id,
                     SolutionId(12),
                     SharedString::from("claude-acp"),
-                    agent_client_protocol::schema::SessionId::new(acp_id),
+                    agent_client_protocol::schema::v1::SessionId::new(acp_id),
                 );
                 s.cwd = cwd.clone();
                 let id = BackgroundShellId::new("bvb4ful1z");
@@ -3497,7 +3497,7 @@ async fn agent_watcher_rearms_after_the_acp_session_id_rotates(cx: &mut TestAppC
         let store = SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("session");
         session.update(cx, |s, _| {
-            s.acp_session_id = agent_client_protocol::schema::SessionId::new("acp-rotated");
+            s.acp_session_id = agent_client_protocol::schema::v1::SessionId::new("acp-rotated");
         });
         store.update(cx, |store, cx| {
             store.ensure_background_agent_watcher(session_id, fs.clone(), cx);

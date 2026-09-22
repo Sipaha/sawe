@@ -27,7 +27,7 @@ pub(crate) fn insert_cold_session(
             session_id,
             solution_id,
             agent_id,
-            agent_client_protocol::schema::SessionId::new("acp-cold"),
+            agent_client_protocol::schema::v1::SessionId::new("acp-cold"),
         );
         s.title = SharedString::from("Cold");
         s.project = project;
@@ -156,11 +156,11 @@ pub(crate) async fn create_session_with_thread(
 pub(crate) fn make_task_tool_call(
     id: &str,
     tool_name: &str,
-    status: agent_client_protocol::schema::ToolCallStatus,
+    status: agent_client_protocol::schema::v1::ToolCallStatus,
     description: Option<&str>,
     subagent_type: Option<&str>,
-) -> agent_client_protocol::schema::ToolCall {
-    use agent_client_protocol::schema as acp;
+) -> agent_client_protocol::schema::v1::ToolCall {
+    use agent_client_protocol::schema::v1 as acp;
     let mut raw_input = serde_json::Map::new();
     if let Some(d) = description {
         raw_input.insert("description".into(), serde_json::Value::String(d.into()));
@@ -239,7 +239,7 @@ pub(crate) async fn resume_a_row_native_session_through_a_failed_row_read(
         id: session_id,
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-retry"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-retry"),
         title: SharedString::from("row-native session"),
         created_at: now,
         last_activity_at: now,

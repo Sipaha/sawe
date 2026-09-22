@@ -372,7 +372,10 @@ pub(crate) fn build_queue_changed_payload(
                             .blocks
                             .iter()
                             .filter(|b| {
-                                matches!(b, agent_client_protocol::schema::ContentBlock::Image(_))
+                                matches!(
+                                    b,
+                                    agent_client_protocol::schema::v1::ContentBlock::Image(_)
+                                )
                             })
                             .count();
                         json!({
@@ -469,8 +472,8 @@ mod tests {
             }
             .expect("thread");
             thread.update(cx, |thread, cx| {
-                let chunk = agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hi".to_string()),
+                let chunk = agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hi".to_string()),
                 );
                 thread.push_user_content_block(None, chunk, cx);
             });
@@ -817,8 +820,10 @@ mod tests {
             acp_thread.update(cx, |thread, cx| {
                 thread.push_user_content_block(
                     None,
-                    agent_client_protocol::schema::ContentBlock::Text(
-                        agent_client_protocol::schema::TextContent::new("live user".to_string()),
+                    agent_client_protocol::schema::v1::ContentBlock::Text(
+                        agent_client_protocol::schema::v1::TextContent::new(
+                            "live user".to_string(),
+                        ),
                     ),
                     cx,
                 );
@@ -935,8 +940,8 @@ mod tests {
             }
             .expect("thread");
             thread.update(cx, |thread, cx| {
-                let chunk = agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hi".to_string()),
+                let chunk = agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hi".to_string()),
                 );
                 thread.push_user_content_block(None, chunk, cx);
             });
@@ -959,20 +964,20 @@ mod tests {
 
     /// Build a text block carrying an `spk_client_send_id` stamp on its
     /// `_meta`, mirroring what the mobile client sends.
-    fn stamped_text(text: &str, csid: i64) -> agent_client_protocol::schema::ContentBlock {
-        let mut block = agent_client_protocol::schema::TextContent::new(text.to_string());
+    fn stamped_text(text: &str, csid: i64) -> agent_client_protocol::schema::v1::ContentBlock {
+        let mut block = agent_client_protocol::schema::v1::TextContent::new(text.to_string());
         let mut meta = serde_json::Map::new();
         meta.insert(
             acp_thread::SPK_CLIENT_SEND_ID_META_KEY.to_string(),
             serde_json::json!(csid),
         );
         block.meta = Some(meta);
-        agent_client_protocol::schema::ContentBlock::Text(block)
+        agent_client_protocol::schema::v1::ContentBlock::Text(block)
     }
 
-    fn image_block() -> agent_client_protocol::schema::ContentBlock {
-        agent_client_protocol::schema::ContentBlock::Image(
-            agent_client_protocol::schema::ImageContent::new(
+    fn image_block() -> agent_client_protocol::schema::v1::ContentBlock {
+        agent_client_protocol::schema::v1::ContentBlock::Image(
+            agent_client_protocol::schema::v1::ImageContent::new(
                 "AAAA".to_string(),
                 "image/png".to_string(),
             ),
@@ -1083,8 +1088,8 @@ mod tests {
             thread.update(cx, |thread, cx| {
                 thread.push_user_content_block(
                     None,
-                    agent_client_protocol::schema::ContentBlock::Text(
-                        agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                    agent_client_protocol::schema::v1::ContentBlock::Text(
+                        agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                     ),
                     cx,
                 );

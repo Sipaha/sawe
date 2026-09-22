@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use acp_thread::AcpThread;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
 use gpui::{Context, Entity, EventEmitter, SharedString, Subscription, Task};
 use rand::RngCore;

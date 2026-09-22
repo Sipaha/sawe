@@ -320,8 +320,6 @@ impl Render for TitleBar {
         let status = self.client.status();
         let status = &*status.borrow();
         let user = self.user_store.read(cx).current_user();
-
-        let signed_in = user.is_some();
         let is_signing_in = user.is_none()
             && matches!(
                 status,
@@ -338,13 +336,7 @@ impl Render for TitleBar {
 
         children.push(
             h_flex()
-                .map(|this| {
-                    if signed_in {
-                        this.pr_1p5()
-                    } else {
-                        this.pr_1()
-                    }
-                })
+                .pr_1()
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 // Sawe fork: the branch widget and run-config strip moved
@@ -691,6 +683,7 @@ impl TitleBar {
         let workspace = self.workspace.clone();
         Button::new("sign_in", "Sign In")
             .label_size(LabelSize::Small)
+            .tab_index(0isize)
             .on_click(move |_, window, cx| {
                 let client = client.clone();
                 let workspace = workspace.clone();
@@ -713,7 +706,7 @@ impl TitleBar {
         let user = user_store.read(cx).current_user();
 
         let user_avatar = user.as_ref().map(|u| u.avatar_uri.clone());
-        let user_login = user.as_ref().map(|u| u.github_login.clone());
+        let username = user.as_ref().map(|u| u.username.clone());
 
         let is_signed_in = user.is_some();
 
@@ -748,23 +741,28 @@ impl TitleBar {
                 }
             });
 
-            ButtonLike::new("user-menu").child(
-                h_flex()
-                    .when_some(business_organization, |this, organization| {
-                        this.gap_2()
-                            .child(Label::new(&organization.name).size(LabelSize::Small))
-                    })
-                    .children(avatar),
-            )
+            ButtonLike::new("user-menu")
+                .aria_label("User menu")
+                .tab_index(0isize)
+                .child(
+                    h_flex()
+                        .when_some(business_organization, |this, organization| {
+                            this.gap_2()
+                                .child(Label::new(&organization.name).size(LabelSize::Small))
+                        })
+                        .children(avatar),
+                )
         } else {
             ButtonLike::new("user-menu")
+                .aria_label("User menu")
+                .tab_index(0isize)
                 .child(Icon::new(IconName::ChevronDown).size(IconSize::Small))
         };
 
         PopoverMenu::new("user-menu")
             .trigger(trigger)
             .menu(move |window, cx| {
-                let user_login = user_login.clone();
+                let username = username.clone();
                 let current_organization = current_organization.clone();
                 let organizations = organizations.clone();
                 let user_store = user_store.clone();
@@ -778,15 +776,15 @@ impl TitleBar {
 
                 ContextMenu::build(window, cx, |menu, _, _cx| {
                     menu.when(is_signed_in, |this| {
-                        let user_login = user_login.clone();
+                        let username = username.clone();
                         this.custom_entry(
                             move |_window, _cx| {
-                                let user_login = user_login.clone().unwrap_or_default();
+                                let username = username.clone().unwrap_or_default();
 
                                 h_flex()
                                     .w_full()
                                     .justify_between()
-                                    .child(Label::new(user_login))
+                                    .child(Label::new(username))
                                     .into_any_element()
                             },
                             move |_, cx| {
@@ -816,7 +814,7 @@ impl TitleBar {
                         )
                         .separator()
                     })
-                    .map(|this| {
+                    .when(is_signed_in, |this| {
                         let mut this = this.header("Organization");
 
                         for (organization, plan) in &organizations {

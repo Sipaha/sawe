@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
 $buildSuccess = $false
+$canCodeSign = $false
 
 $OSArchitecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     "X64" { "x86_64" }
@@ -66,18 +67,31 @@ function CheckEnvironmentVariables {
         return
     }
 
-    $requiredVars = @(
-        'ZED_WORKSPACE', 'RELEASE_VERSION', 'ZED_RELEASE_CHANNEL',
+    $requiredVars = @('ZED_WORKSPACE', 'RELEASE_VERSION', 'ZED_RELEASE_CHANNEL')
+
+    foreach ($var in $requiredVars) {
+        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($var))) {
+            Write-Error "$var is not set"
+            exit 1
+        }
+    }
+
+    # On PRs from forks the signing secrets are not populated,
+    # so skip code signing instead of failing, like bundle-mac does.
+    $signingVars = @(
         'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET',
         'ACCOUNT_NAME', 'CERT_PROFILE_NAME', 'ENDPOINT',
         'FILE_DIGEST', 'TIMESTAMP_DIGEST', 'TIMESTAMP_SERVER'
     )
 
-    foreach ($var in $requiredVars) {
-        if (-not (Test-Path "env:$var")) {
-            Write-Error "$var is not set"
-            exit 1
-        }
+    $missingVars = @($signingVars | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+    if ($missingVars.Count -eq 0) {
+        $script:canCodeSign = $true
+    } else {
+        Write-Host "====== WARNING ======"
+        Write-Host "One or more of the following variables are missing: $($missingVars -join ', ')"
+        Write-Host "This bundle will not be code signed"
+        Write-Host "====== WARNING ======"
     }
 }
 
@@ -102,20 +116,20 @@ function GenerateLicenses {
 function BuildZedAndItsFriends {
     Write-Output "Building Sawe and its friends, for channel: $channel"
     # Build sawe.exe, cli.exe and auto_update_helper.exe
-    cargo build --release --package zed --package cli --package auto_update_helper --target $target
-    Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\sawe.exe" -Force
+    cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target $target
+    Copy-Item -Path ".\$CargoOutDir\sawe.exe" -Destination "$innoDir\sawe.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
     switch ($channel) {
         "stable" {
-            cargo build --release --features stable --no-default-features --package explorer_command_injector --target $target
+            cargo --config .cargo/bundle-config.toml build --release --features stable --no-default-features --package explorer_command_injector --target $target
         }
         "preview" {
-            cargo build --release --features preview --no-default-features --package explorer_command_injector --target $target
+            cargo --config .cargo/bundle-config.toml build --release --features preview --no-default-features --package explorer_command_injector --target $target
         }
         default {
-            cargo build --release --package explorer_command_injector --target $target
+            cargo --config .cargo/bundle-config.toml build --release --package explorer_command_injector --target $target
         }
     }
     Copy-Item -Path ".\$CargoOutDir\explorer_command_injector.dll" -Destination "$innoDir\zed_explorer_command_injector.dll" -Force
@@ -123,12 +137,12 @@ function BuildZedAndItsFriends {
 
 function BuildRemoteServer {
     Write-Output "Building remote_server for $target"
-    cargo build --release --package remote_server --target $target
+    cargo --config .cargo/bundle-config.toml build --release --package remote_server --target $target
 
     # Create zipped remote server binary
     $remoteServerSrc = (Resolve-Path ".\$CargoOutDir\remote_server.exe").Path
 
-    if ($env:CI -and $env:SAWE_SIGN) {
+    if ($canCodeSign -and $env:SAWE_SIGN) {
         Write-Output "Code signing remote_server.exe"
         & "$innoDir\sign.ps1" $remoteServerSrc
     }
@@ -142,24 +156,26 @@ function BuildRemoteServer {
 
 function ZipZedAndItsFriendsDebug {
     $items = @(
-        ".\$CargoOutDir\zed.pdb",
+        ".\$CargoOutDir\sawe.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
         ".\$CargoOutDir\explorer_command_injector.pdb",
         ".\$CargoOutDir\remote_server.pdb"
     )
 
-    Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
+    Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\sawe-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
 }
 
 
 function UploadToSentry {
+    # Sawe keeps debug symbols locally; no upstream Sentry uploads.
+    return
     if (-not (Get-Command "sentry-cli" -ErrorAction SilentlyContinue)) {
         Write-Output "sentry-cli not found. skipping sentry upload."
         Write-Output "install with: 'winget install -e --id=Sentry.sentry-cli'"
         return
     }
-    if (-not (Test-Path "env:SENTRY_AUTH_TOKEN")) {
+    if ([string]::IsNullOrWhiteSpace($env:SENTRY_AUTH_TOKEN)) {
         Write-Output "missing SENTRY_AUTH_TOKEN. skipping sentry upload."
         return
     }
@@ -200,7 +216,7 @@ function MakeAppx {
 }
 
 function SignZedAndItsFriends {
-    if (-not $env:CI) {
+    if (-not $canCodeSign) {
         return
     }
     # Sawe: signing must be opt-in via SAWE_SIGN to avoid invoking the upstream signing infra by accident.
@@ -347,7 +363,10 @@ function BuildInstaller {
     }
 
     $innoArgs = @($issFilePath) + $defs
-    if ($env:CI -and $env:SAWE_SIGN) {
+    $env:ZED_SIGN_BUNDLE = ""
+    if ($canCodeSign -and $env:SAWE_SIGN) {
+        # Checked by sawe.iss to decide whether to sign the installer.
+        $env:ZED_SIGN_BUNDLE = "1"
         $signTool = "powershell.exe -ExecutionPolicy Bypass -File $innoDir\sign.ps1 `$f"
         $innoArgs += "/sDefaultsign=`"$signTool`""
     }
@@ -369,8 +388,8 @@ function BuildInstaller {
 
 ParseZedWorkspace
 $innoDir = "$env:ZED_WORKSPACE\inno\$Architecture"
-$debugArchive = "$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip"
-$debugStoreKey = "$env:ZED_RELEASE_CHANNEL/zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip"
+$debugArchive = "$CargoOutDir\sawe-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip"
+$debugStoreKey = "$env:ZED_RELEASE_CHANNEL/sawe-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip"
 
 CheckEnvironmentVariables
 PrepareForBundle

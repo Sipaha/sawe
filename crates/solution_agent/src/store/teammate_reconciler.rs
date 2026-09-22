@@ -575,7 +575,7 @@ impl SolutionAgentStore {
                 return;
             };
             let text = message.content.to_markdown(cx);
-            crate::background_shell::parse_task_notification(text)
+            crate::background_shell::parse_task_notification(&text)
         };
         let Some(notification) = notification else {
             return;

@@ -128,6 +128,10 @@ impl AddMemberDelegate {
 }
 
 impl PickerDelegate for AddMemberDelegate {
+    fn name() -> &'static str {
+        "SaweAddMember"
+    }
+
     type ListItem = ListItem;
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {

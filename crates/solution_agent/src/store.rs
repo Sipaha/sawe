@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use gpui::{
@@ -3492,14 +3492,14 @@ impl SolutionAgentStore {
         };
         self.send_message_blocks_targeted(
             session_id,
-            vec![agent_client_protocol::schema::ContentBlock::Text(
+            vec![agent_client_protocol::schema::v1::ContentBlock::Text(
                 // Stamp the editor-recovery `_meta` marker (invisible to the
                 // agent's text) so consumers that reason about "the user's goal"
                 // exclude it: the supervisor must not distill "your process hung"
                 // into `user_intent.md`, and `tail_is_unanswered_user_message`
                 // must not mistake THIS prompt for an unanswered human message on
                 // a second consecutive hang.
-                agent_client_protocol::schema::TextContent::new(prompt.to_string())
+                agent_client_protocol::schema::v1::TextContent::new(prompt.to_string())
                     .meta(Some(acp_thread::meta_with_editor_recovery())),
             )],
             crate::model::QueueTarget::Main,

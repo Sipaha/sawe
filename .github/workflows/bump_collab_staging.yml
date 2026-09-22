@@ -3,10 +3,15 @@ name: Bump collab-staging Tag
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   update-collab-staging-tag:
-    if: false # sawe: not applicable
+    if: false # sawe: upstream automation is disabled
     runs-on: namespace-profile-2x4-ubuntu-2404
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1

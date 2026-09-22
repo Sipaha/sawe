@@ -13,6 +13,8 @@ path = "src/test_target_guard.rs"
 
 [dependencies]
 toml.workspace = true
+proc-macro2 = { workspace = true, features = ["span-locations"] }
 
 [build-dependencies]
 toml.workspace = true
+proc-macro2 = { workspace = true, features = ["span-locations"] }

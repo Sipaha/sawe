@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use acp_thread::{AcpThread, AcpThreadEvent, AgentConnection, UserMessageId};
+use acp_thread::{AcpThread, AcpThreadEvent, AgentConnection};
 use action_log::ActionLog;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_servers::{AgentServer, AgentServerDelegate, mcp_servers_for_project};
 use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
@@ -2380,7 +2380,8 @@ fn ask_operator_for_tool_authorization(
                     selected.option_kind,
                     acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::AllowAlways
                 ),
-                acp_thread::RequestPermissionOutcome::Cancelled => false,
+                acp_thread::RequestPermissionOutcome::Cancelled
+                | acp_thread::RequestPermissionOutcome::InterruptedByFollowUp => false,
             },
             Ok(Err(error)) => {
                 log::warn!("claude_native: could not raise tool authorization: {error}");
@@ -2502,7 +2503,6 @@ impl AgentConnection for ClaudeNativeConnection {
 
     fn prompt(
         &self,
-        _user_message_id: UserMessageId,
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {

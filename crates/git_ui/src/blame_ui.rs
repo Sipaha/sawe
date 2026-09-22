@@ -1,9 +1,12 @@
+use crate::commit_blob::{GitBlob, build_buffer};
 use crate::{
     commit_context_menu::{CommitContext, build_commit_context_menu},
-    commit_tooltip::{CommitAvatar, CommitTooltip},
+    commit_tooltip::{CommitAvatar, CommitTooltip, commit_tag_chips},
     commit_view::CommitView,
     git_panel::OpenAtCommit,
 };
+use anyhow::Context as _;
+use editor::git::blame::GitBlame;
 use editor::{
     BlameRenderer, Editor, SplitSide,
     git::blame::{BlameOptions, BlameRunPosition},
@@ -14,18 +17,26 @@ use git::{
     GitHostingProviderRegistry, blame::BlameEntry, commit::ParsedCommitMessage,
     parse_git_remote_url, repository::CommitSummary,
 };
+use git::{Oid, repository::RepoPath};
 use gpui::{
-    Entity, Hsla, MouseButton, ScrollHandle, TextStyle, TextStyleRefinement, UnderlineStyle,
-    WeakEntity, prelude::*,
+    Entity, Hsla, MouseButton, ScrollHandle, Subscription, TextStyle, TextStyleRefinement,
+    UnderlineStyle, WeakEntity, prelude::*,
 };
 use markdown::{Markdown, MarkdownElement};
-use project::{git_store::Repository, project_settings::ProjectSettings};
+use multi_buffer::MultiBuffer;
+use project::{
+    git_store::Repository,
+    project_settings::{InlineBlameLocation, ProjectSettings},
+};
 use settings::Settings as _;
+use std::sync::Arc;
 use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{CopyButton, Divider, prelude::*, tooltip_container};
 use util::ResultExt as _;
+use util::paths::PathStyle;
 use workspace::Workspace;
+use workspace::notifications::NotifyTaskExt as _;
 
 /// Ceiling on the author column, in monospace columns. Only 7 of the 1931
 /// author names in this repository's history reach it once shortened, so it is
@@ -50,6 +61,104 @@ const GIT_BLAME_AVATAR_BORDER: Pixels = px(2.);
 
 pub struct GitBlameRenderer;
 
+fn format_blame_text(blame_entry: &BlameEntry, cx: &App) -> String {
+    let relative_timestamp = blame_entry_relative_timestamp(blame_entry);
+    let author = blame_entry.author.as_deref().unwrap_or_default();
+    let summary_enabled = ProjectSettings::get_global(cx)
+        .git
+        .inline_blame
+        .show_commit_summary;
+
+    match blame_entry.summary.as_ref() {
+        Some(summary) if summary_enabled => {
+            format!("{author}, {relative_timestamp} - {summary}")
+        }
+        _ => format!("{author}, {relative_timestamp}"),
+    }
+}
+
+#[derive(Default)]
+pub struct GitBlameStatus {
+    text: Option<SharedString>,
+    active_editor: Option<Entity<Editor>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl GitBlameStatus {
+    fn update(&mut self, editor: Entity<Editor>, _window: &mut Window, cx: &mut Context<Self>) {
+        let inline_blame = ProjectSettings::get_global(cx).git.inline_blame;
+        let text =
+            if inline_blame.enabled && inline_blame.location == InlineBlameLocation::StatusBar {
+                editor
+                    .update(cx, |editor, cx| editor.active_git_blame_entry(cx))
+                    .map(|blame_entry| SharedString::from(format_blame_text(&blame_entry, cx)))
+            } else {
+                None
+            };
+
+        if text != self.text {
+            self.text = text;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for GitBlameStatus {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let inline_blame = ProjectSettings::get_global(cx).git.inline_blame;
+        if !inline_blame.enabled || inline_blame.location != InlineBlameLocation::StatusBar {
+            return div();
+        }
+
+        div().when_some(self.text.clone(), |el, text| {
+            el.child(
+                Button::new("git-blame-status", text.clone())
+                    .label_size(LabelSize::Small)
+                    .start_icon(
+                        Icon::new(IconName::FileGit)
+                            .size(IconSize::Small)
+                            .color(Color::Hint),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(editor) = this.active_editor.clone() {
+                            let focus_handle = gpui::Focusable::focus_handle(editor.read(cx), cx);
+                            focus_handle.dispatch_action(
+                                &editor::actions::OpenGitBlameCommit,
+                                window,
+                                cx,
+                            );
+                        }
+                    }))
+                    .tooltip(ui::Tooltip::text(text)),
+            )
+        })
+    }
+}
+
+impl workspace::StatusItemView for GitBlameStatus {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn workspace::item::ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = active_pane_item.and_then(|item| item.act_as::<Editor>(cx)) {
+            self.active_editor = Some(editor.clone());
+            self._subscriptions = vec![cx.observe_in(&editor, window, Self::update)];
+            self.update(editor, window, cx);
+        } else {
+            self.text = None;
+            self.active_editor = None;
+            self._subscriptions.clear();
+            cx.notify();
+        }
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
+        None
+    }
+}
+
 impl BlameRenderer for GitBlameRenderer {
     fn max_author_columns(&self) -> usize {
         GIT_BLAME_MAX_AUTHOR_COLUMNS
@@ -69,6 +178,7 @@ impl BlameRenderer for GitBlameRenderer {
         style: &TextStyle,
         blame_entry: BlameEntry,
         details: Option<ParsedCommitMessage>,
+        tag_names: Vec<SharedString>,
         repository: Entity<Repository>,
         workspace: WeakEntity<Workspace>,
         editor: Entity<Editor>,
@@ -82,6 +192,7 @@ impl BlameRenderer for GitBlameRenderer {
             style,
             blame_entry,
             details,
+            tag_names,
             repository,
             workspace,
             editor,
@@ -100,6 +211,7 @@ impl BlameRenderer for GitBlameRenderer {
         style: &TextStyle,
         blame_entry: BlameEntry,
         details: Option<ParsedCommitMessage>,
+        tag_names: Vec<SharedString>,
         repository: Entity<Repository>,
         workspace: WeakEntity<Workspace>,
         editor: Entity<Editor>,
@@ -301,6 +413,7 @@ impl BlameRenderer for GitBlameRenderer {
                                     CommitTooltip::blame_entry(
                                         &blame_entry,
                                         details.clone(),
+                                        tag_names.clone(),
                                         repository.clone(),
                                         workspace.clone(),
                                         cx,
@@ -357,6 +470,7 @@ impl BlameRenderer for GitBlameRenderer {
         blame: BlameEntry,
         scroll_handle: ScrollHandle,
         details: Option<ParsedCommitMessage>,
+        tag_names: Vec<SharedString>,
         markdown: Entity<Markdown>,
         repository: Entity<Repository>,
         workspace: WeakEntity<Workspace>,
@@ -500,6 +614,8 @@ impl BlameRenderer for GitBlameRenderer {
                                     .child(
                                         h_flex()
                                             .gap_1()
+                                            .min_w_0()
+                                            .children(commit_tag_chips(&tag_names))
                                             .when_some(pull_request, |this, pr| {
                                                 this.child(
                                                     Button::new(
@@ -576,6 +692,18 @@ impl BlameRenderer for GitBlameRenderer {
             })
             .into_any_element(),
         )
+    }
+
+    fn open_blame_revision(
+        &self,
+        path: RepoPath,
+        revision: Oid,
+        repository: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        open_buffer_blame_at_revision(repository, workspace, path, revision, window, cx);
     }
 
     fn open_blame_commit(
@@ -925,4 +1053,162 @@ mod tests {
         // repository's history.
         assert_eq!(truncate_to_columns("Ha\u{200b}yes", 5), "Ha\u{200b}yes");
     }
+}
+
+fn open_buffer_blame_at_revision(
+    repository: Entity<Repository>,
+    workspace: WeakEntity<Workspace>,
+    path: RepoPath,
+    revision: Oid,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window
+        .spawn(cx, {
+            let workspace = workspace.clone();
+            async move |cx| {
+                let (language_registry, worktree_id) =
+                    workspace.read_with(cx, |workspace, cx| {
+                        let project = workspace.project().read(cx);
+                        (
+                            project.languages().clone(),
+                            worktree_id_for_repo_path(repository.read(cx), project, &path, cx),
+                        )
+                    })?;
+                let worktree_id = worktree_id.context("project has no worktrees")?;
+
+                let file_name = path
+                    .file_name()
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| path.display(PathStyle::local()).to_string());
+                let display_name = format!("{file_name} @ {}", revision.display_short());
+
+                let activated_existing = workspace.update_in(cx, |workspace, window, cx| {
+                    activate_existing_blame_editor(
+                        workspace,
+                        &repository,
+                        &path,
+                        revision,
+                        window,
+                        cx,
+                    )
+                })?;
+                if activated_existing {
+                    return Ok(());
+                }
+
+                let (content, blame) = repository
+                    .update(cx, |repository, cx| {
+                        repository.blame_buffer_at_revision(path.clone(), revision, cx)
+                    })
+                    .await?;
+
+                let file = Arc::new(GitBlob {
+                    path: path.clone(),
+                    worktree_id,
+                    is_deleted: false,
+                    is_binary: false,
+                    display_name: display_name.clone(),
+                }) as Arc<dyn language::File>;
+
+                let buffer = build_buffer(content, file, &language_registry, cx).await?;
+
+                workspace.update_in(cx, |workspace, window, cx| {
+                    if activate_existing_blame_editor(
+                        workspace,
+                        &repository,
+                        &path,
+                        revision,
+                        window,
+                        cx,
+                    ) {
+                        return;
+                    }
+
+                    let project = workspace.project().clone();
+                    let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+                    let editor = cx.new(|cx| {
+                        let mut editor = Editor::for_multibuffer(
+                            multi_buffer.clone(),
+                            Some(project.clone()),
+                            window,
+                            cx,
+                        );
+                        editor.set_read_only(true);
+                        editor.set_should_serialize(false, cx);
+                        editor
+                    });
+                    let git_blame = cx.new(|cx| {
+                        GitBlame::new_static(
+                            multi_buffer,
+                            project,
+                            repository,
+                            [(buffer, blame)],
+                            Some(revision),
+                            cx,
+                        )
+                    });
+                    editor.update(cx, |editor, cx| editor.set_blame(git_blame, window, cx));
+                    workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+                })
+            }
+        })
+        .detach_and_notify_err(workspace, window, cx);
+}
+
+fn activate_existing_blame_editor(
+    workspace: &mut Workspace,
+    repository: &Entity<Repository>,
+    path: &RepoPath,
+    revision: Oid,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    match existing_blame_editor(workspace, repository, path, revision, cx) {
+        Some(existing) => {
+            workspace.activate_item(&existing, true, true, window, cx);
+            true
+        }
+        None => false,
+    }
+}
+
+fn existing_blame_editor(
+    workspace: &Workspace,
+    repository: &Entity<Repository>,
+    path: &RepoPath,
+    revision: Oid,
+    cx: &App,
+) -> Option<Entity<Editor>> {
+    workspace
+        .panes()
+        .iter()
+        .flat_map(|pane| pane.read(cx).items())
+        .find_map(|item| {
+            let editor = item.downcast::<Editor>()?;
+            let blame = editor.read(cx).blame()?;
+            if blame.read(cx).highlighted_sha() != Some(revision) {
+                return None;
+            }
+            let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+            let buffer_id = buffer.read(cx).remote_id();
+            if blame.read(cx).repository(cx, buffer_id).as_ref() != Some(repository) {
+                return None;
+            }
+            let file = buffer.read(cx).file()?;
+            let blob = (file.as_ref() as &dyn std::any::Any).downcast_ref::<GitBlob>()?;
+            (blob.path == *path).then_some(editor)
+        })
+}
+
+fn worktree_id_for_repo_path(
+    repository: &Repository,
+    project: &project::Project,
+    path: &RepoPath,
+    cx: &App,
+) -> Option<project::WorktreeId> {
+    repository
+        .repo_path_to_project_path(path, cx)
+        .map(|path| path.worktree_id)
+        .or_else(|| project.worktrees(cx).next().map(|tree| tree.read(cx).id()))
 }

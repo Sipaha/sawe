@@ -180,7 +180,10 @@ impl McpServerTool for FindInBuffersTool {
         let query = query.map_err(|err| anyhow::anyhow!("invalid_query: {err}"))?;
 
         let results = cx.update(|cx| project.update(cx, |proj, cx| proj.search(query, cx)));
-        let project::SearchResults { rx, _task_handle } = results;
+        let project::SearchResults {
+            rx,
+            task_handle: _task_handle,
+        } = results;
 
         let mut all_matches: Vec<SearchMatch> = Vec::new();
         let mut hit_limit = false;

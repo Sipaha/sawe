@@ -5,7 +5,7 @@
 use std::{path::PathBuf, rc::Rc};
 
 use acp_thread::{AgentConnection, NativeAgentModelInfo};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
 use anyhow::Result;
 use gpui::{AsyncApp, Task};

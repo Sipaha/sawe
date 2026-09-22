@@ -125,8 +125,8 @@ impl SolutionAgentStore {
                     m.chunks
                         .iter()
                         .map(|chunk| match chunk {
-                            acp_thread::AssistantMessageChunk::Message { block }
-                            | acp_thread::AssistantMessageChunk::Thought { block } => {
+                            acp_thread::AssistantMessageChunk::Message { block, .. }
+                            | acp_thread::AssistantMessageChunk::Thought { block, .. } => {
                                 block.to_markdown(cx)
                             }
                         })
@@ -1839,8 +1839,8 @@ impl SolutionAgentStore {
         // observer attribution, so the old two-element layout (gist note + plain
         // bubble) is gone. The marker rides on `_meta`, invisible to the agent's
         // text.
-        let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-            agent_client_protocol::schema::TextContent::new(content)
+        let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+            agent_client_protocol::schema::v1::TextContent::new(content)
                 .meta(Some(acp_thread::meta_with_observer_nudge())),
         )];
         // `from_user: false` — a supervisor nudge must NOT reset the
@@ -1957,8 +1957,8 @@ impl SolutionAgentStore {
                             m.chunks
                                 .iter()
                                 .map(|chunk| match chunk {
-                                    AssistantMessageChunk::Message { block }
-                                    | AssistantMessageChunk::Thought { block } => {
+                                    AssistantMessageChunk::Message { block, .. }
+                                    | AssistantMessageChunk::Thought { block, .. } => {
                                         block.to_markdown(cx)
                                     }
                                 })

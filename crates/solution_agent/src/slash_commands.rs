@@ -1,6 +1,6 @@
 //! Slash-command completion provider for the session compose editor. Surfaces `/`-commands the agent advertises via ACP.
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result as AnyhowResult;
 use editor::{CompletionContext, CompletionProvider as EditorCompletionProvider};
 use gpui::{App, Context, Entity, Task, WeakEntity, Window};

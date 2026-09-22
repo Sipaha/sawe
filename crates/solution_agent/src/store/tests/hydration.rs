@@ -35,7 +35,7 @@ async fn hydrate_all_hydrates_cold_sessions(cx: &mut TestAppContext) {
         id: id_a,
         solution_id: solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
         created_at: now,
         last_activity_at: now,
@@ -52,7 +52,7 @@ async fn hydrate_all_hydrates_cold_sessions(cx: &mut TestAppContext) {
     };
     let meta_b = crate::model::SolutionSessionMetadata {
         id: id_b,
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-b"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-b"),
         title: SharedString::from("session B"),
         ..meta_a.clone()
     };
@@ -328,7 +328,7 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
         id: id_a,
         solution_id: solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
         created_at: now,
         last_activity_at: now,
@@ -509,7 +509,7 @@ fn entries_from_rows_terminalizes_stranded_tool_calls() {
         crate::session_entry::SessionEntryKind::ToolCall {
             id: "toolu_1".into(),
             label_md: "Agent".into(),
-            kind: agent_client_protocol::schema::ToolKind::Think,
+            kind: agent_client_protocol::schema::v1::ToolKind::Think,
             status,
             content_md: vec![],
             raw_input: None,
@@ -581,7 +581,7 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
         id: id_a,
         solution_id: solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
         created_at: now,
         last_activity_at: now,
@@ -698,7 +698,7 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
         id: id_a,
         solution_id: solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
         created_at: now,
         last_activity_at: now,
@@ -836,7 +836,7 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
         id: id_a,
         solution_id: solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-legacy"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-legacy"),
         title: SharedString::from("legacy session"),
         created_at: now,
         last_activity_at: now,
@@ -945,7 +945,7 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         id: id_a,
         solution_id: solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("session A"),
         created_at: now,
         last_activity_at: now,
@@ -1107,7 +1107,7 @@ async fn an_undecodable_blob_is_not_migrated_away(cx: &mut TestAppContext) {
         id,
         solution_id,
         agent_id: SharedString::from("claude-acp"),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("corrupt session"),
         created_at: now,
         last_activity_at: now,
@@ -1247,7 +1247,7 @@ async fn hydrate_all_restores_model_and_effort(cx: &mut TestAppContext) {
         id,
         solution_id,
         agent_id: SharedString::from("claude-acp"),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("cold"),
         created_at: now,
         last_activity_at: now,
@@ -1332,7 +1332,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         id: id_a,
         solution_id: solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("model session"),
         created_at: now,
         last_activity_at: now,
@@ -1475,7 +1475,7 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         id: id_a,
         solution_id: solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-a"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-a"),
         title: SharedString::from("legacy session"),
         created_at: now,
         last_activity_at: now,
@@ -1845,8 +1845,8 @@ async fn cold_restore_stamps_mod_seq_and_reseats_change_seq(cx: &mut TestAppCont
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("live msg".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("live msg".to_string()),
                 ),
                 cx,
             );
@@ -1899,7 +1899,7 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
         id: session_id,
         solution_id: solution_id,
         agent_id: SharedString::from("mock-agent"),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-model-test"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-model-test"),
         title: SharedString::from("model-test session"),
         created_at: now,
         last_activity_at: now,
@@ -2004,8 +2004,8 @@ async fn clear_wipes_the_legacy_blob_so_a_restore_cannot_replay_it(cx: &mut Test
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "the secret the user wants gone".to_string(),
                     ),
                 ),
@@ -2041,7 +2041,7 @@ async fn clear_wipes_the_legacy_blob_so_a_restore_cannot_replay_it(cx: &mut Test
     cx.update(|cx| {
         acp_thread.update(cx, |_, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
             ));
         })
     });
@@ -2149,8 +2149,8 @@ async fn compact_wipes_the_legacy_blob_like_clear_does(cx: &mut TestAppContext) 
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "the secret the user wants gone".to_string(),
                     ),
                 ),
@@ -2239,7 +2239,7 @@ async fn resume_of_a_wiped_session_does_not_repaint_the_blob(cx: &mut TestAppCon
         id: session_id,
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-wiped"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-wiped"),
         title: SharedString::from("cleared session"),
         created_at: now,
         last_activity_at: now,
@@ -2369,7 +2369,7 @@ async fn a_failed_epoch_read_on_reopen_does_not_un_wipe_the_session(cx: &mut Tes
         id: crate::model::SolutionSessionId::new(),
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new(acp),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new(acp),
         title: SharedString::from("cleared session"),
         created_at: Utc::now(),
         last_activity_at: Utc::now(),
@@ -2561,7 +2561,7 @@ async fn resume_of_an_undecodable_blob_leaves_the_row_recoverable(cx: &mut TestA
         id: session_id,
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-corrupt"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-corrupt"),
         title: SharedString::from("corrupt session"),
         created_at: now,
         last_activity_at: now,
@@ -2713,7 +2713,7 @@ async fn a_failed_row_read_on_reopen_does_not_delete_the_rows(cx: &mut TestAppCo
         id: session_id,
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-rows"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-rows"),
         title: SharedString::from("row-native session"),
         created_at: now,
         last_activity_at: now,
@@ -3326,7 +3326,7 @@ async fn a_flagged_wiped_session_never_rewinds_its_epoch(cx: &mut TestAppContext
         id: session_id,
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-wiped"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-wiped"),
         title: SharedString::from("wiped session"),
         created_at: now,
         last_activity_at: now,
@@ -3624,7 +3624,7 @@ async fn a_permanently_undecodable_transcript_refuses_with_permanent_advice(
         id: session_id,
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-corrupt"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-corrupt"),
         title: SharedString::from("corrupt session"),
         created_at: now,
         last_activity_at: now,
@@ -3763,7 +3763,7 @@ async fn a_failed_blob_read_on_reopen_does_not_wipe_the_session(cx: &mut TestApp
         id: session_id,
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-legacy"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-legacy"),
         title: SharedString::from("legacy session"),
         created_at: now,
         last_activity_at: now,
@@ -3904,7 +3904,7 @@ async fn resume_of_a_legacy_blob_session_still_restores_it(cx: &mut TestAppConte
         id: session_id,
         solution_id,
         agent_id: agent_id.clone(),
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-legacy"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-legacy"),
         title: SharedString::from("legacy session"),
         created_at: now,
         last_activity_at: now,
@@ -3983,8 +3983,8 @@ async fn a_failed_row_write_must_not_advance_the_epoch(cx: &mut TestAppContext) 
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 false,
                 cx,
@@ -4086,8 +4086,8 @@ async fn a_failed_row_write_makes_the_next_flush_re_cover_every_row(cx: &mut Tes
         cx.update(|cx| {
             acp_thread.update(cx, |t, cx| {
                 t.push_assistant_content_block(
-                    agent_client_protocol::schema::ContentBlock::Text(
-                        agent_client_protocol::schema::TextContent::new(text.to_string()),
+                    agent_client_protocol::schema::v1::ContentBlock::Text(
+                        agent_client_protocol::schema::v1::TextContent::new(text.to_string()),
                     ),
                     false,
                     cx,
@@ -4101,8 +4101,8 @@ async fn a_failed_row_write_makes_the_next_flush_re_cover_every_row(cx: &mut Tes
             acp_thread.update(cx, |t, cx| {
                 t.push_user_content_block(
                     Some(acp_thread::UserMessageId::new()),
-                    agent_client_protocol::schema::ContentBlock::Text(
-                        agent_client_protocol::schema::TextContent::new(text.to_string()),
+                    agent_client_protocol::schema::v1::ContentBlock::Text(
+                        agent_client_protocol::schema::v1::TextContent::new(text.to_string()),
                     ),
                     cx,
                 );
@@ -4193,7 +4193,7 @@ async fn mock_agent_server_composes_a_prompt_gate_with_resume_support(cx: &mut T
         id: crate::model::SolutionSessionId::new(),
         solution_id,
         agent_id,
-        acp_session_id: agent_client_protocol::schema::SessionId::new("acp-combined"),
+        acp_session_id: agent_client_protocol::schema::v1::SessionId::new("acp-combined"),
         title: SharedString::from("combined options"),
         created_at: now,
         last_activity_at: now,
@@ -4260,8 +4260,8 @@ async fn a_flush_captured_before_a_predecessor_failed_does_not_advance_the_epoch
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("alpha".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("alpha".to_string()),
                 ),
                 false,
                 cx,

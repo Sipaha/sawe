@@ -3,7 +3,7 @@ use crate::{
     Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowParams,
+    WindowParams, WindowVisibility,
 };
 use image::RgbaImage;
 use parking_lot::Mutex;
@@ -253,6 +253,12 @@ impl PlatformWindow for HeadlessWindow {
         true
     }
 
+    fn visibility(&self) -> WindowVisibility {
+        WindowVisibility::Visible
+    }
+
+    fn on_visibility_change(&self, _callback: Box<dyn FnMut(WindowVisibility)>) {}
+
     fn is_hovered(&self) -> bool {
         false
     }
@@ -384,7 +390,7 @@ struct NoopAtlas;
 impl PlatformAtlas for NoopAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        _key: &crate::AtlasKey,
+        _key: crate::AtlasKey,
         _build: &mut dyn FnMut() -> anyhow::Result<
             Option<(Size<DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
         >,

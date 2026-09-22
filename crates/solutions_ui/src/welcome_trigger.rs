@@ -3,7 +3,7 @@
 //! solutions open. Wired into the `close_solution` flow in
 //! [`crate::solutions_ui`].
 //!
-//! Note on the "empty list" condition. `MultiWorkspace::close_workspace`
+//! Note on the "empty list" condition. `MultiWorkspace::remove`
 //! always provides a fallback workspace when the active one is being
 //! closed, so the literal `workspaces()` list rarely goes to zero —
 //! instead we usually end up with one workspace whose project has no

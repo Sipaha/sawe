@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 
 /// How the spawned `claude` process binds to a session.
 pub enum SessionArg {

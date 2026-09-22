@@ -223,7 +223,7 @@ async fn collect_diagnostic_items(
                             },
                         },
                         severity: severity_to_string(entry.diagnostic.severity).to_string(),
-                        message: entry.diagnostic.message.clone(),
+                        message: entry.diagnostic.message.to_string(),
                         source: entry.diagnostic.source.clone(),
                         code: entry.diagnostic.code.as_ref().map(|code| match code {
                             lsp::NumberOrString::Number(n) => n.to_string(),

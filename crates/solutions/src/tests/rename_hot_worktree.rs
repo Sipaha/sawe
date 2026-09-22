@@ -19,7 +19,6 @@ use gpui::TestAppContext;
 use project::Project;
 use settings::SettingsStore;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 use util::rel_path::rel_path;
 
@@ -57,7 +56,7 @@ async fn renaming_a_solution_moves_the_folder_under_a_live_worktree(cx: &mut Tes
         release_channel::init(semver::Version::new(0, 0, 0), cx);
     });
 
-    let fs = Arc::new(fs::RealFs::new(None, cx.executor()));
+    let fs = fs::RealFs::new(None, cx.executor());
     let project = Project::test(fs, [member_path.as_path()], cx).await;
 
     // An open buffer must survive the move.

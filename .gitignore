@@ -71,3 +71,6 @@ crates/docs_preprocessor/actions.json
 # docs/findings/. 51 of them (5.4 MB of PNGs) were committed by accident and
 # removed on 2026-09-14; they remain retrievable at a71e73602a9ac8e7d84ee16db9993d3377af3c15.
 /.agents/reports/
+
+.local*
+.cache

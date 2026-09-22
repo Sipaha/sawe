@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use acp_thread::{AcpThread, AgentConnection as _, AgentThreadEntry, ToolCall, ToolCallStatus};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
 use claude_native::command::{ClaudeCommandSpec, SessionArg};
 use claude_native::process::ClaudeProcess;
@@ -280,8 +280,7 @@ async fn prompt_resolves_on_result_and_streams_text(cx: &mut TestAppContext) {
         "hello".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id, prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     let response = {
         let timeout = cx.background_executor.timer(Duration::from_secs(10)).fuse();
@@ -337,8 +336,7 @@ async fn can_use_tool_is_auto_approved_without_prompt(cx: &mut TestAppContext) {
         "run a command".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id, prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     // The mock emits a `can_use_tool` control request. The connection
     // AUTO-APPROVES it (the fork's bypass stance — see
@@ -438,8 +436,7 @@ async fn cancel_clean_interrupt_resolves_without_kill(cx: &mut TestAppContext) {
         "hello".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id.clone(), prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     // Let the turn start streaming before cancelling.
     cx.run_until_parked();
@@ -493,8 +490,7 @@ async fn cancel_escalates_to_kill_and_resume(cx: &mut TestAppContext) {
         "hello".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id.clone(), prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     cx.run_until_parked();
     cx.update(|cx| connection.cancel(&session_id, cx));
@@ -562,8 +558,7 @@ async fn repeated_cancel_does_not_double_escalate(cx: &mut TestAppContext) {
         "hello".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id.clone(), prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     cx.run_until_parked();
 
@@ -645,8 +640,7 @@ async fn prompt_stays_pending_without_result(cx: &mut TestAppContext) {
         "hello".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id, prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     // The mock streams text but never sends `result`; the prompt must remain
     // pending. Race it against a short timer and assert the timer wins.
@@ -714,8 +708,7 @@ async fn hook_inject_round_trips_additional_context(cx: &mut TestAppContext) {
         "hello".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id, prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     let response = {
         let timeout = cx.background_executor.timer(Duration::from_secs(10)).fuse();
@@ -795,8 +788,7 @@ async fn hook_pulls_from_registered_store_closure(cx: &mut TestAppContext) {
         "hello".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id, prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     let response = {
         let timeout = cx.background_executor.timer(Duration::from_secs(10)).fuse();
@@ -851,8 +843,7 @@ async fn subagent_tool_use_carries_parent_meta_through_pump(cx: &mut TestAppCont
         "run a subagent".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id, prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
 
     let response = {
         let timeout = cx.background_executor.timer(Duration::from_secs(10)).fuse();
@@ -901,8 +892,7 @@ async fn markdown_for_scenario(scenario: &str, cx: &mut TestAppContext) -> Strin
         "hello".to_string(),
     ))];
     let request = acp::PromptRequest::new(session_id, prompt);
-    let prompt_task =
-        cx.update(|cx| connection.prompt(acp_thread::UserMessageId::new(), request, cx));
+    let prompt_task = cx.update(|cx| connection.prompt(request, cx));
     let response = {
         let timeout = cx.background_executor.timer(Duration::from_secs(10)).fuse();
         let prompt_task = prompt_task.fuse();

@@ -379,9 +379,9 @@ impl InlineAssistant {
                 continue;
             }
 
-            let latest_selection = newest_selection.get_or_insert_with(|| selection.clone());
+            let latest_selection = newest_selection.get_or_insert_with(|| selection);
             if selection.id > latest_selection.id {
-                *latest_selection = selection.clone();
+                *latest_selection = selection;
             }
             selections.push(selection);
         }
@@ -1355,7 +1355,7 @@ impl InlineAssistant {
             for row_range in inserted_row_ranges {
                 editor.highlight_rows::<InlineAssist>(
                     row_range,
-                    cx.theme().status().info_background,
+                    |cx| cx.theme().status().info_background,
                     Default::default(),
                     cx,
                 );
@@ -1424,7 +1424,7 @@ impl InlineAssistant {
                     editor.set_show_edit_predictions(Some(false), window, cx);
                     editor.highlight_rows::<DeletedLines>(
                         Anchor::Min..Anchor::Max,
-                        cx.theme().status().deleted_background,
+                        |cx| cx.theme().status().deleted_background,
                         Default::default(),
                         cx,
                     );
@@ -1469,6 +1469,13 @@ impl InlineAssistant {
                 .focus_handle(cx)
                 .contains_focused(window, cx)
             && let Some(terminal_view) = console_panel.read(cx).active_terminal_view(cx)
+        {
+            return Some(InlineAssistTarget::Terminal(terminal_view));
+        }
+
+        if let Some(agent_panel) = workspace.panel::<AgentPanel>(cx)
+            && let Some(terminal_view) = agent_panel.read(cx).visible_terminal_view().cloned()
+            && terminal_view.focus_handle(cx).contains_focused(window, cx)
         {
             return Some(InlineAssistTarget::Terminal(terminal_view));
         }

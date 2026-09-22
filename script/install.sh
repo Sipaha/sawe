@@ -26,10 +26,10 @@ main() {
     fi
 
     case "$platform-$arch" in
-        macos-arm64* | linux-arm64* | linux-armhf | linux-aarch64)
+        macos-arm64* | linux-arm64* | linux-aarch64)
             arch="aarch64"
             ;;
-        macos-x86* | linux-x86* | linux-i686*)
+        macos-x86* | linux-x86*)
             arch="x86_64"
             ;;
         *)
@@ -114,6 +114,16 @@ linux() {
     rm -rf "$HOME/.local/sawe$suffix.app"
     mkdir -p "$HOME/.local/sawe$suffix.app"
     tar -xzf "$temp/sawe-linux-$arch.tar.gz" -C "$HOME/.local/"
+
+    sawe_binary="$HOME/.local/sawe$suffix.app/libexec/sawe-bin"
+    if [ -f "$sawe_binary" ] && command -v ldd >/dev/null 2>&1; then
+        missing="$(ldd "$sawe_binary" 2>/dev/null | sed -n 's/^[[:space:]]*\(.*\) => not found$/\1/p')"
+        if [ -n "$missing" ]; then
+            echo "Warning: your system is missing libraries that Sawe needs:"
+            echo "$missing" | sed 's/^/    /'
+            echo "Install them with your package manager, or Sawe will fail to start."
+        fi
+    fi
 
     # Setup ~/.local directories
     mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"

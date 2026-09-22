@@ -1,6 +1,6 @@
 # ADR-0001: Fork philosophy — no scheduled upstream merge, two-zone refactor rules
 
-**Status:** accepted
+**Status:** superseded by [ADR-0006](0006-explicit-upstream-integrations.md)
 **Date:** 2026-05-15
 **Deciders:** Pavel Simonov (@Sipaha)
 **Related:** [`FORK.md`](../../../FORK.md), [`CLAUDE.md`](../../../CLAUDE.md) § "Fork philosophy"

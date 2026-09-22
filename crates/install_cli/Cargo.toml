@@ -10,13 +10,14 @@ workspace = true
 
 [lib]
 path = "src/install_cli.rs"
-
+doctest = false
 [features]
 test-support = []
 
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
+log.workspace = true
 release_channel.workspace = true
 smol.workspace = true
 util.workspace = true

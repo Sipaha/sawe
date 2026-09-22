@@ -371,7 +371,7 @@ fn render_avatar(
 ) -> AnyElement {
     if settings.fetch_avatars && remote.is_some() {
         return CommitAvatar::new(sha, author_email, remote)
-            .size(rems_from_px(40.))
+            .size(rems_from_px(40_f32))
             .render(window, cx);
     }
 
@@ -382,7 +382,7 @@ fn render_avatar(
         .find(|c| c.is_alphanumeric())
         .map(|c| c.to_uppercase().next().unwrap_or(c))
         .unwrap_or('?');
-    let size = rems_from_px(40.).to_pixels(window.rem_size());
+    let size = rems_from_px(40_f32).to_pixels(window.rem_size());
     h_flex()
         .size(size)
         .justify_center()

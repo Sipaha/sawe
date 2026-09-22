@@ -115,7 +115,11 @@ mod imp {
     /// unrelated process after one.
     fn boot_id() -> Option<String> {
         let raw = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-        let id: String = raw.trim().chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let id: String = raw
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
         (id.len() == 32).then_some(id)
     }
 
@@ -396,7 +400,10 @@ mod tests {
     impl Sleeper {
         fn spawn() -> Self {
             let mut command = Command::new("sleep");
-            command.arg("300").stdout(Stdio::null()).stderr(Stdio::null());
+            command
+                .arg("300")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             crate::set_pre_exec_to_start_new_session(&mut command);
             Sleeper {
                 child: command.spawn().expect("spawn sleep"),
@@ -537,7 +544,10 @@ mod tests {
         assert_eq!(report.killed, 0);
         assert_eq!(report.runs_live, 1);
         assert_eq!(report.runs_swept, 0);
-        assert!(sleeper.is_alive(), "another editor's agent survives the sweep");
+        assert!(
+            sleeper.is_alive(),
+            "another editor's agent survives the sweep"
+        );
         assert!(dir.exists(), "a live run keeps its directory");
     }
 
@@ -591,7 +601,10 @@ mod tests {
         // down this very process — so a green run is the assertion, and a
         // harness that dies mid-suite is the failure.
         let mut command = Command::new("sleep");
-        command.arg("300").stdout(Stdio::null()).stderr(Stdio::null());
+        command
+            .arg("300")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let mut child = command.spawn().expect("spawn sleep");
         let pid = child.id();
         let (_, pgrp) = super::imp_read_stat_for_test(pid).expect("live child");

@@ -21,7 +21,7 @@ use acp_thread::{
     AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock, PlanEntry, ToolCall,
     ToolCallContent, ToolCallStatus, UserMessage, UserMessageId,
 };
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, AppContext, SharedString};
 use markdown::Markdown;
 use serde::{Deserialize, Serialize};
@@ -125,8 +125,8 @@ pub struct PersistedPlanEntry {
 pub fn to_persisted(entry: &AgentThreadEntry, cx: &App) -> Option<PersistedEntryV2> {
     match entry {
         AgentThreadEntry::UserMessage(msg) => Some(PersistedEntryV2::User(PersistedUserMessage {
-            id: msg.id.as_ref().map(user_message_id_to_string),
-            content_md: msg.content.to_markdown(cx).to_string(),
+            id: msg.client_id.as_ref().map(user_message_id_to_string),
+            content_md: msg.content.to_markdown(cx),
             chunks: msg.chunks.clone(),
         })),
         AgentThreadEntry::AssistantMessage(msg) => {
@@ -134,11 +134,11 @@ pub fn to_persisted(entry: &AgentThreadEntry, cx: &App) -> Option<PersistedEntry
                 .chunks
                 .iter()
                 .map(|chunk| match chunk {
-                    AssistantMessageChunk::Message { block } => {
-                        PersistedAssistantChunk::Message(block.to_markdown(cx).to_string())
+                    AssistantMessageChunk::Message { block, .. } => {
+                        PersistedAssistantChunk::Message(block.to_markdown(cx))
                     }
-                    AssistantMessageChunk::Thought { block } => {
-                        PersistedAssistantChunk::Thought(block.to_markdown(cx).to_string())
+                    AssistantMessageChunk::Thought { block, .. } => {
+                        PersistedAssistantChunk::Thought(block.to_markdown(cx))
                     }
                 })
                 .collect();
@@ -189,7 +189,7 @@ pub fn to_persisted(entry: &AgentThreadEntry, cx: &App) -> Option<PersistedEntry
         // Context-compaction markers are an in-session affordance (the model
         // summarizing its own history) and aren't part of the durable
         // transcript — skip them, like in-flight tool calls.
-        AgentThreadEntry::ContextCompaction(_) => None,
+        AgentThreadEntry::ContextCompaction(_) | AgentThreadEntry::Elicitation(_) => None,
         // System notes ARE durable — they're the user-visible record that the
         // editor (watchdog / usage-limit / supervisor) acted on the session, so
         // they must survive a reconnect / restart even though they aren't in
@@ -207,10 +207,13 @@ pub fn to_persisted(entry: &AgentThreadEntry, cx: &App) -> Option<PersistedEntry
 pub fn from_persisted(persisted: PersistedEntryV2, cx: &mut App) -> AgentThreadEntry {
     match persisted {
         PersistedEntryV2::User(p) => AgentThreadEntry::UserMessage(UserMessage {
-            id: p.id.as_deref().map(user_message_id_from_string),
+            protocol_id: None,
+            is_optimistic: false,
+            client_id: p.id.as_deref().map(user_message_id_from_string),
             content: ContentBlock::Markdown {
                 markdown: cx.new(|cx| Markdown::new(p.content_md.into(), None, None, cx)),
-            },
+            }
+            .into(),
             chunks: p.chunks,
             checkpoint: None,
             indented: false,
@@ -221,14 +224,18 @@ pub fn from_persisted(persisted: PersistedEntryV2, cx: &mut App) -> AgentThreadE
                 .into_iter()
                 .map(|chunk| match chunk {
                     PersistedAssistantChunk::Message(md) => AssistantMessageChunk::Message {
+                        id: None,
                         block: ContentBlock::Markdown {
                             markdown: cx.new(|cx| Markdown::new(md.into(), None, None, cx)),
-                        },
+                        }
+                        .into(),
                     },
                     PersistedAssistantChunk::Thought(md) => AssistantMessageChunk::Thought {
+                        id: None,
                         block: ContentBlock::Markdown {
                             markdown: cx.new(|cx| Markdown::new(md.into(), None, None, cx)),
-                        },
+                        }
+                        .into(),
                     },
                 })
                 .collect();
@@ -279,6 +286,9 @@ pub fn from_persisted(persisted: PersistedEntryV2, cx: &mut App) -> AgentThreadE
                 subagent_session_info: None,
                 subagent_id: None,
                 sandbox_authorization_details: None,
+                sandbox_fallback_authorization_details: None,
+                sandbox_not_applied: None,
+                title: None,
                 // Cold blobs only persist terminal statuses (see
                 // `TerminalToolCallStatus`), so the rehydrated call is
                 // never InProgress and therefore never needs a

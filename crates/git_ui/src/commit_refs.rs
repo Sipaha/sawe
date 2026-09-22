@@ -140,7 +140,7 @@ pub fn ref_chip(
                 .bg_color(accent_color.opacity(0.25))
                 .border_color(accent_color.opacity(0.5)),
             ChipGlyph::Protected => chip
-                .icon(IconName::LockOutlined)
+                .icon(IconName::Lock)
                 .bg_color(accent_color.opacity(0.12))
                 .border_color(accent_color.opacity(0.5)),
             ChipGlyph::None => chip

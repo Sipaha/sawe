@@ -184,7 +184,7 @@ mod tests {
             kind: SessionEntryKind::ToolCall {
                 id: id.to_string(),
                 label_md: "Bash".to_string(),
-                kind: agent_client_protocol::schema::ToolKind::Execute,
+                kind: agent_client_protocol::schema::v1::ToolKind::Execute,
                 status: crate::session_entry::ToolStatus::Completed,
                 content_md: Vec::new(),
                 raw_input: None,

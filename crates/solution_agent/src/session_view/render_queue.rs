@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use gpui::{AnyElement, Context, Div, IntoElement, ParentElement, SharedString, Styled, relative};
 use markdown::MarkdownElement;
 use ui::prelude::*;
@@ -79,7 +79,7 @@ impl SolutionSessionView {
             let mut images: Vec<Arc<gpui::Image>> = Vec::new();
             for bundle in &bundles {
                 for block in &bundle.blocks {
-                    if let agent_client_protocol::schema::ContentBlock::Image(img) = block
+                    if let agent_client_protocol::schema::v1::ContentBlock::Image(img) = block
                         && let Some(decoded) = decode_image_local(img)
                     {
                         images.push(decoded);

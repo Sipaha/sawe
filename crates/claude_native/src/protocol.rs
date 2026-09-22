@@ -6,7 +6,7 @@
 //! so a future `claude` that adds message kinds (or emits a stray
 //! `{"type":"ping"}`) does not break the reader.
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

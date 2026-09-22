@@ -34,8 +34,8 @@ use std::{
     sync::Arc,
 };
 use ui::{
-    Color, DiffStat, Icon, IconButton, IconName, Label, LabelCommon as _, SharedString, Tooltip,
-    prelude::*, vertical_divider,
+    Color, DiffStat, Divider, Icon, IconButton, IconName, Label, LabelCommon as _, SharedString,
+    Tooltip, prelude::*,
 };
 use util::paths::{PathExt as _, PathStyle};
 use workspace::{
@@ -682,7 +682,7 @@ impl SoloDiffView {
         // `DiffBlameBase::Blob` — chasing the choice through to `<sha>^N` is a
         // call-site change here, not a redesign of the blame seam.
         let commit_diff = repository.update(cx, |repository, _| {
-            repository.load_commit_diff(sha.to_string())
+            repository.load_commit_diff(sha.to_string(), false)
         });
         let request = DiffLoadRequest::begin(&workspace_entity, cx);
 
@@ -1448,7 +1448,7 @@ impl Render for SoloDiffStyleToolbar {
                         this.dispatch_action(&GoToHunk, window, cx)
                     })),
             )
-            .child(vertical_divider())
+            .child(Divider::vertical())
             .child(
                 IconButton::new("solo-diff-unified", IconName::DiffUnified)
                     .icon_size(IconSize::Small)
@@ -1467,7 +1467,7 @@ impl Render for SoloDiffStyleToolbar {
                         this.set_diff_view_style(DiffViewStyle::Split, window, cx);
                     })),
             )
-            .child(vertical_divider())
+            .child(Divider::vertical())
             .child(
                 soft_wrap_button("solo-diff-soft-wrap", is_soft_wrap_enabled, &focus_handle)
                     .icon_size(IconSize::Small)
@@ -1475,7 +1475,7 @@ impl Render for SoloDiffStyleToolbar {
                         this.dispatch_action(&ToggleSoftWrap, window, cx)
                     })),
             )
-            .child(vertical_divider())
+            .child(Divider::vertical())
             .child(div().w_1())
     }
 }
@@ -1543,7 +1543,7 @@ impl Render for SoloDiffGitToolbar {
                     .color(Color::Muted)
                     .into_any_element()
             }))
-            .child(vertical_divider())
+            .child(Divider::vertical())
             // Buffer search is offered for *either* source: `as_searchable`
             // already returns this view's editor whatever it is showing, so
             // the button is an affordance for something both sources can
@@ -1617,10 +1617,11 @@ pub(crate) fn difference_count_label(count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git::repository::{CommitDiff, CommitFile, repo_path};
+    use git::repository::repo_path;
     use git::status::{FileStatus, StageStatus, StatusCode, TrackedStatus};
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
     use project::FakeFs;
+    use project::git_store::{CommitDiff, CommitFile};
     use search::BufferSearchBar;
     use settings::SettingsStore;
     use std::path::Path;
@@ -1734,9 +1735,14 @@ mod tests {
     }
 
     fn set_commit(context: &DiffTestContext, sha: &str, files: Vec<CommitFile>) {
-        context
-            .fs
-            .set_commit_diff(path!("/project/.git").as_ref(), sha, CommitDiff { files });
+        context.fs.set_commit_diff(
+            path!("/project/.git").as_ref(),
+            sha,
+            CommitDiff {
+                is_shallow_boundary: false,
+                files,
+            },
+        );
     }
 
     async fn open_commit_with(
@@ -1901,6 +1907,7 @@ mod tests {
 
     fn blame_entry_at_sha(row: u32, author: &str, sha: ::git::Oid) -> ::git::blame::BlameEntry {
         ::git::blame::BlameEntry {
+            boundary: false,
             sha,
             range: row..row + 1,
             original_line_number: row + 1,
@@ -3846,6 +3853,7 @@ mod tests {
                 dot_git.as_ref(),
                 SHA,
                 CommitDiff {
+                    is_shallow_boundary: false,
                     files: vec![commit_file("src/lib.rs", Some("one\n"), Some("two\n"))],
                 },
             );

@@ -5,6 +5,10 @@ description: Extend Zed's AI agent with reusable, on-demand skill files for spec
 
 # Skills {#skills}
 
+> **Note:** This page describes inherited upstream Zed interfaces. Sawe uses
+> [Native AI Sessions](./native-sessions.md) in the Solution band; its upstream
+> Agent Panel and cloud-agent sign-in are disabled.
+
 Skills are reusable instruction packages that give the agent specialized knowledge for specific tasks: test-driven development workflows, document processing, database integrations, or your team's internal coding standards.
 
 A skill is a folder containing a `SKILL.md` file with metadata and instructions. The agent sees a catalog of all installed skills and can load one on demand, or you can invoke any skill directly from the message editor with a slash command.
@@ -119,11 +123,11 @@ Step-by-step instructions for the agent...
 
 #### Frontmatter Fields {#frontmatter-fields}
 
-| Field                      | Required | Description                                                                                                                       |
-| -------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                     | Yes      | Lowercase letters, numbers, and hyphens only. Max 64 characters. Should match the folder name.                                    |
-| `description`              | Yes      | What the skill does and when to use it. Keep it under 1024 bytes; skills with longer descriptions still load, but with a warning. |
-| `disable-model-invocation` | No       | Set to `true` to hide from the agent's catalog (invocable via slash command or @-mention only).                                   |
+| Field                      | Required | Description                                                                                                                              |
+| -------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                     | Yes      | Lowercase letters, numbers, and hyphens only. Max 64 characters. Should match the folder name.                                           |
+| `description`              | Yes      | What the skill does and when to use it. Keep it at most 1024 characters; skills with longer descriptions still load, but with a warning. |
+| `disable-model-invocation` | No       | Set to `true` to hide from the agent's catalog (invocable via slash command or @-mention only).                                          |
 
 > **Tip:** Write descriptions that help the agent recognize when a skill is relevant. Include specific task types and trigger phrases: "Use when handling PDFs, extracting text, or filling forms" is better than "Helps with PDFs."
 
@@ -190,7 +194,7 @@ The agent cannot edit `SKILL.md` files or their bundled resources without your e
 
 ## Agent Path Boundaries {#agent-path-boundaries}
 
-Zed Skills apply to the Zed Agent. External Agents and Terminal Threads may have their own native skills, prompts, or instruction systems. Configure those in the External Agent or CLI.
+Zed Skills apply to the Zed Agent. [External Agents](./external-agents.md) and Terminal Threads may have their own native skills, prompts, or instruction systems. Configure those in the External Agent or CLI.
 
 ## Limitations {#limitations}
 

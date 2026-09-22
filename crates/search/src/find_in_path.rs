@@ -870,7 +870,7 @@ impl FindInPath {
                 .timer(Duration::from_millis(150))
                 .await;
 
-            let SearchResults { rx, _task_handle } =
+            let SearchResults { rx, task_handle } =
                 project.update(cx, |project, cx| project.search(query, cx));
             let mut chunks = pin!(rx.ready_chunks(1024));
 
@@ -934,6 +934,8 @@ impl FindInPath {
                 }
                 futures_lite::future::yield_now().await;
             }
+            // The producer task must stay alive until its result stream closes.
+            drop(task_handle);
 
             this.update(cx, |this, cx| {
                 this.status = if limit_reached {

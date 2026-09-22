@@ -540,8 +540,8 @@ async fn cancelled_stop_keeps_bundles_reserved_by_an_in_flight_steer(cx: &mut Te
                         origin: crate::model::MessageOrigin::User,
                         id,
                         target: crate::model::QueueTarget::Main,
-                        blocks: vec![agent_client_protocol::schema::ContentBlock::Text(
-                            agent_client_protocol::schema::TextContent::new(text),
+                        blocks: vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                            agent_client_protocol::schema::v1::TextContent::new(text),
                         )],
                     });
                     id
@@ -562,7 +562,7 @@ async fn cancelled_stop_keeps_bundles_reserved_by_an_in_flight_steer(cx: &mut Te
         let thread = session.read(cx).acp_thread().cloned().unwrap();
         thread.update(cx, |_t, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::Cancelled,
+                agent_client_protocol::schema::v1::StopReason::Cancelled,
             ));
         });
     });
@@ -701,7 +701,7 @@ async fn stopping_safety_net_does_not_fire_after_natural_recovery(cx: &mut TestA
         let thread = session.read(cx).acp_thread().cloned().expect("live thread");
         thread.update(cx, |_thread, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::Cancelled,
+                agent_client_protocol::schema::v1::StopReason::Cancelled,
             ));
         });
     });
@@ -767,7 +767,7 @@ async fn turn_complete_event_transitions_running_to_idle(cx: &mut TestAppContext
     cx.update(|cx| {
         acp_thread.update(cx, |_thread, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
             ));
         });
     });
@@ -796,7 +796,7 @@ async fn turn_complete_event_transitions_running_to_idle(cx: &mut TestAppContext
 #[gpui::test]
 async fn send_while_waiting_for_confirmation_unblocks_the_turn(cx: &mut TestAppContext) {
     use acp_thread::{AgentThreadEntry, ToolCallStatus};
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
 
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
@@ -916,7 +916,7 @@ async fn send_while_waiting_for_confirmation_unblocks_the_turn(cx: &mut TestAppC
     cx.update(|cx| {
         acp_thread.update(cx, |_thread, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
             ));
         });
     });
@@ -1019,8 +1019,8 @@ async fn streaming_activity_clears_latched_errored_state(cx: &mut TestAppContext
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("recovering".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("recovering".to_string()),
                 ),
                 false,
                 cx,
@@ -1039,8 +1039,8 @@ async fn streaming_activity_clears_latched_errored_state(cx: &mut TestAppContext
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(" more".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(" more".to_string()),
                 ),
                 false,
                 cx,
@@ -1058,7 +1058,7 @@ async fn tool_authorization_request_transitions_to_awaiting_input(cx: &mut TestA
     cx.update(|cx| {
         acp_thread.update(cx, |_thread, cx| {
             cx.emit(acp_thread::AcpThreadEvent::ToolAuthorizationRequested(
-                agent_client_protocol::schema::ToolCallId::new("test-tool"),
+                agent_client_protocol::schema::v1::ToolCallId::new("test-tool"),
             ));
         });
     });
@@ -1167,8 +1167,8 @@ async fn queued_messages_get_per_message_timestamp_prefix(cx: &mut TestAppContex
                     notified: false,
                 };
             });
-            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new("first thought".to_string()),
+            let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("first thought".to_string()),
             )];
             store
                 .send_message_blocks(session_id, blocks, cx)
@@ -1184,7 +1184,7 @@ async fn queued_messages_get_per_message_timestamp_prefix(cx: &mut TestAppContex
             assert_eq!(s.pending_messages.len(), 1, "one queued bundle after first enqueue");
             let bundle = &s.pending_messages[0];
             let first = match &bundle.blocks[0] {
-                agent_client_protocol::schema::ContentBlock::Text(t) => t.text.as_str(),
+                agent_client_protocol::schema::v1::ContentBlock::Text(t) => t.text.as_str(),
                 other => panic!("first block must be Text, got {other:?}"),
             };
             assert!(first.starts_with('['), "first block starts with timestamp prefix, got {first:?}");
@@ -1197,7 +1197,7 @@ async fn queued_messages_get_per_message_timestamp_prefix(cx: &mut TestAppContex
                 .blocks
                 .iter()
                 .filter_map(|b| match b {
-                    agent_client_protocol::schema::ContentBlock::Text(t) => Some(t.text.clone()),
+                    agent_client_protocol::schema::v1::ContentBlock::Text(t) => Some(t.text.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -1217,8 +1217,8 @@ async fn queued_messages_get_per_message_timestamp_prefix(cx: &mut TestAppContex
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new("follow-up".to_string()),
+            let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("follow-up".to_string()),
             )];
             store
                 .send_message_blocks(session_id, blocks, cx)
@@ -1237,7 +1237,7 @@ async fn queued_messages_get_per_message_timestamp_prefix(cx: &mut TestAppContex
                 .blocks
                 .iter()
                 .filter_map(|b| match b {
-                    agent_client_protocol::schema::ContentBlock::Text(t) => Some(t.text.clone()),
+                    agent_client_protocol::schema::v1::ContentBlock::Text(t) => Some(t.text.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -1250,7 +1250,7 @@ async fn queued_messages_get_per_message_timestamp_prefix(cx: &mut TestAppContex
                 .blocks
                 .iter()
                 .filter(|b| matches!(b,
-                    agent_client_protocol::schema::ContentBlock::Text(t)
+                    agent_client_protocol::schema::v1::ContentBlock::Text(t)
                         if t.text.starts_with('[')
                             && t.text.strip_prefix('[')
                                 .and_then(|s| s.split_once("] "))
@@ -3000,8 +3000,8 @@ async fn cold_send_unknown_solution_returns_structured_error(cx: &mut TestAppCon
     let task = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new("hello".to_string()),
+            let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
             )];
             store.send_message_blocks(session_id, blocks, cx)
         })
@@ -3038,8 +3038,8 @@ async fn hot_send_does_not_enter_wake_path(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
-            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new("hot path".to_string()),
+            let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("hot path".to_string()),
             )];
             // Detach — we only care that the synchronous state flip
             // happened. The actual prompt path uses the MockConnection
@@ -3075,8 +3075,8 @@ async fn append_stamps_entry_created_ms_once_per_index(cx: &mut TestAppContext) 
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -3089,8 +3089,8 @@ async fn append_stamps_entry_created_ms_once_per_index(cx: &mut TestAppContext) 
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("world".to_string()),
                 ),
                 false,
                 cx,
@@ -3116,8 +3116,8 @@ async fn append_stamps_entry_created_ms_once_per_index(cx: &mut TestAppContext) 
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(" more text".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(" more text".to_string()),
                 ),
                 false,
                 cx,
@@ -3202,8 +3202,8 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -3216,8 +3216,8 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("world".to_string()),
                 ),
                 false,
                 cx,
@@ -3233,8 +3233,8 @@ async fn transcript_mutations_persist_entry_rows(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(" more".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(" more".to_string()),
                 ),
                 false,
                 cx,
@@ -3288,8 +3288,8 @@ async fn ephemeral_session_is_never_persisted(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
                         "private supervisor reasoning".to_string(),
                     ),
                 ),
@@ -3331,8 +3331,8 @@ async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut Test
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -3342,8 +3342,8 @@ async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut Test
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("world".to_string()),
                 ),
                 false,
                 cx,
@@ -3373,8 +3373,8 @@ async fn append_after_resumed_unstamped_history_does_not_fabricate(cx: &mut Test
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("new".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("new".to_string()),
                 ),
                 cx,
             );
@@ -3416,8 +3416,8 @@ async fn reset_context_clears_entries(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -3441,7 +3441,7 @@ async fn reset_context_clears_entries(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |_, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
             ));
         })
     });
@@ -3481,8 +3481,8 @@ async fn entries_removed_truncates_entries(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("first".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("first".to_string()),
                 ),
                 cx,
             );
@@ -3493,8 +3493,8 @@ async fn entries_removed_truncates_entries(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("second".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("second".to_string()),
                 ),
                 false,
                 cx,
@@ -3553,8 +3553,8 @@ async fn rotate_context_clears_entries(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -3611,8 +3611,8 @@ async fn entry_updated_burst_coalesces_then_force_emits(cx: &mut TestAppContext)
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("seed".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("seed".to_string()),
                 ),
                 cx,
             );
@@ -3735,7 +3735,7 @@ async fn entry_updated_burst_coalesces_then_force_emits(cx: &mut TestAppContext)
 /// cover the flushed tail.
 #[gpui::test]
 async fn final_streamed_message_is_visible_to_delta_poll_after_stop(cx: &mut TestAppContext) {
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
 
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
@@ -3937,7 +3937,7 @@ async fn final_streamed_message_is_visible_to_delta_poll_after_stop(cx: &mut Tes
 /// this asserts zero appends right after `Stopped` and the test fails.
 #[gpui::test]
 async fn stopped_flushes_pending_entry_update_debounce_immediately(cx: &mut TestAppContext) {
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
 
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
@@ -4037,7 +4037,7 @@ async fn stopped_flushes_pending_entry_update_debounce_immediately(cx: &mut Test
 /// class this fix closes.
 #[gpui::test]
 async fn errored_flushes_pending_entry_update_debounce_immediately(cx: &mut TestAppContext) {
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
 
     let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
 
@@ -4129,7 +4129,7 @@ fn native_mock_binary() -> PathBuf {
 #[gpui::test]
 async fn send_during_running_on_native_connection_routes_to_queue(cx: &mut TestAppContext) {
     use acp_thread::AgentConnection;
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     use agent_servers::{AgentServer, AgentServerDelegate};
     use claude_native::{ClaudeNativeAgentServer, ClaudeNativeConnection};
     use project::AgentId;
@@ -4275,7 +4275,7 @@ async fn send_during_running_on_native_connection_routes_to_queue(cx: &mut TestA
 #[gpui::test]
 async fn send_while_parked_on_background_work_injects_instead_of_queueing(cx: &mut TestAppContext) {
     use acp_thread::AgentConnection;
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     use agent_servers::{AgentServer, AgentServerDelegate};
     use claude_native::{ClaudeNativeAgentServer, ClaudeNativeConnection};
     use project::AgentId;
@@ -4450,7 +4450,7 @@ async fn send_while_parked_on_background_work_injects_instead_of_queueing(cx: &m
 #[gpui::test]
 async fn registered_store_pull_drains_queue_and_returns_followup_text(cx: &mut TestAppContext) {
     use acp_thread::AgentConnection;
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     use agent_servers::{AgentServer, AgentServerDelegate};
     use claude_native::ClaudeNativeConnection;
     use project::AgentId;
@@ -5023,7 +5023,7 @@ async fn idle_flush_prepends_not_a_reply_hint(cx: &mut TestAppContext) {
     cx.update(|cx| {
         thread.update(cx, |_thread, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
             ));
         });
     });
@@ -5056,7 +5056,7 @@ async fn idle_flush_prepends_not_a_reply_hint(cx: &mut TestAppContext) {
                     .chunks
                     .iter()
                     .filter_map(|b| {
-                        if let agent_client_protocol::schema::ContentBlock::Text(t) = b {
+                        if let agent_client_protocol::schema::v1::ContentBlock::Text(t) = b {
                             Some(t.text.as_str())
                         } else {
                             None
@@ -5090,8 +5090,8 @@ async fn new_entry_rebuilds_session_entries(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -5103,8 +5103,8 @@ async fn new_entry_rebuilds_session_entries(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("world".to_string()),
                 ),
                 false,
                 cx,
@@ -5148,8 +5148,8 @@ async fn entry_updated_preserves_created_ms(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -5161,8 +5161,8 @@ async fn entry_updated_preserves_created_ms(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("world".to_string()),
                 ),
                 false,
                 cx,
@@ -5228,8 +5228,8 @@ async fn mod_seq_stamped_on_live_mutations(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -5241,8 +5241,8 @@ async fn mod_seq_stamped_on_live_mutations(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("world".to_string()),
                 ),
                 false,
                 cx,
@@ -5347,8 +5347,8 @@ async fn entry_updated_emits_the_global_entry_index(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("live".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("live".to_string()),
                 ),
                 cx,
             );
@@ -5446,8 +5446,8 @@ async fn new_entry_after_cold_prefix_lands_at_live_base(cx: &mut TestAppContext)
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("live msg".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("live msg".to_string()),
                 ),
                 cx,
             );
@@ -5513,8 +5513,8 @@ async fn enqueue_bumps_queue_watermark(cx: &mut TestAppContext) {
             });
             let queue_seq_before = session.read(cx).queue_seq;
             assert_eq!(queue_seq_before, 0, "fresh session starts with queue_seq 0");
-            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new("follow-up".to_string()),
+            let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("follow-up".to_string()),
             )];
             store
                 .send_message_blocks(session_id, blocks, cx)
@@ -5558,7 +5558,7 @@ async fn subagent_spawn_bumps_subagents_watermark(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_wm_1",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Worker"),
                     None,
                 ),
@@ -5599,7 +5599,7 @@ async fn idle_transition_gc_bumps_subagents_watermark(cx: &mut TestAppContext) {
                 make_task_tool_call(
                     "toolu_gc_1",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Worker"),
                     None,
                 ),
@@ -5703,7 +5703,7 @@ async fn idle_transition_gc_closes_stranded_teammate_stream(cx: &mut TestAppCont
                 make_task_tool_call(
                     "toolu_gc_2",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Worker"),
                     None,
                 ),
@@ -5795,7 +5795,7 @@ async fn idle_transition_gc_excludes_live_async_agent_teammate(cx: &mut TestAppC
                 make_task_tool_call(
                     "toolu_async_gc",
                     "Agent",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Async worker"),
                     None,
                 ),
@@ -5907,7 +5907,7 @@ async fn idle_transition_gc_does_not_bump_last_activity_at(cx: &mut TestAppConte
                 make_task_tool_call(
                     "toolu_gc_clock",
                     "Task",
-                    agent_client_protocol::schema::ToolCallStatus::InProgress,
+                    agent_client_protocol::schema::v1::ToolCallStatus::InProgress,
                     Some("Worker"),
                     None,
                 ),
@@ -6122,8 +6122,8 @@ async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -6151,7 +6151,7 @@ async fn reset_context_bumps_epoch(cx: &mut TestAppContext) {
     cx.update(|cx| {
         acp_thread.update(cx, |_, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
             ));
         })
     });
@@ -6202,8 +6202,8 @@ async fn reset_context_with_queue_bumps_epoch_and_queue_watermark(cx: &mut TestA
                     notified: false,
                 };
             });
-            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new("queued".to_string()),
+            let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("queued".to_string()),
             )];
             store
                 .send_message_blocks(session_id, blocks, cx)
@@ -6289,8 +6289,8 @@ async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppCont
         acp_thread.update(cx, |t, cx| {
             t.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("hello".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
                 ),
                 cx,
             );
@@ -6300,8 +6300,8 @@ async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppCont
     cx.update(|cx| {
         acp_thread.update(cx, |t, cx| {
             t.push_assistant_content_block(
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("world".to_string()),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new("world".to_string()),
                 ),
                 false,
                 cx,
@@ -6334,7 +6334,7 @@ async fn transcript_clear_resets_stale_rows_and_bumps_epoch(cx: &mut TestAppCont
     cx.update(|cx| {
         acp_thread.update(cx, |_, cx| {
             cx.emit(acp_thread::AcpThreadEvent::Stopped(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
             ));
         })
     });
@@ -6734,7 +6734,7 @@ fn classify_done_reasoning_park_vs_completion() {
 #[test]
 fn tail_unanswered_user_detection() {
     use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind, SystemEntryLevel};
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     let ent = |kind| {
         std::sync::Arc::new(SessionEntry {
             created_ms: 0,
@@ -7862,8 +7862,10 @@ async fn reset_context_recovers_error_and_rejects_busy_without_losing_history(
         thread.update(cx, |thread, cx| {
             thread.push_user_content_block(
                 Some(acp_thread::UserMessageId::new()),
-                agent_client_protocol::schema::ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new("keep until reset succeeds"),
+                agent_client_protocol::schema::v1::ContentBlock::Text(
+                    agent_client_protocol::schema::v1::TextContent::new(
+                        "keep until reset succeeds",
+                    ),
                 ),
                 cx,
             );

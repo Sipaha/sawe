@@ -19,12 +19,13 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   check-hotfix-reviews:
-    if: false # sawe: not applicable
+    if: false # sawe: upstream automation is disabled
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     timeout-minutes: 5
     env:
       REPO: ${{ github.repository }}

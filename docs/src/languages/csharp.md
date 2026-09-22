@@ -123,9 +123,7 @@ csharp-ls can be configured in a Zed settings file with:
     "csharp-ls": {
       "binary": {
         "path": "/path/to/csharp-ls",
-        "arguments": [
-          /* add extra arguments */
-        ]
+        "arguments": [/* add extra arguments */]
       },
       "settings": {
         // Default values are shown below.

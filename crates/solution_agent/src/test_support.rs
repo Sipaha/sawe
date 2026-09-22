@@ -36,7 +36,7 @@ pub struct PromptGate(pub async_channel::Receiver<()>);
 /// gate before returning `Ok(EndTurn)`.
 pub struct MockConnection {
     next_session: Cell<u64>,
-    pub session_meta: std::cell::RefCell<Option<agent_client_protocol::schema::Meta>>,
+    pub session_meta: std::cell::RefCell<Option<agent_client_protocol::schema::v1::Meta>>,
     prompt_gate: parking_lot::Mutex<Option<PromptGate>>,
     // Counts `cancel()` calls so tests can assert the store forwarded a stop
     // exactly once (and didn't double-forward on a repeated cancel).
@@ -50,13 +50,13 @@ pub struct MockConnection {
     /// Sessions the store believes this connection still owns. A real
     /// connection keeps its subprocess handles here; the mock keeps only the
     /// ids, which is enough to assert that the app-quit reaper asked for them.
-    live_sessions: Arc<parking_lot::Mutex<Vec<agent_client_protocol::schema::SessionId>>>,
+    live_sessions: Arc<parking_lot::Mutex<Vec<agent_client_protocol::schema::v1::SessionId>>>,
     reaped: Arc<AtomicUsize>,
 }
 
 impl MockConnection {
     /// Ids handed out by `new_session` and not yet closed or reaped.
-    pub fn live_sessions(&self) -> Vec<agent_client_protocol::schema::SessionId> {
+    pub fn live_sessions(&self) -> Vec<agent_client_protocol::schema::v1::SessionId> {
         self.live_sessions.lock().clone()
     }
 
@@ -123,7 +123,7 @@ impl acp_thread::AgentConnection for MockConnection {
         self: Rc<Self>,
         project: gpui::Entity<project::Project>,
         work_dirs: util::path_list::PathList,
-        meta: Option<agent_client_protocol::schema::Meta>,
+        meta: Option<agent_client_protocol::schema::v1::Meta>,
         cx: &mut App,
     ) -> Task<anyhow::Result<gpui::Entity<acp_thread::AcpThread>>> {
         *self.session_meta.borrow_mut() = meta;
@@ -144,7 +144,7 @@ impl acp_thread::AgentConnection for MockConnection {
     ) -> Task<anyhow::Result<gpui::Entity<acp_thread::AcpThread>>> {
         let n = self.next_session.get();
         self.next_session.set(n + 1);
-        let session_id = agent_client_protocol::schema::SessionId::new(format!("mock-{n}"));
+        let session_id = agent_client_protocol::schema::v1::SessionId::new(format!("mock-{n}"));
         self.live_sessions.lock().push(session_id.clone());
         let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
         let connection: Rc<dyn acp_thread::AgentConnection> = self;
@@ -157,7 +157,9 @@ impl acp_thread::AgentConnection for MockConnection {
                 project,
                 action_log,
                 session_id,
-                watch::Receiver::constant(agent_client_protocol::schema::PromptCapabilities::new()),
+                watch::Receiver::constant(
+                    agent_client_protocol::schema::v1::PromptCapabilities::new(),
+                ),
                 cx,
             )
         });
@@ -176,7 +178,7 @@ impl acp_thread::AgentConnection for MockConnection {
     }
     fn close_session(
         self: Rc<Self>,
-        session_id: &agent_client_protocol::schema::SessionId,
+        session_id: &agent_client_protocol::schema::v1::SessionId,
         _cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
         self.live_sessions.lock().retain(|id| id != session_id);
@@ -188,7 +190,7 @@ impl acp_thread::AgentConnection for MockConnection {
     }
     fn resume_session(
         self: Rc<Self>,
-        session_id: agent_client_protocol::schema::SessionId,
+        session_id: agent_client_protocol::schema::v1::SessionId,
         project: gpui::Entity<project::Project>,
         work_dirs: util::path_list::PathList,
         _title: Option<SharedString>,
@@ -211,28 +213,29 @@ impl acp_thread::AgentConnection for MockConnection {
                 project,
                 action_log,
                 session_id,
-                watch::Receiver::constant(agent_client_protocol::schema::PromptCapabilities::new()),
+                watch::Receiver::constant(
+                    agent_client_protocol::schema::v1::PromptCapabilities::new(),
+                ),
                 cx,
             )
         });
         Task::ready(Ok(thread))
     }
-    fn auth_methods(&self) -> &[agent_client_protocol::schema::AuthMethod] {
+    fn auth_methods(&self) -> &[agent_client_protocol::schema::v1::AuthMethod] {
         &[]
     }
     fn authenticate(
         &self,
-        _method: agent_client_protocol::schema::AuthMethodId,
+        _method: agent_client_protocol::schema::v1::AuthMethodId,
         _cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
         Task::ready(Ok(()))
     }
     fn prompt(
         &self,
-        _user_message_id: acp_thread::UserMessageId,
-        _params: agent_client_protocol::schema::PromptRequest,
+        _params: agent_client_protocol::schema::v1::PromptRequest,
         cx: &mut App,
-    ) -> Task<anyhow::Result<agent_client_protocol::schema::PromptResponse>> {
+    ) -> Task<anyhow::Result<agent_client_protocol::schema::v1::PromptResponse>> {
         let gate = self.prompt_gate.lock().clone();
         match gate {
             None => Task::ready(Err(anyhow::anyhow!("not used in this test"))),
@@ -242,14 +245,14 @@ impl acp_thread::AgentConnection for MockConnection {
             // mid-flight" (e.g. for the rotation-race regression in
             // `send_message_blocks`).
             Some(gate) => cx.spawn(async move |_| match gate.0.recv().await {
-                Ok(()) => Ok(agent_client_protocol::schema::PromptResponse::new(
-                    agent_client_protocol::schema::StopReason::EndTurn,
+                Ok(()) => Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+                    agent_client_protocol::schema::v1::StopReason::EndTurn,
                 )),
                 Err(_) => Err(anyhow::anyhow!("mock prompt failed (gate closed)")),
             }),
         }
     }
-    fn cancel(&self, _session_id: &agent_client_protocol::schema::SessionId, _cx: &mut App) {
+    fn cancel(&self, _session_id: &agent_client_protocol::schema::v1::SessionId, _cx: &mut App) {
         self.cancel_count.fetch_add(1, Ordering::SeqCst);
     }
     fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {

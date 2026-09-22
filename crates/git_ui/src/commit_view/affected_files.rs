@@ -7,8 +7,9 @@
 use std::collections::{BTreeMap, HashSet};
 
 use editor::Editor;
-use git::repository::{CommitFile, CommitFileStatus};
+use git::repository::CommitFileStatus;
 use gpui::{AnyElement, Entity, ParentElement, Styled, prelude::*};
+use project::git_store::CommitFile;
 use ui::prelude::*;
 
 use crate::GitStatusIcon;

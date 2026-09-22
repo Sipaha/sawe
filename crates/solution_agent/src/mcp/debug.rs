@@ -1,6 +1,6 @@
 //! Debug-only `solution_agent` MCP verification tool (`seed_cold_session`).
 //! Relocated verbatim from the former monolithic `mcp.rs`.
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use context_server::listener::{McpServerTool, ToolResponse};
 use context_server::types::ToolResponseContent;

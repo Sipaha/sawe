@@ -1,11 +1,11 @@
 ---
-title: Getting Started with Zed
-description: Get started with Zed, the fast open-source code editor. Essential commands, environment setup, and navigation basics.
+title: Getting Started with Sawe
+description: Get started with Sawe. Essential commands, environment setup, and navigation basics.
 ---
 
 # Getting Started
 
-Zed is an open-source code editor with built-in collaboration and AI tools.
+Sawe is a code editor based on Zed, with multi-project Solutions and native Claude and Codex sessions.
 
 This guide covers the essential commands, environment setup, and navigation basics.
 
@@ -13,21 +13,21 @@ This guide covers the essential commands, environment setup, and navigation basi
 
 ### Welcome Page
 
-When you open Zed without a folder, you see the welcome page in the main editor area. The welcome page offers quick actions to open a folder, clone a repository, or view documentation. Once you open a folder or file, the welcome page disappears. If you split the editor into multiple panes, the welcome page appears only in the center pane when empty—other panes show a standard empty state.
-
-To reopen the welcome page, close all items in the center pane or use the command palette to search for "Welcome".
+Sawe opens a separate launcher window with Solution controls and recent
+Solutions. Opening a Solution opens its workspace. The launcher remains separate
+from editor panes and docks. Use {#action zed::ShowWelcome} to reopen it.
 
 ### 1. Open a Project
 
 Open a folder from the command line:
 
 ```sh
-zed ~/projects/my-app
+sawe ~/projects/my-app
 ```
 
-Or use `Cmd+O` (macOS) / `Ctrl+O` (Linux/Windows) to open a folder from within Zed.
+Or use `Cmd+O` (macOS) / `Ctrl+O` (Linux/Windows) to open a folder from within Sawe.
 
-By default, new projects open in your current window's threads sidebar. To open in a new window instead, use `zed -n ~/projects/my-app` or press `Cmd+Enter` when selecting from Open Recent. See [Windows & Projects](./windows-and-projects.md) for more details.
+Solution tabs in the title bar switch between open Solutions. To open in a new window instead, use `sawe -n ~/projects/my-app` or press `Cmd+Enter` when selecting from Open Recent. See [Windows & Projects](./windows-and-projects.md) for more details.
 
 ### 2. Learn the Essential Commands
 
@@ -40,11 +40,11 @@ By default, new projects open in your current window's threads sidebar. To open 
 | Toggle terminal | `` Ctrl+` ``  | `` Ctrl+` ``   |
 | Open settings   | `Cmd+,`       | `Ctrl+,`       |
 
-The command palette (`Cmd+Shift+P`) is your gateway to every action in Zed. If you forget a shortcut, search for it there.
+The [command palette](./command-palette.md) (`Cmd+Shift+P`) is your gateway to every action in Sawe. If you forget a shortcut, search for it there.
 
 ### Panel Layout
 
-Use **Panel Layout > Agentic** from the user menu in the title bar (or the {#action workspace::UseAgenticLayout} action) when you want the Agent Panel and Threads Sidebar next to each other on the left. Use **Panel Layout > Classic** (or {#action workspace::UseClassicLayout}) to restore the editor-oriented layout.
+Sawe uses a project toolbar above the editor and a Solution band below it. The band hosts native Claude or Codex sessions beside terminal, Git history, or debugger utilities. The upstream Agent Panel and Threads Sidebar are not enabled.
 
 ### 3. Configure Your Editor
 
@@ -53,12 +53,12 @@ Open the Settings Editor with `Cmd+,` (macOS) or `Ctrl+,` (Linux/Windows). Searc
 Common first changes:
 
 - **Theme**: Press `Cmd+K Cmd+T` (macOS) or `Ctrl+K Ctrl+T` (Linux/Windows) to open the theme selector
-- **Font**: Search for `buffer_font_family` in Settings
+- **Font**: Search for [`buffer_font_family`](./reference/all-settings.md#buffer-font-family) in Settings
 - **Format on save**: Search for `format_on_save` and set to `on`
 
 ### 4. Set Up Your Language
 
-Zed includes built-in support for many languages. For others, install the extension:
+Sawe includes built-in support for many languages. For others, install the extension:
 
 1. Open Extensions with `Cmd+Shift+X` (macOS) or `Ctrl+Shift+X` (Linux/Windows)
 2. Search for your language
@@ -68,9 +68,12 @@ See [Languages](./languages.md) for language-specific setup instructions.
 
 ### 5. Try AI Features
 
-Zed includes built-in AI assistance. Open the Agent Panel with `Cmd+Shift+A` (macOS) or `Ctrl+Shift+A` (Linux/Windows) to start a conversation, or use `Cmd+Enter` (macOS) / `Ctrl+Enter` (Linux/Windows) for inline assistance.
+Create a native Claude or Codex session in the Solution band. Sessions share the
+Solution's member-project context and keep separate conversations. Authentication
+uses the installed provider CLI. See [Native AI Sessions](./ai/native-sessions.md).
 
-See [AI Overview](./ai/overview.md) to configure providers and learn what's possible.
+The inherited upstream Agent Panel, sign-in, and cloud-hosted agent UI are disabled.
+Inline assistance and API-key providers remain available where configured.
 
 ## Coming from Another Editor?
 
@@ -78,9 +81,9 @@ We have dedicated guides for switching from other editors:
 
 - [VS Code](./migrate/vs-code.md) — Import settings, map keybindings, find equivalent features
 - [IntelliJ IDEA](./migrate/intellij.md) — Adapt to Zed's approach to navigation and refactoring
-- [PyCharm](./migrate/pycharm.md) — Set up Python development in Zed
+- [PyCharm](./migrate/pycharm.md) — Set up Python development in Sawe
 - [WebStorm](./migrate/webstorm.md) — Configure JavaScript/TypeScript workflows
-- [RustRover](./migrate/rustrover.md) — Rust development in Zed
+- [RustRover](./migrate/rustrover.md) — Rust development in Sawe
 
 You can also enable familiar keybindings:
 
