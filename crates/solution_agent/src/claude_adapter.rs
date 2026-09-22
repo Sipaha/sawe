@@ -2,10 +2,20 @@ use gpui::SharedString;
 use solutions::Solution;
 use ui::IconName;
 
-use crate::adapter::SolutionAgentAdapter;
+use crate::adapter::{AgentBrand, SolutionAgentAdapter};
 use crate::model::AgentServerId;
 
 pub const CLAUDE_ACP_AGENT_ID: &str = "claude-acp";
+
+/// Claude's chrome in the "new session" picker, on its session tabs and in
+/// the status row. See [`AgentBrand`] for why the model list carries no
+/// version numbers.
+pub const BRAND: AgentBrand = AgentBrand {
+    name: "Claude",
+    vendor: "Anthropic",
+    logo: IconName::AiClaude,
+    models: "Sonnet · Opus · Haiku",
+};
 
 pub struct ClaudeAcpAdapter;
 
@@ -15,11 +25,11 @@ impl SolutionAgentAdapter for ClaudeAcpAdapter {
     }
 
     fn display_name(&self) -> SharedString {
-        SharedString::from("Claude")
+        SharedString::from(BRAND.name)
     }
 
     fn icon(&self) -> IconName {
-        IconName::AiClaude
+        BRAND.logo
     }
 
     fn supports_resume(&self) -> bool {

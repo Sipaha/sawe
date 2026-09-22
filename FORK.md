@@ -141,7 +141,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/ui/src/components/scrollbar.rs`, `crates/gpui/src/elements/div.rs` | **(decision #82)** `track_anchor` / `tracks_scroll_handle` + `nested_in_scroll_container`; gpui gains `Interactivity::tracked_scroll_handle()` and `PartialEq` for `ScrollHandle`. | `ui` / `gpui` |
 | `crates/git_ui/src/rollback_modal.rs` | **New.** IDEA's Rollback Changes dialog: checkbox tree over the affected files (reusing the git panel's `TreeViewState::build_tree_entries`), "N modified" summary, "Delete local copies of added files", Rollback / Close. Only checked files are rolled back. | `git_ui` |
 | `crates/workspace/src/mcp/windows.rs` | `windows.click_at` gained a `clicks` parameter — two separate calls are not a double click, so a handler branching on `click_count()` was untestable. Also `windows.resize` (content size in logical pixels): the headless window is fixed at 1920x1080, which hid the Solution band's status-bar overflow from every agent-driven check. It calls `Window::bounds_changed` after `Window::resize` because the headless platform window mutates its bounds without firing the resize callback. | `workspace` |
-| `crates/workspace/src/status_bar.rs` | `flex_none` on the row — it silently absorbed the workspace column's overflow (default `flex-shrink: 1`) and an over-tall Solution band ate it. The row is also ~10% taller than upstream's 30px (`STATUS_BAR_HEIGHT`), with its contents scaled to match by a rem override (decision 138). | `workspace` |
+| `crates/workspace/src/status_bar.rs` | `flex_none` on the row — it silently absorbed the workspace column's overflow (default `flex-shrink: 1`) and an over-tall Solution band ate it. The row is also 1.2× upstream's 30px (`STATUS_BAR_HEIGHT` = 36px, after two ~10% bumps), with its contents scaled to match by a rem override (decision 138). | `workspace` |
 | `crates/editor/src/split_connectors.rs` | Connector ribbons for the side-by-side diff. **(decision #62)** `ribbon_edges` gives a collapsed insertion edge the insertion rule's real 2px extent so the ribbon and the rule join flush. | `editor` |
 | `crates/editor/src/split.rs` | **(decision #79)** The left pane mirrors the right pane's `show_headers()` instead of guessing from `is_singleton()`. | `editor` |
 | `crates/git_ui/src/solo_diff_view.rs`, `crates/git_ui/src/project_diff.rs`, `crates/git_ui/src/commit_view.rs` | **(decision #78)** Diff toolbars lost every staging/commit button and gained the `N difference(s)` count (`difference_count_label` + `HunkCountCache`). | `git_ui` |
@@ -1339,12 +1339,16 @@ proportion. `DEFAULT_BAND_HEIGHT = 320` (also what double-clicking the top edge 
 **The window-relative ceiling (`MAX_BAND_HEIGHT_FRACTION = 0.8`, floored by `viewport - BAND_RESERVED_HEIGHT`)
 is applied at render, as a pure function of (stored height, live viewport height), and never persisted.**
 The fraction alone is not enough, because it is a fraction of the *whole window* while the band only competes
-for what is left after the chrome: title bar 30 + project toolbar 30 + status bar 30 + two 1px workspace
+for what is left after the chrome: title bar + project toolbar + the status bar + two 1px workspace
 borders. The band is `flex_none`; the project zone is `flex_1` with basis 0 (shrinks to 0 first) and the status
-bar is a plain 30px row with the default `flex-shrink: 1` — so an over-tall band zeroes the editor and then eats
-the status bar. That happens for every window shorter than ~460px (`0.8H + 30 > H - 62`), which is reachable:
-`window_min_size` is 240. Hence `BAND_RESERVED_HEIGHT = 150` (~92px of chrome + ~58px so the project zone is
-still an editor rather than a hairline); re-derive it if any chrome height changes. Below ~290px of window the
+bar is a fixed row — so an over-tall band zeroes the editor and then eats
+the status bar. That happens for every window shorter than ~460px, which is reachable:
+`window_min_size` is 240. Hence `BAND_RESERVED_HEIGHT` — **156 today**: 61px of chrome above the band, plus
+`workspace::STATUS_BAR_HEIGHT` (36px, decision 138), plus 59px so the project zone is
+still an editor rather than a hairline. Do not copy those numbers around: `band_reserved_height_terms()`
+returns the three terms and `the_band_reserve_is_derived_from_the_live_status_bar_height` asserts their sum
+against the live `STATUS_BAR_HEIGHT`, so a change to the bar's height fails that test rather than silently
+leaving the reserve describing chrome that no longer exists (it went 150 → 153 → 156 that way). Below ~290px of window the
 reserve and `MIN_BAND_HEIGHT` cannot both hold and the floor deliberately wins. The tempting shape — notice during layout that the
 band no longer fits, clamp it, and save the clamped value — cannot work here: `Window::invalidate_view` returns
 `false` and pushes no `Effect::Notify` while `draw_phase != DrawPhase::None`, so a `cx.notify()` raised from
@@ -2899,8 +2903,11 @@ the one hole these tests still have) are in
 
 ### 138. The status bar is scaled by one rem override, and the AI session tabs take their height from a button metric
 
-The maintainer asked for a status bar about 10% taller with its contents grown to match.
-The row height is one literal (`workspace::status_bar::STATUS_BAR_HEIGHT`, 30px → 33px), but
+The maintainer asked for a status bar about 10% taller with its contents grown to match —
+twice, as it turned out: 30px → 33px (2026-09-03) and 33px → 36px (2026-09-22), the rem
+override tracking it at 1.1× then 1.2×. The two constants are one ratio written twice and
+move together.
+The row height is one literal (`workspace::status_bar::STATUS_BAR_HEIGHT`), but
 "everything inside it" is not: the bar hosts a dozen items owned by a dozen crates
 (`search`, `go_to_line`, `diagnostics`, `language_tools`, `git_ui`, `remote_control_ui`,
 `solution_agent`, …), each sizing itself with `LabelSize` / `IconSize` / `ButtonSize` /
@@ -2912,9 +2919,10 @@ What makes the one-line version possible is that every one of those tokens resol
 `rems_from_px` — they are `Rems`, not `Pixels`, and `Rems` are resolved against the window's
 rem size *at layout time*. So `ui::utils::WithRemSize` (already in the tree, used by the agent
 panel, picker and `ContextMenu` to *reset* the rem inside a buffer-font subtree) wrapped
-around the bar with `ui_font_size * 1.1` scales labels, icons, button heights, padding and
-gaps by exactly one factor. Measured on real pixels: the bar band goes 30 rows → 33, and the
-"Remote Control" label 98×10px → 109×11px.
+around the bar with `ui_font_size * STATUS_BAR_UI_SCALE` scales labels, icons, button
+heights, padding and gaps by exactly one factor. Measured on real pixels: the bar band goes
+30 rows → 33 → 36, the "Remote Control" label 98×10px → 109×11px, and an AI session tab pill
+22px → 24 → 26.
 
 Two things the override deliberately does not reach, and they are the reason it is safe:
 `ui::ContextMenu` re-establishes `ui_font_size` for its own subtree, so a right-click menu
@@ -5373,3 +5381,45 @@ in `project::lsp_workspace_cache` and one in `project::solution_roots`
 (mutation-checked: the in-use set, the generation key, its root separator, the
 TTL switch, the unstamped-generation skip, the argument append and the
 longest-prefix match each fail their own test).
+
+### 198. A provider is a logo, a name and a model line — written once, read by three surfaces
+
+The maintainer, on the `+` picker in the session tab strip: *«какие-то крошечные у нас
+варианты в дропдауне при создании новой сессии»* — two one-line `ContextMenu` entries reading
+"Codex (OpenAI)" and "Claude (Anthropic)", identical in shape, distinguishable only by
+reading them. And on the strip itself: nothing said which agent a tab was talking to, because
+session titles are generated from the conversation and never name the provider.
+
+What: a `solution_agent::adapter::AgentBrand` const per agent — `name`, `vendor`, `logo`
+(`IconName`) and `models`, a `·`-separated list with the **default first**. The picker rows
+became `ContextMenu::custom_entry`s: logo, name + greyed vendor, and the model line greyed
+underneath, which takes the row from ~16px to ~38px without any height having to be declared
+(`ListItem` applies an explicit height only when one is set, and the menu never sets one).
+Each session tab gained the same logo, left of its state dot. `status_row`'s hardcoded
+`"Codex"`/`"Claude"` match now reads the same const.
+
+Why a free function over the id (`adapter::agent_brand(&str)`) rather than the obvious
+`AdapterRegistry` lookup: the registry is not reachable where the chrome renders. The store's
+test harness registers **no** adapters, so every paint test would have silently lost its
+logos, and a session restored from disk can name an agent this build no longer ships — which
+now falls back to the state dot alone rather than to a wrong logo. The adapters' own
+`display_name()` / `icon()` delegate to the same const, so the registry and the chrome cannot
+disagree about a provider.
+
+*Rules out:* sourcing the model line from the live `ModelCatalog`. It is accurate — it comes
+from the agent CLI at probe time — but it is empty until something has probed (probing spawns
+a process, which a dropdown cannot do), and its order is the CLI's, so "default first" would
+have been a promise only the fallback kept. The const is instead deliberately **version-free**
+("Sonnet · Opus · Haiku", not "Sonnet 4.6"): family names are what both CLIs' pickers are
+keyed on and have been stable for a year, while version numbers would be stale before the
+next release.
+
+How to apply: a new agent adds a `BRAND` const beside its adapter and one arm in
+`agent_brand`; the picker, the tabs and the status row pick it up with no further edits. The
+logos are painted by `ui::Icon`, which renders an SVG as a monochrome mask — the hardcoded
+fills inside `assets/icons/ai_open_ai.svg` / `ai_claude.svg` are ignored, so both marks follow
+the theme. Guarded by two paint tests in `session_tab_strip`: the picker's rows assert both
+logos paint and that a row is taller than a single-label entry, and the tab test seeds one
+session per provider and asserts each mark lands **inside its own pill** while the pill keeps
+`ButtonSize::Default`'s height. Verified live on the headless binary: status bar 36px tall,
+tab pills 26px, both marks on the strip, and the picker painting the two-line rows.

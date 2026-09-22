@@ -57,6 +57,7 @@ use util::ResultExt as _;
 use workspace::item::ItemHandle;
 use workspace::{HideStatusItem, MultiWorkspace, StatusItemView, Workspace};
 
+use crate::adapter::AgentBrand;
 use crate::model::{SessionState, SolutionSessionId};
 use crate::rename_session_modal::RenameSessionModal;
 use crate::reopen_session_modal::open_reopen_session_modal;
@@ -78,6 +79,13 @@ struct TabCandidate {
     session_id: SolutionSessionId,
     tab_order: i64,
     title: SharedString,
+    /// The provider behind this session, so a glance at the strip says *which*
+    /// agent each tab is talking to (maintainer request, 2026-09-22) — session
+    /// titles are generated from the conversation and never mention the
+    /// provider. `None` for a session naming an agent this build no longer
+    /// ships; such a tab renders with the state dot alone rather than a wrong
+    /// logo.
+    brand: Option<&'static AgentBrand>,
     is_cold: bool,
     is_errored: bool,
     is_running: bool,
@@ -271,6 +279,73 @@ fn close_prompt_detail() -> String {
     )
 }
 
+/// `debug_selector` for one provider row in the `+` picker. Built from the
+/// brand's own name so the paint test cannot assert a row that is no longer
+/// offered.
+fn agent_choice_selector(brand: &AgentBrand) -> String {
+    format!("AGENT-CHOICE-{}", brand.name)
+}
+
+/// `debug_selector` for the provider logo, in the picker row and on a session
+/// tab alike. Its own selector because a plain `ui::Icon` — unlike
+/// `IconButton`, which registers `ICON-{icon}` — carries none, and "the logo
+/// stopped painting" is precisely the regression these two surfaces exist to
+/// prevent.
+fn agent_logo_selector(brand: &AgentBrand) -> String {
+    format!("AGENT-LOGO-{}", brand.name)
+}
+
+/// The provider mark, wrapped so it carries [`agent_logo_selector`].
+fn render_agent_logo(brand: &'static AgentBrand, size: IconSize, color: Color) -> Div {
+    div()
+        .debug_selector(|| agent_logo_selector(brand))
+        .flex()
+        .flex_none()
+        .items_center()
+        .child(Icon::new(brand.logo).size(size).color(color))
+}
+
+/// One provider row in the `+` picker: the vendor's logo, the agent's name,
+/// and — greyed, on a second line — the models it runs with its default
+/// first.
+///
+/// A `ContextMenu::custom_entry` rather than a plain `entry`, for the height:
+/// `ContextMenuEntry` is a single `Label` in a `Dense` `ListItem`, i.e. one
+/// ~16px line, and with only the words "Codex (OpenAI)" / "Claude
+/// (Anthropic)" to tell them apart the two rows had to be *read* rather than
+/// recognised (maintainer request, 2026-09-22). `ListItem` applies a height
+/// only when one is set explicitly and the menu never sets one, so this
+/// two-line body simply makes the row as tall as it needs to be — nothing
+/// else in the menu has to be re-measured.
+///
+/// The logo is drawn by `ui::Icon`, which paints an SVG as a monochrome mask;
+/// the hardcoded fills inside `ai_open_ai.svg` / `ai_claude.svg` are ignored,
+/// so both marks follow the theme's foreground colour in light and dark.
+fn render_agent_choice(brand: &'static AgentBrand) -> AnyElement {
+    h_flex()
+        .debug_selector(|| agent_choice_selector(brand))
+        .gap_2p5()
+        .py_1()
+        .child(render_agent_logo(brand, IconSize::Medium, Color::Default))
+        .child(
+            v_flex()
+                .gap_0p5()
+                .child(
+                    h_flex().gap_1p5().child(Label::new(brand.name)).child(
+                        Label::new(brand.vendor)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(
+                    Label::new(brand.models)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        )
+        .into_any_element()
+}
+
 /// The vertical rule that closes the AI-dialog group off from the status
 /// bar's other left-hand items.
 ///
@@ -439,6 +514,7 @@ impl SessionTabStrip {
                     session_id: session.id,
                     tab_order,
                     title: session.title.clone(),
+                    brand: crate::adapter::agent_brand(session.agent_id.as_ref()),
                     is_cold: session.is_cold(),
                     is_errored: matches!(session.state, SessionState::Errored(_)),
                     // `Stopping` is deliberately NOT folded in here, even though
@@ -528,13 +604,28 @@ impl SessionTabStrip {
             // subtree (`workspace::status_bar::STATUS_BAR_UI_SCALE`), so a
             // fixed pixel width would hold the tab at its old size while its
             // label grew — i.e. truncate more text than before.
-            .min_w(rems_from_px(90.))
-            .max_w(rems_from_px(180.))
+            // Both bumped by the width the provider logo + its gap add, so
+            // the label still gets the same room it had before the logo
+            // arrived rather than paying for it out of its own truncation
+            // budget.
+            .min_w(rems_from_px(104.))
+            .max_w(rems_from_px(194.))
             .rounded_sm()
             .when_some(background, |this, bg| this.bg(bg))
             .border_b_2()
             .border_color(border)
             .cursor_pointer()
+            // Provider logo first, then the state dot: the logo answers
+            // "which agent" (fixed for the tab's life) and the dot answers
+            // "what is it doing right now", so the stable signal leads and
+            // the changing one sits next to the title it qualifies.
+            // `IconSize::XSmall` keeps the pair inside
+            // `ButtonSize::Default.rems()` at the status bar's rem scale.
+            .children(
+                candidate
+                    .brand
+                    .map(|brand| render_agent_logo(brand, IconSize::XSmall, Color::Muted)),
+            )
             .child(Indicator::dot().color(dot_color))
             .child(
                 // Own flex row at full height so the label is optically
@@ -639,16 +730,23 @@ impl SessionTabStrip {
             )
             .menu(|window, cx| {
                 Some(ContextMenu::build(window, cx, |menu, _, _| {
-                    menu.entry("Codex (OpenAI)", None, |window, cx| {
-                        if let Ok(action) = cx.build_action("console_panel::NewCodexChat", None) {
-                            window.dispatch_action(action, cx);
-                        }
-                    })
-                    .entry("Claude (Anthropic)", None, |window, cx| {
-                        if let Ok(action) = cx.build_action("console_panel::NewChat", None) {
-                            window.dispatch_action(action, cx);
-                        }
-                    })
+                    menu.custom_entry(
+                        |_, _| render_agent_choice(&crate::codex_adapter::BRAND),
+                        |window, cx| {
+                            if let Ok(action) = cx.build_action("console_panel::NewCodexChat", None)
+                            {
+                                window.dispatch_action(action, cx);
+                            }
+                        },
+                    )
+                    .custom_entry(
+                        |_, _| render_agent_choice(&crate::claude_adapter::BRAND),
+                        |window, cx| {
+                            if let Ok(action) = cx.build_action("console_panel::NewChat", None) {
+                                window.dispatch_action(action, cx);
+                            }
+                        },
+                    )
                 }))
             })
     }
@@ -904,8 +1002,8 @@ mod tests {
     struct TabPaintHarness {
         strip: Entity<SessionTabStrip>,
         solution_id: SolutionId,
-        /// `(session id, title, is_active)` per tab, left to right.
-        tabs: Vec<(SolutionSessionId, SharedString, bool)>,
+        /// `(session id, title, is_active, agent id)` per tab, left to right.
+        tabs: Vec<(SolutionSessionId, SharedString, bool, &'static str)>,
     }
 
     impl Render for TabPaintHarness {
@@ -915,14 +1013,15 @@ mod tests {
             let strip = self.strip.clone();
             let rows = strip.update(cx, |strip, cx| {
                 let weak_self = cx.weak_entity();
-                let order: Vec<SolutionSessionId> = tabs.iter().map(|(id, _, _)| *id).collect();
+                let order: Vec<SolutionSessionId> = tabs.iter().map(|(id, _, _, _)| *id).collect();
                 tabs.iter()
                     .enumerate()
-                    .map(|(ix, (session_id, title, is_active))| {
+                    .map(|(ix, (session_id, title, is_active, agent_id))| {
                         let candidate = TabCandidate {
                             session_id: *session_id,
                             tab_order: ix as i64,
                             title: title.clone(),
+                            brand: crate::adapter::agent_brand(agent_id),
                             is_cold: true,
                             is_errored: false,
                             is_running: false,
@@ -1084,9 +1183,22 @@ mod tests {
         let (_harness, cx) = cx.add_window_view(|_window, cx| TabPaintHarness {
             strip: cx.new(|cx| SessionTabStrip::new(None, cx)),
             solution_id,
+            // One tab per provider: the strip's whole job here is telling
+            // them apart, so a single-provider fixture could not fail the
+            // logo assertions below.
             tabs: vec![
-                (SolutionSessionId::new(), SharedString::from("first"), false),
-                (SolutionSessionId::new(), SharedString::from("second"), true),
+                (
+                    SolutionSessionId::new(),
+                    SharedString::from("first"),
+                    false,
+                    crate::codex_adapter::CODEX_AGENT_ID,
+                ),
+                (
+                    SolutionSessionId::new(),
+                    SharedString::from("second"),
+                    true,
+                    crate::claude_adapter::CLAUDE_ACP_AGENT_ID,
+                ),
             ],
         });
         cx.run_until_parked();
@@ -1105,11 +1217,33 @@ mod tests {
         );
 
         // `ButtonSize::Default` at the test window's default 16px rem: the
-        // metric the neighbouring `+` / overflow buttons use.
+        // metric the neighbouring `+` / overflow buttons use. The provider
+        // logo added in 2026-09-22 goes *inside* that row — if it ever pushed
+        // the pill taller it would push the status bar with it.
         assert_eq!(active.size.height, px(22.));
         assert_eq!(
             inactive.size.height, active.size.height,
             "selection must not change the row's height"
+        );
+
+        // Each tab wears its provider's mark, so the strip says which agent a
+        // tab talks to without the user having to open it (maintainer
+        // request, 2026-09-22).
+        let codex_logo: &'static str =
+            Box::leak(agent_logo_selector(&crate::codex_adapter::BRAND).into_boxed_str());
+        let claude_logo: &'static str =
+            Box::leak(agent_logo_selector(&crate::claude_adapter::BRAND).into_boxed_str());
+        let codex_logo_bounds = cx
+            .debug_bounds(codex_logo)
+            .expect("the Codex tab must carry the OpenAI mark");
+        let claude_logo_bounds = cx
+            .debug_bounds(claude_logo)
+            .expect("the Claude tab must carry the Anthropic mark");
+        assert!(
+            inactive.contains(&codex_logo_bounds.center())
+                && active.contains(&claude_logo_bounds.center()),
+            "each mark must sit inside its own tab — a logo painted into the \
+             wrong pill is exactly the failure this strip exists to prevent"
         );
     }
 
@@ -1251,13 +1385,37 @@ mod tests {
             None,
             "a left click on `+` must not open the reopen picker"
         );
+        // `debug_bounds` takes a `'static` selector and the rows name
+        // themselves after their brand, so leak the two derived names once.
+        let codex_selector: &'static str =
+            Box::leak(agent_choice_selector(&crate::codex_adapter::BRAND).into_boxed_str());
+        let claude_selector: &'static str =
+            Box::leak(agent_choice_selector(&crate::claude_adapter::BRAND).into_boxed_str());
         let codex = cx
-            .debug_bounds("MENU_ITEM-Codex (OpenAI)")
+            .debug_bounds(codex_selector)
             .expect("Codex must be offered");
         let claude = cx
-            .debug_bounds("MENU_ITEM-Claude (Anthropic)")
+            .debug_bounds(claude_selector)
             .expect("Claude must be offered");
         assert!(codex.origin.y < claude.origin.y);
+        // Each row carries its vendor's logo and, under the agent's name, the
+        // grey model line — that pair is the whole point of the redesign
+        // (maintainer request, 2026-09-22), and a row that quietly lost one
+        // would still pass every assertion above.
+        let codex_logo: &'static str =
+            Box::leak(agent_logo_selector(&crate::codex_adapter::BRAND).into_boxed_str());
+        let claude_logo: &'static str =
+            Box::leak(agent_logo_selector(&crate::claude_adapter::BRAND).into_boxed_str());
+        assert!(
+            cx.debug_bounds(codex_logo).is_some() && cx.debug_bounds(claude_logo).is_some(),
+            "both provider logos must paint in the picker"
+        );
+        assert!(
+            claude.size.height > px(28.),
+            "a provider row is two lines tall (name + models), not the ~16px \
+             single-label row a plain `ContextMenu::entry` paints; got {:?}",
+            claude.size.height
+        );
         cx.simulate_event(gpui::MouseMoveEvent {
             position: claude.center(),
             pressed_button: None,
@@ -1266,7 +1424,7 @@ mod tests {
         cx.simulate_click(claude.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert_eq!(*new_chat_dispatches.borrow(), 1);
-        assert!(cx.debug_bounds("MENU_ITEM-Claude (Anthropic)").is_none());
+        assert!(cx.debug_bounds(claude_selector).is_none());
     }
 
     /// The reopen-a-closed-chat flow is a **visible button** next to the `+`

@@ -1428,9 +1428,9 @@ pub const MAX_BAND_HEIGHT_FRACTION: f32 = 0.8;
 ///
 /// - `61.0` of chrome above the band, measured live at 1280x384: the platform
 ///   title bar plus the member tab row.
-/// - `f32::from(workspace::STATUS_BAR_HEIGHT)` below it — 33.0 today. This is
-///   the term that moved when the status bar was scaled up (2026-09-03), and
-///   it is why this constant went 150 → 153.
+/// - `f32::from(workspace::STATUS_BAR_HEIGHT)` below it — 36.0 today. This is
+///   the term that moves whenever the status bar is scaled up, and it is why
+///   this constant went 150 → 153 (2026-09-03) → 156 (2026-09-22).
 /// - `59.0` more so the project zone is still an editor rather than a
 ///   hairline.
 ///
@@ -1439,7 +1439,7 @@ pub const MAX_BAND_HEIGHT_FRACTION: f32 = 0.8;
 /// status bar on screen is the `min_h_0` on the workspace column in
 /// `Workspace::render` plus the band — not the status bar — being the
 /// shrinkable sibling; see the comments there.
-pub const BAND_RESERVED_HEIGHT: f32 = 153.0;
+pub const BAND_RESERVED_HEIGHT: f32 = 156.0;
 
 /// The three terms [`BAND_RESERVED_HEIGHT`] is the sum of: chrome above the
 /// band, the status bar below it, and the slack that keeps the project zone an

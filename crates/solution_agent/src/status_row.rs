@@ -150,11 +150,12 @@ pub(crate) fn render_status_row(
     let compact_pending = s.is_compaction_pending();
     let compact_permission_pending = crate::compact::has_pending_compact_approval(s, cx);
     let agent_id = s.agent_id.clone();
-    let agent_label: SharedString = match agent_id.as_ref() {
-        crate::codex_adapter::CODEX_AGENT_ID => "Codex".into(),
-        crate::claude_adapter::CLAUDE_ACP_AGENT_ID => "Claude".into(),
-        _ => agent_id.clone(),
-    };
+    // One source of truth for "what do we call this provider" — the same
+    // const the `+` picker and the session tabs read, so the three surfaces
+    // cannot drift apart. An agent this build doesn't ship falls back to its
+    // raw id rather than rendering blank.
+    let agent_label: SharedString = crate::adapter::agent_brand(agent_id.as_ref())
+        .map_or_else(|| agent_id.clone(), |brand| brand.name.into());
     // For most states the short label ("Idle", "Running", …) is
     // the right thing to show. For `Errored(msg)` we surface the
     // full message inline so the user actually learns *what* went

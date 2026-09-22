@@ -14,15 +14,17 @@ use ui::{
     utils::WithRemSize,
 };
 
-/// The status bar's fixed row height. Sawe runs the bar ~10% taller than
-/// upstream's 30px (maintainer request, 2026-09-03) — see
-/// [`STATUS_BAR_UI_SCALE`] for the other half of that change, which grows the
-/// bar's *contents* by the same factor so the row still reads as one system.
+/// The status bar's fixed row height. Sawe runs the bar 1.2× upstream's 30px
+/// — first taken to 33px on 2026-09-03, then a further ~10% to 36px on
+/// 2026-09-22, both maintainer requests. See [`STATUS_BAR_UI_SCALE`] for the
+/// other half of that change, which grows the bar's *contents* by the same
+/// factor so the row still reads as one system; the two constants are the one
+/// ratio written twice and must move together.
 ///
 /// Anything sizing itself against the status bar (e.g.
 /// `solution_agent::model::BAND_RESERVED_HEIGHT`) must be re-derived when this
 /// changes.
-pub const STATUS_BAR_HEIGHT: Pixels = px(33.);
+pub const STATUS_BAR_HEIGHT: Pixels = px(36.);
 
 /// Rem multiplier applied to the status bar's whole subtree, so its contents
 /// grow with [`STATUS_BAR_HEIGHT`] rather than rattling around in a taller row.
@@ -43,9 +45,9 @@ pub const STATUS_BAR_HEIGHT: Pixels = px(33.);
 /// `WithRemSize(ui_font_size)` — **deferral does not reset the rem by
 /// itself**: `DeferredDraw` captures the ambient rem size and restores it when
 /// the deferred subtree is drawn (`gpui::Window`), so a future status-bar item
-/// that defers something which is NOT a `ContextMenu` will inherit this 1.1×
+/// that defers something which is NOT a `ContextMenu` will inherit this 1.2×
 /// and must reset it the way `ContextMenu` does.
-const STATUS_BAR_UI_SCALE: f32 = 1.1;
+const STATUS_BAR_UI_SCALE: f32 = 1.2;
 
 /// How much more eagerly the left group yields width than the right one.
 ///
@@ -736,9 +738,9 @@ mod tests {
         let expected = unscaled * STATUS_BAR_UI_SCALE;
         // Half-pixel tolerance, not exact equality: painted bounds are snapped
         // to the physical-pixel grid, so at the test window's scale factor an
-        // expected 21.175px lands as 21.0px. Tight enough to fail on a wrong
-        // scale factor (a 1.2 would be ~1.9px away), loose enough not to be a
-        // rounding test.
+        // expected 23.1px lands as 23.0px. Tight enough to fail on a wrong
+        // scale factor (the previous 1.1 would be ~1.9px away), loose enough
+        // not to be a rounding test.
         assert!(
             (f32::from(button.size.height) - f32::from(expected)).abs() <= 0.5,
             "an item in the bar must paint at {expected:?} (= {unscaled:?} × \

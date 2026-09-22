@@ -7,6 +7,46 @@ use ui::IconName;
 
 use crate::model::AgentServerId;
 
+/// Brand chrome for an agent: the logo, name and vendor that identify it in
+/// the "new session" picker and on its session tabs, plus the models it
+/// normally runs.
+///
+/// Resolved from a bare agent id by [`agent_brand`] rather than through
+/// [`AdapterRegistry`] on purpose — the chrome that needs it renders in
+/// places where the registry is not reachable or not populated (the store's
+/// test harness registers **no** adapters, and a session restored from disk
+/// can name an agent this build no longer ships). The adapters below then
+/// read their own `display_name`/`icon` back out of the same const, so the
+/// picker, the tabs and the status row cannot disagree about a provider.
+pub struct AgentBrand {
+    /// Short product name — "Claude", "Codex".
+    pub name: &'static str,
+    /// Who makes it — "Anthropic", "OpenAI". Shown greyed beside the models.
+    pub vendor: &'static str,
+    /// The vendor's mark, drawn as a monochrome mask by `ui::Icon` (the fill
+    /// colours inside the SVG files are ignored, so both logos follow the
+    /// theme).
+    pub logo: IconName,
+    /// The models this agent normally runs, **default first**, `·`-separated.
+    ///
+    /// Display-only and deliberately version-free: the authoritative list
+    /// comes from the agent CLI at probe time
+    /// (`native_controls::probe_models` → `ModelCatalog`), and it moves every
+    /// few weeks. A version number baked in here would be stale before the
+    /// next release, whereas the family names are what both CLIs' own model
+    /// pickers are keyed on and have been stable for a year.
+    pub models: &'static str,
+}
+
+/// The brand for `agent_id`, or `None` for an agent this build does not ship.
+pub fn agent_brand(agent_id: &str) -> Option<&'static AgentBrand> {
+    match agent_id {
+        crate::claude_adapter::CLAUDE_ACP_AGENT_ID => Some(&crate::claude_adapter::BRAND),
+        crate::codex_adapter::CODEX_AGENT_ID => Some(&crate::codex_adapter::BRAND),
+        _ => None,
+    }
+}
+
 pub trait SolutionAgentAdapter: Send + Sync {
     fn agent_id(&self) -> AgentServerId;
     fn display_name(&self) -> SharedString;
