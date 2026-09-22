@@ -331,7 +331,7 @@ impl ContextMenu {
             // See the note in `ContextMenu::new`: select an item when the menu
             // opens so screen readers announce it instead of just "menu".
             cx.on_focus_in(&focus_handle, window, |this, window, cx| {
-                if this.selected_index.is_none() {
+                if this.selected_index.is_none() && Self::opened_from_keyboard(window) {
                     this.select_toggled_or_first(window, cx);
                 }
             })
@@ -1044,6 +1044,20 @@ impl ContextMenu {
     /// than the menu container, so that assistive technology immediately
     /// announces a meaningful item (ideally the current selection) instead of
     /// just "menu".
+    /// sawe: whether the menu that just gained focus was opened from the
+    /// keyboard, the only case in which it preselects a row on open.
+    /// `DropdownMenu`'s open-time selection goes through this too.
+    ///
+    /// Upstream preselects unconditionally so a screen reader announces an item
+    /// rather than the bare menu. The selection is also what paints a row as
+    /// highlighted, so a menu opened with the mouse showed its first row lit
+    /// before the pointer reached it (maintainer report, 2026-09-23). Keyboard
+    /// users keep the announcement; with the mouse, nothing is highlighted
+    /// until hover or an arrow key, as before the 2026-09-22 integration.
+    pub(crate) fn opened_from_keyboard(window: &Window) -> bool {
+        window.last_input_was_keyboard()
+    }
+
     pub fn select_toggled_or_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let toggled_ix = self.items.iter().position(|item| {
             matches!(
@@ -2145,7 +2159,10 @@ impl ContextMenu {
         // menus we prefer the currently-checked item. We only do this when
         // nothing is selected yet so we don't override an existing selection.
         cx.on_focus_in(&focus_handle, window, |context_menu, window, cx| {
-            if context_menu.selected_index.is_none() && !context_menu.suppress_focus_selection {
+            if context_menu.selected_index.is_none()
+                && !context_menu.suppress_focus_selection
+                && Self::opened_from_keyboard(window)
+            {
                 context_menu.select_toggled_or_first(window, cx);
             }
             context_menu.suppress_focus_selection = false;
@@ -2447,6 +2464,77 @@ mod tests {
     use gpui::TestAppContext;
 
     use super::*;
+
+    /// Mounts the menu as the window's root view, so it is in the dispatch
+    /// tree and its `on_focus_in` listener actually fires on focus — a menu
+    /// that is merely built never receives focus events.
+    fn open_two_entry_menu(
+        cx: &mut TestAppContext,
+    ) -> (Entity<ContextMenu>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        cx.add_window_view(|window, cx| {
+            ContextMenu::new(window, cx, |menu, _, _| {
+                menu.header("Header")
+                    .entry("First entry", None, |_, _| {})
+                    .entry("Second entry", None, |_, _| {})
+            })
+        })
+    }
+
+    fn focus_menu(context_menu: &Entity<ContextMenu>, cx: &mut gpui::VisualTestContext) {
+        // Focus events carry an empty path while the window is inactive, so
+        // `on_focus_in` would never see the menu gain focus.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let focus_handle = context_menu.read(cx).focus_handle.clone();
+            window.focus(&focus_handle, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    // sawe: a menu opened with the mouse must not paint its first row as
+    // selected before the pointer is anywhere near it (maintainer report,
+    // 2026-09-23: "the first item is highlighted without hover").
+    #[gpui::test]
+    fn mouse_opened_menu_starts_without_a_selection(cx: &mut TestAppContext) {
+        let (context_menu, cx) = open_two_entry_menu(cx);
+        cx.simulate_mouse_move(
+            gpui::point(px(1.), px(1.)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        focus_menu(&context_menu, cx);
+
+        context_menu.update(cx, |context_menu, _| {
+            assert_eq!(
+                None, context_menu.selected_index,
+                "Opening a menu with the mouse must not preselect a row"
+            );
+        });
+    }
+
+    // The upstream accessibility behaviour stays for keyboard users: a menu
+    // opened from the keyboard lands on its first selectable row, so a screen
+    // reader announces an item rather than the bare menu container.
+    #[gpui::test]
+    fn keyboard_opened_menu_selects_the_first_entry(cx: &mut TestAppContext) {
+        let (context_menu, cx) = open_two_entry_menu(cx);
+        cx.simulate_keystrokes("a");
+        focus_menu(&context_menu, cx);
+
+        context_menu.update(cx, |context_menu, _| {
+            assert_eq!(
+                Some(1),
+                context_menu.selected_index,
+                "Opening a menu from the keyboard should land on the first selectable row"
+            );
+        });
+    }
 
     #[gpui::test]
     fn can_navigate_back_over_headers(cx: &mut TestAppContext) {

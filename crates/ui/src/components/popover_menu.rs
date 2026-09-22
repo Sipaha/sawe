@@ -747,4 +747,170 @@ mod tests {
             "clicking away from the popover must still close it"
         );
     }
+
+    /// The shape of the AI session strip's `+` picker: a `PopoverMenu` whose
+    /// `ContextMenu::build` holds two `custom_entry` provider rows.
+    struct ProviderPickerHarness {
+        handle: PopoverMenuHandle<ContextMenu>,
+        menu: Rc<RefCell<Option<Entity<ContextMenu>>>>,
+    }
+
+    impl Render for ProviderPickerHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let menu_slot = self.menu.clone();
+            div().size_full().child(
+                PopoverMenu::new("provider-picker-test")
+                    .with_handle(self.handle.clone())
+                    .trigger(Button::new("provider-picker-trigger", "+"))
+                    .menu(move |window, cx| {
+                        let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                            menu.custom_entry(
+                                |_, _| div().child("Codex").into_any_element(),
+                                |_, _| {},
+                            )
+                            .custom_entry(
+                                |_, _| div().child("Claude").into_any_element(),
+                                |_, _| {},
+                            )
+                        });
+                        *menu_slot.borrow_mut() = Some(menu.clone());
+                        Some(menu)
+                    }),
+            )
+        }
+    }
+
+    fn open_provider_picker(
+        cx: &mut TestAppContext,
+        before_open: impl FnOnce(&mut gpui::VisualTestContext),
+    ) -> Option<usize> {
+        init_test(cx);
+        let handle = PopoverMenuHandle::<ContextMenu>::default();
+        let menu_slot: Rc<RefCell<Option<Entity<ContextMenu>>>> = Rc::default();
+        let (_harness, cx) = cx.add_window_view({
+            let handle = handle.clone();
+            let menu_slot = menu_slot.clone();
+            move |_, _| ProviderPickerHarness {
+                handle,
+                menu: menu_slot,
+            }
+        });
+        // Focus events carry an empty path while the window is inactive, so
+        // the menu's `on_focus_in` would never fire without this.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        before_open(cx);
+
+        cx.update(|window, app| handle.show(window, app));
+        cx.run_until_parked();
+        assert!(handle.is_deployed(), "the picker must open");
+
+        // `show_menu` hands focus to the painted menu two `on_next_frame`s
+        // later, and the test platform only serves frame requests that the
+        // test drives itself. Give it that focus here, as `show_menu` would.
+        let menu = menu_slot
+            .borrow()
+            .clone()
+            .expect("the menu builder must have run");
+        cx.update(|window, app| {
+            let focus_handle = menu.read(app).focus_handle(app);
+            window.focus(&focus_handle, app);
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, app| {
+            assert!(
+                menu.read(app).focus_handle(app).is_focused(window),
+                "the opened picker must hold focus, or the open-time selection never runs"
+            );
+            menu.read(app).selected_index()
+        })
+    }
+
+    // sawe: maintainer report 2026-09-23 — the `+` picker opened with a click
+    // showed its first provider highlighted before the pointer touched it.
+    #[gpui::test]
+    async fn mouse_opened_picker_highlights_nothing(cx: &mut TestAppContext) {
+        let selected = open_provider_picker(cx, |cx| {
+            cx.simulate_mouse_move(gpui::point(px(900.), px(700.)), None, Modifiers::none());
+        });
+        assert_eq!(
+            selected, None,
+            "a click-opened picker must not preselect a row"
+        );
+    }
+
+    #[gpui::test]
+    async fn keyboard_opened_picker_selects_its_first_row(cx: &mut TestAppContext) {
+        let selected = open_provider_picker(cx, |cx| cx.simulate_keystrokes("a"));
+        assert_eq!(
+            selected,
+            Some(0),
+            "a keyboard-opened picker lands on its first row for assistive technology"
+        );
+    }
+
+    /// A select-style `DropdownMenu` whose second row is the checked value.
+    struct DropdownHarness {
+        handle: PopoverMenuHandle<ContextMenu>,
+        menu: Entity<ContextMenu>,
+    }
+
+    impl Render for DropdownHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                crate::DropdownMenu::new("dropdown-test", "Second", self.menu.clone())
+                    .handle(self.handle.clone()),
+            )
+        }
+    }
+
+    fn open_dropdown(
+        cx: &mut TestAppContext,
+        before_open: impl FnOnce(&mut gpui::VisualTestContext),
+    ) -> Option<usize> {
+        init_test(cx);
+        let handle = PopoverMenuHandle::<ContextMenu>::default();
+        let (harness, cx) = cx.add_window_view({
+            let handle = handle.clone();
+            move |window, cx| DropdownHarness {
+                handle,
+                menu: ContextMenu::build(window, cx, |menu, _, _| {
+                    menu.toggleable_entry("First", false, IconPosition::Start, None, |_, _| {})
+                        .toggleable_entry("Second", true, IconPosition::Start, None, |_, _| {})
+                }),
+            }
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        before_open(cx);
+
+        cx.update(|window, app| handle.show(window, app));
+        cx.run_until_parked();
+        assert!(handle.is_deployed(), "the dropdown must open");
+        cx.update(|_, app| harness.read(app).menu.read(app).selected_index())
+    }
+
+    // sawe: the same open-time preselection lives in `DropdownMenu`'s
+    // `on_open`, so a click-opened select lit its checked row unprompted.
+    #[gpui::test]
+    async fn mouse_opened_dropdown_highlights_nothing(cx: &mut TestAppContext) {
+        let selected = open_dropdown(cx, |cx| {
+            cx.simulate_mouse_move(gpui::point(px(900.), px(700.)), None, Modifiers::none());
+        });
+        assert_eq!(
+            selected, None,
+            "a click-opened dropdown must not preselect a row"
+        );
+    }
+
+    #[gpui::test]
+    async fn keyboard_opened_dropdown_selects_its_checked_row(cx: &mut TestAppContext) {
+        let selected = open_dropdown(cx, |cx| cx.simulate_keystrokes("a"));
+        assert_eq!(
+            selected,
+            Some(1),
+            "a keyboard-opened dropdown lands on the checked value for assistive technology"
+        );
+    }
 }

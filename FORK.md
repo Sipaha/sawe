@@ -5556,3 +5556,48 @@ Result: 40 workflow files, 39 hard-disabled by 107 `if: false # sawe: upstream
 automation is disabled` job guards, with `run_tests.yml` narrowed to
 `workflow_dispatch:`. A future integration that re-imports this pack should
 delete it again rather than re-gate it.
+
+### 202. Menus preselect a row on open only when opened from the keyboard
+
+Upstream's accessibility PR (#60397, "a11y: Landmarks and menu improvements",
+arrived with the 2026-09-22 integration) makes every menu select a row the moment
+it opens: `ContextMenu`'s `on_focus_in` calls `select_toggled_or_first`, and
+`DropdownMenu`'s `on_open` does the same. The intent is the ARIA menu-button
+pattern — a screen reader should announce a real item, not the bare "menu".
+
+But the selection is also what paints a row as highlighted. So after the merge,
+every menu opened **with the mouse** showed a row lit before the pointer had gone
+near it — the maintainer reported it on the AI session strip's `+` provider picker
+("the first item is highlighted even without hover", 2026-09-23). Before the
+integration nothing was selected until hover or an arrow key.
+
+The fork keeps upstream's behaviour for keyboard users and restores the old one
+for the mouse: `ContextMenu::opened_from_keyboard(window)` —
+`window.last_input_was_keyboard()`, which gpui documents as existing for exactly
+this focus-visible distinction — gates both the `on_focus_in` path and
+`DropdownMenu`'s `on_open` path. Opening a menu with a keybinding still lands on
+the first (or checked) row; a click opens it with nothing selected, and the first
+arrow key still selects the first row.
+
+Why not revert the upstream code: the announcement matters to the people who need
+it, and they drive menus from the keyboard. Why not keep upstream's behaviour: a
+merge should not change what the maintainer sees as a side effect, and a lit row
+under an untouched pointer reads as a hover bug.
+
+How to apply: the tests are in `crates/ui` — `context_menu::tests`
+(`mouse_opened_menu_starts_without_a_selection`,
+`keyboard_opened_menu_selects_the_first_entry`) and `popover_menu::tests`
+(`mouse_opened_picker_highlights_nothing`, `keyboard_opened_picker_selects_its_first_row`
+for the `+` picker's exact shape, and the two `*_dropdown_*` tests). Each mouse test
+fails if the gate is removed. **When writing a gpui test around focus, activate the
+window first** (`window.activate_window()`): an inactive window dispatches focus
+events with an empty path, so `on_focus_in` never fires and a test of open-time
+selection passes for the wrong reason — which is how the first draft of these tests
+went green without the fix. A later integration that touches either call site
+should keep the gate on both.
+
+In a headless probe the preselected row is set but not repainted until the next
+input event, so a screenshot of a freshly opened menu cannot tell the two
+behaviours apart. Read the state instead: open the menu with a click, press Down,
+then screenshot — the highlight lands on the **second** row if the first was
+preselected (the bug) and on the **first** row if nothing was.

@@ -281,11 +281,18 @@ impl RenderOnce for DropdownMenu {
         // first item) so assistive technology announces a meaningful item
         // immediately, instead of focusing the bare menu container and
         // announcing only "menu". See the ARIA menu button pattern.
+        //
+        // sawe: only when opened from the keyboard. The selection is what
+        // paints a row as highlighted, so doing it for a click lit a row the
+        // pointer never touched — see `ContextMenu::opened_from_keyboard`.
         let menu_for_open = self.menu.clone();
         let mut popover = PopoverMenu::new((self.id.clone(), "popover"))
             .full_width(self.full_width)
             .with_handle(handle)
             .on_open(std::rc::Rc::new(move |window, cx| {
+                if !ContextMenu::opened_from_keyboard(window) {
+                    return;
+                }
                 menu_for_open.update(cx, |menu, cx| {
                     menu.select_toggled_or_first(window, cx);
                 });
