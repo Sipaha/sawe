@@ -5653,3 +5653,31 @@ themes and is not close to the theme's error red. Guarded by
 rejects a grey), plus the existing paint tests that each logo lands inside its own pill. The
 working tab's pulse wrapper and the error stripe carry the `SESSION-TAB-LOGO-WORKING` and
 `SESSION-TAB-ERROR-STRIPE` debug selectors.
+
+### 204. A session tab shows its session's age in a fixed-width slot
+
+The maintainer, 2026-09-23: put the time of the last action on the tab, like the status row's
+"1m ago", but without the tab growing — a fixed width, and when the text does not fit, a
+compact form capped at `99d`.
+
+What: `session_tab_strip::tab_age_label` renders the **same clock** as the status row and the
+stuck-turn watchdog, `SolutionSession::last_activity_at` (persisted, so a tab restored from
+disk shows its real age, not the restart time), as at most three characters: `now` (< 1 min),
+`Nm`, `Nh`, then `Nd` capped at `99d` — past 99 days the label stops changing. It sits
+right-aligned in a slot of fixed width `AGE_SLOT_PX` after the title, in `LabelSize::XSmall`,
+`Color::Muted`, in the **monospaced buffer font** (maintainer request) — every label is three
+cells wide and the digits don't jitter as it ticks. A 15 s tick (`AGE_TICK`) re-renders the strip so labels move with no store event.
+
+Why the compact form always, rather than "1m ago" when it fits: in a fixed slot "59m ago"
+would need a slot three times as wide on every tab; the compact form is what a fixed width can
+honour. The slot is sized from a **measurement**, not a guess. The first cut used the
+proportional `.ZedSans`, where `m` is the widest glyph: `59m` measured 23px at the status bar's
+1.2 rem scale and the 20-rem-px slot (24 real px) left it 1px. The slot became 24 (≈29 real
+px); in JetBrains Mono every label measures 19–20px of ink in it. The tab's `min_w`/`max_w` grew
+by the slot's net 18px (it replaced the 6px state dot, #203), so titles keep their room.
+
+How to apply: guarded by `the_tab_age_is_compact_and_capped_at_99_days` (boundaries, the cap,
+clock skew, ≤ 3 characters) and by the tab paint test, which paints `99d` and `59m`, asserts each
+fits inside its slot and that both slots are the same width (mutation-checked: a 10px slot fails
+it). A new unit longer than three characters, or a font much wider than `.ZedSans`, needs the
+slot re-measured — the buffer font is user-configurable.

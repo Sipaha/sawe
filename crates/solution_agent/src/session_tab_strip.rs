@@ -84,6 +84,10 @@ struct TabCandidate {
     brand: Option<&'static AgentBrand>,
     is_errored: bool,
     is_running: bool,
+    /// The session's activity clock — the same `last_activity_at` the status
+    /// row's "1m ago" and the stuck-turn watchdog read — shown on the tab as
+    /// a compact age ([`tab_age_label`]).
+    last_activity_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Split `entries` into (visible, overflow) at `MAX_VISIBLE_TABS`. A free
@@ -361,6 +365,48 @@ fn render_tab_logo(brand: Option<&'static AgentBrand>, look: TabLogoLook, ix: us
         .into_any_element()
 }
 
+/// How often the strip re-renders so tab ages advance. The coarsest unit a
+/// tab shows under an hour is a minute, so a label is at most this late.
+const AGE_TICK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Width of the age slot on a tab. Fixed, so a tab never changes width as its
+/// age ticks over (maintainer request, 2026-09-23). The label is in the
+/// monospaced buffer font, so every label is three cells: measured in the
+/// default JetBrains Mono at the status bar's 1.2 rem scale, `59m`/`now`/`23h`
+/// are 20px of ink and `99d` 19px, against a slot of 24 × 1.2 ≈ 29px. (In the
+/// proportional `.ZedSans` of the first cut, `59m` was 23px — `m` is the
+/// widest glyph there.) Pinned by the paint test, which fits `59m` and `99d`.
+const AGE_SLOT_PX: f32 = 24.;
+
+/// The largest day count a tab shows. Past it the label stops changing rather
+/// than growing a fourth character.
+const MAX_AGE_DAYS: i64 = 99;
+
+/// A session tab's age: the status row's "1m ago" compressed to at most three
+/// characters so it fits [`AGE_SLOT_PX`] — `now`, `12m`, `5h`, `3d`, capped at
+/// `99d`. A timestamp in the future (clock skew) reads as `now`.
+fn tab_age_label(ts: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = now.signed_duration_since(ts).num_seconds();
+    if secs < 60 {
+        "now".into()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", (secs / 86_400).min(MAX_AGE_DAYS))
+    }
+}
+
+/// `debug_selector` of a tab's fixed-width age slot and of the label inside
+/// it, so the paint test can check the label fits the slot.
+fn age_slot_selector(ix: usize) -> String {
+    format!("SESSION-TAB-AGE-SLOT-{ix}")
+}
+fn age_text_selector(ix: usize) -> String {
+    format!("SESSION-TAB-AGE-TEXT-{ix}")
+}
+
 /// `debug_selector` on an errored tab's stripe.
 const ERROR_STRIPE_SELECTOR: &str = "SESSION-TAB-ERROR-STRIPE";
 
@@ -469,6 +515,10 @@ fn render_group_divider() -> impl IntoElement {
 pub struct SessionTabStrip {
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     _subscriptions: Vec<Subscription>,
+    /// Re-renders the strip every [`AGE_TICK`] so each tab's age label moves
+    /// on its own, the way the status row's "1m ago" does, even when no store
+    /// event fires.
+    _age_tick: gpui::Task<()>,
 }
 
 impl SessionTabStrip {
@@ -497,9 +547,19 @@ impl SessionTabStrip {
             subscriptions.push(cx.observe(&mw, |_, _, cx| cx.notify()));
         }
 
+        let age_tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AGE_TICK).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+
         Self {
             multi_workspace,
             _subscriptions: subscriptions,
+            _age_tick: age_tick,
         }
     }
 
@@ -619,6 +679,7 @@ impl SessionTabStrip {
                     // after the badge has gone idle while a cancelled turn winds
                     // down.
                     is_running: matches!(session.state, SessionState::Running { .. }),
+                    last_activity_at: session.last_activity_at,
                 })
             })
             .collect();
@@ -694,9 +755,10 @@ impl SessionTabStrip {
             // Both bumped by the width the provider logo + its gap add, so
             // the label still gets the same room it had before the logo
             // arrived rather than paying for it out of its own truncation
-            // budget.
-            .min_w(rems_from_px(104_f32))
-            .max_w(rems_from_px(194_f32))
+            // budget — and again by the age slot's net 18px (its 24px + gap,
+            // less the 6px state dot + gap it replaced), for the same reason.
+            .min_w(rems_from_px(122_f32))
+            .max_w(rems_from_px(212_f32))
             .relative()
             .rounded_sm()
             .when_some(background, |this, bg| this.bg(bg))
@@ -729,6 +791,33 @@ impl SessionTabStrip {
                             .size(LabelSize::Small)
                             .color(style.label)
                             .truncate(),
+                    ),
+            )
+            // Time since the session's last activity, right-aligned in a
+            // fixed-width slot so the tab's width never follows the text.
+            .child(
+                div()
+                    .debug_selector(move || age_slot_selector(ix))
+                    .flex_none()
+                    .w(rems_from_px(AGE_SLOT_PX))
+                    .flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .debug_selector(move || age_text_selector(ix))
+                            .flex_none()
+                            .child(
+                                Label::new(tab_age_label(
+                                    candidate.last_activity_at,
+                                    chrono::Utc::now(),
+                                ))
+                                .size(LabelSize::XSmall)
+                                // Monospaced (the buffer font), so every
+                                // label is exactly three cells wide and the
+                                // digits don't jitter as the age ticks.
+                                .buffer_font(cx)
+                                .color(Color::Muted),
+                            ),
                     ),
             )
             // No close cross: closing a session tab goes through the
@@ -1109,6 +1198,14 @@ mod tests {
                             brand: crate::adapter::agent_brand(agent_id),
                             is_errored: false,
                             is_running: false,
+                            // The first tab is far past the cap ("99d"), the
+                            // second paints `59m` — the widest label, `m`
+                            // being the widest glyph. The paint test fits both.
+                            last_activity_at: if ix == 0 {
+                                chrono::Utc::now() - chrono::Duration::days(200)
+                            } else {
+                                chrono::Utc::now() - chrono::Duration::seconds(59 * 60 + 30)
+                            },
                         };
                         strip
                             .render_tab(
@@ -1328,6 +1425,33 @@ mod tests {
                 && active.contains(&claude_logo_bounds.center()),
             "each mark must sit inside its own tab — a logo painted into the \
              wrong pill is exactly the failure this strip exists to prevent"
+        );
+
+        // Each tab shows how long ago its session was last active, in a slot
+        // whose width does not follow the text (maintainer request,
+        // 2026-09-23): tab 0 paints "99d", tab 1 the widest label, "59m",
+        // and both slots are the same width with the text inside.
+        fn painted(cx: &mut gpui::VisualTestContext, selector: String) -> gpui::Bounds<Pixels> {
+            let selector: &'static str = Box::leak(selector.into_boxed_str());
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must paint"))
+        }
+        let slots = [
+            painted(cx, age_slot_selector(0)),
+            painted(cx, age_slot_selector(1)),
+        ];
+        for (ix, slot) in slots.iter().enumerate() {
+            let text = painted(cx, age_text_selector(ix));
+            assert!(
+                slot.contains(&text.origin)
+                    && text.right() <= slot.right()
+                    && text.size.width > px(0.),
+                "tab {ix}'s age must fit inside its fixed slot: text {text:?}, slot {slot:?}"
+            );
+        }
+        assert_eq!(
+            slots[0].size.width, slots[1].size.width,
+            "the age slot must not change width with its text"
         );
     }
 
@@ -1712,6 +1836,42 @@ mod tests {
             TabLogoLook::Errored,
             "an error wins over running, as it did for the dot"
         );
+    }
+
+    /// The tab's age is the status row's "1m ago" in at most three
+    /// characters, capped at 99 days (maintainer request, 2026-09-23).
+    #[test]
+    fn the_tab_age_is_compact_and_capped_at_99_days() {
+        let now = chrono::Utc::now();
+        let ago = |secs: i64| tab_age_label(now - chrono::Duration::seconds(secs), now);
+        assert_eq!(ago(0), "now");
+        assert_eq!(ago(59), "now");
+        assert_eq!(ago(60), "1m");
+        assert_eq!(ago(3599), "59m");
+        assert_eq!(ago(3600), "1h");
+        assert_eq!(ago(86_399), "23h");
+        assert_eq!(ago(86_400), "1d");
+        assert_eq!(ago(99 * 86_400), "99d");
+        assert_eq!(ago(100 * 86_400), "99d", "the day count stops at 99");
+        assert_eq!(ago(5000 * 86_400), "99d");
+        assert_eq!(
+            ago(-120),
+            "now",
+            "a future timestamp (clock skew) is \"now\""
+        );
+        for secs in [
+            0,
+            59,
+            60,
+            3599,
+            3600,
+            86_399,
+            86_400,
+            99 * 86_400,
+            10_000 * 86_400,
+        ] {
+            assert!(ago(secs).chars().count() <= 3, "{secs}s -> {:?}", ago(secs));
+        }
     }
 
     /// Each provider's colour is its own and actually coloured — a brand
