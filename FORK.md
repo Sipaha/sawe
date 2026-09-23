@@ -5402,14 +5402,15 @@ What: a `solution_agent::adapter::AgentBrand` const per agent — `name`, `vendo
 became `ContextMenu::custom_entry`s: logo, name + greyed vendor, and the model line greyed
 underneath, which takes the row from ~16px to ~38px without any height having to be declared
 (`ListItem` applies an explicit height only when one is set, and the menu never sets one).
-Each session tab gained the same logo, left of its state dot. `status_row`'s hardcoded
+Each session tab gained the same logo (which has since replaced the tab's state dot — see
+#203). `status_row`'s hardcoded
 `"Codex"`/`"Claude"` match now reads the same const.
 
 Why a free function over the id (`adapter::agent_brand(&str)`) rather than the obvious
 `AdapterRegistry` lookup: the registry is not reachable where the chrome renders. The store's
 test harness registers **no** adapters, so every paint test would have silently lost its
 logos, and a session restored from disk can name an agent this build no longer ships — which
-now falls back to the state dot alone rather than to a wrong logo. The adapters' own
+now falls back to a neutral `Sparkle` mark rather than to a wrong logo. The adapters' own
 `display_name()` / `icon()` delegate to the same const, so the registry and the chrome cannot
 disagree about a provider.
 
@@ -5424,8 +5425,8 @@ next release.
 How to apply: a new agent adds a `BRAND` const beside its adapter and one arm in
 `agent_brand`; the picker, the tabs and the status row pick it up with no further edits. The
 logos are painted by `ui::Icon`, which renders an SVG as a monochrome mask — the hardcoded
-fills inside `assets/icons/ai_open_ai.svg` / `ai_claude.svg` are ignored, so both marks follow
-the theme. Guarded by two paint tests in `session_tab_strip`: the picker's rows assert both
+fills inside `assets/icons/ai_open_ai.svg` / `ai_claude.svg` are ignored, so the colour
+always comes from the caller (`AgentBrand::color`, #203). Guarded by two paint tests in `session_tab_strip`: the picker's rows assert both
 logos paint and that a row is taller than a single-label entry, and the tab test seeds one
 session per provider and asserts each mark lands **inside its own pill** while the pill keeps
 `ButtonSize::Default`'s height. Verified live on the headless binary: status bar 36px tall,
@@ -5601,3 +5602,42 @@ input event, so a screenshot of a freshly opened menu cannot tell the two
 behaviours apart. Read the state instead: open the menu with a click, press Down,
 then screenshot — the highlight lands on the **second** row if the first was
 preselected (the bug) and on the **first** row if nothing was.
+
+### 203. A session tab's provider logo is its state signal; the state dot is gone
+
+The maintainer, 2026-09-23, on the session tab strip: make the provider logo coloured and
+blinking while the tab's session is working, and remove the state dot beside it. And on the
+`+` picker: the provider icon is very small — make it coloured and bigger.
+
+What: `AgentBrand` gained `color` (`0xRRGGBB`) and `tint()`. Claude is `0xD97757` (its
+orange); Codex is `0x10A37F`, OpenAI's green — the current OpenAI mark is monochrome, so
+this is the colour its products are recognised by rather than an official logo colour. The
+tab logo follows `session_tab_strip::tab_logo_look`:
+
+| Session | Logo |
+|---|---|
+| `Running` | brand colour, pulsing (1s, opacity 0.4→1.0 — the status row's "thinking" curve) |
+| `Errored` | `Color::Muted`, static — and the tab's **title** turns `Color::Error` |
+| idle, cold, `Stopping` | `Color::Muted`, static |
+
+The picker's logo is the brand colour at 24px (`PICKER_LOGO_PX`, the height of the row's two
+text lines) instead of 16px in the theme's foreground.
+
+Why errors turn the title red although the request did not mention them: the dot carried four
+states, and three of them collapse harmlessly into "muted", but a red dot was the only thing on
+the strip that said a background session had failed. Removing the dot without moving that
+signal would have dropped it silently. It goes on the title, not the logo, because the first
+cut painted the logo red and the probe screenshot showed a failed Claude tab and a working one
+in nearly the same colour — Claude's orange is close to the theme's error red. The cold/idle distinction (muted vs default dot) was
+dropped on purpose — neither is "working", and the status row still shows it for the open
+session.
+
+`Running` excludes `Stopping` exactly as the dot did and as `status_row`'s own `is_running`
+does, so the tab stops pulsing when the badge goes idle rather than ~40s later while a cancelled
+turn winds down. The pulse uses `AnimationExt::with_animation`, which honours
+`App::reduce_motion`.
+
+How to apply: a new agent's `BRAND` const needs a `color` — a mid-tone that reads on both
+themes. Guarded by `the_tab_logo_carries_the_session_state` and `each_brand_has_its_own_colour`
+(the latter rejects a grey), plus the existing paint tests that each logo lands inside its own
+pill. A working tab's pulse wrapper carries the `SESSION-TAB-LOGO-WORKING` debug selector.

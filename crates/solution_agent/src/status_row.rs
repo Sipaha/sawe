@@ -692,9 +692,9 @@ pub(crate) fn render_status_row(
         } else {
             // `error_text.is_some()` above is the only path that sets
             // `is_errored` true (see `state_dot_color`'s doc comment), so this
-            // branch always passes `false` for it. Shared with
-            // `session_tab_strip`'s per-tab dot so the two surfaces can never
-            // disagree about the same session's color.
+            // branch always passes `false` for it. (The session tab strip's
+            // per-tab dot that used to share this colour is gone; its logo now
+            // pulses on the same `is_running`.)
             label = label.color(state_dot_color(false, is_running || is_resuming, is_cold));
         }
         let inner: gpui::AnyElement = if is_running {
@@ -1314,9 +1314,10 @@ fn supervisor_popover_menu(
     })
 }
 
-/// Color for the per-session state indicator, shared between this row's own
-/// state badge (above) and `session_tab_strip`'s per-tab dot so the two
-/// surfaces can never disagree about the same session's color. Priority
+/// Color for this row's per-session state badge (above). The session tab
+/// strip no longer has a state dot — its provider logo pulses instead — but
+/// it keeps the same `is_running` definition, so the two cannot disagree
+/// about whether a session is working. Priority
 /// mirrors the badge exactly: an error always wins, then "actively running"
 /// (`is_running` here means exactly `SessionState::Running` — NOT
 /// `Stopping`, matching this file's own `is_running` at line 228 above; the

@@ -14,6 +14,8 @@ pub const BRAND: AgentBrand = AgentBrand {
     name: "Claude",
     vendor: "Anthropic",
     logo: IconName::AiClaude,
+    // Claude's orange.
+    color: 0xD97757,
     models: "Sonnet · Opus · Haiku",
 };
 

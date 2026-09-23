@@ -24,9 +24,15 @@ pub struct AgentBrand {
     /// Who makes it — "Anthropic", "OpenAI". Shown greyed beside the models.
     pub vendor: &'static str,
     /// The vendor's mark, drawn as a monochrome mask by `ui::Icon` (the fill
-    /// colours inside the SVG files are ignored, so both logos follow the
-    /// theme).
+    /// colours inside the SVG files are ignored, so the colour always comes
+    /// from the caller — see [`Self::color`]).
     pub logo: IconName,
+    /// The vendor's signature colour as `0xRRGGBB`, which tints [`Self::logo`]
+    /// wherever it is meant to read as the brand: always in the new-session
+    /// picker, and on a session tab while that session is working
+    /// (maintainer request, 2026-09-23). A mid-tone, so it holds up on both
+    /// the light and the dark theme.
+    pub color: u32,
     /// The models this agent normally runs, **default first**, `·`-separated.
     ///
     /// Display-only and deliberately version-free: the authoritative list
@@ -36,6 +42,13 @@ pub struct AgentBrand {
     /// next release, whereas the family names are what both CLIs' own model
     /// pickers are keyed on and have been stable for a year.
     pub models: &'static str,
+}
+
+impl AgentBrand {
+    /// [`Self::color`] as a `ui::Color`.
+    pub fn tint(&self) -> ui::Color {
+        ui::Color::Custom(gpui::rgb(self.color).into())
+    }
 }
 
 /// The brand for `agent_id`, or `None` for an agent this build does not ship.

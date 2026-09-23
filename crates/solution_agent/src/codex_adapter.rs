@@ -16,6 +16,9 @@ pub const BRAND: AgentBrand = AgentBrand {
     name: "Codex",
     vendor: "OpenAI",
     logo: IconName::AiOpenAi,
+    // OpenAI's green. The current OpenAI mark is monochrome; this is the
+    // colour its products have been recognised by.
+    color: 0x10A37F,
     models: "GPT-5 Codex · GPT-5 · GPT-5 Codex Mini",
 };
 

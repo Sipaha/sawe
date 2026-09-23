@@ -45,14 +45,11 @@
 use std::cell::RefCell;
 
 use gpui::{
-    App, Context, ElementId, IntoElement, ParentElement, PromptLevel, Render, SharedString, Styled,
-    Subscription, WeakEntity, Window, div,
+    Animation, AnimationExt as _, App, Context, ElementId, IntoElement, ParentElement, PromptLevel,
+    Render, SharedString, Styled, Subscription, WeakEntity, Window, div, pulsating_between,
 };
 use solutions::{SolutionId, SolutionStore};
-use ui::{
-    ContextMenu, Divider, DividerColor, Indicator, PopoverMenu, Tooltip, prelude::*,
-    right_click_menu,
-};
+use ui::{ContextMenu, Divider, DividerColor, PopoverMenu, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 use workspace::item::ItemHandle;
 use workspace::{HideStatusItem, MultiWorkspace, StatusItemView, Workspace};
@@ -61,7 +58,6 @@ use crate::adapter::AgentBrand;
 use crate::model::{SessionState, SolutionSessionId};
 use crate::rename_session_modal::RenameSessionModal;
 use crate::reopen_session_modal::open_reopen_session_modal;
-use crate::status_row::state_dot_color;
 use crate::store::{SolutionAgentStore, SolutionAgentStoreEvent};
 
 /// How many session tabs render inline before the rest spill into the
@@ -83,10 +79,9 @@ struct TabCandidate {
     /// agent each tab is talking to (maintainer request, 2026-09-22) — session
     /// titles are generated from the conversation and never mention the
     /// provider. `None` for a session naming an agent this build no longer
-    /// ships; such a tab renders with the state dot alone rather than a wrong
-    /// logo.
+    /// ships; such a tab wears a neutral mark rather than a wrong logo, so its
+    /// state still shows.
     brand: Option<&'static AgentBrand>,
-    is_cold: bool,
     is_errored: bool,
     is_running: bool,
 }
@@ -127,9 +122,9 @@ fn toggle_selection(
 /// gates the confirmation prompt on is unit-testable without a live
 /// `SolutionSession` entity. Deliberately includes `Stopping` — a cancel is
 /// still winding down, so it is just as much a reason to confirm as
-/// `Running` is. Does NOT match `status_row.rs`'s `is_running` (which feeds
-/// the tab's status dot and excludes `Stopping`) — the two are different
-/// questions answered from the same `SessionState`.
+/// `Running` is. Does NOT match the tab's own `is_running` (which drives the
+/// pulsing logo and excludes `Stopping`) — the two are different questions
+/// answered from the same `SessionState`.
 fn is_busy_state(state: &SessionState) -> bool {
     matches!(
         state,
@@ -295,6 +290,79 @@ fn agent_logo_selector(brand: &AgentBrand) -> String {
     format!("AGENT-LOGO-{}", brand.name)
 }
 
+/// Height of the provider mark in the `+` picker: the height of its two text
+/// lines, so the logo reads as the row's lead rather than a bullet.
+const PICKER_LOGO_PX: f32 = 24.;
+
+/// How a session tab's provider logo shows the session's state, now that the
+/// logo is the tab's only state signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabLogoLook {
+    /// Working: the brand's colour, pulsing.
+    Working,
+    /// The session hit an error. The logo stays muted and the tab's *title*
+    /// turns red instead: red on the logo was nearly Claude's own orange, so
+    /// a failed Claude tab read like a working one. Keeps the one signal of
+    /// the removed state dot that would otherwise have been lost.
+    Errored,
+    /// Idle or not yet spawned: muted, like the rest of the strip's chrome.
+    Idle,
+}
+
+/// Map a tab's state onto its logo. Errors win, as they did for the dot.
+fn tab_logo_look(is_errored: bool, is_running: bool) -> TabLogoLook {
+    if is_errored {
+        TabLogoLook::Errored
+    } else if is_running {
+        TabLogoLook::Working
+    } else {
+        TabLogoLook::Idle
+    }
+}
+
+/// `debug_selector` on the pulse wrapping a working tab's logo, so a paint
+/// test can tell a working tab from an idle one.
+const WORKING_LOGO_SELECTOR: &str = "SESSION-TAB-LOGO-WORKING";
+
+/// A session tab's provider logo, coloured and animated per [`TabLogoLook`].
+/// A session whose agent this build no longer ships gets a neutral mark
+/// instead of a wrong logo, so its state still shows.
+///
+/// The pulse is `AnimationExt::with_animation`, which honours
+/// `App::reduce_motion`, on the same 1s 0.4→1.0 opacity curve the status
+/// row's "thinking" sparkle uses, so the two working signals beat together.
+fn render_tab_logo(brand: Option<&'static AgentBrand>, look: TabLogoLook, ix: usize) -> AnyElement {
+    let color = match (look, brand) {
+        (TabLogoLook::Working, Some(brand)) => brand.tint(),
+        (TabLogoLook::Working, None) => Color::Accent,
+        (TabLogoLook::Errored | TabLogoLook::Idle, _) => Color::Muted,
+    };
+    let logo = match brand {
+        Some(brand) => render_agent_logo(brand, IconSize::XSmall, color),
+        None => div().flex().flex_none().items_center().child(
+            Icon::new(IconName::Sparkle)
+                .size(IconSize::XSmall)
+                .color(color),
+        ),
+    };
+    if look != TabLogoLook::Working {
+        return logo.into_any_element();
+    }
+    div()
+        .debug_selector(|| WORKING_LOGO_SELECTOR.to_string())
+        .flex()
+        .flex_none()
+        .child(logo)
+        .with_animation(
+            ElementId::NamedInteger("session-tab-logo-pulse".into(), ix as u64),
+            Animation::new(std::time::Duration::from_secs(1))
+                .repeat()
+                .with_easing(pulsating_between(0.4, 1.0)),
+            |element, delta| element.opacity(delta),
+        )
+        .into_any_element()
+}
+
 /// The provider mark, wrapped so it carries [`agent_logo_selector`].
 fn render_agent_logo(brand: &'static AgentBrand, size: IconSize, color: Color) -> Div {
     div()
@@ -320,13 +388,19 @@ fn render_agent_logo(brand: &'static AgentBrand, size: IconSize, color: Color) -
 ///
 /// The logo is drawn by `ui::Icon`, which paints an SVG as a monochrome mask;
 /// the hardcoded fills inside `ai_open_ai.svg` / `ai_claude.svg` are ignored,
-/// so both marks follow the theme's foreground colour in light and dark.
+/// so the colour is the brand's own [`AgentBrand::color`], and the mark spans
+/// both text lines ([`PICKER_LOGO_PX`]) instead of sitting beside the first
+/// one at 16px (maintainer request, 2026-09-23: "the icon is very small").
 fn render_agent_choice(brand: &'static AgentBrand) -> AnyElement {
     h_flex()
         .debug_selector(|| agent_choice_selector(brand))
         .gap_2p5()
         .py_1()
-        .child(render_agent_logo(brand, IconSize::Medium, Color::Default))
+        .child(render_agent_logo(
+            brand,
+            IconSize::Custom(rems_from_px(PICKER_LOGO_PX)),
+            brand.tint(),
+        ))
         .child(
             v_flex()
                 .gap_0p5()
@@ -515,18 +589,17 @@ impl SessionTabStrip {
                     tab_order,
                     title: session.title.clone(),
                     brand: crate::adapter::agent_brand(session.agent_id.as_ref()),
-                    is_cold: session.is_cold(),
                     is_errored: matches!(session.state, SessionState::Errored(_)),
                     // `Stopping` is deliberately NOT folded in here, even though
                     // `close_tab`'s busy-check below treats it the same as
                     // `Running` — the two questions are different ("is the agent
-                    // doing something, for the dot" vs "would closing abandon
-                    // work, for the confirm prompt"). `status_row.rs`'s own
-                    // `is_running` (the thing `state_dot_color`'s other caller
-                    // feeds) is `matches!(s.state, Running { .. }) && !is_resuming`
-                    // — it does NOT include `Stopping` either. Matching that
-                    // exactly is what keeps the two surfaces' dots from
-                    // disagreeing while a cancelled turn winds down.
+                    // doing something, for the pulsing logo" vs "would closing
+                    // abandon work, for the confirm prompt"). `status_row.rs`'s
+                    // own `is_running` (it colours the state badge through
+                    // `state_dot_color`) does NOT include `Stopping` either.
+                    // Matching that is what keeps the tab from still pulsing
+                    // after the badge has gone idle while a cancelled turn winds
+                    // down.
                     is_running: matches!(session.state, SessionState::Running { .. }),
                 })
             })
@@ -547,11 +620,7 @@ impl SessionTabStrip {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let session_id = candidate.session_id;
-        let dot_color = state_dot_color(
-            candidate.is_errored,
-            candidate.is_running,
-            candidate.is_cold,
-        );
+        let logo_look = tab_logo_look(candidate.is_errored, candidate.is_running);
         let title = if candidate.title.is_empty() {
             SharedString::from(session_id.to_string())
         } else {
@@ -615,18 +684,12 @@ impl SessionTabStrip {
             .border_b_2()
             .border_color(border)
             .cursor_pointer()
-            // Provider logo first, then the state dot: the logo answers
-            // "which agent" (fixed for the tab's life) and the dot answers
-            // "what is it doing right now", so the stable signal leads and
-            // the changing one sits next to the title it qualifies.
-            // `IconSize::XSmall` keeps the pair inside
-            // `ButtonSize::Default.rems()` at the status bar's rem scale.
-            .children(
-                candidate
-                    .brand
-                    .map(|brand| render_agent_logo(brand, IconSize::XSmall, Color::Muted)),
-            )
-            .child(Indicator::dot().color(dot_color))
+            // The provider logo answers both "which agent" and "is it working
+            // right now" — the separate state dot it used to sit beside is
+            // gone (maintainer request, 2026-09-23). `IconSize::XSmall` keeps
+            // it inside `ButtonSize::Default.rems()` at the status bar's rem
+            // scale.
+            .child(render_tab_logo(candidate.brand, logo_look, ix))
             .child(
                 // Own flex row at full height so the label is optically
                 // centred in the pill, mirroring `console_panel::panel`'s tab.
@@ -642,7 +705,11 @@ impl SessionTabStrip {
                     .child(
                         Label::new(title.clone())
                             .size(LabelSize::Small)
-                            .color(style.label)
+                            .color(if logo_look == TabLogoLook::Errored {
+                                Color::Error
+                            } else {
+                                style.label
+                            })
                             .truncate(),
                     ),
             )
@@ -1022,7 +1089,6 @@ mod tests {
                             tab_order: ix as i64,
                             title: title.clone(),
                             brand: crate::adapter::agent_brand(agent_id),
-                            is_cold: true,
                             is_errored: false,
                             is_running: false,
                         };
@@ -1612,6 +1678,36 @@ mod tests {
         assert_eq!(toggle_selection(None, id), Some(id));
         assert_eq!(toggle_selection(Some(id), id), None);
         assert_eq!(toggle_selection(Some(other), id), Some(id));
+    }
+
+    /// The tab's logo is its state signal since the dot went (maintainer
+    /// request, 2026-09-23): it pulses in the brand colour while the session
+    /// works and is muted otherwise; an error — the dot's one signal that
+    /// would otherwise have been lost — turns the tab's title red.
+    #[test]
+    fn the_tab_logo_carries_the_session_state() {
+        assert_eq!(tab_logo_look(false, true), TabLogoLook::Working);
+        assert_eq!(tab_logo_look(false, false), TabLogoLook::Idle);
+        assert_eq!(tab_logo_look(true, false), TabLogoLook::Errored);
+        assert_eq!(
+            tab_logo_look(true, true),
+            TabLogoLook::Errored,
+            "an error wins over running, as it did for the dot"
+        );
+    }
+
+    /// Each provider's colour is its own and actually coloured — a brand
+    /// tint that collapsed to the theme's grey would silently undo the
+    /// request.
+    #[test]
+    fn each_brand_has_its_own_colour() {
+        let claude = crate::claude_adapter::BRAND.color;
+        let codex = crate::codex_adapter::BRAND.color;
+        assert_ne!(claude, codex);
+        for hex in [claude, codex] {
+            let hsla: gpui::Hsla = gpui::rgb(hex).into();
+            assert!(hsla.s > 0.3, "{hex:06X} must be a colour, not a grey");
+        }
     }
 
     /// The restart path, end to end: rows on disk, an empty in-memory store,
