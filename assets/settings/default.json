@@ -87,7 +87,12 @@
   // You can set this to ".SystemUIFont" to use the system font
   // ".ZedSans" currently aliases to "IBM Plex Sans", but this may
   // change in the future
-  "ui_font_family": ".ZedSans",
+  //
+  // Sawe's UI is monospaced by default: the same bundled JetBrains Mono as
+  // the buffer, so labels, counters and timestamps line up in columns and
+  // don't jitter as they change. Set ".ZedSans" to go back to the
+  // proportional IBM Plex Sans.
+  "ui_font_family": "JetBrains Mono",
   // Set the UI's font fallbacks, this will be merged with the platform's
   // default font fallbacks.
   "ui_font_fallbacks": null,
