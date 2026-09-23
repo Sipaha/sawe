@@ -5410,7 +5410,7 @@ Why a free function over the id (`adapter::agent_brand(&str)`) rather than the o
 `AdapterRegistry` lookup: the registry is not reachable where the chrome renders. The store's
 test harness registers **no** adapters, so every paint test would have silently lost its
 logos, and a session restored from disk can name an agent this build no longer ships — which
-now falls back to a neutral `Sparkle` mark rather than to a wrong logo. The adapters' own
+now falls back to a `Sparkle` mark rather than to a wrong logo. The adapters' own
 `display_name()` / `icon()` delegate to the same const, so the registry and the chrome cannot
 disagree about a provider.
 
@@ -5603,41 +5603,53 @@ behaviours apart. Read the state instead: open the menu with a click, press Down
 then screenshot — the highlight lands on the **second** row if the first was
 preselected (the bug) and on the **first** row if nothing was.
 
-### 203. A session tab's provider logo is its state signal; the state dot is gone
+### 203. A session tab's provider logo is always in its brand colour; state is motion and a stripe
 
 The maintainer, 2026-09-23, on the session tab strip: make the provider logo coloured and
-blinking while the tab's session is working, and remove the state dot beside it. And on the
-`+` picker: the provider icon is very small — make it coloured and bigger.
+blinking while the tab's session is working, and remove the state dot beside it; then — after
+a first cut greyed idle logos out and turned an errored tab's title red — don't grey idle
+sessions (small monochrome marks are hard to tell apart on the tabs), and mark an error with a
+red stripe on the tab's left or top instead of red text. And on the `+` picker: the provider
+icon is very small — make it coloured and bigger.
 
 What: `AgentBrand` gained `color` (`0xRRGGBB`) and `tint()`. Claude is `0xD97757` (its
 orange); Codex is `0x10A37F`, OpenAI's green — the current OpenAI mark is monochrome, so
-this is the colour its products are recognised by rather than an official logo colour. The
-tab logo follows `session_tab_strip::tab_logo_look`:
+this is the colour its products are recognised by rather than an official logo colour. Every
+tab's logo is drawn in its brand colour, always; `session_tab_strip::tab_logo_look` only
+decides what is added on top:
 
-| Session | Logo |
+| Session | Tab |
 |---|---|
-| `Running` | brand colour, pulsing (1s, opacity 0.4→1.0 — the status row's "thinking" curve) |
-| `Errored` | `Color::Muted`, static — and the tab's **title** turns `Color::Error` |
-| idle, cold, `Stopping` | `Color::Muted`, static |
+| `Running` | logo pulses (1s, opacity 0.4→1.0 — the status row's "thinking" curve) |
+| `Errored` | static logo + a 2px `status().error` stripe along the tab's **top** edge |
+| idle, cold, `Stopping` | static logo |
 
 The picker's logo is the brand colour at 24px (`PICKER_LOGO_PX`, the height of the row's two
 text lines) instead of 16px in the theme's foreground.
 
-Why errors turn the title red although the request did not mention them: the dot carried four
-states, and three of them collapse harmlessly into "muted", but a red dot was the only thing on
-the strip that said a background session had failed. Removing the dot without moving that
-signal would have dropped it silently. It goes on the title, not the logo, because the first
-cut painted the logo red and the probe screenshot showed a failed Claude tab and a working one
-in nearly the same colour — Claude's orange is close to the theme's error red. The cold/idle distinction (muted vs default dot) was
-dropped on purpose — neither is "working", and the status row still shows it for the open
-session.
+Why errors are marked although the first request did not mention them: the dot carried four
+states, and a red dot was the only thing on the strip that said a background session had
+failed. Removing the dot without moving that signal would have dropped it silently. Where it
+went, and what was ruled out:
 
-`Running` excludes `Stopping` exactly as the dot did and as `status_row`'s own `is_running`
-does, so the tab stops pulsing when the badge goes idle rather than ~40s later while a cancelled
-turn winds down. The pulse uses `AnimationExt::with_animation`, which honours
-`App::reduce_motion`.
+- *Not a red logo* — the theme's error red is nearly Claude's orange; in the probe a failed
+  Claude tab and a working one came out the same colour.
+- *Not a red title* — tried, and the maintainer called it too much.
+- *The top edge, not the left* — the tab's bottom edge is already the selection underline;
+  the top keeps the two apart, and both show at once on an errored active tab.
+- *Its own absolutely positioned element* (`render_error_stripe`) — a `div` has one border
+  colour for all sides, so `border_t` could not be red while `border_b` is the accent.
+
+The cold/idle distinction the dot drew (muted vs default) was dropped on purpose; neither is
+"working", and the status row still shows it for the open session. `Running` excludes
+`Stopping` exactly as the dot and `status_row`'s own `is_running` do, so the tab stops pulsing
+when the badge goes idle. The pulse uses `AnimationExt::with_animation`, which honours
+`App::reduce_motion`. A session naming an agent this build no longer ships shows an
+accent-coloured `Sparkle` in place of a logo.
 
 How to apply: a new agent's `BRAND` const needs a `color` — a mid-tone that reads on both
-themes. Guarded by `the_tab_logo_carries_the_session_state` and `each_brand_has_its_own_colour`
-(the latter rejects a grey), plus the existing paint tests that each logo lands inside its own
-pill. A working tab's pulse wrapper carries the `SESSION-TAB-LOGO-WORKING` debug selector.
+themes and is not close to the theme's error red. Guarded by
+`the_tab_logo_carries_the_session_state` and `each_brand_has_its_own_colour` (the latter
+rejects a grey), plus the existing paint tests that each logo lands inside its own pill. The
+working tab's pulse wrapper and the error stripe carry the `SESSION-TAB-LOGO-WORKING` and
+`SESSION-TAB-ERROR-STRIPE` debug selectors.

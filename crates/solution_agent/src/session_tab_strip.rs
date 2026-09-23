@@ -294,18 +294,21 @@ fn agent_logo_selector(brand: &AgentBrand) -> String {
 /// lines, so the logo reads as the row's lead rather than a bullet.
 const PICKER_LOGO_PX: f32 = 24.;
 
-/// How a session tab's provider logo shows the session's state, now that the
-/// logo is the tab's only state signal.
+/// How a session tab shows its session's state now that the state dot is
+/// gone (maintainer requests, 2026-09-23). The provider logo is always in its
+/// brand colour — a muted 12px mark was barely distinguishable from its
+/// neighbours — so state is carried by motion and by a stripe, never by
+/// greying the logo out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabLogoLook {
-    /// Working: the brand's colour, pulsing.
+    /// Working: the logo pulses.
     Working,
-    /// The session hit an error. The logo stays muted and the tab's *title*
-    /// turns red instead: red on the logo was nearly Claude's own orange, so
-    /// a failed Claude tab read like a working one. Keeps the one signal of
-    /// the removed state dot that would otherwise have been lost.
+    /// The session hit an error: a red stripe along the tab's top edge
+    /// ([`render_error_stripe`]). Not a red logo — the theme's error red is
+    /// nearly Claude's orange — and not a red title, which read as too much.
+    /// Keeps the one signal of the removed dot that would otherwise be lost.
     Errored,
-    /// Idle or not yet spawned: muted, like the rest of the strip's chrome.
+    /// Idle or not yet spawned: the logo, static.
     Idle,
 }
 
@@ -332,17 +335,12 @@ const WORKING_LOGO_SELECTOR: &str = "SESSION-TAB-LOGO-WORKING";
 /// `App::reduce_motion`, on the same 1s 0.4→1.0 opacity curve the status
 /// row's "thinking" sparkle uses, so the two working signals beat together.
 fn render_tab_logo(brand: Option<&'static AgentBrand>, look: TabLogoLook, ix: usize) -> AnyElement {
-    let color = match (look, brand) {
-        (TabLogoLook::Working, Some(brand)) => brand.tint(),
-        (TabLogoLook::Working, None) => Color::Accent,
-        (TabLogoLook::Errored | TabLogoLook::Idle, _) => Color::Muted,
-    };
     let logo = match brand {
-        Some(brand) => render_agent_logo(brand, IconSize::XSmall, color),
+        Some(brand) => render_agent_logo(brand, IconSize::XSmall, brand.tint()),
         None => div().flex().flex_none().items_center().child(
             Icon::new(IconName::Sparkle)
                 .size(IconSize::XSmall)
-                .color(color),
+                .color(Color::Accent),
         ),
     };
     if look != TabLogoLook::Working {
@@ -361,6 +359,26 @@ fn render_tab_logo(brand: Option<&'static AgentBrand>, look: TabLogoLook, ix: us
             |element, delta| element.opacity(delta),
         )
         .into_any_element()
+}
+
+/// `debug_selector` on an errored tab's stripe.
+const ERROR_STRIPE_SELECTOR: &str = "SESSION-TAB-ERROR-STRIPE";
+
+/// The red stripe along an errored tab's top edge. Its own absolutely
+/// positioned element because the tab's border is already the bottom
+/// selection underline, and a `div` has one border colour for all sides.
+/// The top edge rather than the left so it cannot be mistaken for, or
+/// collide with, that underline.
+fn render_error_stripe(cx: &App) -> Div {
+    div()
+        .debug_selector(|| ERROR_STRIPE_SELECTOR.to_string())
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(px(2.))
+        .rounded_t_sm()
+        .bg(cx.theme().status().error)
 }
 
 /// The provider mark, wrapped so it carries [`agent_logo_selector`].
@@ -679,8 +697,12 @@ impl SessionTabStrip {
             // budget.
             .min_w(rems_from_px(104_f32))
             .max_w(rems_from_px(194_f32))
+            .relative()
             .rounded_sm()
             .when_some(background, |this, bg| this.bg(bg))
+            .when(logo_look == TabLogoLook::Errored, |this| {
+                this.child(render_error_stripe(cx))
+            })
             .border_b_2()
             .border_color(border)
             .cursor_pointer()
@@ -705,11 +727,7 @@ impl SessionTabStrip {
                     .child(
                         Label::new(title.clone())
                             .size(LabelSize::Small)
-                            .color(if logo_look == TabLogoLook::Errored {
-                                Color::Error
-                            } else {
-                                style.label
-                            })
+                            .color(style.label)
                             .truncate(),
                     ),
             )
@@ -1680,10 +1698,10 @@ mod tests {
         assert_eq!(toggle_selection(Some(other), id), Some(id));
     }
 
-    /// The tab's logo is its state signal since the dot went (maintainer
-    /// request, 2026-09-23): it pulses in the brand colour while the session
-    /// works and is muted otherwise; an error — the dot's one signal that
-    /// would otherwise have been lost — turns the tab's title red.
+    /// The tab carries its state without the dot (maintainer requests,
+    /// 2026-09-23): the brand-coloured logo pulses while the session works
+    /// and is static otherwise; an error — the dot's one signal that would
+    /// otherwise have been lost — adds a red stripe along the tab's top.
     #[test]
     fn the_tab_logo_carries_the_session_state() {
         assert_eq!(tab_logo_look(false, true), TabLogoLook::Working);
