@@ -5648,7 +5648,10 @@ when the badge goes idle. The pulse uses `AnimationExt::with_animation`, which h
 accent-coloured `Sparkle` in place of a logo.
 
 How to apply: a new agent's `BRAND` const needs a `color` — a mid-tone that reads on both
-themes and is not close to the theme's error red. Guarded by
+themes and is not close to the theme's error red. **The phone mirrors this table**:
+`spk-editor-mobile`'s `ui/common/ProviderBrand.kt` maps the same `agent_id`s to the same
+colours and to vector-drawable copies of the same logos (session rows, the session screen's
+status strip, the New session dialog). A new provider or a changed colour lands in both repos. Guarded by
 `the_tab_logo_carries_the_session_state` and `each_brand_has_its_own_colour` (the latter
 rejects a grey), plus the existing paint tests that each logo lands inside its own pill. The
 working tab's pulse wrapper and the error stripe carry the `SESSION-TAB-LOGO-WORKING` and
