@@ -23,6 +23,8 @@ use util::ResultExt as _;
 /// Cap for the scrollable match list — the registry can hold dozens of
 /// projects, which otherwise blows the popover open to full screen height.
 const LIST_MAX_HEIGHT_REMS: f32 = 18.0;
+/// Width of the popover frame.
+const POPOVER_WIDTH_REMS: f32 = 34.0;
 
 pub struct AddProjectPicker {
     picker: Entity<Picker<AddProjectDelegate>>,
@@ -39,6 +41,10 @@ impl AddProjectPicker {
                 // `PopoverMenu` already dismisses on an outside mouse-down.
                 .embedded()
                 .show_scrollbar(true)
+                // The frame's width less its 1px border on each side: the
+                // embedded picker sizes its own results column, and at the
+                // frame's full width it overhangs the border.
+                .initial_width(rems(POPOVER_WIDTH_REMS - 2. / f32::from(window.rem_size())))
                 .max_height(rems(LIST_MAX_HEIGHT_REMS))
         });
         Self { picker }
@@ -57,7 +63,7 @@ impl Render for AddProjectPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("ActiveProjectAddPicker")
-            .w(rems(34.))
+            .w(rems(POPOVER_WIDTH_REMS))
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()
             .border_color(cx.theme().colors().border)

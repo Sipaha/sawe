@@ -32,10 +32,24 @@ use crate::window_helpers::is_solution_open_anywhere;
 
 /// Width of the popover. Rows fill this width so the trash icon sits
 /// flush against the right edge instead of hugging the (short) label.
+///
+/// The picker is told the same width, less the frame's border, as its
+/// `initial_width`: since the upstream picker rework the picker sizes its own
+/// results column (to `picker::DEFAULT_MODAL_WIDTH`, 34rem, unless told
+/// otherwise) even when embedded, so a width set only on this frame left the
+/// search row, the rows and the scrollbar hanging ~220px past it on a
+/// transparent background (maintainer report, 2026-09-23).
 const POPOVER_WIDTH: f32 = 320.0;
+/// The frame's border, one side.
+const FRAME_BORDER: f32 = 1.0;
 /// Cap for the scrollable match list alone (the search row and the
 /// "no matches" footer sit outside it).
 const LIST_MAX_HEIGHT: f32 = 320.0;
+
+/// `debug_selector` of the popover's frame and of its search row, so a paint
+/// test can check the picker's content stays inside the frame.
+const FRAME_SELECTOR: &str = "SOLUTION-PICKER-FRAME";
+const SEARCH_ROW_SELECTOR: &str = "SOLUTION-PICKER-SEARCH-ROW";
 
 pub struct SolutionPickerDropdown {
     picker: Entity<Picker<SolutionPickerDelegate>>,
@@ -87,6 +101,9 @@ impl SolutionPickerDropdown {
                 // an outside mouse-down.
                 .embedded()
                 .show_scrollbar(true)
+                .initial_width(rems(
+                    (POPOVER_WIDTH - 2. * FRAME_BORDER) / f32::from(window.rem_size()),
+                ))
                 .max_height(rems(LIST_MAX_HEIGHT / f32::from(window.rem_size())))
         });
 
@@ -133,9 +150,10 @@ impl Render for SolutionPickerDropdown {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("SolutionPickerDropdown")
+            .debug_selector(|| FRAME_SELECTOR.to_string())
             .w(px(POPOVER_WIDTH))
             .bg(cx.theme().colors().elevated_surface_background)
-            .border_1()
+            .border(px(FRAME_BORDER))
             .border_color(cx.theme().colors().border)
             .rounded_md()
             .child(self.picker.clone())
@@ -429,6 +447,7 @@ impl PickerDelegate for SolutionPickerDelegate {
             v_flex()
                 .child(
                     h_flex()
+                        .debug_selector(|| SEARCH_ROW_SELECTOR.to_string())
                         .m_1p5()
                         .px_2()
                         .h_7()
@@ -682,6 +701,27 @@ mod tests {
         });
         let picker = dropdown.read_with(cx, |dropdown, _| dropdown.picker.clone());
         (dropdown, picker, dir, cx)
+    }
+
+    /// The picker's content — search row included — stays inside the
+    /// popover's frame. After the
+    /// upstream picker rework the embedded picker sized itself to 34rem while
+    /// the frame stayed 320px, so everything but the frame's own background
+    /// hung past its right edge.
+    #[gpui::test]
+    async fn the_picker_fits_inside_the_popover_frame(cx: &mut TestAppContext) {
+        let (_dropdown, _picker, _dir, cx) = build_dropdown(&["Alpha", "Bundles"], cx);
+        cx.run_until_parked();
+        let frame = cx
+            .debug_bounds(FRAME_SELECTOR)
+            .expect("the popover frame must paint");
+        let search = cx
+            .debug_bounds(SEARCH_ROW_SELECTOR)
+            .expect("the search row must paint");
+        assert!(
+            search.right() <= frame.right() && search.left() >= frame.left(),
+            "the search row must sit inside the frame: row {search:?}, frame {frame:?}"
+        );
     }
 
     #[gpui::test]

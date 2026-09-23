@@ -5746,3 +5746,22 @@ is a whole pixel), pinned to the pill's top edge, and lays out identically in bo
 client-decorated one it overlaps the underline by 1px, where it paints nothing. Verified in the
 probe: logo ink and capitals both span the same ten rows.
 
+### 207. Embedded pickers in fork popovers get the popover's width explicitly
+
+The maintainer, 2026-09-23: the solution picker (title bar `+`) painted its search row, rows,
+trash icons and scrollbar ~220px past its own frame, on a transparent background.
+
+Why: since the upstream picker rework (merged in 790aa911ab) `Picker` sizes its results column
+itself — `Shape::apply_results_size`, defaulting to `picker::DEFAULT_MODAL_WIDTH` (34rem) — in
+every presentation, `embedded()` included. `SolutionPickerDropdown` only set 320px on its own
+frame, so the picker inside ran to 34rem. `AddProjectPicker`'s frame was 34rem too, which
+overhung its 1px border by 2px.
+
+What: both pass the frame's width less its border to `Picker::initial_width`
+(`POPOVER_WIDTH` / `POPOVER_WIDTH_REMS`, `FRAME_BORDER`). Guarded by
+`the_picker_fits_inside_the_popover_frame` (the search row lies inside the frame;
+mutation-checked: without `initial_width` the row is 532px in a 320px frame).
+
+How to apply: any fork popover that embeds a `Picker` must give it `initial_width`; a width on
+the wrapper alone no longer constrains it.
+
