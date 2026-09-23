@@ -1603,6 +1603,10 @@ impl Render for SolutionSessionView {
         // Parked on self so the list processor closure (which must be
         // `'static`) can reach it via `&mut Self`.
         self.assistant_label_for_render = assistant_label;
+        let agent_ui_font_size = {
+            use settings::Settings as _;
+            theme_settings::ThemeSettings::get_global(cx).agent_ui_font_size(cx)
+        };
         let session = self.session.read(cx);
         div()
             .id("solution-session-view")
@@ -1649,6 +1653,15 @@ impl Render for SolutionSessionView {
             .flex()
             .flex_col()
             .size_full()
+            // The conversation's text size. Markdown text takes its size
+            // from the inherited text style, not from
+            // `MarkdownStyle::base_text_style` (its runs carry font and
+            // colour only), so without this the prose rendered at the UI's
+            // 1rem and `agent_ui_font_size` did nothing here. Upstream's
+            // agent panel gets the same effect by wrapping itself in
+            // `WithRemSize(agent_ui_font_size)`; this sets the text size only,
+            // so labels, icons and spacing keep the UI scale.
+            .text_size(agent_ui_font_size)
             .bg(cx.theme().colors().panel_background)
             .when_some(find_bar, |this, bar| this.child(bar))
             .child({

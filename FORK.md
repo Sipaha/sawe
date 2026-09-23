@@ -135,14 +135,14 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/paths/src/paths.rs` | `.zed` → `.sawe` rename for per-worktree config dir. Adds `run_configurations_file()` (global `~/.spk/sawe/config/run-configurations.json`) and `local_run_configurations_file_relative_path()` (`.sawe/run-configurations.json`) for S-RUN. Adds `remote_control_settings_file()` (`~/.spk/sawe/config/remote-control.json`) for R-1. Adds `remote_control_cert_file()` / `remote_control_key_file()` siblings for the R-2 self-signed TLS cert + key (persisted across restarts so fingerprint pinning stays stable). | rebrand / `run_config` (S-RUN) / `remote_control` (R-1 / R-2) |
 | `crates/gpui_tokio/src/gpui_tokio.rs` | Adds `Tokio::try_handle(cx) -> Option<tokio::runtime::Handle>` — the non-panicking analogue of `Tokio::handle`, used by `remote_control::store::start_listener_async` to short-circuit when the runtime isn't installed (rather than panic deep in the bootstrap path). | `remote_control` (R-2) |
 | `assets/keymaps/default-*.json` | Default shortcuts for Solutions / sessions. Adds `alt-shift-f10` → `run_config::Run`, `alt-shift-f9` → `run_config::Debug`, `alt-shift-f2` → `run_config::Stop` (Workspace context; IntelliJ-style — `alt-shift` variants chosen because `shift-f10`/`shift-f9`/`ctrl-f2` are already bound in Editor context). | `solutions_ui` / `run_config_ui` |
-| `assets/settings/default.json`, `assets/settings/initial_user_settings.json`, `assets/fonts/jetbrains-mono/` | Default `solutions.root`; default `icon_theme: "Material Icon Theme"` + auto-install of the matching extension (colored project tree, IDEA-like, vs upstream's monochrome `Zed (Default)`); default `toolbar.{breadcrumbs,quick_actions,selections_menu}: false` (IDEA-style — no toolbar row under the tab bar; whole row disappears when all items hidden, Ctrl+F search bars unaffected; re-enable per-user in settings or per-editor via `editor::ToggleBreadcrumb`); default `project_panel.{sticky_scroll,auto_fold_dirs}: false` (the pinned ancestor rows cover the tree while scrolling, and the folded `a/b/c` chains hide real directory levels — both are opt-in here, doc-comment defaults in `settings_content/src/workspace.rs` updated to match); **decision #184** — the editor is sized and shaped against IDEA: bundled JetBrains Mono as `buffer_font_family` **and, since #205, as `ui_font_family`**, `buffer_font_size: 13`, `buffer_line_height: {custom: 1.662}`, `ui_font_size: 16`, and the seed template pins no font size at all. | `solutions` / rebrand |
+| `assets/settings/default.json`, `assets/settings/initial_user_settings.json`, `assets/fonts/jetbrains-mono/` | Default `solutions.root`; default `icon_theme: "Material Icon Theme"` + auto-install of the matching extension (colored project tree, IDEA-like, vs upstream's monochrome `Zed (Default)`); default `toolbar.{breadcrumbs,quick_actions,selections_menu}: false` (IDEA-style — no toolbar row under the tab bar; whole row disappears when all items hidden, Ctrl+F search bars unaffected; re-enable per-user in settings or per-editor via `editor::ToggleBreadcrumb`); default `project_panel.{sticky_scroll,auto_fold_dirs}: false` (the pinned ancestor rows cover the tree while scrolling, and the folded `a/b/c` chains hide real directory levels — both are opt-in here, doc-comment defaults in `settings_content/src/workspace.rs` updated to match); **decision #184** — the editor is sized and shaped against IDEA: bundled JetBrains Mono as `buffer_font_family` **and, since #205, as `ui_font_family`**, `buffer_font_size: 13`, `buffer_line_height: {custom: 1.662}`, `ui_font_size: 16`, `agent_ui_font_size: 14` (#206), and the seed template pins no font size at all. | `solutions` / rebrand |
 | `crates/zed/Cargo.toml` `[[bin]]` | Binary name overridden to `sawe` (cargo crate `zed` unchanged). | rebrand |
 | `.cargo/config.toml` | `[target.x86_64-unknown-linux-gnu]` block forcing `-fuse-ld=mold`. See decision 15. | build |
 | `crates/terminal_view/src/terminal_panel.rs` | Dropped the now-unused `TerminalDockPosition` import (a local edit had removed its only use, leaving a dead import that failed `clippy -D warnings`). | upstream-fix |
 | `crates/ui/src/components/scrollbar.rs`, `crates/gpui/src/elements/div.rs` | **(decision #82)** `track_anchor` / `tracks_scroll_handle` + `nested_in_scroll_container`; gpui gains `Interactivity::tracked_scroll_handle()` and `PartialEq` for `ScrollHandle`. | `ui` / `gpui` |
 | `crates/git_ui/src/rollback_modal.rs` | **New.** IDEA's Rollback Changes dialog: checkbox tree over the affected files (reusing the git panel's `TreeViewState::build_tree_entries`), "N modified" summary, "Delete local copies of added files", Rollback / Close. Only checked files are rolled back. | `git_ui` |
 | `crates/workspace/src/mcp/windows.rs` | `windows.click_at` gained a `clicks` parameter — two separate calls are not a double click, so a handler branching on `click_count()` was untestable. Also `windows.resize` (content size in logical pixels): the headless window is fixed at 1920x1080, which hid the Solution band's status-bar overflow from every agent-driven check. It calls `Window::bounds_changed` after `Window::resize` because the headless platform window mutates its bounds without firing the resize callback. | `workspace` |
-| `crates/workspace/src/status_bar.rs` | `flex_none` on the row — it silently absorbed the workspace column's overflow (default `flex-shrink: 1`) and an over-tall Solution band ate it. The row is also 1.2× upstream's 30px (`STATUS_BAR_HEIGHT` = 36px, after two ~10% bumps), with its contents scaled to match by a rem override (decision 138). | `workspace` |
+| `crates/workspace/src/status_bar.rs` | `flex_none` on the row — it silently absorbed the workspace column's overflow (default `flex-shrink: 1`) and an over-tall Solution band ate it. The row is also 1.2× upstream's 30px (`STATUS_BAR_HEIGHT` = 36px, after two ~10% bumps), with its contents scaled to match by a rem override (decision 138). Adds `status_bar_content_height(window)` — the row's height less the 1px bottom border it grows under client-side decorations — so an item can fill the bar with an exact margin (the session tabs, #206). | `workspace` |
 | `crates/editor/src/split_connectors.rs` | Connector ribbons for the side-by-side diff. **(decision #62)** `ribbon_edges` gives a collapsed insertion edge the insertion rule's real 2px extent so the ribbon and the rule join flush. | `editor` |
 | `crates/editor/src/split.rs` | **(decision #79)** The left pane mirrors the right pane's `show_headers()` instead of guessing from `is_singleton()`. | `editor` |
 | `crates/git_ui/src/solo_diff_view.rs`, `crates/git_ui/src/project_diff.rs`, `crates/git_ui/src/commit_view.rs` | **(decision #78)** Diff toolbars lost every staging/commit button and gained the `N difference(s)` count (`difference_count_label` + `HunkCountCache`). | `git_ui` |
@@ -5667,7 +5667,8 @@ What: `session_tab_strip::tab_age_label` renders the **same clock** as the statu
 stuck-turn watchdog, `SolutionSession::last_activity_at` (persisted, so a tab restored from
 disk shows its real age, not the restart time), as at most three characters: `now` (< 1 min),
 `Nm`, `Nh`, then `Nd` capped at `99d` — past 99 days the label stops changing. It sits
-right-aligned in a slot of fixed width `AGE_SLOT_PX` after the title, in `LabelSize::XSmall`,
+left-aligned in a slot of fixed width `AGE_SLOT_PX` right after the title and a `·` separator
+(#206), in `LabelSize::XSmall`,
 `Color::Muted`, in the **monospaced buffer font** (maintainer request) — every label is three
 cells wide and the digits don't jitter as it ticks. A 15 s tick (`AGE_TICK`) re-renders the strip so labels move with no store event.
 
@@ -5676,8 +5677,9 @@ would need a slot three times as wide on every tab; the compact form is what a f
 honour. The slot is sized from a **measurement**, not a guess. The first cut used the
 proportional `.ZedSans`, where `m` is the widest glyph: `59m` measured 23px at the status bar's
 1.2 rem scale and the 20-rem-px slot (24 real px) left it 1px. The slot became 24 (≈29 real
-px); in JetBrains Mono every label measures 19–20px of ink in it. The tab's `min_w`/`max_w` grew
-by the slot's net 18px (it replaced the 6px state dot, #203), so titles keep their room.
+px); in JetBrains Mono every label measures 19–20px of ink in it. The tab's `max_w` grew
+by the slot's net 18px (it replaced the 6px state dot, #203), so titles keep their room; the
+`min_w` it also had is gone (#206).
 
 How to apply: guarded by `the_tab_age_is_compact_and_capped_at_99_days` (boundaries, the cap,
 clock skew, ≤ 3 characters) and by the tab paint test, which paints `99d` and `59m`, asserts each
@@ -5694,7 +5696,7 @@ What: `assets/settings/default.json` sets `"ui_font_family": "JetBrains Mono"` (
 i.e. IBM Plex Sans). It is the font already bundled for the buffer (#184), so nothing new ships.
 `agent_ui_font_family` stays `null` and falls back to the UI font, so the agent conversation is
 monospaced too; the buffer and the size (`ui_font_size: 16`, a comfort setting per #184) are
-unchanged. A user who wants the proportional font back sets `".ZedSans"`; the comment in
+unchanged. The conversation's prose read as too large in mono at 16px and is 14px since #206. A user who wants the proportional font back sets `".ZedSans"`; the comment in
 `default.json` says so.
 
 Verified in an isolated probe, before and after on the same profile: title bar, project tree,
@@ -5703,3 +5705,44 @@ and the `+` picker all render in JetBrains Mono with no clipped or overlapping t
 wider, so lines run longer and labels truncate sooner — the expected cost, not a defect.
 `gpui`'s `fallback_font_stack` still lists `.ZedSans`; it is a fallback for missing glyphs, not
 the UI font, and was left alone.
+
+### 206. Session tabs hug their content and fill the bar; the conversation honours `agent_ui_font_size`
+
+The maintainer, 2026-09-23, four reports after restarting onto the monospaced UI (#205): the text
+in the dialog became too big; the gap between a tab's name and its age is too large — use a dot
+separator; the gap above and below a tab differs — trim it to 1px; the provider logo is not
+level with the tab's title.
+
+**Dialog text.** Markdown lays its text out at the *inherited* text size: the runs it builds carry
+font and colour, not size, so `MarkdownStyle::base_text_style.font_size` does not reach the
+glyphs. Upstream's agent panel gets its size by wrapping itself in
+`WithRemSize(agent_ui_font_size)`; Sawe's `SolutionSessionView` never did, so
+`agent_ui_font_size` only ever sized the composer and the transcript sat at the UI's 1rem —
+16px, which in JetBrains Mono read as oversized. The view's root now sets
+`.text_size(agent_ui_font_size)` (text only — labels, icons and spacing keep the UI scale), and
+`default.json` sets `agent_ui_font_size: 14`, the size of the dialog's own labels. Guarded by
+`the_transcript_prose_follows_agent_ui_font_size` (a paragraph wraps taller at 30px than at 10px;
+mutation-checked: without the `text_size` both are 147px).
+
+**Tab layout.** The gap came from two things: the tab's `min_w` let a short title's box stretch,
+and the age was right-aligned in its fixed slot, so even a long, truncated title had empty cells
+before a two-character age. Now the tab has no minimum width, the title box does not grow, a
+muted `·` follows it, and the age is left-aligned in the same fixed slot (so the tab still does
+not change width as the age ticks). The tab paint test asserts the age starts at most 20px after
+the title text (mutation-checked: the old layout measures 34px).
+
+**Tab height.** The pill used the `+` button's `ButtonSize::Default` (26px at the bar's rem
+scale). Measured on the maintainer's screenshot: the client-decorated bar is 35px visible (its
+1px bottom border sits past the window edge), leaving 4px above and 5px below. The pill is now
+`workspace::status_bar_content_height(window) - 2 × TAB_INSET` (1px) — 33px there, 34px in a
+server-decorated 36px bar — centred, so 1px each side in both.
+
+**Logo alignment.** The logo (an SVG, snapped as a box) and the title (glyphs, snapped at the
+baseline) round a half-pixel centre differently. In the 31px content box of the 33px pill the
+row's centre is on a half pixel and the logo landed 1px above the capitals — exactly the
+screenshot; in the probe's 32px box it was level. So the logo/title/age row no longer centres in
+the pill's own box: it has a constant height, `tab_content_height()` = 32px (even, so its centre
+is a whole pixel), pinned to the pill's top edge, and lays out identically in both bars — in the
+client-decorated one it overlaps the underline by 1px, where it paints nothing. Verified in the
+probe: logo ink and capitals both span the same ten rows.
+

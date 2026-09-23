@@ -365,6 +365,32 @@ fn render_tab_logo(brand: Option<&'static AgentBrand>, look: TabLogoLook, ix: us
         .into_any_element()
 }
 
+/// Gap between a tab and the status bar's top and bottom edges.
+const TAB_INSET: Pixels = px(1.);
+
+/// A tab's height: the status bar's content box less [`TAB_INSET`] on each
+/// side. The bar centres its items, so the gaps come out equal.
+fn tab_height(window: &Window) -> Pixels {
+    workspace::status_bar_content_height(window) - TAB_INSET * 2.
+}
+
+/// Width of the selected tab's accent underline, the pill's bottom border.
+const TAB_UNDERLINE: Pixels = px(2.);
+
+/// Height of the row holding a tab's logo, title and age, pinned to the top
+/// of the pill: the pill's content box in the server-decorated bar (36px bar,
+/// 34px pill, less the underline) — 32px, an even number, so the row's centre
+/// falls on a whole pixel. On a half pixel the logo (an SVG, snapped as a box)
+/// and the title (glyphs, snapped at the baseline) round differently and the
+/// logo sits a pixel above the text; that is what the maintainer saw in the
+/// 35px client-decorated bar, where the pill's own content box is 31px. A
+/// constant rather than that box so both bars lay the row out identically;
+/// in the client-decorated one it overlaps the underline by 1px, where the
+/// centred content paints nothing.
+fn tab_content_height() -> Pixels {
+    workspace::STATUS_BAR_HEIGHT - TAB_INSET * 2. - TAB_UNDERLINE
+}
+
 /// How often the strip re-renders so tab ages advance. The coarsest unit a
 /// tab shows under an hour is a minute, so a label is at most this late.
 const AGE_TICK: std::time::Duration = std::time::Duration::from_secs(15);
@@ -405,6 +431,11 @@ fn age_slot_selector(ix: usize) -> String {
 }
 fn age_text_selector(ix: usize) -> String {
     format!("SESSION-TAB-AGE-TEXT-{ix}")
+}
+/// `debug_selector` of the box hugging a tab's title text, so the paint test
+/// can check the age follows the title rather than sitting at the far end.
+fn title_selector(ix: usize) -> String {
+    format!("SESSION-TAB-TITLE-{ix}")
 }
 
 /// `debug_selector` on an errored tab's stripe.
@@ -696,6 +727,7 @@ impl SessionTabStrip {
         order: Vec<SolutionSessionId>,
         weak_self: WeakEntity<Self>,
         weak_workspace: Option<WeakEntity<Workspace>>,
+        tab_height: Pixels,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let session_id = candidate.session_id;
@@ -736,28 +768,28 @@ impl SessionTabStrip {
             })
             .flex()
             .flex_none()
-            .items_center()
-            // A definite height, taken from the same `ButtonSize` metric the
-            // neighbouring `+`/overflow `IconButton`s size themselves with, so
-            // the pill matches them and scales with the status bar's rem
-            // override. It must be explicit: `h_full()` here was inert (no
-            // ancestor has a definite height), which left the row's height an
-            // accident of its tallest child — the close cross this strip no
-            // longer has. Without it the label sits in a pill with no
-            // vertical extent at all.
-            .h(ButtonSize::Default.rems())
-            .gap_1()
+            // The content row below is pinned to the pill's top edge, not
+            // centred: see `tab_content_height`.
+            .items_start()
+            // A definite height: the status bar's content box less
+            // `TAB_INSET` top and bottom, so the pill fills the bar with a
+            // 1px margin (maintainer request, 2026-09-23). The earlier
+            // `ButtonSize::Default` height (the `+` button's, 26px at the
+            // bar's rem scale) left 4px above and 5px below in the 35px
+            // client-decorated bar. In px, not rems: the bar's own height is
+            // px. It must be explicit — `h_full()` here is inert (no ancestor
+            // has a definite height).
+            .h(tab_height)
             .px_1p5()
             // In rems, not px: the status bar overrides the rem size for its
             // subtree (`workspace::status_bar::STATUS_BAR_UI_SCALE`), so a
             // fixed pixel width would hold the tab at its old size while its
             // label grew — i.e. truncate more text than before.
-            // Both bumped by the width the provider logo + its gap add, so
-            // the label still gets the same room it had before the logo
-            // arrived rather than paying for it out of its own truncation
-            // budget — and again by the age slot's net 18px (its 24px + gap,
-            // less the 6px state dot + gap it replaced), for the same reason.
-            .min_w(rems_from_px(122_f32))
+            // No minimum: the tab hugs its content, so a short title is
+            // followed straight by ` · 1d` instead of a stretch of empty pill
+            // (maintainer request, 2026-09-23). The maximum is bumped by the
+            // width the provider logo, the separator and the age slot add, so
+            // a long title still gets the room it had before they arrived.
             .max_w(rems_from_px(212_f32))
             .relative()
             .rounded_sm()
@@ -765,58 +797,67 @@ impl SessionTabStrip {
             .when(logo_look == TabLogoLook::Errored, |this| {
                 this.child(render_error_stripe(cx))
             })
-            .border_b_2()
+            .border_b(TAB_UNDERLINE)
             .border_color(border)
             .cursor_pointer()
-            // The provider logo answers both "which agent" and "is it working
-            // right now" — the separate state dot it used to sit beside is
-            // gone (maintainer request, 2026-09-23). `IconSize::XSmall` keeps
-            // it inside `ButtonSize::Default.rems()` at the status bar's rem
-            // scale.
-            .child(render_tab_logo(candidate.brand, logo_look, ix))
             .child(
-                // Own flex row at full height so the label is optically
-                // centred in the pill, mirroring `console_panel::panel`'s tab.
-                // NB: no `LineHeightStyle::UiLabel` — it pins line-height to
-                // 1.0×font-size and `.truncate()` adds `overflow: hidden`, so
-                // descenders get clipped at the bottom edge.
                 div()
-                    .flex_1()
+                    .flex()
                     .min_w_0()
-                    .flex()
                     .items_center()
-                    .h_full()
+                    .gap_1()
+                    .h(tab_content_height())
+                    // The provider logo answers both "which agent" and "is it working
+                    // right now" — the separate state dot it used to sit beside is
+                    // gone (maintainer request, 2026-09-23). `IconSize::XSmall`
+                    // at the status bar's rem scale.
+                    .child(render_tab_logo(candidate.brand, logo_look, ix))
                     .child(
-                        Label::new(title.clone())
-                            .size(LabelSize::Small)
-                            .color(style.label)
-                            .truncate(),
-                    ),
-            )
-            // Time since the session's last activity, right-aligned in a
-            // fixed-width slot so the tab's width never follows the text.
-            .child(
-                div()
-                    .debug_selector(move || age_slot_selector(ix))
-                    .flex_none()
-                    .w(rems_from_px(AGE_SLOT_PX))
-                    .flex()
-                    .justify_end()
+                        // Own flex row at full height so the label is optically
+                        // centred in the pill, mirroring `console_panel::panel`'s tab.
+                        // NB: no `LineHeightStyle::UiLabel` — it pins line-height to
+                        // 1.0×font-size and `.truncate()` adds `overflow: hidden`, so
+                        // descenders get clipped at the bottom edge.
+                        // Shrinks (to truncate under `max_w`) but never grows, so
+                        // the separator and the age sit right after the title.
+                        div().min_w_0().flex().items_center().h_full().child(
+                            div()
+                                .debug_selector(move || title_selector(ix))
+                                .min_w_0()
+                                .child(
+                                    Label::new(title.clone())
+                                        .size(LabelSize::Small)
+                                        .color(style.label)
+                                        .truncate(),
+                                ),
+                        ),
+                    )
+                    .child(Label::new("·").size(LabelSize::XSmall).color(Color::Muted))
+                    // Time since the session's last activity, left-aligned right after
+                    // the separator in a fixed-width slot, so the tab's width never
+                    // follows the text as the age ticks.
                     .child(
                         div()
-                            .debug_selector(move || age_text_selector(ix))
+                            .debug_selector(move || age_slot_selector(ix))
                             .flex_none()
+                            .w(rems_from_px(AGE_SLOT_PX))
+                            .flex()
                             .child(
-                                Label::new(tab_age_label(
-                                    candidate.last_activity_at,
-                                    chrono::Utc::now(),
-                                ))
-                                .size(LabelSize::XSmall)
-                                // Monospaced (the buffer font), so every
-                                // label is exactly three cells wide and the
-                                // digits don't jitter as the age ticks.
-                                .buffer_font(cx)
-                                .color(Color::Muted),
+                                div()
+                                    .debug_selector(move || age_text_selector(ix))
+                                    .flex_none()
+                                    .child(
+                                        Label::new(tab_age_label(
+                                            candidate.last_activity_at,
+                                            chrono::Utc::now(),
+                                        ))
+                                        .size(LabelSize::XSmall)
+                                        // Monospaced (the buffer font), so every
+                                        // label is exactly three cells wide and the
+                                        // digits don't jitter as the age ticks.
+                                        .buffer_font(cx)
+                                        .color(Color::Muted),
+                                    ),
                             ),
                     ),
             )
@@ -966,7 +1007,7 @@ impl SessionTabStrip {
 }
 
 impl Render for SessionTabStrip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(solution_id) = self.active_solution_id(cx) else {
             return div().h_full().into_any_element();
         };
@@ -983,6 +1024,7 @@ impl Render for SessionTabStrip {
         let order: Vec<SolutionSessionId> = candidates.iter().map(|c| c.session_id).collect();
         let weak_self = cx.weak_entity();
         let weak_workspace = self.workspace_weak(cx);
+        let tab_height = tab_height(window);
 
         let tabs = visible.iter().enumerate().map(|(ix, candidate)| {
             self.render_tab(
@@ -993,6 +1035,7 @@ impl Render for SessionTabStrip {
                 order.clone(),
                 weak_self.clone(),
                 weak_workspace.clone(),
+                tab_height,
                 cx,
             )
         });
@@ -1181,8 +1224,9 @@ mod tests {
     }
 
     impl Render for TabPaintHarness {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let solution_id = self.solution_id;
+            let tab_height = tab_height(window);
             let tabs = self.tabs.clone();
             let strip = self.strip.clone();
             let rows = strip.update(cx, |strip, cx| {
@@ -1216,6 +1260,7 @@ mod tests {
                                 order.clone(),
                                 weak_self.clone(),
                                 None,
+                                tab_height,
                                 cx,
                             )
                             .into_any_element()
@@ -1397,11 +1442,16 @@ mod tests {
              above did paint"
         );
 
-        // `ButtonSize::Default` at the test window's default 16px rem: the
-        // metric the neighbouring `+` / overflow buttons use. The provider
-        // logo added in 2026-09-22 goes *inside* that row — if it ever pushed
-        // the pill taller it would push the status bar with it.
-        assert_eq!(active.size.height, px(22.));
+        // The status bar's content box less 1px top and bottom (maintainer
+        // request, 2026-09-23). The provider logo goes *inside* that row — if
+        // it ever pushed the pill taller it would push the status bar with it.
+        let expected_height = cx.update(|window, _| tab_height(window));
+        assert_eq!(active.size.height, expected_height);
+        assert_eq!(
+            expected_height,
+            workspace::STATUS_BAR_HEIGHT - px(2.),
+            "the test window is server-decorated: a 36px bar, a 34px tab"
+        );
         assert_eq!(
             inactive.size.height, active.size.height,
             "selection must not change the row's height"
@@ -1453,6 +1503,18 @@ mod tests {
             slots[0].size.width, slots[1].size.width,
             "the age slot must not change width with its text"
         );
+
+        // The age follows the title, one separator dot away, however short
+        // the title — not pushed to the far end of a wider tab (maintainer
+        // request, 2026-09-23: the gap read as too large).
+        for (ix, slot) in slots.iter().enumerate() {
+            let title = painted(cx, title_selector(ix));
+            let gap = slot.left() - title.right();
+            assert!(
+                gap > px(0.) && gap <= px(20.),
+                "tab {ix}'s age must sit right after its title: gap {gap:?}"
+            );
+        }
     }
 
     /// Stand-in for `console_panel::NewChat`, registered under that exact

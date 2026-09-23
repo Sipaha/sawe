@@ -38,6 +38,21 @@ Prose sitting ~7px left of tool-call content is deliberate:
 the offset is the role cue, after an earlier attempt to align it read as one
 undifferentiated column. Changing that is a design decision, not a fix.
 
+## 3. Monospaced-UI follow-ups: dialog text size, tab gap, tab height, logo level — fixed (FORK.md #206)
+
+- **Dialog text too big.** `agent_ui_font_size` had never reached the transcript: markdown text
+  inherits its size from the enclosing element, and `SolutionSessionView` set none, so prose sat
+  at the UI's 16px whatever the setting said (a probe with `agent_ui_font_size: 30` grew only the
+  composer). The view root now sets `text_size(agent_ui_font_size)`; default is 14.
+- **Probe trap found on the way:** a probe editor left running keeps `mcp.lock`/`mcp.sock`, the
+  next launch exits, and the driver silently screenshots the *old* build. `.v/round2.sh` now
+  deletes the socket before launch and refuses to continue unless `mcp.lock` holds the PID it
+  just started.
+- **Tab height / logo.** Measure from the maintainer's own screenshot before theorising — it
+  showed a 35px bar (client decorations) where the probe has 36px, which is why the probe looked
+  fine: the logo-vs-text offset is a half-pixel rounding difference between SVG and glyph
+  snapping, visible only at the odd bar height.
+
 ## Reproducing a pre-merge build without rebuilding one
 
 A long-running process keeps its executable readable at `/proc/<pid>/exe` after

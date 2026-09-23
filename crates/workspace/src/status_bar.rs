@@ -26,6 +26,23 @@ use ui::{
 /// changes.
 pub const STATUS_BAR_HEIGHT: Pixels = px(36.);
 
+/// Height of the status bar's content box: [`STATUS_BAR_HEIGHT`] less the 1px
+/// bottom border it grows under client-side decorations (see
+/// [`StatusBar::render`]; `mb(-1)` pushes that border past the window edge, so
+/// the visible bar is the content box). Items are centred in it, so an item
+/// this height less `2 * inset` sits exactly `inset` from both edges — which a
+/// rem-sized item cannot, because the content box is 35px under client
+/// decorations and an odd leftover splits unevenly.
+pub fn status_bar_content_height(window: &Window) -> Pixels {
+    match window.window_decorations() {
+        Decorations::Server => STATUS_BAR_HEIGHT,
+        Decorations::Client { .. } => STATUS_BAR_HEIGHT - STATUS_BAR_CLIENT_BORDER,
+    }
+}
+
+/// The bottom border [`StatusBar::render`] adds under client-side decorations.
+const STATUS_BAR_CLIENT_BORDER: Pixels = px(1.);
+
 /// Rem multiplier applied to the status bar's whole subtree, so its contents
 /// grow with [`STATUS_BAR_HEIGHT`] rather than rattling around in a taller row.
 ///
@@ -244,7 +261,7 @@ impl Render for StatusBar {
                         let needs_gap_fix = false;
                         if needs_gap_fix { px(-1.) } else { px(0.) }
                     })
-                    .border_b(px(1.0))
+                    .border_b(STATUS_BAR_CLIENT_BORDER)
                     .border_color(cx.theme().colors().status_bar_background),
             })
             .child(

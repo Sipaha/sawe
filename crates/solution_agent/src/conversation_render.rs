@@ -598,6 +598,11 @@ pub(crate) fn render_entry(
         .into_any_element()
 }
 
+/// `debug_selector` of an assistant message's container.
+pub(crate) fn assistant_message_selector(entry_idx: usize) -> String {
+    format!("solution-session-assistant-message-{entry_idx}")
+}
+
 pub(crate) fn render_assistant_message(
     entry_idx: usize,
     chunks: &[AssistantChunk],
@@ -620,6 +625,8 @@ pub(crate) fn render_assistant_message(
     // `mb_3` mirrors the user bubble's bottom margin so messages
     // breathe without the chunky `my_0p5` gaps.
     let mut container = v_flex().group(group_name.clone()).relative().px_1().mb_3(); // 12 px — a hair more than the user bubble's mb_3 above; both stay synced.
+    // Lets a paint test measure how the prose lays out.
+    container = container.debug_selector(move || assistant_message_selector(entry_idx));
     // While the agent is mid-turn we may have only `Thought` chunks —
     // show them so the user sees activity. Once any real `Message`
     // chunk arrives the thoughts become noise (Claude was reasoning)

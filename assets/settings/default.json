@@ -123,7 +123,13 @@
   // The font family for agent responses in the agent panel. Falls back to the UI font family if unset.
   "agent_ui_font_family": null,
   // The default font size for agent responses in the agent panel. Falls back to the UI font size if unset.
-  "agent_ui_font_size": null,
+  //
+  // Sawe sets 14 rather than inheriting the UI's 16: at 16 the monospaced UI
+  // font (JetBrains Mono, wider and with a taller x-height than the old
+  // proportional .ZedSans) made conversation prose read as oversized next to
+  // the 13px buffer text of tool output. 14 is also the size of the dialog's
+  // own labels (tool headers, status row), so prose and chrome match.
+  "agent_ui_font_size": 14,
   // The font family for user messages in the agent panel. Falls back to the buffer font family if unset.
   "agent_buffer_font_family": null,
   // The default font size for user messages in the agent panel.

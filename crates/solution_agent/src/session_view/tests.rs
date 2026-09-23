@@ -1460,11 +1460,15 @@ async fn the_compose_box_is_sized_by_the_panel_not_by_the_code_font(cx: &mut gpu
     // Deliberately far apart, and the buffer deliberately the smaller of the
     // two: an assertion that only checked "not the default" would pass while
     // the composer silently followed the code font.
-    let set_sizes = |ui: f32, buffer: f32, cx: &mut gpui::App| {
+    // `agent_ui_font_size` is set explicitly: Sawe's default.json gives it
+    // its own value (14, FORK.md #206), so it no longer follows the UI size.
+    let set_sizes = |agent: f32, buffer: f32, cx: &mut gpui::App| {
         SettingsStore::update_global(cx, |store, cx| {
             store
                 .set_user_settings(
-                    &format!(r#"{{ "ui_font_size": {ui}, "buffer_font_size": {buffer} }}"#),
+                    &format!(
+                        r#"{{ "agent_ui_font_size": {agent}, "buffer_font_size": {buffer} }}"#
+                    ),
                     cx,
                 )
                 .expect("set_user_settings");
@@ -1504,7 +1508,7 @@ async fn the_compose_box_is_sized_by_the_panel_not_by_the_code_font(cx: &mut gpu
     assert_eq!(
         expected,
         gpui::px(20.0),
-        "precondition: `agent_ui_font_size` falls back to the UI font size"
+        "precondition: the user's `agent_ui_font_size` is in effect"
     );
     assert_eq!(
         composer_size(vcx),
@@ -1521,6 +1525,96 @@ async fn the_compose_box_is_sized_by_the_panel_not_by_the_code_font(cx: &mut gpu
     assert_eq!(
         composer_size(vcx),
         gpui::px(24.0),
-        "and it follows the panel when the user changes the UI font size"
+        "and it follows the panel when the user changes `agent_ui_font_size`"
+    );
+}
+
+/// The conversation's prose follows `agent_ui_font_size`.
+///
+/// Markdown text takes its size from the inherited text style, not from the
+/// `MarkdownStyle` it is handed, so until the view set that style the setting
+/// did nothing to the transcript — prose stayed at the UI's 1rem while only the
+/// composer followed it (maintainer report, 2026-09-23: "the text in the
+/// dialog is too big" after the UI went monospaced). Measured through the
+/// paint: the same paragraph at a larger size wraps into more lines, so its
+/// message block is taller.
+#[gpui::test]
+async fn the_transcript_prose_follows_agent_ui_font_size(cx: &mut gpui::TestAppContext) {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    use crate::store::SolutionAgentStore;
+    use gpui::UpdateGlobal as _;
+    use gpui::{VisualTestContext, px, size};
+    use settings::SettingsStore;
+    use std::sync::Arc;
+
+    let (solution_id, _tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
+    cx.update(|cx| {
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+        SolutionAgentStore::init_global(cx, registry);
+    });
+    let set_agent_size = |size: f32, cx: &mut gpui::App| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(&format!(r#"{{ "agent_ui_font_size": {size} }}"#), cx)
+                .expect("set_user_settings");
+        });
+    };
+    cx.update(|cx| set_agent_size(10.0, cx));
+
+    let session_id = crate::model::SolutionSessionId::new();
+    let workspace_window =
+        cx.add_window(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+    let workspace_weak = cx.update(|cx| {
+        workspace_window
+            .root(cx)
+            .expect("workspace window alive")
+            .downgrade()
+    });
+    let paragraph = "word ".repeat(120);
+    let entries = vec![Arc::new(SessionEntry {
+        created_ms: 0,
+        mod_seq: 1,
+        subagent_id: None,
+        kind: SessionEntryKind::AssistantMessage {
+            chunks: vec![AssistantChunk::Message(paragraph)],
+        },
+    })];
+    let session = cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = crate::store::tests::insert_cold_session(
+                session_id,
+                solution_id,
+                SharedString::from("mock-agent"),
+                Some(120_000),
+                Some(project.clone()),
+                store,
+                cx,
+            );
+            session.update(cx, |s, cx| s.set_entries(entries, cx));
+            session
+        })
+    });
+    let view_window = cx.add_window(|window, cx| {
+        SolutionSessionView::for_test(session_id, session.clone(), workspace_weak, window, cx)
+    });
+    let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
+    vcx.simulate_resize(size(px(900.), px(900.)));
+    vcx.run_until_parked();
+
+    let selector: &'static str =
+        Box::leak(crate::conversation_render::assistant_message_selector(0).into_boxed_str());
+    let small = vcx
+        .debug_bounds(selector)
+        .expect("the assistant message must paint");
+    vcx.update(|_, cx| set_agent_size(30.0, cx));
+    vcx.run_until_parked();
+    let large = vcx
+        .debug_bounds(selector)
+        .expect("the assistant message must paint");
+    assert!(
+        large.size.height > small.size.height,
+        "a larger agent_ui_font_size must wrap the paragraph into more lines: \
+         {small:?} at 10px vs {large:?} at 30px"
     );
 }
