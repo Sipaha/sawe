@@ -5686,6 +5686,8 @@ clock skew, ≤ 3 characters) and by the tab paint test, which paints `99d` and 
 fits inside its slot and that both slots are the same width (mutation-checked: a 10px slot fails
 it). A new unit longer than three characters, or a font much wider than `.ZedSans`, needs the
 slot re-measured — the buffer font is user-configurable.
+The phone's session list shows the same form (spk-editor-mobile `core/SessionAge.kt`,
+`compactSessionAge`) in a monospaced slot sized from `99d` — change both together.
 
 ### 205. The UI font is monospaced — JetBrains Mono, the same font as the buffer
 
