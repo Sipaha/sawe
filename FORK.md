@@ -5620,7 +5620,7 @@ decides what is added on top:
 
 | Session | Tab |
 |---|---|
-| `Running` | logo pulses (1s, opacity 0.4→1.0 — the status row's "thinking" curve) |
+| `Running` | logo pulses (1s, opacity 0.4→1.0 — the status row's "thinking" curve) — **except on the active tab**, whose dialog is on screen and already animates "Thinking…" (maintainer, 2026-09-23: two things blinking at once was too much); `the_active_tab_logo_does_not_pulse` |
 | `Errored` | static logo + a 2px `status().error` stripe along the tab's **top** edge |
 | idle, cold, `Stopping` | static logo |
 

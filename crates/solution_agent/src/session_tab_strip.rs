@@ -305,7 +305,8 @@ const PICKER_LOGO_PX: f32 = 24.;
 /// greying the logo out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabLogoLook {
-    /// Working: the logo pulses.
+    /// Working: the logo pulses. Only on a tab that is not the open dialog
+    /// — see [`tab_logo_look`].
     Working,
     /// The session hit an error: a red stripe along the tab's top edge
     /// ([`render_error_stripe`]). Not a red logo — the theme's error red is
@@ -317,10 +318,15 @@ enum TabLogoLook {
 }
 
 /// Map a tab's state onto its logo. Errors win, as they did for the dot.
-fn tab_logo_look(is_errored: bool, is_running: bool) -> TabLogoLook {
+///
+/// The active tab's logo never pulses: its session is the dialog on screen,
+/// whose status row already animates "Thinking…", and two things blinking at
+/// once was too much (maintainer request, 2026-09-23). The pulse is for
+/// sessions the user is not looking at.
+fn tab_logo_look(is_errored: bool, is_running: bool, is_active: bool) -> TabLogoLook {
     if is_errored {
         TabLogoLook::Errored
-    } else if is_running {
+    } else if is_running && !is_active {
         TabLogoLook::Working
     } else {
         TabLogoLook::Idle
@@ -731,7 +737,7 @@ impl SessionTabStrip {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let session_id = candidate.session_id;
-        let logo_look = tab_logo_look(candidate.is_errored, candidate.is_running);
+        let logo_look = tab_logo_look(candidate.is_errored, candidate.is_running, is_active);
         let title = if candidate.title.is_empty() {
             SharedString::from(session_id.to_string())
         } else {
@@ -1890,14 +1896,23 @@ mod tests {
     /// otherwise have been lost — adds a red stripe along the tab's top.
     #[test]
     fn the_tab_logo_carries_the_session_state() {
-        assert_eq!(tab_logo_look(false, true), TabLogoLook::Working);
-        assert_eq!(tab_logo_look(false, false), TabLogoLook::Idle);
-        assert_eq!(tab_logo_look(true, false), TabLogoLook::Errored);
+        assert_eq!(tab_logo_look(false, true, false), TabLogoLook::Working);
+        assert_eq!(tab_logo_look(false, false, false), TabLogoLook::Idle);
+        assert_eq!(tab_logo_look(true, false, false), TabLogoLook::Errored);
         assert_eq!(
-            tab_logo_look(true, true),
+            tab_logo_look(true, true, false),
             TabLogoLook::Errored,
             "an error wins over running, as it did for the dot"
         );
+    }
+
+    /// The open dialog's tab does not pulse — its status row already animates
+    /// "Thinking…" (maintainer request, 2026-09-23) — but an error on it still
+    /// shows.
+    #[test]
+    fn the_active_tab_logo_does_not_pulse() {
+        assert_eq!(tab_logo_look(false, true, true), TabLogoLook::Idle);
+        assert_eq!(tab_logo_look(true, true, true), TabLogoLook::Errored);
     }
 
     /// The tab's age is the status row's "1m ago" in at most three
