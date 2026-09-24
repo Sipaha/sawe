@@ -20967,6 +20967,52 @@ async fn test_range_format_respects_language_tab_size_override(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_tab_tooltip_shows_path_from_project_root(cx: &mut TestAppContext) {
+    use workspace::item::Item as _;
+
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "project": { "src": { "main.rs": "" } },
+            "outside.txt": "",
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/root/project").as_ref()], cx).await;
+
+    let mut tooltip_for = async |path: &str| {
+        let buffer = project
+            .update(cx, |project, cx| project.open_local_buffer(path, cx))
+            .await
+            .unwrap();
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            build_editor_with_project(project.clone(), buffer, window, cx)
+        });
+        editor.update(cx, |editor, cx| editor.tab_tooltip_text(cx))
+    };
+
+    assert_eq!(
+        tooltip_for(path!("/root/project/src/main.rs")).await,
+        Some(
+            std::path::Path::new("project")
+                .join("src")
+                .join("main.rs")
+                .to_string_lossy()
+                .into_owned()
+                .into()
+        )
+    );
+    assert_eq!(
+        tooltip_for(path!("/root/outside.txt")).await,
+        Some(path!("/root/outside.txt").into()),
+        "a file outside the project keeps its absolute path"
+    );
+}
+
+#[gpui::test]
 async fn test_document_format_whitespace_only_discards_content_changes(
     cx: &mut TestAppContext,
 ) {

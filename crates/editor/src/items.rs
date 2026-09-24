@@ -48,7 +48,7 @@ use text::{BufferId, BufferSnapshot, OffsetRangeExt, Selection, ToPoint as _};
 use ui::{IconDecorationKind, prelude::*};
 use util::{
     ResultExt, TryFutureExt, debug_panic,
-    paths::{PathExt, UrlExt as _},
+    paths::UrlExt as _,
     rel_path::RelPath,
 };
 use workspace::item::{Dedup, ItemSettings, SerializableItem, TabContentParams};
@@ -698,15 +698,10 @@ impl Item for Editor {
             .and_then(|buffer| buffer.read(cx).file())
             .and_then(|file| File::from_dyn(Some(file)))
         {
-            Some(
-                file.worktree
-                    .read(cx)
-                    .absolutize(&file.path)
-                    .compact()
-                    .to_string_lossy()
-                    .into_owned()
-                    .into(),
-            )
+            // Relative to the project root (`sawe/Procfile.web`): an absolute
+            // path repeats the Solution's location on every tab. Files outside
+            // any visible worktree still get their `~`-compacted absolute path.
+            Some(language::File::full_path(file, cx).to_string_lossy().into_owned().into())
         } else {
             let title = multi_buffer.title(cx);
             (!title.is_empty()).then(|| title.to_string().into())
