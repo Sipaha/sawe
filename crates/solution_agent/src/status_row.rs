@@ -532,7 +532,10 @@ pub(crate) fn render_status_row(
                 let weak_view = weak_view.clone();
                 let compact_tooltip = compact_tooltip.clone();
                 let clear_tooltip = clear_tooltip.clone();
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    // Three consequential actions: a taller row is an easier
+                    // target and the menu is short enough to afford it.
+                    let mut menu = menu.item_height(px(34.));
                     let with_reason = |label: &str| -> SharedString {
                         if compact_enabled {
                             label.to_string().into()

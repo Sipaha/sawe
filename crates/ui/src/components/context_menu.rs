@@ -223,6 +223,8 @@ pub struct ContextMenu {
     _on_blur_subscription: Subscription,
     keep_open_on_confirm: bool,
     fixed_width: Option<DefiniteLength>,
+    /// Height of each entry row; `None` keeps the dense default.
+    item_height: Option<Pixels>,
     main_menu: Option<Entity<ContextMenu>>,
     main_menu_observed_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     // Docs aide-related fields
@@ -351,6 +353,7 @@ impl ContextMenu {
                     _on_blur_subscription,
                     keep_open_on_confirm: true,
                     fixed_width: None,
+                    item_height: None,
                     main_menu: None,
                     main_menu_observed_bounds: Rc::new(Cell::new(None)),
                     documentation_aside: None,
@@ -421,6 +424,7 @@ impl ContextMenu {
                 ),
                 keep_open_on_confirm: false,
                 fixed_width: None,
+                item_height: None,
                 main_menu: None,
                 main_menu_observed_bounds: Rc::new(Cell::new(None)),
                 documentation_aside: None,
@@ -864,6 +868,13 @@ impl ContextMenu {
         self
     }
 
+    /// Gives every entry this height instead of the dense default — for a short
+    /// menu of consequential actions, where a bigger target is worth the space.
+    pub fn item_height(mut self, height: Pixels) -> Self {
+        self.item_height = Some(height);
+        self
+    }
+
     pub fn end_slot_action(mut self, action: Box<dyn Action>) -> Self {
         self.end_slot_action = Some(action);
         self
@@ -1272,6 +1283,7 @@ impl ContextMenu {
                 _on_blur_subscription,
                 keep_open_on_confirm: false,
                 fixed_width: None,
+                item_height: None,
                 documentation_aside: None,
                 aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
                 main_menu: Some(parent_entity),
@@ -1582,6 +1594,7 @@ impl ContextMenu {
             .child(
                 ListItem::new(ix)
                     .inset(true)
+                    .when_some(self.item_height, |item, height| item.height(height))
                     .aria_role(Role::MenuItem)
                     .when(is_active_descendant, |item| item.aria_active_descendant())
                     .aria_label(label.clone())
@@ -1885,6 +1898,7 @@ impl ContextMenu {
 
         div()
             .id(("context-menu-child", ix))
+            .debug_selector(|| format!("context-menu-entry-{ix}"))
             .when_some(documentation_aside.clone(), |this, documentation_aside| {
                 this.occlude()
                     .on_hover(cx.listener(move |menu, hovered, _, cx| {
@@ -1917,6 +1931,7 @@ impl ContextMenu {
                 ListItem::new(ix)
                     .group_name("label_container")
                     .inset(true)
+                    .when_some(self.item_height, |item, height| item.height(height))
                     .disabled(*disabled)
                     .aria_role(if toggle.is_some() {
                         Role::MenuItemCheckBox
@@ -2182,6 +2197,7 @@ impl ContextMenu {
             _on_blur_subscription,
             keep_open_on_confirm: false,
             fixed_width: None,
+            item_height: None,
             main_menu: None,
             main_menu_observed_bounds: Rc::new(Cell::new(None)),
             documentation_aside: None,
@@ -2464,6 +2480,37 @@ mod tests {
     use gpui::TestAppContext;
 
     use super::*;
+
+    #[gpui::test]
+    fn item_height_sets_the_entry_row_height(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let entry_height = |item_height: Option<Pixels>, cx: &mut TestAppContext| {
+            let (_, cx) = cx.add_window_view(|window, cx| {
+                ContextMenu::new(window, cx, move |menu, _, _| {
+                    let menu = match item_height {
+                        Some(height) => menu.item_height(height),
+                        None => menu,
+                    };
+                    menu.entry("First entry", None, |_, _| {})
+                })
+            });
+            cx.run_until_parked();
+            cx.debug_bounds("context-menu-entry-0")
+                .expect("the entry must paint")
+                .size
+                .height
+        };
+
+        assert_eq!(entry_height(Some(px(34.)), cx), px(34.));
+        assert!(
+            entry_height(None, cx) < px(30.),
+            "without item_height the menu stays dense"
+        );
+    }
 
     /// Mounts the menu as the window's root view, so it is in the dispatch
     /// tree and its `on_focus_in` listener actually fires on focus — a menu
