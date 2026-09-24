@@ -36,10 +36,10 @@ pub struct CreateSessionParams {
     /// (`unknown_parent_session` or `parent_session_in_different_solution`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
-    /// Optional user-supplied title. When absent the desktop assigns a
-    /// title automatically from the first user turn — clients that
-    /// want a stable, human-supplied name (e.g. the phone) can set
-    /// this. Renamable later via `solution_agent.rename_session`.
+    /// Optional user-supplied title. When absent the tab starts as
+    /// `{Provider} New` (` #N` when taken) and the agent names it once the
+    /// task is clear (FORK.md #209). Renamable later via
+    /// `solution_agent.rename_session`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Optional working directory for the agent subprocess, passed through
@@ -320,6 +320,11 @@ impl McpServerTool for DeleteSessionTool {
 pub struct RenameSessionParams {
     pub session_id: String,
     pub title: String,
+    /// Rename only while the tab still has its default `{Provider} New`
+    /// title — what an agent naming its own tab passes, so it can never
+    /// overwrite a title the user chose (FORK.md #209).
+    #[serde(default)]
+    pub only_if_default: bool,
 }
 
 impl<'de> Deserialize<'de> for RenameSessionParams {
@@ -329,11 +334,13 @@ impl<'de> Deserialize<'de> for RenameSessionParams {
         struct Inner {
             session_id: String,
             title: String,
+            only_if_default: bool,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
             session_id: inner.session_id,
             title: inner.title,
+            only_if_default: inner.only_if_default,
         })
     }
 }
@@ -358,20 +365,39 @@ impl McpServerTool for RenameSessionTool {
             !input.session_id.is_empty(),
             "invalid_params: session_id is required"
         );
-        anyhow::ensure!(!input.title.is_empty(), "invalid_params: title is required");
+        let title = input.title.trim();
+        anyhow::ensure!(!title.is_empty(), "invalid_params: title is required");
         let session_id = SolutionSessionId::parse(&input.session_id)
             .map_err(|e| anyhow!("bad session id: {e}"))?;
-        let title = SharedString::from(input.title);
+        let title = SharedString::from(title.to_string());
 
-        cx.update(|cx| -> Result<()> {
+        let renamed = cx.update(|cx| -> Result<bool> {
             let store = SolutionAgentStore::global(cx);
-            store.update(cx, |store, cx| store.rename_session(session_id, title, cx))?;
-            Ok(())
+            store.update(cx, |store, cx| {
+                if input.only_if_default {
+                    let session = store
+                        .session(session_id)
+                        .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
+                    let session = session.read(cx);
+                    if !crate::store::is_default_session_title(
+                        &session.title,
+                        session.agent_id.as_ref(),
+                    ) {
+                        return Ok(false);
+                    }
+                }
+                store.rename_session(session_id, title, cx)?;
+                Ok(true)
+            })
         })?;
 
         Ok(ToolResponse {
             content: vec![ToolResponseContent::Text {
-                text: "renamed".to_string(),
+                text: if renamed {
+                    "renamed".to_string()
+                } else {
+                    "kept: the tab already has a title someone chose".to_string()
+                },
             }],
             structured_content: RenameSessionResult {},
         })

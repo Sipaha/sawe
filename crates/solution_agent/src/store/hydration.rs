@@ -243,12 +243,36 @@ fn short_session_title(session_id: SolutionSessionId) -> SharedString {
     SharedString::from(session_id.to_string())
 }
 
+/// `{Provider} New` — the tab title a session of `agent_id` starts with,
+/// until the agent names it (FORK.md #209). An agent with no brand reads
+/// `Agent New`.
+pub(crate) fn default_session_title_base(agent_id: &str) -> String {
+    let provider = crate::adapter::agent_brand(agent_id)
+        .map(|brand| brand.name)
+        .unwrap_or("Agent");
+    format!("{provider} New")
+}
+
+/// Whether `title` is still a default [`unique_session_title`] handed a
+/// session of `agent_id` — `Claude New`, `Claude New #3` — i.e. nobody has
+/// named the tab yet.
+pub(crate) fn is_default_session_title(title: &str, agent_id: &str) -> bool {
+    let base = default_session_title_base(agent_id);
+    title == base
+        || title
+            .strip_prefix(base.as_str())
+            .and_then(|rest| rest.strip_prefix(" #"))
+            .is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+}
+
 /// Pick a tab title that doesn't collide with any existing session in
 /// the same Solution. First call returns `base`; subsequent collisions
-/// get ` 2`, ` 3`, … appended (matching the "Untitled 2 / 3" convention
-/// the rest of the editor uses for duplicate names). Caps at 1000 just
-/// to avoid an infinite loop on a pathological state — practically
-/// nobody opens 1000 sessions of the same project in one Solution.
+/// get ` #1`, ` #2`, … appended — the first free number (maintainer
+/// request, 2026-09-24). Caps at 1000 just to avoid an infinite loop on a
+/// pathological state — practically nobody opens 1000 sessions of the
+/// same project in one Solution.
 pub(crate) fn unique_session_title(
     base: &str,
     store: &SolutionAgentStore,
@@ -266,8 +290,8 @@ pub(crate) fn unique_session_title(
     if !existing.contains(base) {
         return SharedString::from(base.to_string());
     }
-    for n in 2..1000 {
-        let candidate = format!("{base} {n}");
+    for n in 1..1000 {
+        let candidate = format!("{base} #{n}");
         if !existing.contains(&candidate) {
             return SharedString::from(candidate);
         }

@@ -987,6 +987,7 @@ pub(crate) use queue::summarize_blocks_for_log;
 pub use hydration::PersistedSession;
 pub(crate) use hydration::{build_cold_session, entries_from_rows, is_wiped_row_native};
 use hydration::{extract_preview, unique_session_title};
+pub(crate) use hydration::{default_session_title_base, is_default_session_title};
 // Every store.rs caller of `cold_entries_from_persisted` moved into `hydration`;
 // only the `store/tests/hydration.rs` bucket still reaches it via
 // `crate::store::cold_entries_from_persisted`, so gate the re-export to avoid a
@@ -1575,10 +1576,11 @@ impl SolutionAgentStore {
                         .model_catalog
                         .set_models(agent_id.clone(), live_models.clone());
                 }
-                // Default tab title = the Solution name. Dedup'd against
-                // existing sessions in the same Solution so successive opens
-                // land as `name`, `name 2`, `name 3`, …
-                let title_base: SharedString = SharedString::from(solution.name.clone());
+                // Default tab title = `{Provider} New`, dedup'd against the
+                // other sessions in the Solution (`Claude New`, `Claude New
+                // #1`, …) until the agent names it — see the tab-title line
+                // `build_session_meta` adds to the prompt (FORK.md #209).
+                let title_base = hydration::default_session_title_base(agent_id.as_ref());
                 let title = unique_session_title(&title_base, store, &solution_id, cx);
                 let entity = cx.new(|cx| {
                     let mut s = SolutionSession::new_idle(
@@ -1769,6 +1771,7 @@ impl SolutionAgentStore {
                 prompt.push_str(&format!(
                     "\nYour stable Sawe session ID is `{id}`. Use this exact ID as from_session_id for agent messages; it is not the provider thread ID.\n"
                 ));
+                prompt.push_str(&session_title_instruction(id, agent_id.as_ref()));
             }
             if !prompt.is_empty() {
                 meta.insert(
@@ -6150,3 +6153,21 @@ mod permission_tests {
         });
     }
 }
+
+/// The system-prompt line asking an agent to name its own tab (FORK.md #209).
+///
+/// A new session's tab reads `{Provider} New` until someone names it, and the
+/// agent is the one that knows what the conversation is about. The rename goes
+/// through `only_if_default`, so an agent can never overwrite a title the user
+/// chose — including one chosen after this prompt was sent.
+fn session_title_instruction(session_id: SolutionSessionId, agent_id: &str) -> String {
+    let default_title = default_session_title_base(agent_id);
+    format!(
+        "\nYour Sawe tab title starts as the placeholder `{default_title}` (possibly with a ` #N` suffix). \
+         Once the user's first request makes the task clear, give the tab a short, specific title \
+         (2-5 words, in the language the user writes in) by calling `solution_agent.rename_session` \
+         with session_id `{session_id}`, your title, and `only_if_default: true`. \
+         Do it once; don't rename the tab again unless the user asks.\n"
+    )
+}
+

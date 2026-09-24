@@ -132,6 +132,54 @@ async fn list_agents_returns_empty_when_no_adapters_registered(cx: &mut gpui::Te
     }
 }
 
+/// An agent names its own tab with `only_if_default: true` (FORK.md #209):
+/// the rename lands while the tab still has its `{Provider} New` title and is
+/// refused once anyone has chosen a title, so an agent can never overwrite
+/// the user's.
+#[gpui::test]
+async fn rename_session_only_if_default_spares_a_chosen_title(cx: &mut gpui::TestAppContext) {
+    let (session_id, _img, _tmp) = seed_session_with_image(cx).await;
+    let (agent_id, title_of) = cx.update(|cx| {
+        let store = crate::store::SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("seeded");
+        (session.read(cx).agent_id.to_string(), session.clone())
+    });
+    let default_title = format!(
+        "{} #2",
+        crate::store::default_session_title_base(&agent_id)
+    );
+    let rename = |title: &str, only_if_default: bool| RenameSessionParams {
+        session_id: session_id.to_string(),
+        title: title.to_string(),
+        only_if_default,
+    };
+    let title = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| title_of.read(cx).title.to_string())
+    };
+
+    RenameSessionTool
+        .run(rename(&default_title, false), &mut cx.to_async())
+        .await
+        .expect("a plain rename always applies");
+    assert_eq!(title(cx), default_title);
+
+    RenameSessionTool
+        .run(rename("  Fix the login flow  ", true), &mut cx.to_async())
+        .await
+        .expect("the agent names its default tab");
+    assert_eq!(title(cx), "Fix the login flow", "renamed, and trimmed");
+
+    let result = RenameSessionTool
+        .run(rename("Something else", true), &mut cx.to_async())
+        .await
+        .expect("a refused rename is not an error");
+    assert_eq!(title(cx), "Fix the login flow", "a chosen title is kept");
+    match &result.content[0] {
+        ToolResponseContent::Text { text } => assert!(text.starts_with("kept"), "{text}"),
+        _ => panic!("expected text content"),
+    }
+}
+
 #[gpui::test]
 async fn get_session_default_flags_omit_full_content(cx: &mut gpui::TestAppContext) {
     let (session_id, _img, _tmp) = seed_session_with_image(cx).await;

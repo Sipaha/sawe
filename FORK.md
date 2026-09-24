@@ -5399,7 +5399,8 @@ The maintainer, on the `+` picker in the session tab strip: *«какие-то �
 варианты в дропдауне при создании новой сессии»* — two one-line `ContextMenu` entries reading
 "Codex (OpenAI)" and "Claude (Anthropic)", identical in shape, distinguishable only by
 reading them. And on the strip itself: nothing said which agent a tab was talking to, because
-session titles are generated from the conversation and never name the provider.
+session titles never named the provider. (Since #209 a new tab is titled `{Provider} New` until
+the agent names it; after that, only the logo says who it talks to.)
 
 What: a `solution_agent::adapter::AgentBrand` const per agent — `name`, `vendor`, `logo`
 (`IconName`) and `models`, a `·`-separated list with the **default first**. The picker rows
@@ -5624,7 +5625,7 @@ decides what is added on top:
 
 | Session | Tab |
 |---|---|
-| `Running` | logo pulses (1s, opacity 0.4→1.0 — the status row's "thinking" curve) — **except on the active tab**, whose dialog is on screen and already animates "Thinking…" (maintainer, 2026-09-23: two things blinking at once was too much); `the_active_tab_logo_does_not_pulse` |
+| `Running` | logo pulses (opacity 0.4→1.0, the status row's "thinking" curve, but a 2 s period — half its rate; the 1 s pulse read as flicker, maintainer 2026-09-24 — `TAB_LOGO_PULSE_PERIOD`) — **except on the active tab**, whose dialog is on screen and already animates "Thinking…" (maintainer, 2026-09-23: two things blinking at once was too much); `the_active_tab_logo_does_not_pulse` |
 | `Errored` | static logo + a 2px `status().error` stripe along the tab's **top** edge |
 | idle, cold, `Stopping` | static logo |
 
@@ -5824,3 +5825,31 @@ painted `DIFF-TAB-BODY`), `test_a_second_comparison_replaces_the_diff_tab_conten
 `test_a_local_file_diffs_the_live_buffer_against_the_base`, and (git)
 `test_since_with_worktree_diffs_the_revision_itself`. The key-context, blame-base and re-list
 assertions were each mutation-checked.
+
+### 209. A new session's tab is `{Provider} New` until its agent names it
+
+The maintainer, 2026-09-24: *«имя вкладки для новой сессии именовать по дефолту "{Provider} New"
+(если такое имя уже есть, то в конец дописываем " #{первый не занятый номер начиная с 1}") и в
+промпте добавим указание агентам придумать имя для своей вкладки если оно дефолтное и через сокет
+поменять его»*.
+
+What: `create_session_with_parent` titles a session `default_session_title_base(agent_id)` —
+`Claude New`, `Codex New` (`AgentBrand::name`; `Agent New` for an unbranded agent) — and
+`unique_session_title` appends ` #1`, ` #2`, … taking the **first free** number among the
+Solution's sessions (it used to be the Solution name, then ` 2`, ` 3`). The worker system prompt
+(`build_session_meta` → `session_title_instruction`) tells the agent that its tab starts as that
+placeholder and to name it — 2–5 words, in the user's language — once the first request makes the
+task clear, by calling `solution_agent.rename_session` with its session id and
+`only_if_default: true`, once.
+
+`only_if_default` is the part that makes the prompt safe: `rename_session` then renames only while
+`is_default_session_title` holds (`{Provider} New` or `{Provider} New #<digits>`) and otherwise
+answers `kept: …` without error. The prompt is sent when the ACP session is created, so it cannot
+know whether the user renames the tab later; the guard lives where the current title does. The
+tool also trims the title now. A plain rename (the user, the phone) is unaffected.
+
+Guarded by `a_default_session_title_is_the_provider_and_new`,
+`new_sessions_take_the_first_free_default_title` (through the real create path, including a freed
+number being reused), `rename_session_only_if_default_spares_a_chosen_title`, and the prompt
+assertions in `build_session_meta_emits_correct_json_shape`.
+

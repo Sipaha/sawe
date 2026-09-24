@@ -2900,6 +2900,12 @@ fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
                 let prompt = identity_meta["systemPrompt"]["append"].as_str().unwrap();
                 assert!(prompt.contains(&format!("Your stable Sawe session ID is `{id}`")));
                 assert!(prompt.contains("solution_agent.send_agent_message"));
+                // FORK.md #209: the agent names its own `Claude New` tab,
+                // through the guard that spares a title the user chose.
+                assert!(prompt.contains("`Claude New`"), "{prompt}");
+                assert!(prompt.contains("solution_agent.rename_session"));
+                assert!(prompt.contains(&format!("session_id `{id}`")));
+                assert!(prompt.contains("only_if_default: true"));
             }
 
             // Unknown agent → None (registry lookup fails)
@@ -7923,3 +7929,93 @@ async fn reset_context_recovers_error_and_rejects_busy_without_losing_history(
         assert_ne!(session.acp_thread().unwrap(), &thread);
     });
 }
+
+/// FORK.md #209: a new tab is `{Provider} New`, then `{Provider} New #1`,
+/// `#2`, … — the first free number — and only those titles count as
+/// unnamed.
+#[test]
+fn a_default_session_title_is_the_provider_and_new() {
+    use crate::claude_adapter::CLAUDE_ACP_AGENT_ID;
+    use crate::codex_adapter::CODEX_AGENT_ID;
+    use crate::store::{default_session_title_base, is_default_session_title};
+
+    assert_eq!(default_session_title_base(CLAUDE_ACP_AGENT_ID), "Claude New");
+    assert_eq!(default_session_title_base(CODEX_AGENT_ID), "Codex New");
+    assert_eq!(default_session_title_base("someone-else"), "Agent New");
+
+    for title in ["Claude New", "Claude New #1", "Claude New #12"] {
+        assert!(is_default_session_title(title, CLAUDE_ACP_AGENT_ID), "{title}");
+    }
+    for title in [
+        "Codex New",
+        "Claude New #",
+        "Claude New #x",
+        "Claude New 2",
+        "Claude Newer",
+        "Fix the login flow",
+    ] {
+        assert!(!is_default_session_title(title, CLAUDE_ACP_AGENT_ID), "{title}");
+    }
+}
+
+/// FORK.md #209, through the real create path: each new session of a
+/// provider takes the first free `{Provider} New` / `{Provider} New #N`, and a
+/// number freed by a rename is reused.
+#[gpui::test]
+async fn new_sessions_take_the_first_free_default_title(cx: &mut TestAppContext) {
+    let (first, _thread, _tmp) = create_session_with_thread(cx).await;
+    let (solution_id, agent_id, project) = cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(first).expect("first session");
+        let s = session.read(cx);
+        (
+            s.solution_id,
+            s.agent_id.clone(),
+            s.project.clone().expect("first has project"),
+        )
+    });
+    let base = crate::store::default_session_title_base(agent_id.as_ref());
+    let title_of = |cx: &mut TestAppContext, id| {
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(id).expect("session");
+            session.read(cx).title.to_string()
+        })
+    };
+    let create = |cx: &mut TestAppContext| {
+        let (agent_id, project) = (agent_id.clone(), project.clone());
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.create_session_with_parent(
+                    solution_id, agent_id, project, None, None, None, None, false, false, cx,
+                )
+            })
+        })
+    };
+
+    // Whatever the fixture named the first session, give it the base name so
+    // the numbering below starts from a known state.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.rename_session(first, base.clone().into(), cx)
+        })
+    })
+    .expect("rename");
+
+    let second = create(cx).await.expect("second session");
+    assert_eq!(title_of(cx, second), format!("{base} #1"));
+    let third = create(cx).await.expect("third session");
+    assert_eq!(title_of(cx, third), format!("{base} #2"));
+
+    // `#1` is named by its agent; the next new tab takes the freed number.
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.rename_session(second, "Fix the login flow".into(), cx)
+        })
+    })
+    .expect("rename");
+    let fourth = create(cx).await.expect("fourth session");
+    assert_eq!(title_of(cx, fourth), format!("{base} #1"));
+}
+

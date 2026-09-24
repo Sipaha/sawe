@@ -76,8 +76,8 @@ struct TabCandidate {
     tab_order: i64,
     title: SharedString,
     /// The provider behind this session, so a glance at the strip says *which*
-    /// agent each tab is talking to (maintainer request, 2026-09-22) — session
-    /// titles are generated from the conversation and never mention the
+    /// agent each tab is talking to (maintainer request, 2026-09-22) — once the
+    /// agent has named its tab (FORK.md #209) the title no longer mentions the
     /// provider. `None` for a session naming an agent this build no longer
     /// ships; such a tab wears a neutral mark rather than a wrong logo, so its
     /// state still shows.
@@ -333,6 +333,9 @@ fn tab_logo_look(is_errored: bool, is_running: bool, is_active: bool) -> TabLogo
     }
 }
 
+/// One full fade-out-and-back of a working tab's logo.
+const TAB_LOGO_PULSE_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `debug_selector` on the pulse wrapping a working tab's logo, so a paint
 /// test can tell a working tab from an idle one.
 const WORKING_LOGO_SELECTOR: &str = "SESSION-TAB-LOGO-WORKING";
@@ -363,7 +366,10 @@ fn render_tab_logo(brand: Option<&'static AgentBrand>, look: TabLogoLook, ix: us
         .child(logo)
         .with_animation(
             ElementId::NamedInteger("session-tab-logo-pulse".into(), ix as u64),
-            Animation::new(std::time::Duration::from_secs(1))
+            // Half the status row's "Thinking…" rate: the tab sits in the
+            // corner of the eye, where a 1 s pulse read as flicker
+            // (maintainer request, 2026-09-24).
+            Animation::new(TAB_LOGO_PULSE_PERIOD)
                 .repeat()
                 .with_easing(pulsating_between(0.4, 1.0)),
             |element, delta| element.opacity(delta),
