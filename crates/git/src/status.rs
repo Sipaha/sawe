@@ -510,6 +510,11 @@ pub enum DiffTreeType {
         base: SharedString,
         head: SharedString,
     },
+    /// `base` straight against the working tree — `git diff <base>`, with no
+    /// merge-base: what the file is now against what it was at `base`.
+    SinceWithWorktree {
+        base: SharedString,
+    },
 }
 
 #[derive(Debug, PartialEq)]

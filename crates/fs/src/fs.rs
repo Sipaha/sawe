@@ -2558,6 +2558,22 @@ impl FakeFs {
         .unwrap();
     }
 
+    /// Teach the fake repository what [`GitRepository::load_commit_range`]
+    /// should answer for `base..head`; unset, the two commits compare equal.
+    pub fn set_commit_range_diff(
+        &self,
+        dot_git: &Path,
+        base: &str,
+        head: &str,
+        diff: impl Into<git::repository::CommitDiff>,
+    ) {
+        let diff = diff.into();
+        self.with_git_state(dot_git, true, |state| {
+            state.commit_diffs.insert(format!("{base}..{head}"), diff);
+        })
+        .unwrap();
+    }
+
     pub fn set_commit_data(
         &self,
         dot_git: &Path,

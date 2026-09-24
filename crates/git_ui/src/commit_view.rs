@@ -152,13 +152,6 @@ pub struct CommitView {
     explain_expanded: bool,
     explain_error: Option<SharedString>,
     _explain_task: Option<Task<()>>,
-    /// `Some((base, head))` when this view is IDEA's "Compare Versions":
-    /// the diff between two selected commits rather than one commit
-    /// against its parent. There is no single commit to describe, so the
-    /// metadata panel is skipped and the tab is titled `base..head`;
-    /// `commit` holds the head commit only so the rest of the view has
-    /// the details it reads.
-    compare_range: Option<(SharedString, SharedString)>,
 }
 
 struct CommitDiffAddon {
@@ -217,10 +210,6 @@ impl Addon for CommitDiffAddon {
             )
         })
     }
-}
-
-fn short_sha(sha: &str) -> &str {
-    sha.get(0..7).unwrap_or(sha)
 }
 
 impl CommitView {
@@ -285,7 +274,6 @@ impl CommitView {
                                 workspace_entity,
                                 workspace_handle,
                                 stash,
-                                None,
                                 window,
                                 cx,
                             )
@@ -295,18 +283,8 @@ impl CommitView {
                         pane.update(cx, |pane, cx| {
                             let existing = pane.items().enumerate().find_map(|(ix, item)| {
                                 let view = item.downcast::<CommitView>()?;
-                                let view = view.read(cx);
-                                // `compare_range` is half of the identity, not
-                                // a detail: a `base..head` comparison hangs
-                                // itself off the *head* commit's details, so
-                                // matching on the sha alone made opening
-                                // commit B close the user's open `A..B` tab
-                                // and replace it with B on its own.
-                                // `open_range` has always filtered on the
-                                // range for the mirror-image reason.
-                                let matches =
-                                    view.commit.sha == commit_sha && view.compare_range.is_none();
-                                matches.then(|| (ix, item.item_id()))
+                                (view.read(cx).commit.sha == commit_sha)
+                                    .then(|| (ix, item.item_id()))
                             });
 
                             if let Some((ix, existing_id)) = existing {
@@ -338,84 +316,6 @@ impl CommitView {
         &self.commit.sha
     }
 
-    /// IDEA's "Compare Versions": diff two selected commits against each
-    /// other (`base` older, `head` newer) rather than a commit against its
-    /// parent. Opens a bare diff tab titled `base..head`.
-    pub fn open_range(
-        base_sha: String,
-        head_sha: String,
-        repo: WeakEntity<Repository>,
-        workspace: WeakEntity<Workspace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let commit_diff = repo
-            .update(cx, |repo, _| {
-                repo.load_commit_range(base_sha.clone(), head_sha.clone())
-            })
-            .ok();
-        // The view still wants a `CommitDetails` to hang its state off; the
-        // head commit is the meaningful one, and none of it is rendered in
-        // compare mode anyway.
-        let commit_details = repo.update(cx, |repo, _| repo.show(head_sha.clone())).ok();
-        let range: (SharedString, SharedString) =
-            (base_sha.clone().into(), head_sha.clone().into());
-
-        window
-            .spawn(cx, async move |cx| {
-                let commit_diff = commit_diff?;
-                let commit_details = commit_details?;
-                let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
-                let commit_diff = commit_diff.log_err()?.log_err()?;
-                let commit_details = commit_details.log_err()?.log_err()?;
-                let repo = repo.upgrade()?;
-
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        let project = workspace.project();
-                        let workspace_entity = cx.entity();
-                        let workspace_handle = cx.weak_entity();
-                        let range_for_view = range.clone();
-                        let commit_view = cx.new(|cx| {
-                            CommitView::new(
-                                commit_details,
-                                commit_diff,
-                                repo,
-                                project.clone(),
-                                workspace_entity,
-                                workspace_handle,
-                                None,
-                                Some(range_for_view),
-                                window,
-                                cx,
-                            )
-                        });
-
-                        let pane = workspace.active_pane();
-                        pane.update(cx, |pane, cx| {
-                            let existing = pane.items().position(|item| {
-                                item.downcast::<CommitView>().is_some_and(|view| {
-                                    view.read(cx).compare_range.as_ref() == Some(&range)
-                                })
-                            });
-                            match existing {
-                                Some(ix) => pane.activate_item(ix, true, true, window, cx),
-                                None => pane.add_item(
-                                    Box::new(commit_view),
-                                    true,
-                                    true,
-                                    None,
-                                    window,
-                                    cx,
-                                ),
-                            }
-                        })
-                    })
-                    .log_err()
-            })
-            .detach();
-    }
-
     fn new(
         commit: CommitDetails,
         commit_diff: CommitDiff,
@@ -424,24 +324,13 @@ impl CommitView {
         workspace_entity: Entity<Workspace>,
         workspace: WeakEntity<Workspace>,
         stash: Option<usize>,
-        compare_range: Option<(SharedString, SharedString)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // A two-commit comparison has no commit of its own to describe, so it
-        // renders only the diff editor — no metadata panel (see `render`) and
-        // no commit-message excerpt.
         let is_shallow_boundary = commit_diff.is_shallow_boundary;
-        let compact = compare_range.is_some();
         let language_registry = project.read(cx).languages().clone();
         let multibuffer = cx.new(|cx| {
-            // Compare mode names both revisions in the tab, so the
-            // multibuffer's own path header would be redundant chrome.
-            let mut multibuffer = if compact {
-                MultiBuffer::without_headers(Capability::ReadOnly)
-            } else {
-                MultiBuffer::new(Capability::ReadOnly)
-            };
+            let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
             multibuffer.set_all_diff_hunks_expanded(cx);
             multibuffer
         });
@@ -597,16 +486,11 @@ impl CommitView {
             explain_expanded: false,
             explain_error: None,
             _explain_task: None,
-            compare_range,
         };
-        // The metadata panel (parents / refs / contains) isn't rendered in
-        // compare mode, so don't pay for the git calls that fill it.
-        if !compact {
-            let sha_for_meta = view.commit.sha.to_string();
-            view.contains_panel
-                .load(sha_for_meta.clone(), repository.clone(), cx);
-            view.spawn_load_metadata(sha_for_meta, repository, cx);
-        }
+        let sha_for_meta = view.commit.sha.to_string();
+        view.contains_panel
+            .load(sha_for_meta.clone(), repository.clone(), cx);
+        view.spawn_load_metadata(sha_for_meta, repository, cx);
         view
     }
 
@@ -637,7 +521,6 @@ impl CommitView {
                     workspace_entity,
                     view.workspace.clone(),
                     view.stash,
-                    None,
                     window,
                     cx,
                 );
@@ -1178,21 +1061,12 @@ impl Item for CommitView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        if let Some((base, head)) = &self.compare_range {
-            return format!("{}..{}", short_sha(base), short_sha(head)).into();
-        }
         let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
         let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
         format!("{short_sha} — {subject}").into()
     }
 
     fn tab_tooltip_content(&self, _: &App) -> Option<TabTooltipContent> {
-        if let Some((base, head)) = &self.compare_range {
-            let text = format!("Compare {} with {}", short_sha(base), short_sha(head));
-            return Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
-                move |_, _| Label::new(text.clone()).into_any_element(),
-            ))));
-        }
         let short_sha = self.commit.sha.get(0..16).unwrap_or(&*self.commit.sha);
         let subject = self.commit.message.split('\n').next().unwrap();
 
@@ -1381,7 +1255,6 @@ impl Item for CommitView {
                 explain_expanded: self.explain_expanded,
                 explain_error: self.explain_error.clone(),
                 _explain_task: None,
-                compare_range: self.compare_range.clone(),
             }
         })))
     }
@@ -1399,14 +1272,6 @@ impl Render for CommitView {
             .on_action(cx.listener(|view, _: &ExplainCommit, window, cx| {
                 view.toggle_or_request_explain(window, cx);
             }));
-
-        // A two-commit comparison — just the diff editor, no commit metadata.
-        if self.compare_range.is_some() {
-            return base.when(
-                !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
-                |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
-            );
-        }
 
         base.child(self.render_metadata_panel(window, cx))
             .when(self.is_shallow_boundary, |this| {
@@ -1597,188 +1462,4 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
         .get(stash_index)
         .map(|entry| entry.oid.to_string() == sha)
         .unwrap_or(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use git::repository::repo_path;
-    use gpui::{TestAppContext, VisualTestContext};
-    use project::FakeFs;
-    use project::git_store::CommitFile;
-    use settings::SettingsStore;
-    use std::path::Path;
-    use util::path;
-    use workspace::MultiWorkspace;
-
-    const BASE_SHA: &str = "1111111111111111111111111111111111111111";
-    const HEAD_SHA: &str = "2222222222222222222222222222222222222222";
-
-    fn init_test(cx: &mut TestAppContext) {
-        zlog::init_test();
-        cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-            editor::init(cx);
-            crate::init(cx);
-            let store = solutions::SolutionStore::for_test(std::path::PathBuf::new(), cx);
-            solutions::install_global_for_test(store, cx);
-        });
-    }
-
-    struct CommitTestContext {
-        workspace: Entity<Workspace>,
-        repository: Entity<Repository>,
-    }
-
-    async fn commit_test_context(
-        cx: &mut TestAppContext,
-    ) -> (CommitTestContext, VisualTestContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.background_executor.clone());
-        fs.insert_tree(
-            path!("/project"),
-            serde_json::json!({
-                ".git": {},
-                "a.rs": "one\ntwo\nthree\n",
-            }),
-        )
-        .await;
-        fs.set_commit_diff(
-            path!("/project/.git").as_ref(),
-            HEAD_SHA,
-            CommitDiff {
-                is_shallow_boundary: false,
-                files: vec![CommitFile {
-                    path: repo_path("a.rs"),
-                    old_text: Some("one\n".to_string()),
-                    new_text: Some("two\n".to_string()),
-                    is_binary: false,
-                }],
-            },
-        );
-
-        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
-        let window_handle =
-            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = window_handle
-            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
-            .expect("the test window holds a workspace");
-        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        cx.run_until_parked();
-
-        let repository = workspace
-            .update_in(&mut cx, |workspace, _window, cx| {
-                workspace.project().read(cx).active_repository(cx)
-            })
-            .expect("the fake project exposes its repository");
-
-        (
-            CommitTestContext {
-                workspace,
-                repository,
-            },
-            cx,
-        )
-    }
-
-    fn commit_details(sha: &str) -> CommitDetails {
-        CommitDetails {
-            sha: sha.to_string().into(),
-            message: "a commit".into(),
-            commit_timestamp: 1_700_000_000,
-            author_email: "tester@example.com".into(),
-            author_name: "Tester".into(),
-        }
-    }
-
-    /// IDEA's "Compare Versions" hangs its view off the *head* commit's
-    /// details, so a `base..head` tab and a whole-commit tab for `head` share
-    /// a sha. `open`'s dedupe used to match on that sha alone and
-    /// `remove_item` the comparison — opening commit B closed the user's open
-    /// `A..B`. `open_range` has always also filtered on the range; this is the
-    /// same predicate from the other side.
-    #[gpui::test]
-    async fn test_opening_a_commit_leaves_a_compare_versions_tab_alone(cx: &mut TestAppContext) {
-        let (context, mut cx) = commit_test_context(cx).await;
-
-        let range = (
-            SharedString::from(BASE_SHA.to_string()),
-            SharedString::from(HEAD_SHA.to_string()),
-        );
-        let compare_view = context
-            .workspace
-            .update_in(&mut cx, |workspace, window, cx| {
-                let project = workspace.project().clone();
-                let workspace_entity = cx.entity();
-                let workspace_handle = cx.weak_entity();
-                let view = cx.new(|cx| {
-                    CommitView::new(
-                        commit_details(HEAD_SHA),
-                        CommitDiff {
-                            is_shallow_boundary: false,
-                            files: Vec::new(),
-                        },
-                        context.repository.clone(),
-                        project,
-                        workspace_entity,
-                        workspace_handle,
-                        None,
-                        Some(range.clone()),
-                        window,
-                        cx,
-                    )
-                });
-                workspace.active_pane().update(cx, |pane, cx| {
-                    pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
-                });
-                view
-            });
-        cx.run_until_parked();
-
-        cx.update(|window, cx| {
-            CommitView::open(
-                HEAD_SHA.to_string(),
-                context.repository.downgrade(),
-                context.workspace.downgrade(),
-                None,
-                None,
-                window,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        let ranges = context.workspace.read_with(&cx, |workspace, cx| {
-            workspace
-                .active_pane()
-                .read(cx)
-                .items()
-                .filter_map(|item| item.downcast::<CommitView>())
-                .map(|view| view.read(cx).compare_range.clone())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(
-            ranges.len(),
-            2,
-            "the comparison and the whole-commit view are two tabs, not one"
-        );
-        assert!(
-            ranges.contains(&Some(range)),
-            "and the comparison is still one of them"
-        );
-        assert!(
-            ranges.contains(&None),
-            "beside the whole-commit view that was just opened"
-        );
-        assert!(
-            compare_view
-                .read_with(&cx, |view, _| view.compare_range.is_some())
-                .then_some(true)
-                .is_some(),
-            "the comparison view is the one that survived"
-        );
-    }
 }

@@ -179,6 +179,8 @@ impl Render for StashMessageModal {
 
 mod changes_list;
 pub(crate) mod commit_tab;
+mod diff_tab;
+pub use diff_tab::DiffTabHead;
 
 pub use commit_tab::{CommitRefs, CommitSelection, CommitSelectionSource};
 pub use zed_actions::git_panel::ToggleFocus;
@@ -218,6 +220,9 @@ actions!(
         ActivateChangesTab,
         /// Activates the Commit tab, when a commit is open in it.
         ActivateCommitTab,
+        /// Activates the Diff tab, when a comparison of two commits is open
+        /// in it.
+        ActivateDiffTab,
         /// Opens the selected file itself in an editor tab (IDEA's "Jump to
         /// Source"), as opposed to `menu::Confirm`, which opens its diff.
         JumpToSource,
@@ -615,15 +620,20 @@ const STATE_OPACITY_STEP: f32 = 0.04;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenDiff {
     /// A working-copy diff, the kind the Changes tab opens.
+    /// `base` is `None` for the uncommitted changes the Changes tab lists and
+    /// a revision for the Diff tab's "Compare with Local".
     Working {
         repository_id: RepositoryId,
         repo_path: RepoPath,
+        base: Option<SharedString>,
     },
-    /// A commit's diff. `file` is `Some` for the Commit tab's single-file
-    /// diff and `None` for a whole-commit `CommitView`, which no single file
-    /// row can claim.
+    /// A commit's diff. `file` is `Some` for a single-file diff and `None` for
+    /// a whole-commit `CommitView`, which no single file row can claim. `base`
+    /// is `None` for a commit against its parent (the Commit tab) and the left
+    /// revision of a two-commit comparison (the Diff tab).
     Commit {
         sha: SharedString,
+        base: Option<SharedString>,
         file: Option<RepoPath>,
     },
 }
@@ -636,12 +646,21 @@ impl OpenDiff {
             // One item type now serves both tabs, so it is the *source* that
             // says which kind of mark this is, not the item's type.
             return Some(match solo_diff.source() {
-                DiffSource::WorkingTree { repo_path, .. } => Self::Working {
+                DiffSource::WorkingTree {
+                    repo_path, base, ..
+                } => Self::Working {
                     repository_id: solo_diff.repository_id(),
                     repo_path: repo_path.clone(),
+                    base: base.clone(),
                 },
-                DiffSource::Commit { sha, repo_path, .. } => Self::Commit {
+                DiffSource::Commit {
+                    sha,
+                    base,
+                    repo_path,
+                    ..
+                } => Self::Commit {
                     sha: sha.clone(),
+                    base: base.clone(),
                     file: Some(repo_path.clone()),
                 },
             });
@@ -651,6 +670,7 @@ impl OpenDiff {
         if let Some(commit_view) = item.downcast::<CommitView>() {
             return Some(Self::Commit {
                 sha: commit_view.read(cx).sha().clone(),
+                base: None,
                 file: None,
             });
         }
@@ -666,7 +686,21 @@ impl OpenDiff {
             Self::Working {
                 repository_id: open_repository_id,
                 repo_path,
+                base: None,
             } if *open_repository_id == repository_id => Some(repo_path),
+            _ => None,
+        }
+    }
+
+    /// The working-tree file this diff shows against `base` — the Diff tab's
+    /// "Compare with Local" rows.
+    fn local_file(&self, base: &str) -> Option<&RepoPath> {
+        match self {
+            Self::Working {
+                repo_path,
+                base: Some(open_base),
+                ..
+            } if open_base.as_ref() == base => Some(repo_path),
             _ => None,
         }
     }
@@ -678,8 +712,23 @@ impl OpenDiff {
         match self {
             Self::Commit {
                 sha: open_sha,
+                base: None,
                 file: Some(file),
             } if open_sha.as_ref() == sha => Some(file),
+            _ => None,
+        }
+    }
+
+    /// The file of the `base..head` comparison this diff shows. `None` for any
+    /// other pair — including `head` alone against its parent, which is the
+    /// Commit tab's diff of the same path, not this one.
+    fn range_file(&self, base: &str, head: &str) -> Option<&RepoPath> {
+        match self {
+            Self::Commit {
+                sha: open_head,
+                base: Some(open_base),
+                file: Some(file),
+            } if open_head.as_ref() == head && open_base.as_ref() == base => Some(file),
             _ => None,
         }
     }
@@ -766,6 +815,9 @@ enum GitPanelTab {
     /// Only reachable while `GitPanel::commit_tab` is `Some` — the tab is not
     /// in the tab bar otherwise.
     Commit,
+    /// The files changed between two commits (FORK.md #208). Only reachable
+    /// while `GitPanel::diff_tab` is `Some`.
+    Diff,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -1203,6 +1255,8 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     /// `Some` exactly while the closable Commit tab is in the tab bar.
     commit_tab: Option<commit_tab::CommitTabState>,
+    /// `Some` exactly while the closable Diff tab is in the tab bar.
+    diff_tab: Option<diff_tab::DiffTabState>,
     /// Height the user dragged the Commit tab's message block to; `None` while
     /// the block is still sized by the flex pass.
     ///
@@ -1366,12 +1420,15 @@ impl GitPanel {
                         repository_id,
                         RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
                         _,
-                    ) if this
-                        .active_repository
-                        .as_ref()
-                        .is_some_and(|repository| repository.read(cx).id == *repository_id) =>
-                    {
-                        this.schedule_update(window, cx);
+                    ) => {
+                        this.refresh_local_diff_tab(*repository_id, cx);
+                        if this
+                            .active_repository
+                            .as_ref()
+                            .is_some_and(|repository| repository.read(cx).id == *repository_id)
+                        {
+                            this.schedule_update(window, cx);
+                        }
                     }
                     GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::RepositoryRemoved(_)
@@ -1494,6 +1551,7 @@ impl GitPanel {
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
                 commit_tab: None,
+                diff_tab: None,
                 commit_message_height: None,
                 commit_refs_row_width: None,
                 _settings_subscription,
@@ -1686,6 +1744,12 @@ impl GitPanel {
             // are not about the changes list at all — `escape` returns focus to
             // the editor. `CommitTab` is where those live for this tab.
             dispatch_context.add("CommitTab");
+        } else if self.active_tab == GitPanelTab::Diff
+            && self.focus_handle.contains_focused(window, cx)
+        {
+            // The same reasoning as the Commit tab above: no changes list on
+            // screen, so none of its bindings may reach the hidden one.
+            dispatch_context.add("DiffTab");
         } else if self.focus_handle.contains_focused(window, cx) {
             // The Commit tab renders no changes list and has no keyboard
             // navigation of its own, yet `set_active_tab` focuses the panel. The
@@ -6064,7 +6128,7 @@ impl GitPanel {
         let tab = |id: ElementId,
                    active: bool,
                    show_changes: bool,
-                   closable: bool,
+                   closes: Option<GitPanelTab>,
                    label: SharedString,
                    set_active_tab: GitPanelTab,
                    tooltip_action: Box<dyn Action>| {
@@ -6112,14 +6176,19 @@ impl GitPanel {
                 // painting its children). Swapping this `IconButton` for an
                 // element that does not stop propagation would re-activate the
                 // tab the click just closed — survivable only because
-                // `set_active_tab` refuses `Commit` while it is closed.
-                .when(closable, |this| {
+                // `set_active_tab` refuses a closable tab while it is closed.
+                .when_some(closes, |this, closes| {
+                    let (id, tooltip) = match closes {
+                        GitPanelTab::Diff => ("close-diff-tab", "Close Diff Tab"),
+                        _ => ("close-commit-tab", "Close Commit Tab"),
+                    };
                     this.child(
-                        IconButton::new("close-commit-tab", IconName::Close)
+                        IconButton::new(id, IconName::Close)
                             .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Close Commit Tab"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_commit_tab(window, cx);
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(cx.listener(move |this, _, window, cx| match closes {
+                                GitPanelTab::Diff => this.close_diff_tab(window, cx),
+                                _ => this.close_commit_tab(window, cx),
                             })),
                     )
                 })
@@ -6141,7 +6210,7 @@ impl GitPanel {
                 ElementId::Name("changes-tab".into()),
                 active_tab == GitPanelTab::Changes,
                 true,
-                false,
+                None,
                 "Changes".into(),
                 GitPanelTab::Changes,
                 ActivateChangesTab.boxed_clone(),
@@ -6152,10 +6221,22 @@ impl GitPanel {
                         ElementId::Name("commit-tab".into()),
                         active_tab == GitPanelTab::Commit,
                         false,
-                        true,
+                        Some(GitPanelTab::Commit),
                         "Commit".into(),
                         GitPanelTab::Commit,
                         ActivateCommitTab.boxed_clone(),
+                    ))
+            })
+            .when(self.diff_tab_is_open(), |this| {
+                this.child(Divider::vertical().color(ui::DividerColor::BorderFaded))
+                    .child(tab(
+                        ElementId::Name("diff-tab".into()),
+                        active_tab == GitPanelTab::Diff,
+                        false,
+                        Some(GitPanelTab::Diff),
+                        "Diff".into(),
+                        GitPanelTab::Diff,
+                        ActivateDiffTab.boxed_clone(),
                     ))
             })
     }
@@ -6187,6 +6268,9 @@ impl GitPanel {
         // user-facing route into it — the row itself, `ActivateCommitTab`, the
         // `ctrl-2` keybinding — is a no-op rather than an empty tab.
         if tab == GitPanelTab::Commit && !self.commit_tab_is_open() {
+            return;
+        }
+        if tab == GitPanelTab::Diff && !self.diff_tab_is_open() {
             return;
         }
         if self.active_tab == tab {
@@ -7081,6 +7165,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_commit_tab))
+            .on_action(cx.listener(Self::activate_diff_tab))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -7129,6 +7214,7 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::Commit => this.child(self.render_commit_tab(window, cx)),
+                        GitPanelTab::Diff => this.child(self.render_diff_tab(window, cx)),
                     })
                     .into_any_element(),
             )
@@ -9367,6 +9453,407 @@ mod tests {
         );
     }
 
+    const DIFF_BASE: &str = "1111111111111111111111111111111111111111";
+    const DIFF_HEAD: &str = "2222222222222222222222222222222222222222";
+
+    /// "Compare Versions" puts two commits' changed files into the Diff tab
+    /// (FORK.md #208) instead of one editor tab holding every file's diff.
+    /// Fixture: `base..head` changes `one.txt` and `two.txt`.
+    async fn show_test_diff_range(fixture: &ChangesTabFixture, cx: &mut VisualTestContext) {
+        let fs = fixture.workspace.read_with(cx, |workspace, cx| {
+            fs::Fs::as_fake(workspace.project().read(cx).fs().as_ref())
+        });
+        fs.set_commit_range_diff(
+            path!("/project/.git").as_ref(),
+            DIFF_BASE,
+            DIFF_HEAD,
+            project::git_store::CommitDiff {
+                is_shallow_boundary: false,
+                files: [&fixture.one, &fixture.two]
+                    .into_iter()
+                    .map(|path| project::git_store::CommitFile {
+                        path: path.clone(),
+                        old_text: Some("base\n".into()),
+                        new_text: Some("head\n".into()),
+                        is_binary: false,
+                    })
+                    .collect(),
+            },
+        );
+        let repository = fixture.repository.clone();
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.show_comparison(
+                repository,
+                DIFF_BASE.parse().expect("a full sha"),
+                DiffTabHead::Commit(DIFF_HEAD.parse().expect("a full sha")),
+                "Base subject".into(),
+                "Head subject".into(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_show_diff_range_opens_the_diff_tab_with_the_changed_files(
+        cx: &mut TestAppContext,
+    ) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let cx = &mut cx;
+        fixture.panel.read_with(cx, |panel, _| {
+            assert!(!panel.diff_tab_is_open(), "precondition: no comparison yet");
+        });
+
+        show_test_diff_range(&fixture, cx).await;
+
+        fixture.panel.read_with(cx, |panel, _| {
+            assert!(panel.diff_tab_is_open());
+            assert_eq!(panel.active_tab, GitPanelTab::Diff);
+            let state = panel.diff_tab.as_ref().expect("the tab is open");
+            let commit_tab::LoadState::Loaded(loaded) = &state.files else {
+                panic!("the comparison's files must have loaded");
+            };
+            let paths = loaded.paths();
+            let mut expected = vec![fixture.one.clone(), fixture.two.clone()];
+            expected.sort();
+            assert_eq!(paths, expected);
+        });
+    }
+
+    /// A file row of the Diff tab opens that file's `base..head` diff in the
+    /// shared diff tab, and only the Diff tab's row claims the open mark —
+    /// the Commit tab's row for the head commit's own diff of the same path is
+    /// a different diff.
+    #[gpui::test]
+    async fn test_a_diff_tab_file_opens_its_range_diff(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let cx = &mut cx;
+        show_test_diff_range(&fixture, cx).await;
+
+        let open = cx.update(|window, cx| {
+            SoloDiffView::open_range_file(
+                DIFF_BASE.into(),
+                DIFF_HEAD.into(),
+                fixture.repository.clone(),
+                fixture.one.clone(),
+                fixture.workspace.downgrade(),
+                DiffOpen::Summon { focus: false },
+                window,
+                cx,
+            )
+        });
+        open.await
+            .expect("the range's file opens")
+            .expect("the gesture opened a view");
+        cx.run_until_parked();
+
+        let diff = fixture.only_diff(cx);
+        diff.read_with(cx, |view, _| {
+            assert_eq!(
+                view.source().sha().map(SharedString::as_ref),
+                Some(DIFF_HEAD)
+            );
+            assert_eq!(
+                view.source().base().map(SharedString::as_ref),
+                Some(DIFF_BASE)
+            );
+        });
+        fixture.panel.read_with(cx, |panel, _| {
+            let open_diff = panel.open_diff.as_ref().expect("a diff is open");
+            assert_eq!(
+                open_diff.range_file(DIFF_BASE, DIFF_HEAD),
+                Some(&fixture.one)
+            );
+            assert_eq!(
+                panel.open_commit_file(DIFF_HEAD),
+                None,
+                "the head commit's own diff of this path is not what is open"
+            );
+            assert_eq!(open_diff.range_file(DIFF_HEAD, DIFF_BASE), None);
+        });
+    }
+
+    /// Like the Commit tab, the Diff tab shows no changes list, so none of the
+    /// changes list's bindings may reach the hidden one — `space` would stage
+    /// a file nobody can see, `delete` would restore it.
+    #[gpui::test]
+    async fn test_the_diff_tab_withholds_the_changes_list_key_context(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let cx = &mut cx;
+        let changes_list_bindings = gpui::KeyBindingContextPredicate::parse(
+            "GitPanel && ChangesList && !GitBranchSelector",
+        )
+        .expect("the shipped keymap's predicate parses");
+        let diff_tab_bindings =
+            gpui::KeyBindingContextPredicate::parse("GitPanel && (CommitTab || DiffTab)")
+                .expect("the shipped keymap's predicate parses");
+
+        show_test_diff_range(&fixture, cx).await;
+        cx.update_window_entity(&fixture.panel, |panel, window, cx| {
+            panel.focus_handle.focus(window, cx);
+            let context = panel.dispatch_context(window, cx);
+            assert!(
+                !changes_list_bindings.eval(std::slice::from_ref(&context)),
+                "the Diff tab must not carry the changes list's context"
+            );
+            assert!(
+                diff_tab_bindings.eval(&[context]),
+                "and it must carry its own, where `escape` lives"
+            );
+        });
+    }
+
+    /// The whole path the user takes: "Compare Versions" on two selected
+    /// commits opens the git panel's dock and paints the Diff tab — the
+    /// assertion is on the painted tree, not on `active_tab`.
+    #[gpui::test]
+    async fn test_compare_versions_paints_the_diff_tab(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let cx = &mut cx;
+        // A second panel for the same workspace, this time docked: the
+        // fixture's own is a bare entity, which nothing paints.
+        let panel = fixture.workspace.update_in(cx, |workspace, window, cx| {
+            let panel = GitPanel::new(workspace, window, cx);
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("DIFF-TAB-BODY").is_none(),
+            "precondition: nothing compared yet"
+        );
+
+        let fs = fixture.workspace.read_with(cx, |workspace, cx| {
+            fs::Fs::as_fake(workspace.project().read(cx).fs().as_ref())
+        });
+        fs.set_commit_range_diff(
+            path!("/project/.git").as_ref(),
+            DIFF_BASE,
+            DIFF_HEAD,
+            project::git_store::CommitDiff {
+                is_shallow_boundary: false,
+                files: vec![project::git_store::CommitFile {
+                    path: fixture.one.clone(),
+                    old_text: Some("base\n".into()),
+                    new_text: Some("head\n".into()),
+                    is_binary: false,
+                }],
+            },
+        );
+        let context = crate::commit_context_menu::MultiCommitContext {
+            workspace: fixture.workspace.downgrade(),
+            repository: fixture.repository.clone(),
+            shas: vec![DIFF_BASE.into(), DIFF_HEAD.into()],
+            subjects: vec!["Base subject".into(), "Head subject".into()],
+            work_dir: None,
+            contiguous: false,
+        };
+        cx.update(|window, cx| {
+            crate::commit_context_menu::compare_versions(context, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.diff_tab_comparison(),
+                Some((
+                    DIFF_BASE.parse().expect("a full sha"),
+                    DiffTabHead::Commit(DIFF_HEAD.parse().expect("a full sha"))
+                )),
+                "the older commit is the base"
+            );
+        });
+        assert!(
+            cx.debug_bounds("DIFF-TAB-BODY").is_some(),
+            "the docked panel must be showing the Diff tab"
+        );
+        assert!(
+            fixture.open_diffs(cx).is_empty(),
+            "no editor tab opens until a file is picked"
+        );
+    }
+
+    /// There is one Diff tab. Comparing another pair while it is open
+    /// re-points it — new files, cursor and collapsed folders reset — rather
+    /// than adding a second tab (maintainer, 2026-09-24).
+    #[gpui::test]
+    async fn test_a_second_comparison_replaces_the_diff_tab_contents(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let cx = &mut cx;
+        show_test_diff_range(&fixture, cx).await;
+        fixture.panel.update(cx, |panel, cx| {
+            let state = panel.diff_tab.as_mut().expect("the tab is open");
+            state.selected_file = Some(fixture.one.clone());
+            state.collapsed_dirs.insert("".into());
+            cx.notify();
+        });
+
+        const OTHER_HEAD: &str = "3333333333333333333333333333333333333333";
+        let fs = fixture.workspace.read_with(cx, |workspace, cx| {
+            fs::Fs::as_fake(workspace.project().read(cx).fs().as_ref())
+        });
+        fs.set_commit_range_diff(
+            path!("/project/.git").as_ref(),
+            DIFF_HEAD,
+            OTHER_HEAD,
+            project::git_store::CommitDiff {
+                is_shallow_boundary: false,
+                files: vec![project::git_store::CommitFile {
+                    path: fixture.two.clone(),
+                    old_text: Some("head\n".into()),
+                    new_text: Some("later\n".into()),
+                    is_binary: false,
+                }],
+            },
+        );
+        let repository = fixture.repository.clone();
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.show_comparison(
+                repository,
+                DIFF_HEAD.parse().expect("a full sha"),
+                DiffTabHead::Commit(OTHER_HEAD.parse().expect("a full sha")),
+                "Head subject".into(),
+                "Later subject".into(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        fixture.panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.diff_tab_comparison(),
+                Some((
+                    DIFF_HEAD.parse().expect("a full sha"),
+                    DiffTabHead::Commit(OTHER_HEAD.parse().expect("a full sha"))
+                ))
+            );
+            let state = panel.diff_tab.as_ref().expect("still one tab");
+            let commit_tab::LoadState::Loaded(loaded) = &state.files else {
+                panic!("the new comparison's files must have loaded");
+            };
+            assert_eq!(loaded.paths(), vec![fixture.two.clone()]);
+            assert_eq!(state.selected_file, None, "the old cursor is gone");
+            assert!(state.collapsed_dirs.is_empty(), "so are the old folds");
+        });
+    }
+
+    /// "Compare with Local Working Tree" lists the files that differ between
+    /// the commit and the working tree as it is now, re-lists them when the
+    /// working tree changes, and a row opens the live local file against its
+    /// copy at the commit.
+    #[gpui::test]
+    async fn test_a_comparison_with_local_lists_and_follows_the_working_tree(
+        cx: &mut TestAppContext,
+    ) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let cx = &mut cx;
+        let fs = fixture.workspace.read_with(cx, |workspace, cx| {
+            fs::Fs::as_fake(workspace.project().read(cx).fs().as_ref())
+        });
+        // At the base, `one.txt` differs from the disk and `two.txt` matches.
+        fs.set_merge_base_content_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("one.txt", "base one\n".into()),
+                ("two.txt", "two\n".into()),
+            ],
+        );
+        let repository = fixture.repository.clone();
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.show_comparison(
+                repository,
+                DIFF_BASE.parse().expect("a full sha"),
+                DiffTabHead::WorkingTree,
+                "Base subject".into(),
+                SharedString::default(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let listed = |cx: &mut VisualTestContext| {
+            fixture.panel.read_with(cx, |panel, _| {
+                let state = panel.diff_tab.as_ref().expect("the tab is open");
+                let commit_tab::LoadState::Loaded(loaded) = &state.files else {
+                    panic!("the comparison's files must have loaded");
+                };
+                loaded.paths()
+            })
+        };
+        assert_eq!(listed(cx), vec![fixture.one.clone()]);
+
+        // Editing `two.txt` on disk makes it differ from the base too; the
+        // repository's status event is what re-lists the tab.
+        fs.write(path!("/project/two.txt").as_ref(), b"edited two\n")
+            .await
+            .expect("the fake file is writable");
+        let repository_id = fixture.repository_id;
+        cx.update(|_, cx| {
+            let git_store = fixture.panel.read(cx).project.read(cx).git_store().clone();
+            git_store.update(cx, |_, cx| {
+                cx.emit(GitStoreEvent::RepositoryUpdated(
+                    repository_id,
+                    RepositoryEvent::StatusesChanged,
+                    false,
+                ));
+            });
+        });
+        cx.run_until_parked();
+        let mut expected = vec![fixture.one.clone(), fixture.two.clone()];
+        expected.sort();
+        assert_eq!(listed(cx), expected);
+
+        let open = cx.update(|window, cx| {
+            SoloDiffView::open_local_file(
+                DIFF_BASE.into(),
+                fixture.repository.clone(),
+                fixture.one.clone(),
+                fixture.workspace.downgrade(),
+                DiffOpen::Summon { focus: false },
+                window,
+                cx,
+            )
+        });
+        open.await
+            .expect("the local file opens")
+            .expect("the gesture opened a view");
+        cx.run_until_parked();
+        fixture.panel.read_with(cx, |panel, _| {
+            let open_diff = panel.open_diff.as_ref().expect("a diff is open");
+            assert_eq!(open_diff.local_file(DIFF_BASE), Some(&fixture.one));
+            assert_eq!(
+                open_diff.working_file(repository_id),
+                None,
+                "a diff against the commit is not the Changes tab's diff of the file"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_closing_the_diff_tab_returns_to_changes(cx: &mut TestAppContext) {
+        let (fixture, mut cx) = changes_tab_fixture(cx).await;
+        let cx = &mut cx;
+        show_test_diff_range(&fixture, cx).await;
+
+        fixture.panel.update_in(cx, |panel, window, cx| {
+            panel.close_diff_tab(window, cx);
+            assert!(!panel.diff_tab_is_open());
+            assert_eq!(panel.active_tab, GitPanelTab::Changes);
+
+            panel.activate_diff_tab(&ActivateDiffTab, window, cx);
+            assert_eq!(
+                panel.active_tab,
+                GitPanelTab::Changes,
+                "a closed Diff tab cannot be activated into an empty tab"
+            );
+        });
+    }
+
     /// Arrow-key stepping through the list follows the shared diff, and only
     /// the shared diff: with nothing open it must not start one, or holding
     /// `down` would spray a tab per file.
@@ -9470,6 +9957,7 @@ mod tests {
                 Some(OpenDiff::Working {
                     repository_id,
                     repo_path: one.clone(),
+                    base: None,
                 }),
             );
             assert!(panel.is_open_working_diff(repository_id, &one));
@@ -9498,6 +9986,7 @@ mod tests {
                 Some(OpenDiff::Working {
                     repository_id,
                     repo_path: two.clone(),
+                    base: None,
                 }),
             );
         });
@@ -9543,6 +10032,7 @@ mod tests {
             assert_eq!(
                 panel.open_diff,
                 Some(OpenDiff::Commit {
+                    base: None,
                     sha: "abc123".into(),
                     file: Some(one.clone()),
                 }),
@@ -9573,6 +10063,7 @@ mod tests {
                 Some(OpenDiff::Working {
                     repository_id,
                     repo_path: one.clone(),
+                    base: None,
                 }),
                 "the mark follows the pane, not the last row acted on"
             );
@@ -9606,12 +10097,14 @@ mod tests {
         let working = OpenDiff::Working {
             repository_id: first_repository,
             repo_path: path.clone(),
+            base: None,
         };
         assert_eq!(working.working_file(first_repository), Some(&path));
         assert_eq!(working.working_file(second_repository), None);
         assert_eq!(working.commit_file("abc123"), None);
 
         let commit_file = OpenDiff::Commit {
+            base: None,
             sha: "abc123".into(),
             file: Some(path.clone()),
         };
@@ -9620,6 +10113,7 @@ mod tests {
         assert_eq!(commit_file.working_file(first_repository), None);
 
         let whole_commit = OpenDiff::Commit {
+            base: None,
             sha: "abc123".into(),
             file: None,
         };
@@ -10505,6 +10999,7 @@ mod tests {
         panel.update(cx, |panel, cx| {
             panel.set_open_diff(
                 Some(OpenDiff::Commit {
+                    base: None,
                     sha: "823a3f8a".into(),
                     file: Some(path.clone()),
                 }),

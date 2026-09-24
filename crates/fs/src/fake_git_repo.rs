@@ -350,6 +350,28 @@ impl GitRepository for FakeGitRepository {
         .boxed()
     }
 
+    fn load_commit_range(
+        &self,
+        base: String,
+        head: String,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<git::repository::CommitDiff>> {
+        // Keyed `base..head` in the same map as single commits, which a full
+        // sha can never collide with.
+        let key = format!("{base}..{head}");
+        self.with_state_async(false, move |state| {
+            Ok(state
+                .commit_diffs
+                .get(&key)
+                .cloned()
+                .unwrap_or(git::repository::CommitDiff {
+                    files: Vec::new(),
+                    is_shallow_boundary: false,
+                }))
+        })
+        .boxed()
+    }
+
     fn set_index_text(
         &self,
         path: RepoPath,
@@ -375,20 +397,26 @@ impl GitRepository for FakeGitRepository {
     }
 
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
-        let worktree_contents =
-            matches!(request, DiffTreeType::MergeBaseWithWorktree { .. }).then(|| {
-                let workdir_path = self.dot_git_path.parent().unwrap();
-                self.fs
-                    .files()
-                    .iter()
-                    .filter_map(|path| {
-                        let path_in_repo = path.strip_prefix(workdir_path).ok()?;
-                        let path_in_repo = RelPath::new(path_in_repo, PathStyle::local()).ok()?;
-                        let content = self.fs.read_file_sync(path).ok()?;
-                        Some((RepoPath::from_rel_path(&path_in_repo), content))
-                    })
-                    .collect::<HashMap<_, _>>()
-            });
+        // The fake keeps one "base" snapshot, `merge_base_contents`, so a
+        // straight comparison with the working tree reads the same as a
+        // merge-base one.
+        let worktree_contents = matches!(
+            request,
+            DiffTreeType::MergeBaseWithWorktree { .. } | DiffTreeType::SinceWithWorktree { .. }
+        )
+        .then(|| {
+            let workdir_path = self.dot_git_path.parent().unwrap();
+            self.fs
+                .files()
+                .iter()
+                .filter_map(|path| {
+                    let path_in_repo = path.strip_prefix(workdir_path).ok()?;
+                    let path_in_repo = RelPath::new(path_in_repo, PathStyle::local()).ok()?;
+                    let content = self.fs.read_file_sync(path).ok()?;
+                    Some((RepoPath::from_rel_path(&path_in_repo), content))
+                })
+                .collect::<HashMap<_, _>>()
+        });
         self.with_state_async(false, move |state| {
             let contents = worktree_contents.as_ref().unwrap_or(&state.head_contents);
             let tracked_paths = state
@@ -421,7 +449,19 @@ impl GitRepository for FakeGitRepository {
         self.with_state_async(false, |state| {
             Ok(revs
                 .into_iter()
-                .map(|rev| state.refs.get(&rev).cloned())
+                .map(|rev| {
+                    state.refs.get(&rev).cloned().or_else(|| {
+                        // `<revision>:<path>` names a blob. The fake keeps one
+                        // "base" snapshot, `merge_base_contents`, and answers
+                        // from it whatever the revision.
+                        let (_, path) = rev.split_once(':')?;
+                        let path = RepoPath::new(path).ok()?;
+                        state
+                            .merge_base_contents
+                            .get(&path)
+                            .map(|oid| oid.to_string())
+                    })
+                })
                 .collect())
         })
     }

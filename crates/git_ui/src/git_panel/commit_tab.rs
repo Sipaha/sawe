@@ -16,7 +16,7 @@ use super::*;
 
 use crate::commit_refs;
 use git::repository::CommitDetails;
-use git::status::{StatusCode, TrackedStatus};
+use git::status::{StatusCode, TrackedStatus, TreeDiffStatus};
 use gpui::{
     AnyElement, ClipboardItem, EntityId, FontWeight, StyleRefinement, TextRun, TextStyleRefinement,
     UnderlineStyle, canvas, rems,
@@ -318,7 +318,7 @@ const COMMIT_TAB_SECTIONS: [CommitTabSection; 5] = [
 /// hosts that shared no type; the git graph's sidebar is gone and the Commit
 /// tab is the only host left, but erasing the host is also what keeps these
 /// closures safe to install into event callbacks under the panel's own lease
-/// — see [`GitPanel::commit_file_row_handlers`].
+/// — see [`GitPanel::file_row_handlers`].
 #[derive(Clone)]
 struct ChangedFileRowHandlers {
     /// Left click on a file row — marks it as the tree's selected file.
@@ -327,6 +327,74 @@ struct ChangedFileRowHandlers {
     deploy_file_context_menu: Rc<dyn Fn(&RepoPath, Point<Pixels>, &mut Window, &mut App)>,
     /// Click on a directory header row — collapses or expands the group.
     toggle_directory: Rc<dyn Fn(&SharedString, &mut Window, &mut App)>,
+}
+
+/// Which revisions a changed-file row's diff is between: the Commit tab's
+/// commit against its first parent, or the Diff tab's `base..head`
+/// comparison of two commits or of a commit with the working tree
+/// (FORK.md #208). Carries FULL shas, never `display_short()`: they are
+/// forwarded verbatim to the loaders, which find nothing under a short one.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum FileDiffTarget {
+    Commit(SharedString),
+    Range {
+        base: SharedString,
+        head: SharedString,
+    },
+    Local {
+        base: SharedString,
+    },
+}
+
+impl FileDiffTarget {
+    fn open(
+        &self,
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        workspace: WeakEntity<Workspace>,
+        mode: DiffOpen,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Option<Entity<SoloDiffView>>>> {
+        match self {
+            Self::Commit(sha) => SoloDiffView::open_commit_file(
+                sha.clone(),
+                repository,
+                repo_path,
+                workspace,
+                mode,
+                window,
+                cx,
+            ),
+            Self::Range { base, head } => SoloDiffView::open_range_file(
+                base.clone(),
+                head.clone(),
+                repository,
+                repo_path,
+                workspace,
+                mode,
+                window,
+                cx,
+            ),
+            Self::Local { base } => SoloDiffView::open_local_file(
+                base.clone(),
+                repository,
+                repo_path,
+                workspace,
+                mode,
+                window,
+                cx,
+            ),
+        }
+    }
+}
+
+/// Which tab a changed-file tree belongs to, so the row handlers write the
+/// cursor and the collapsed directories back into that tab's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileTreeOwner {
+    Commit,
+    Diff,
 }
 
 /// The two independent highlight states a changed-file row can be in.
@@ -343,7 +411,7 @@ struct ChangedFileRowMarks {
 }
 
 #[derive(Clone)]
-struct ChangedFileEntry {
+pub(super) struct ChangedFileEntry {
     status: FileStatus,
     file_name: SharedString,
     dir_path: SharedString,
@@ -356,25 +424,17 @@ struct ChangedFileEntry {
 }
 
 impl ChangedFileEntry {
-    fn from_commit_file(file: &CommitFile, stat: Option<DiffLineCount>) -> Self {
-        let file_name: SharedString = file
-            .path
+    fn new(repo_path: &RepoPath, status_code: StatusCode, stat: Option<DiffLineCount>) -> Self {
+        let file_name: SharedString = repo_path
             .file_name()
             .map(|n| n.to_string())
             .unwrap_or_default()
             .into();
-        let dir_path: SharedString = file
-            .path
+        let dir_path: SharedString = repo_path
             .parent()
             .map(|p| p.as_unix_str().to_string())
             .unwrap_or_default()
             .into();
-
-        let status_code = match (&file.old_text, &file.new_text) {
-            (None, Some(_)) => StatusCode::Added,
-            (Some(_), None) => StatusCode::Deleted,
-            _ => StatusCode::Modified,
-        };
 
         let status = FileStatus::Tracked(TrackedStatus {
             index_status: status_code,
@@ -385,9 +445,30 @@ impl ChangedFileEntry {
             status,
             file_name,
             dir_path,
-            repo_path: file.path.clone(),
+            repo_path: repo_path.clone(),
             stat,
         }
+    }
+
+    fn from_commit_file(file: &CommitFile, stat: Option<DiffLineCount>) -> Self {
+        let status_code = match (&file.old_text, &file.new_text) {
+            (None, Some(_)) => StatusCode::Added,
+            (Some(_), None) => StatusCode::Deleted,
+            _ => StatusCode::Modified,
+        };
+        Self::new(&file.path, status_code, stat)
+    }
+
+    /// A file of a revision-vs-working-tree comparison. Such a listing names
+    /// files and statuses only — it loads no text — so the row has no
+    /// figures.
+    pub(super) fn from_tree_diff(repo_path: &RepoPath, status: &TreeDiffStatus) -> Self {
+        let status_code = match status {
+            TreeDiffStatus::Added => StatusCode::Added,
+            TreeDiffStatus::Modified { .. } => StatusCode::Modified,
+            TreeDiffStatus::Deleted { .. } => StatusCode::Deleted,
+        };
+        Self::new(repo_path, status_code, None)
     }
 
     /// The diff half of a left click on this row (the selection half is the
@@ -402,7 +483,7 @@ impl ChangedFileEntry {
     fn handle_row_click(
         &self,
         click_count: usize,
-        commit_sha: &SharedString,
+        target: &FileDiffTarget,
         repository: &WeakEntity<Repository>,
         workspace: &WeakEntity<Workspace>,
         window: &mut Window,
@@ -418,16 +499,16 @@ impl ChangedFileEntry {
         } else {
             DiffOpen::Retarget
         };
-        SoloDiffView::open_commit_file(
-            commit_sha.clone(),
-            repository,
-            self.repo_path.clone(),
-            workspace.clone(),
-            mode,
-            window,
-            cx,
-        )
-        .detach_and_notify_err(workspace.clone(), window, cx);
+        target
+            .open(
+                repository,
+                self.repo_path.clone(),
+                workspace.clone(),
+                mode,
+                window,
+                cx,
+            )
+            .detach_and_notify_err(workspace.clone(), window, cx);
     }
 
     /// Full repo-relative path, used for tooltips and the copy-path menu.
@@ -450,7 +531,7 @@ impl ChangedFileEntry {
         &self,
         ix: usize,
         indent: Pixels,
-        commit_sha: SharedString,
+        target: FileDiffTarget,
         repository: WeakEntity<Repository>,
         workspace: WeakEntity<Workspace>,
         handlers: ChangedFileRowHandlers,
@@ -530,7 +611,7 @@ impl ChangedFileEntry {
                             (handlers.select_file)(&entry.repo_path, window, cx);
                             entry.handle_row_click(
                                 event.click_count(),
-                                &commit_sha,
+                                &target,
                                 &repository,
                                 &workspace,
                                 window,
@@ -570,7 +651,10 @@ enum ChangedFileRow {
 /// the diff landed. A file with no entry in [`CommitDiffStats::per_file`] — a
 /// binary one — renders no figures, and `show_stats` (the `git_panel.diff_stats`
 /// setting) drops them from every row at once.
-fn changed_file_entries(loaded: &LoadedCommitDiff, show_stats: bool) -> Vec<ChangedFileEntry> {
+pub(super) fn changed_file_entries(
+    loaded: &LoadedCommitDiff,
+    show_stats: bool,
+) -> Vec<ChangedFileEntry> {
     loaded
         .diff
         .files
@@ -1044,9 +1128,9 @@ fn detail_text_style(color: Color, weight: Option<gpui::FontWeight>, cx: &App) -
 
 /// The `+N −M` of one file, or of a whole commit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct DiffLineCount {
-    added: usize,
-    removed: usize,
+pub(super) struct DiffLineCount {
+    pub(super) added: usize,
+    pub(super) removed: usize,
 }
 
 /// A commit's +/− figures, whole and per file.
@@ -1057,8 +1141,8 @@ struct DiffLineCount {
 /// the way, and throwing them away only to recompute them per frame would run
 /// [`line_diff`] over every file of the commit on the render path.
 #[derive(Default)]
-struct CommitDiffStats {
-    total: DiffLineCount,
+pub(super) struct CommitDiffStats {
+    pub(super) total: DiffLineCount,
     /// Keyed by the path of the `CommitFile` it was derived from. A **binary**
     /// file has no entry at all rather than a zero one — see
     /// [`compute_diff_stats`] — so `per_file` is not the same length as
@@ -1076,7 +1160,7 @@ struct CommitDiffStats {
 /// a binary file, so diffing it would only ever produce a truthful-looking
 /// `+0 −0`. Skipping it from the total as well as from the rows keeps
 /// `total == sum(per_file)` true by construction.
-fn compute_diff_stats(diff: &CommitDiff) -> CommitDiffStats {
+pub(super) fn compute_diff_stats(diff: &CommitDiff) -> CommitDiffStats {
     let mut stats = CommitDiffStats::default();
     for file in &diff.files {
         if file.is_binary {
@@ -1182,8 +1266,8 @@ pub(super) enum LoadState<T> {
 }
 
 pub(super) struct LoadedCommitDiff {
-    diff: CommitDiff,
-    stats: CommitDiffStats,
+    pub(super) diff: CommitDiff,
+    pub(super) stats: CommitDiffStats,
 }
 
 /// Selectable text of the commit message. `ui::Label` has no selection
@@ -1880,12 +1964,35 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::Commit, window, cx);
     }
 
-    fn toggle_commit_directory(&mut self, key: &SharedString, cx: &mut Context<Self>) {
-        let Some(state) = self.commit_tab.as_mut() else {
+    /// The cursor and the collapsed directories of `owner`'s file tree, when
+    /// that tab is open.
+    fn file_tree_marks_mut(
+        &mut self,
+        owner: FileTreeOwner,
+    ) -> Option<(&mut Option<RepoPath>, &mut HashSet<SharedString>)> {
+        match owner {
+            FileTreeOwner::Commit => self
+                .commit_tab
+                .as_mut()
+                .map(|state| (&mut state.selected_file, &mut state.collapsed_dirs)),
+            FileTreeOwner::Diff => self
+                .diff_tab
+                .as_mut()
+                .map(|state| (&mut state.selected_file, &mut state.collapsed_dirs)),
+        }
+    }
+
+    pub(super) fn toggle_tree_directory(
+        &mut self,
+        owner: FileTreeOwner,
+        key: &SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, collapsed_dirs)) = self.file_tree_marks_mut(owner) else {
             return;
         };
-        if !state.collapsed_dirs.remove(key) {
-            state.collapsed_dirs.insert(key.clone());
+        if !collapsed_dirs.remove(key) {
+            collapsed_dirs.insert(key.clone());
         }
         cx.notify();
     }
@@ -1919,7 +2026,11 @@ impl GitPanel {
     /// renders the same tree outside its own update — so the bundle must be
     /// built here from `cx.weak_entity()` and its closures may only ever be
     /// installed into event callbacks, never called during layout or paint.
-    fn commit_file_row_handlers(&self, cx: &Context<Self>) -> ChangedFileRowHandlers {
+    fn file_row_handlers(
+        &self,
+        owner: FileTreeOwner,
+        cx: &Context<Self>,
+    ) -> ChangedFileRowHandlers {
         let panel = cx.weak_entity();
         ChangedFileRowHandlers {
             select_file: Rc::new({
@@ -1927,8 +2038,8 @@ impl GitPanel {
                 move |repo_path, _window, cx| {
                     panel
                         .update(cx, |panel, cx| {
-                            if let Some(state) = panel.commit_tab.as_mut() {
-                                state.selected_file = Some(repo_path.clone());
+                            if let Some((selected_file, _)) = panel.file_tree_marks_mut(owner) {
+                                *selected_file = Some(repo_path.clone());
                                 cx.notify();
                             }
                         })
@@ -1953,7 +2064,7 @@ impl GitPanel {
             toggle_directory: Rc::new(move |key, _window, cx| {
                 panel
                     .update(cx, |panel, cx| {
-                        panel.toggle_commit_directory(key, cx);
+                        panel.toggle_tree_directory(owner, key, cx);
                     })
                     .ok();
             }),
@@ -2843,10 +2954,48 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let entries = changed_file_entries(loaded, GitPanelSettings::get_global(cx).diff_stats);
-        let repo_label: SharedString = state
-            .selection
-            .repository
+        // Resolved once for the whole list rather than per row: the mark is
+        // keyed by path, so it survives the tab's state being rebuilt on the
+        // next commit selection, and it is only ever *read* here — never fed
+        // back into which diff opens.
+        let open_file = self.open_commit_file(&commit_sha).cloned();
+        self.render_changed_file_tree(
+            ChangedFileTree {
+                owner: FileTreeOwner::Commit,
+                id: "commit-tab-files",
+                repository: &state.selection.repository,
+                entries: changed_file_entries(loaded, GitPanelSettings::get_global(cx).diff_stats),
+                collapsed_dirs: &state.collapsed_dirs,
+                selected_file: state.selected_file.clone(),
+                scroll_handle: state.scroll_handle.clone(),
+                target: FileDiffTarget::Commit(commit_sha),
+                open_file,
+            },
+            window,
+            cx,
+        )
+    }
+
+    /// The directory-grouped changed-files list the Commit and Diff tabs both
+    /// show, with the same row gestures (FORK.md #125) and marks.
+    pub(super) fn render_changed_file_tree(
+        &self,
+        tree: ChangedFileTree<'_>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ChangedFileTree {
+            owner,
+            id,
+            repository,
+            entries,
+            collapsed_dirs,
+            selected_file,
+            scroll_handle,
+            target,
+            open_file,
+        } = tree;
+        let repo_label: SharedString = repository
             .read(cx)
             .work_directory_abs_path
             .file_name()
@@ -2856,22 +3005,15 @@ impl GitPanel {
         let rows: Rc<Vec<ChangedFileRow>> = Rc::new(build_changed_file_rows(
             &entries,
             &repo_label,
-            &state.collapsed_dirs,
+            collapsed_dirs,
         ));
         let row_count = rows.len();
-        let repository = state.selection.repository.downgrade();
+        let repository = repository.downgrade();
         let workspace = self.workspace.clone();
-        let selected_file = state.selected_file.clone();
-        // Resolved once for the whole list rather than per row: the mark is
-        // keyed by path, so it survives the tab's state being rebuilt on the
-        // next commit selection, and it is only ever *read* here — never fed
-        // back into which diff opens.
-        let open_file = self.open_commit_file(&commit_sha).cloned();
-        let scroll_handle = state.scroll_handle.clone();
-        let handlers = self.commit_file_row_handlers(cx);
+        let handlers = self.file_row_handlers(owner, cx);
 
         div()
-            .id("commit-tab-files")
+            .id(id)
             .flex_1()
             // An explicit floor, not `min_h_0()`: as the only `flex_1` child of
             // the tab body the tree would otherwise absorb the whole shortfall
@@ -2879,7 +3021,7 @@ impl GitPanel {
             .min_h(px(COMMIT_FILE_TREE_MIN_HEIGHT))
             .child(
                 uniform_list(
-                    "commit-tab-files-list",
+                    SharedString::from(format!("{id}-list")),
                     row_count,
                     move |range, _window, cx| {
                         range
@@ -2904,7 +3046,7 @@ impl GitPanel {
                                     ChangedFileRow::File(entry) => entry.render(
                                         ix,
                                         px(COMMIT_TREE_INDENT),
-                                        commit_sha.clone(),
+                                        target.clone(),
                                         repository.clone(),
                                         workspace.clone(),
                                         handlers.clone(),
@@ -2927,6 +3069,22 @@ impl GitPanel {
             .vertical_scrollbar_for(&scroll_handle, window, cx)
             .into_any_element()
     }
+}
+
+/// Everything [`GitPanel::render_changed_file_tree`] needs from the tab
+/// hosting the tree.
+pub(super) struct ChangedFileTree<'a> {
+    pub(super) owner: FileTreeOwner,
+    /// Element id of the tree; the list's id is derived from it.
+    pub(super) id: &'static str,
+    pub(super) repository: &'a Entity<Repository>,
+    pub(super) entries: Vec<ChangedFileEntry>,
+    pub(super) collapsed_dirs: &'a HashSet<SharedString>,
+    pub(super) selected_file: Option<RepoPath>,
+    pub(super) scroll_handle: UniformListScrollHandle,
+    pub(super) target: FileDiffTarget,
+    /// The row whose diff the centre pane is showing, if it is one of these.
+    pub(super) open_file: Option<RepoPath>,
 }
 
 #[cfg(test)]
@@ -3647,7 +3805,7 @@ mod tests {
         );
 
         cx.update_window_entity(&panel, |panel, _window, cx| {
-            panel.toggle_commit_directory(&SharedString::from("src"), cx);
+            panel.toggle_tree_directory(FileTreeOwner::Commit, &SharedString::from("src"), cx);
         });
         cx.run_until_parked();
         assert!(
@@ -3679,7 +3837,14 @@ mod tests {
             let sha = self.sha.clone();
             let entry = entry.clone();
             cx.update(move |window, cx| {
-                entry.handle_row_click(count, &sha, &repository, &workspace, window, cx);
+                entry.handle_row_click(
+                    count,
+                    &FileDiffTarget::Commit(sha),
+                    &repository,
+                    &workspace,
+                    window,
+                    cx,
+                );
             });
             cx.run_until_parked();
         }
@@ -4631,7 +4796,7 @@ ships-with-and-then-some-more-of-it";
             "precondition: the commit's one decoration is on screen"
         );
         cx.update_window_entity(&panel, |panel, _window, cx| {
-            panel.toggle_commit_directory(&SharedString::from("src"), cx);
+            panel.toggle_tree_directory(FileTreeOwner::Commit, &SharedString::from("src"), cx);
         });
         cx.run_until_parked();
         assert!(

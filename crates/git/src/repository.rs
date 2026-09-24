@@ -2116,8 +2116,12 @@ impl GitRepository for RealGitRepository {
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
         let git = self.git_binary_in_worktree();
         let working_directory = self.working_directory.clone();
-        let merge_base_ref = match &request {
-            DiffTreeType::MergeBaseWithWorktree { base } => Some(base.clone()),
+        // For a comparison that includes the working tree: the ref the
+        // recreated-file fix-up below compares disk contents against, and
+        // whether that is the ref's merge base with HEAD or the ref itself.
+        let worktree_base = match &request {
+            DiffTreeType::MergeBaseWithWorktree { base } => Some((base.clone(), true)),
+            DiffTreeType::SinceWithWorktree { base } => Some((base.clone(), false)),
             DiffTreeType::MergeBase { .. } | DiffTreeType::Since { .. } => None,
         };
 
@@ -2159,6 +2163,17 @@ impl GitRepository for RealGitRepository {
             ]
             .map(OsString::from)
             .to_vec(),
+            DiffTreeType::SinceWithWorktree { base } => [
+                "diff",
+                "--raw",
+                "-z",
+                "--abbrev=64",
+                "--no-renames",
+                base.as_str(),
+                "--",
+            ]
+            .map(OsString::from)
+            .to_vec(),
         };
 
         self.executor
@@ -2172,7 +2187,7 @@ impl GitRepository for RealGitRepository {
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let mut tree_diff = stdout.parse::<TreeDiff>()?;
-                let Some(merge_base_ref) = merge_base_ref else {
+                let Some((worktree_base, is_merge_base)) = worktree_base else {
                     return Ok(tree_diff);
                 };
                 let Some(working_directory) = working_directory else {
@@ -2218,16 +2233,22 @@ impl GitRepository for RealGitRepository {
                     return Ok(tree_diff);
                 }
 
-                let merge_base_output = git
-                    .build_command(&["merge-base", merge_base_ref.as_ref(), "HEAD"])
-                    .output()
-                    .await?;
-                if !merge_base_output.status.success() {
-                    let stderr = String::from_utf8_lossy(&merge_base_output.stderr);
-                    anyhow::bail!("git merge-base failed: {stderr}");
-                }
-                let merge_base = String::from_utf8_lossy(&merge_base_output.stdout);
-                let merge_base = merge_base.trim();
+                let merge_base = if is_merge_base {
+                    let merge_base_output = git
+                        .build_command(&["merge-base", worktree_base.as_ref(), "HEAD"])
+                        .output()
+                        .await?;
+                    if !merge_base_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&merge_base_output.stderr);
+                        anyhow::bail!("git merge-base failed: {stderr}");
+                    }
+                    String::from_utf8_lossy(&merge_base_output.stdout)
+                        .trim()
+                        .to_string()
+                } else {
+                    worktree_base.to_string()
+                };
+                let merge_base = merge_base.as_str();
 
                 for (path, old) in recreated {
                     let full_path = working_directory.join(path.as_std_path());
@@ -5330,6 +5351,70 @@ mod tests {
         assert_same_path(
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
             repo_dir.path(),
+        );
+    }
+
+    /// "Compare with Local" diffs a commit straight against the working tree
+    /// (FORK.md #208) — not against its merge base with HEAD, which for a
+    /// commit on another branch is a different revision.
+    #[gpui::test]
+    async fn test_since_with_worktree_diffs_the_revision_itself(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let file_path = repo_dir.path().join("file.txt");
+        fs::write(&file_path, "root\n").unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "root"]);
+        git_command(repo_dir.path(), ["branch", "side"]);
+        git_command(repo_dir.path(), ["checkout", "side"]);
+        fs::write(&file_path, "side\n").unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "side"]);
+        let side_oid: Oid = git_command_output(repo_dir.path(), ["rev-parse", "HEAD:file.txt"])
+            .parse()
+            .unwrap();
+        let root_oid: Oid = git_command_output(repo_dir.path(), ["rev-parse", "HEAD^:file.txt"])
+            .parse()
+            .unwrap();
+        git_command(repo_dir.path(), ["checkout", "-"]);
+        fs::write(&file_path, "local\n").unwrap();
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let old_of = |diff: TreeDiff| match diff.entries.get(&repo_path("file.txt")) {
+            Some(TreeDiffStatus::Modified { old }) => *old,
+            other => panic!("file.txt must read as modified, got {other:?}"),
+        };
+        assert_eq!(
+            old_of(
+                repository
+                    .diff_tree(DiffTreeType::SinceWithWorktree {
+                        base: "side".into()
+                    })
+                    .await
+                    .unwrap()
+            ),
+            side_oid,
+            "the left side is the file as of the revision asked for"
+        );
+        assert_eq!(
+            old_of(
+                repository
+                    .diff_tree(DiffTreeType::MergeBaseWithWorktree {
+                        base: "side".into()
+                    })
+                    .await
+                    .unwrap()
+            ),
+            root_oid,
+            "whereas the merge-base variant reads it at the fork point"
         );
     }
 

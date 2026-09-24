@@ -12,6 +12,7 @@ use editor::{
     multibuffer_context_lines,
 };
 use fs::Fs;
+use futures::channel::oneshot;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
     parse_git_remote_url, repository::RepoPath, status::FileStatus,
@@ -24,7 +25,7 @@ use language::{Buffer, Capability, HighlightedText};
 use multi_buffer::{MultiBuffer, MultiBufferSnapshot, PathKey};
 use project::{
     Project,
-    git_store::{Repository, RepositoryId},
+    git_store::{CommitDiff, Repository, RepositoryId},
 };
 use settings::{DiffViewStyle, Settings, update_settings_file};
 use std::{
@@ -188,19 +189,25 @@ impl DiffLoadRequest {
 /// view can never end up half-configured for one of them.
 #[derive(Clone)]
 pub enum DiffSource {
-    /// Uncommitted changes to a file in the working tree. The right-hand side
-    /// is the live project buffer, so the view is editable and its hunks can
-    /// be staged.
+    /// A file in the working tree. The right-hand side is the live project
+    /// buffer, so the view is editable. Against HEAD when `base` is `None` —
+    /// the uncommitted changes the Changes tab lists, whose hunks can be
+    /// staged — or against the revision `base` (the Diff tab's "Compare with
+    /// Local", FORK.md #208), where staging means nothing.
     WorkingTree {
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        base: Option<SharedString>,
     },
-    /// A file as of `sha`, diffed against its parent. Both sides are detached
-    /// historic blobs: read-only, no staging.
+    /// A file as of `sha`, diffed against `base` — its first parent when
+    /// `base` is `None` (the Commit tab), or another revision (the Diff tab's
+    /// comparison of two commits). Both sides are detached historic blobs:
+    /// read-only, no staging.
     Commit {
         repository: Entity<Repository>,
         repo_path: RepoPath,
         sha: SharedString,
+        base: Option<SharedString>,
     },
 }
 
@@ -222,6 +229,14 @@ impl DiffSource {
         match self {
             Self::WorkingTree { .. } => None,
             Self::Commit { sha, .. } => Some(sha),
+        }
+    }
+
+    /// The revision the left side is taken from, when it is not the default
+    /// one — HEAD for a working-tree file, the first parent for a commit's.
+    pub fn base(&self) -> Option<&SharedString> {
+        match self {
+            Self::WorkingTree { base, .. } | Self::Commit { base, .. } => base.as_ref(),
         }
     }
 
@@ -250,29 +265,35 @@ impl DiffSource {
                 Self::WorkingTree {
                     repository,
                     repo_path,
+                    base,
                 },
                 Self::WorkingTree {
                     repository: other_repository,
                     repo_path: other_repo_path,
+                    base: other_base,
                 },
             ) => {
                 repository.read(cx).id == other_repository.read(cx).id
                     && repo_path == other_repo_path
+                    && base == other_base
             }
             (
                 Self::Commit {
                     repository,
                     sha,
                     repo_path,
+                    base,
                 },
                 Self::Commit {
                     repository: other_repository,
                     sha: other_sha,
                     repo_path: other_repo_path,
+                    base: other_base,
                 },
             ) => {
                 repository.read(cx).id == other_repository.read(cx).id
                     && sha == other_sha
+                    && base == other_base
                     && repo_path == other_repo_path
             }
             _ => false,
@@ -316,11 +337,14 @@ fn blame_base_for_source(
     match source {
         // The left pane holds the file's content at HEAD; the right pane is
         // the live project buffer, which blame resolves on its own.
-        DiffSource::WorkingTree { .. } => Some(DiffBlameBase::RhsFilesAt("HEAD".into())),
+        DiffSource::WorkingTree { base, .. } => Some(DiffBlameBase::RhsFilesAt(
+            base.clone().unwrap_or_else(|| "HEAD".into()),
+        )),
         DiffSource::Commit {
             repository,
             repo_path,
             sha,
+            base,
         } => {
             let facts = commit_file?;
             if facts.binary_buffer_id.is_some() {
@@ -348,8 +372,12 @@ fn blame_base_for_source(
                 // `GitRepository::load_commit` diffs against (`git show
                 // --first-parent`, `parent_sha = format!("{commit}^")`), so a
                 // merge commit's two sides agree about which parent they mean.
-                lhs_revision: (!facts.status.is_created())
-                    .then(|| SharedString::from(format!("{sha}^"))),
+                // A comparison of two revisions names its base instead — the
+                // revision `load_commit_range` took the left side from.
+                lhs_revision: (!facts.status.is_created()).then(|| {
+                    base.clone()
+                        .unwrap_or_else(|| SharedString::from(format!("{sha}^")))
+                }),
             })
         }
     }
@@ -369,6 +397,12 @@ fn configure_editor_for_source(
     commit_file: Option<&CommitFileFacts>,
     cx: &mut Context<SplittableEditor>,
 ) {
+    if let DiffSource::WorkingTree { base: Some(_), .. } = source {
+        // The hunks are against an old revision, not the index: "stage" and
+        // "restore" on one of them would act on something other than what it
+        // shows.
+        editor.disable_diff_hunk_controls(cx);
+    }
     if let DiffSource::Commit { .. } = source {
         // History has nothing to stage or revert.
         editor.disable_diff_hunk_controls(cx);
@@ -582,6 +616,7 @@ impl SoloDiffView {
         let source = DiffSource::WorkingTree {
             repository: repository.clone(),
             repo_path: entry.repo_path.clone(),
+            base: None,
         };
         match Self::resolve_gesture(&workspace_entity, &source, mode, window, cx) {
             GestureOutcome::Reused(existing) => return Task::ready(Ok(Some(existing))),
@@ -634,6 +669,88 @@ impl SoloDiffView {
         })
     }
 
+    /// Open (or retarget) the shared diff to the live working-tree file
+    /// `repo_path` against its copy at `base` — the Diff tab's "Compare with
+    /// Local" (FORK.md #208). The right side is the project buffer, so edits
+    /// land on disk and the diff follows them; a file `base` does not have
+    /// diffs against nothing, and a file deleted locally against an empty
+    /// buffer.
+    pub fn open_local_file(
+        base: SharedString,
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        workspace: WeakEntity<Workspace>,
+        mode: DiffOpen,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<Entity<Self>>>> {
+        let Some(workspace_entity) = workspace.upgrade() else {
+            return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
+        };
+
+        let source = DiffSource::WorkingTree {
+            repository: repository.clone(),
+            repo_path: repo_path.clone(),
+            base: Some(base.clone()),
+        };
+        match Self::resolve_gesture(&workspace_entity, &source, mode, window, cx) {
+            GestureOutcome::Reused(existing) => return Task::ready(Ok(Some(existing))),
+            GestureOutcome::Declined => return Task::ready(Ok(None)),
+            GestureOutcome::Load => {}
+        }
+
+        let Some(project_path) = repository
+            .read(cx)
+            .repo_path_to_project_path(&repo_path, cx)
+        else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "could not resolve repository path {:?}",
+                repo_path
+            )));
+        };
+        let base_oid = repository.update(cx, |repository, _| {
+            repository.blob_oid_at(base.to_string(), repo_path.clone())
+        });
+
+        let project = workspace_entity.read(cx).project().clone();
+        let request = DiffLoadRequest::begin(&workspace_entity, cx);
+        window.spawn(cx, async move |cx| {
+            let base_oid = base_oid
+                .await
+                .context("resolving the file at the base revision was cancelled")??;
+            let buffer = project
+                .update(cx, |project, cx| {
+                    project.open_buffer(project_path.clone(), cx)
+                })
+                .await?;
+            let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+            let diff = git_store
+                .update(cx, |git_store, cx| {
+                    git_store.open_diff_since(base_oid, buffer.clone(), repository, cx)
+                })
+                .await?;
+
+            workspace_entity.update_in(cx, |workspace, window, cx| {
+                if !Self::may_still_open(&request, workspace, mode, cx) {
+                    return None;
+                }
+                let workspace_handle = cx.entity();
+                let view = cx.new(|cx| {
+                    Self::new(
+                        project,
+                        source,
+                        LoadedDiff::WorkingTree { buffer, diff },
+                        workspace_handle,
+                        window,
+                        cx,
+                    )
+                });
+                Self::add_to_pane(workspace, &view, mode, window, cx);
+                Some(view)
+            })
+        })
+    }
+
     /// Open (or retarget) the shared diff to a read-only view of `repo_path`
     /// as of `sha`, against its parent.
     ///
@@ -655,9 +772,83 @@ impl SoloDiffView {
         };
 
         let source = DiffSource::Commit {
-            repository: repository.clone(),
-            repo_path: repo_path.clone(),
+            repository,
+            repo_path,
             sha: sha.clone(),
+            base: None,
+        };
+        // Always the *first* parent, which is what pairs with the hard-coded
+        // `<sha>^` in `blame_base_for_source`: this surface has no merge-parent
+        // toggle, so it never reaches `load_commit_diff_against_parent` and the
+        // diff and its left-pane blame cannot name different parents. If it
+        // ever gains that toggle, `lhs_revision` is already a parameter of
+        // `DiffBlameBase::Blob` — chasing the choice through to `<sha>^N` is a
+        // call-site change here, not a redesign of the blame seam.
+        Self::open_historic_file(
+            source,
+            move |repository| repository.load_commit_diff(sha.to_string(), false),
+            workspace_entity,
+            mode,
+            window,
+            cx,
+        )
+    }
+
+    /// Show one file's changes between two revisions — the Diff tab's
+    /// comparison of two commits (FORK.md #208). `head` is the right side and
+    /// `base` the left, exactly as `git diff <base> <head>` has them.
+    ///
+    /// Same gesture rules and the same shared tab as [`Self::open_commit_file`].
+    pub fn open_range_file(
+        base: SharedString,
+        head: SharedString,
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        workspace: WeakEntity<Workspace>,
+        mode: DiffOpen,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<Entity<Self>>>> {
+        let Some(workspace_entity) = workspace.upgrade() else {
+            return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
+        };
+        let source = DiffSource::Commit {
+            repository,
+            repo_path,
+            sha: head.clone(),
+            base: Some(base.clone()),
+        };
+        Self::open_historic_file(
+            source,
+            move |repository| repository.load_commit_range(base.to_string(), head.to_string()),
+            workspace_entity,
+            mode,
+            window,
+            cx,
+        )
+    }
+
+    /// The shared body of [`Self::open_commit_file`] and
+    /// [`Self::open_range_file`]: resolve the gesture, run `load` for the
+    /// diff the file belongs to, pick the file out of it and show it.
+    fn open_historic_file(
+        source: DiffSource,
+        load: impl FnOnce(&mut Repository) -> oneshot::Receiver<Result<CommitDiff>>,
+        workspace_entity: Entity<Workspace>,
+        mode: DiffOpen,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<Entity<Self>>>> {
+        let DiffSource::Commit {
+            repository,
+            repo_path,
+            sha,
+            base,
+        } = source.clone()
+        else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "a working-tree diff is not a historic file"
+            )));
         };
         match Self::resolve_gesture(&workspace_entity, &source, mode, window, cx) {
             GestureOutcome::Reused(existing) => return Task::ready(Ok(Some(existing))),
@@ -674,29 +865,24 @@ impl SoloDiffView {
             .worktrees(cx)
             .next()
             .map(|worktree| worktree.read(cx).id());
-        // Always the *first* parent, which is what pairs with the hard-coded
-        // `<sha>^` in `blame_base_for_source`: this surface has no merge-parent
-        // toggle, so it never reaches `load_commit_diff_against_parent` and the
-        // diff and its left-pane blame cannot name different parents. If it
-        // ever gains that toggle, `lhs_revision` is already a parameter of
-        // `DiffBlameBase::Blob` — chasing the choice through to `<sha>^N` is a
-        // call-site change here, not a redesign of the blame seam.
-        let commit_diff = repository.update(cx, |repository, _| {
-            repository.load_commit_diff(sha.to_string(), false)
-        });
+        let commit_diff = repository.update(cx, |repository, _| load(repository));
         let request = DiffLoadRequest::begin(&workspace_entity, cx);
+        let revisions = match &base {
+            Some(base) => format!("{base}..{sha}"),
+            None => format!("commit {sha}"),
+        };
 
         window.spawn(cx, async move |cx| {
             let commit_diff = commit_diff
                 .await
-                .context("loading the commit's diff was cancelled")??;
+                .context("loading the diff was cancelled")??;
             let file = commit_diff
                 .files
                 .into_iter()
                 .find(|file| file.path == repo_path)
                 .with_context(|| {
                     format!(
-                        "commit {sha} does not contain {}",
+                        "{revisions} does not change {}",
                         repo_path.as_ref().display(PathStyle::local())
                     )
                 })?;
@@ -963,8 +1149,30 @@ impl SoloDiffView {
         let hunk_count = self.hunk_count(cx);
         match &self.source {
             DiffSource::WorkingTree {
+                base: Some(base), ..
+            } => {
+                // Not `status_for_path`: that is the file against HEAD, and
+                // this diff is against `base`.
+                let (added, deleted) = self.multibuffer.read(cx).snapshot(cx).total_changed_lines();
+                GitToolbarContent {
+                    status: None,
+                    diff_stat: Some(git::status::DiffStat { added, deleted }),
+                    hunk_count,
+                    commit: Some(CommitToolbarInfo {
+                        sha: base.clone(),
+                        short_sha: format!(
+                            "{}..local",
+                            base.get(0..git::SHORT_SHA_LENGTH).unwrap_or(base)
+                        )
+                        .into(),
+                        permalink: None,
+                    }),
+                }
+            }
+            DiffSource::WorkingTree {
                 repository,
                 repo_path,
+                base: None,
             } => {
                 // Read fresh on every render, with no subscription of our own:
                 // the toolbar is repainted because the pane repaints it, so a
@@ -980,7 +1188,13 @@ impl SoloDiffView {
                     commit: None,
                 }
             }
-            DiffSource::Commit { sha, .. } => {
+            DiffSource::Commit { sha, base, .. } => {
+                let short = |sha: &SharedString| -> SharedString {
+                    sha.get(0..git::SHORT_SHA_LENGTH)
+                        .unwrap_or(sha)
+                        .to_string()
+                        .into()
+                };
                 // Not `status_for_path`: the working tree may have its own,
                 // unrelated change to this path, and describing a historic
                 // diff with it would be a lie rather than merely stale.
@@ -991,25 +1205,32 @@ impl SoloDiffView {
                     hunk_count,
                     commit: Some(CommitToolbarInfo {
                         sha: sha.clone(),
-                        short_sha: sha
-                            .get(0..git::SHORT_SHA_LENGTH)
-                            .unwrap_or(sha)
-                            .to_string()
-                            .into(),
-                        permalink: self.remote.as_ref().map(|remote| {
-                            let parsed_remote = ParsedGitRemote {
-                                owner: remote.owner.as_ref().into(),
-                                repo: remote.repo.as_ref().into(),
-                            };
-                            let url = remote
-                                .host
-                                .build_commit_permalink(
-                                    &parsed_remote,
-                                    BuildCommitPermalinkParams { sha },
-                                )
-                                .to_string();
-                            (remote.host.name().into(), url)
-                        }),
+                        // A comparison names both ends, `base..head`, the way
+                        // `git diff` would be asked for it.
+                        short_sha: match base {
+                            Some(base) => format!("{}..{}", short(base), short(sha)).into(),
+                            None => short(sha),
+                        },
+                        // A host's commit page shows one commit's own change,
+                        // not this comparison, so a range links nowhere.
+                        permalink: self
+                            .remote
+                            .as_ref()
+                            .filter(|_| base.is_none())
+                            .map(|remote| {
+                                let parsed_remote = ParsedGitRemote {
+                                    owner: remote.owner.as_ref().into(),
+                                    repo: remote.repo.as_ref().into(),
+                                };
+                                let url = remote
+                                    .host
+                                    .build_commit_permalink(
+                                        &parsed_remote,
+                                        BuildCommitPermalinkParams { sha },
+                                    )
+                                    .to_string();
+                                (remote.host.name().into(), url)
+                            }),
                     }),
                 }
             }
@@ -1105,12 +1326,21 @@ impl Item for SoloDiffView {
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         let text = self.tab_tooltip_text(cx)?;
-        let DiffSource::Commit { sha, .. } = &self.source else {
-            return Some(TabTooltipContent::Text(text));
-        };
         // Which revision the file is from is the whole point of this tab, and
         // the title carries only the basename — so say it on a second line.
-        let sha = sha.get(0..16).unwrap_or(sha).to_string();
+        let short = |sha: &SharedString| sha.get(0..16).unwrap_or(sha).to_string();
+        let sha = match &self.source {
+            DiffSource::Commit { sha, base, .. } => match base {
+                Some(base) => format!("{}..{}", short(base), short(sha)),
+                None => short(sha),
+            },
+            DiffSource::WorkingTree {
+                base: Some(base), ..
+            } => format!("{}..local", short(base)),
+            DiffSource::WorkingTree { base: None, .. } => {
+                return Some(TabTooltipContent::Text(text));
+            }
+        };
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
             move |_, _| {
                 v_flex()
@@ -2900,6 +3130,149 @@ mod tests {
                 Some(format!("{SHA}^").as_str()),
                 "and the left pane holds it as of the commit's first parent"
             );
+        });
+    }
+
+    /// The Diff tab's comparison of two commits (FORK.md #208): one file of
+    /// `base..head`, with the left side — and so its blame — taken from `base`
+    /// rather than from the head commit's parent. Its toolbar names both ends
+    /// and links to no single commit's page, and it is a different tab from the
+    /// same file of the head commit alone.
+    #[gpui::test]
+    async fn test_a_range_file_diffs_against_the_base_revision(cx: &mut TestAppContext) {
+        let (context, mut cx) =
+            diff_test_context_with_remote(cx, Some("https://github.com/owner/repo.git")).await;
+        context.fs.set_commit_range_diff(
+            path!("/project/.git").as_ref(),
+            OTHER_SHA,
+            SHA,
+            CommitDiff {
+                is_shallow_boundary: false,
+                files: vec![commit_file("src/lib.rs", Some("base\n"), Some("head\n"))],
+            },
+        );
+        set_commit(
+            &context,
+            SHA,
+            vec![commit_file("src/lib.rs", Some("parent\n"), Some("head\n"))],
+        );
+
+        let open = cx.update(|window, cx| {
+            SoloDiffView::open_range_file(
+                OTHER_SHA.into(),
+                SHA.into(),
+                context.repository.clone(),
+                repo_path("src/lib.rs"),
+                context.workspace.downgrade(),
+                DiffOpen::Summon { focus: false },
+                window,
+                cx,
+            )
+        });
+        let range = open
+            .await
+            .expect("the range's file opens")
+            .expect("the gesture opened a view");
+        cx.run_until_parked();
+
+        range.read_with(&cx, |view, cx| {
+            assert_eq!(
+                view.source().base().map(SharedString::as_ref),
+                Some(OTHER_SHA)
+            );
+            let Some(DiffBlameBase::Blob {
+                rhs_revision,
+                lhs_revision,
+                ..
+            }) = view.editor.read(cx).blame_base()
+            else {
+                panic!("both panes of a range diff are detached blobs");
+            };
+            assert_eq!(rhs_revision.as_ref().map(SharedString::as_ref), Some(SHA));
+            assert_eq!(
+                lhs_revision.as_ref().map(SharedString::as_ref),
+                Some(OTHER_SHA),
+                "the left pane holds the file as of the base, not as of `head^`"
+            );
+            let commit = view
+                .git_toolbar_content(cx)
+                .commit
+                .expect("a range source names its revisions");
+            assert_eq!(commit.short_sha.as_ref(), "fedcba9..0123456");
+            assert_eq!(
+                commit.permalink, None,
+                "a host's commit page shows one commit, not this comparison"
+            );
+        });
+
+        // The head commit's own diff of the same file is a different diff, so
+        // summoning it must not reuse the comparison's tab.
+        let commit = open_commit(&context, SHA, "src/lib.rs", &mut cx)
+            .await
+            .expect("the commit's file opens")
+            .expect("the gesture opened a view");
+        assert_ne!(commit.entity_id(), range.entity_id());
+    }
+
+    /// "Compare with Local" (FORK.md #208): the right side is the live project
+    /// buffer, diffed against the file as of `base` — not against HEAD — so
+    /// blame reads the left pane at `base`, and the hunks, which are not index
+    /// hunks, cannot be staged or restored.
+    #[gpui::test]
+    async fn test_a_local_file_diffs_the_live_buffer_against_the_base(cx: &mut TestAppContext) {
+        let (context, mut cx) = diff_test_context(cx).await;
+        context.fs.set_merge_base_content_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("a.rs", "one\ntwo\nthree\nfour\n".into())],
+        );
+
+        let open = cx.update(|window, cx| {
+            SoloDiffView::open_local_file(
+                OTHER_SHA.into(),
+                context.repository.clone(),
+                repo_path("a.rs"),
+                context.workspace.downgrade(),
+                DiffOpen::Summon { focus: false },
+                window,
+                cx,
+            )
+        });
+        let local = open
+            .await
+            .expect("the local file opens")
+            .expect("the gesture opened a view");
+        cx.run_until_parked();
+
+        local.read_with(&cx, |view, cx| {
+            assert!(view.source().is_editable(), "the right side is the project file");
+            assert_eq!(view.source().base().map(SharedString::as_ref), Some(OTHER_SHA));
+            assert!(
+                matches!(
+                    view.editor.read(cx).blame_base(),
+                    Some(DiffBlameBase::RhsFilesAt(revision)) if revision == OTHER_SHA
+                ),
+                "the left pane is the file at the base, not at HEAD"
+            );
+            assert!(view.editor.read(cx).diff_hunk_controls_disabled());
+            let DiffContents::WorkingTree { diff, .. } = &view.contents else {
+                panic!("a local file is a working-tree diff");
+            };
+            let diff_base = diff
+                .read(cx)
+                .base_text_string(cx)
+                .expect("the file exists at the base");
+            assert_eq!(diff_base, "one\ntwo\nthree\nfour\n");
+        });
+
+        // The Changes tab's diff of the same file is a different diff, and
+        // summoning it must not reuse this one's tab.
+        let working_tree = open_working_tree(&context, "a.rs", &mut cx)
+            .await
+            .expect("the working-tree file opens")
+            .expect("the gesture opened a view");
+        assert_ne!(working_tree.entity_id(), local.entity_id());
+        working_tree.read_with(&cx, |view, cx| {
+            assert!(!view.editor.read(cx).diff_hunk_controls_disabled());
         });
     }
 

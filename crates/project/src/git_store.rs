@@ -7419,6 +7419,33 @@ impl Repository {
     /// arbitrary revision pair has no proto message today, and answering with
     /// some other commit's diff would be worse than failing — so remote
     /// repositories report the gap instead.
+    /// The blob `path` holds at `revision`, or `None` when the path does not
+    /// exist there. What [`GitStore::open_diff_since`] takes to diff a live
+    /// buffer against that revision's copy of the file.
+    pub fn blob_oid_at(
+        &mut self,
+        revision: String,
+        path: RepoPath,
+    ) -> oneshot::Receiver<Result<Option<git::Oid>>> {
+        self.send_job("blob_oid_at", None, move |git_repo, _cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    let spec = format!("{revision}:{}", path.as_unix_str());
+                    let resolved = backend.revparse_batch(vec![spec]).await?;
+                    resolved
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .map(|oid| oid.parse::<git::Oid>())
+                        .transpose()
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("comparing with local changes is only supported locally")
+                }
+            }
+        })
+    }
+
     pub fn load_commit_range(
         &mut self,
         base: String,
@@ -10142,6 +10169,9 @@ impl Repository {
                             (true, true, base, "HEAD".into())
                         }
                         DiffTreeType::Since { base, head } => (false, false, base, head),
+                        DiffTreeType::SinceWithWorktree { .. } => anyhow::bail!(
+                            "comparing a commit with local changes is only supported for local repositories"
+                        ),
                     };
                     let response = client
                         .request(proto::GetTreeDiff {

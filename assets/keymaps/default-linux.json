@@ -1117,10 +1117,11 @@
     "bindings": {
       "ctrl-1": "git_panel::ActivateChangesTab",
       "ctrl-2": "git_panel::ActivateCommitTab",
+      "ctrl-3": "git_panel::ActivateDiffTab",
     },
   },
   {
-    "context": "GitPanel && CommitTab",
+    "context": "GitPanel && (CommitTab || DiffTab)",
     "bindings": {
       "escape": "git_panel::ToggleFocus",
     },

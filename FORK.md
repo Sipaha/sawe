@@ -167,7 +167,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/git_graph/src/git_graph.rs` | **(decision #85)** Multi-row commit selection: `selected_entry_idxs` + `selection_anchor_idx`, the pure `fold_row_click` / `is_first_parent_chain` helpers, modifier-aware `on_row_click`, and `deploy_multi_commit_context_menu`. | `git_graph` |
 | `crates/git_ui/src/commit_context_menu.rs` | **(decision #85)** `MultiCommitContext` + `build_multi_commit_context_menu` (Compare Versions / Squash Commits… / Copy Hashes), and `NameInputModal::with_initial_text` so the squash prompt starts from the surviving commit's subject. | `git_ui` / `git_graph` |
 | `crates/git/src/operations/squash.rs`, `crates/git/src/operations/fixup.rs` | **(decision #86)** Commits newer than the folded range are `pick`ed instead of being rejected as a contiguity violation. | `git` |
-| `crates/git/src/repository.rs`, `crates/project/src/git_store.rs` | **(decision #87)** `load_commit_range(base, head)` on the `GitRepository` trait + the `Repository` entity; `load_commit`'s cat-file blob loader extracted into a shared helper the three loaders now call. | `git` / `project` / `git_ui` |
+| `crates/git/src/repository.rs`, `crates/project/src/git_store.rs` | **(decision #87)** `load_commit_range(base, head)` on the `GitRepository` trait + the `Repository` entity; `load_commit`'s cat-file blob loader extracted into a shared helper the three loaders now call. **(decision #208)** `diff_tree` handles `DiffTreeType::SinceWithWorktree` (the recreated-file fix-up compares against the revision itself instead of a merge base); `Repository::blob_oid_at(revision, path)`. | `git` / `project` / `git_ui` |
+| `crates/git/src/status.rs` | **(decision #208)** `DiffTreeType::SinceWithWorktree { base }` — `git diff <base>` straight against the working tree, no merge base. | `git_ui` (Diff tab) |
 | `crates/git_ui/src/commit_view.rs` | **(decision #87)** `CommitView::open_range` + the `compare_range` field: a bare two-commit diff tab titled `base..head`. | `git_ui` |
 | `crates/solution_agent/src/status_row.rs`, `session_view.rs`, `session_view/lifecycle.rs` | **(decision #88)** `ratchet_used_tokens` + `status_peak_thread`: the meter's high-watermark is scoped to the `AcpThread` that produced it. | `solution_agent` |
 | `crates/solution_agent/src/db/sessions.rs`, `crates/solution_agent/src/store.rs` | **(decision #88)** `SolutionAgentDb::clear_total_tokens` (the COALESCE upsert cannot clear a column), called from `rotate_context` / `reset_context`. | `solution_agent` |
@@ -1198,7 +1199,7 @@ How to apply: after the last target is folded, `pick` the rest. The contiguity e
 
 Why: "Compare Versions" needs a commit-vs-commit diff, and everything in tree diffed a commit against its parent (`load_commit`) or the working tree against a base ref (`ProjectDiff` branch mode). Neither can express `git diff A B`.
 
-How to apply: `GitRepository::load_commit_range(base, head)` (local backend only — an arbitrary revision pair has no meaningful degraded answer over the collab wire, so the remote arm errors) reuses `load_commit`'s name-status parser and cat-file blob loader, which were extracted into one shared helper rather than copied a third time. `CommitView` gained `compare_range: Option<(base, head)>`; when set it takes the same bare shape as single-file mode (no metadata panel, no message excerpt), titles the tab `base..head`, and dedups open tabs on the range rather than on a sha.
+How to apply: `GitRepository::load_commit_range(base, head)` (local backend only — an arbitrary revision pair has no meaningful degraded answer over the collab wire, so the remote arm errors) reuses `load_commit`'s name-status parser and cat-file blob loader, which were extracted into one shared helper rather than copied a third time. **Since #208 the comparison renders in the git panel's Diff tab** — a changed-files list, each file opening its own `SoloDiffView` — and `CommitView`'s `compare_range` mode, which put every file into one multibuffer tab, is deleted.
 
 ### 88. The context meter's high-watermark belongs to one thread, and the persisted count dies with the conversation
 
@@ -1548,7 +1549,7 @@ routes through the first.
 ### 100. The git panel's tabs are `Changes | Commit`; the graph pushes selections down by typed call and the panel signals closes back up by event
 
 What: phase 3 of the Solution-band work (spec `docs/plans/2026-08-26-solution-band-ai-dialogs-design.md` §5, plan
-`docs/plans/2026-08-30-git-panel-commit-tab.md`). The git panel's tab bar is now exactly **Changes | Commit**. The
+`docs/plans/2026-08-30-git-panel-commit-tab.md`). The git panel's tab bar is now exactly **Changes | Commit** (plus, since #208, a closable **Diff** tab for comparisons). The
 History tab is deleted outright, and the git graph's inline right-hand commit-details sidebar is deleted with it.
 Selecting a commit in the graph opens a closable **Commit** tab carrying the full commit message, a
 `short hash · author · date` row, whole-commit +/− totals and a changed-files tree; double-clicking a file there opens
@@ -2720,8 +2721,11 @@ What: `SoloDiffView` (`crates/git_ui/src/solo_diff_view.rs`) renders one file's 
 either of two sources, and `CommitView`'s single-file mode is **deleted** — `single_file`,
 `open_file_diff`, `preview_holds_single_file_diff` and `open_internal` with it. The Commit tab
 calls `SoloDiffView::open_commit_file`, the Changes tab calls `SoloDiffView::open_or_focus`,
-and `CommitView` is left serving the whole-commit view and the `base..head` compare-range view
-(#87). The historic-blob loader they share moved out to `crates/git_ui/src/commit_blob.rs`.
+and `CommitView` is left serving the whole-commit view (its `base..head` compare-range view,
+#87, went with #208). Since #208 both variants also carry an optional `base` — the revision the
+left side is taken from when it is not the default (HEAD for a working-tree file, the first
+parent for a commit's) — which `matches` includes, so the same file against two bases is two
+tabs. The historic-blob loader they share moved out to `crates/git_ui/src/commit_blob.rs`.
 
 Why a `DiffSource` enum and not the bare `editable` bool the ruling proposed: a bool answers
 one question, and the view has to derive **four** things from the same fact — the multibuffer
@@ -5767,3 +5771,56 @@ mutation-checked: without `initial_width` the row is 532px in a 320px frame).
 How to apply: any fork popover that embeds a `Picker` must give it `initial_width`; a width on
 the wrapper alone no longer constrains it.
 
+### 208. Comparisons open in the git panel's Diff tab as a list of files
+
+The maintainer, 2026-09-24: *«при выделении двух коммитов в гите и вызове Compare открывается одна
+вкладка с очень большим списком изменений по всем файлам. Я же ожидаю, что в панели где у нас
+Changes, Commit покажется список измененных файлов между этими версиями и можно будет потыкать по
+каждому и посмотреть что менялось. Это можно оформить отдельной вкладкой Diff»*; then: a new
+comparison replaces the tab's contents rather than adding tabs; the tab says at the top what is
+compared with what; and a commit's context menu gets a comparison with the local state.
+
+What:
+- **The Diff tab** (`git_panel/diff_tab.rs`, `GitPanelTab::Diff`, `GitPanel::show_comparison`) is
+  closable like the Commit tab and exists only while `GitPanel::diff_tab` is `Some`. There is one:
+  showing another comparison re-points it and resets its cursor and folds. Its header reads
+  `Diff between` / `From <sha> <subject>` / `To <sha> <subject>` or `To Local changes`, then the
+  file count (+/− totals for two commits), then the same directory-grouped tree as the Commit tab
+  (`GitPanel::render_changed_file_tree`, shared, parameterised by `FileTreeOwner` and a
+  `FileDiffTarget`), with the same click gestures (#125) and open-file mark.
+- **Two commits** ("Compare Versions" on a two-row graph selection, oldest as base):
+  `load_commit_range`; a file row opens `SoloDiffView::open_range_file` — `DiffSource::Commit`
+  with `base: Some(..)`, read-only blobs, blame on the left at `base`, toolbar `base..head`, no
+  permalink (a host's commit page shows one commit, not this comparison).
+- **A commit and the working tree** (commit context menu → Compare → "Compare with Local Working
+  Tree"): `diff_tree(DiffTreeType::SinceWithWorktree { base })`, i.e. `git diff <base>` with **no
+  merge base** — for a commit on another branch the merge-base variant would compare against the
+  fork point, not the commit. Names and statuses only, so no figures; re-listed on the
+  repository's `StatusesChanged` / `HeadChanged`. A file row opens
+  `SoloDiffView::open_local_file` — `DiffSource::WorkingTree` with `base: Some(..)`: the **live,
+  editable project buffer** against `GitStore::open_diff_since(blob_oid_at(base, path))`, which
+  recomputes as the user types; blame reads the left pane at `base`; hunk stage/restore controls
+  are off, because these hunks are not index hunks. The branch menus' "Compare with Local" still
+  opens `ProjectDiff` in merge-base mode — a branch name is a different question from a commit.
+- **Keys:** `ctrl-3` / `cmd-3` activates the tab. The panel withholds the `ChangesList` key context
+  on the Diff tab exactly as on the Commit tab and adds `DiffTab`; `escape` lives on
+  `GitPanel && (CommitTab || DiffTab)`. Without that, `space` would stage and `delete` restore a
+  file of the hidden Changes list.
+
+Why not keep `CommitView`'s range mode: one multibuffer of every changed file is what the
+maintainer rejected, and the list-plus-single-file shape already existed for one commit. The
+range mode lost its only caller and was deleted (#87).
+
+Remote repositories: both loaders error ("only supported locally"), as `load_commit_range`
+already did — neither comparison has a collab-wire request.
+
+Guarded by (git_ui) `test_show_diff_range_opens_the_diff_tab_with_the_changed_files`,
+`test_compare_versions_paints_the_diff_tab` (end to end through the menu handler, asserting the
+painted `DIFF-TAB-BODY`), `test_a_second_comparison_replaces_the_diff_tab_contents`,
+`test_a_diff_tab_file_opens_its_range_diff`, `test_the_diff_tab_withholds_the_changes_list_key_context`,
+`test_closing_the_diff_tab_returns_to_changes`,
+`test_a_comparison_with_local_lists_and_follows_the_working_tree`,
+`test_a_range_file_diffs_against_the_base_revision`,
+`test_a_local_file_diffs_the_live_buffer_against_the_base`, and (git)
+`test_since_with_worktree_diffs_the_revision_itself`. The key-context, blame-base and re-list
+assertions were each mutation-checked.

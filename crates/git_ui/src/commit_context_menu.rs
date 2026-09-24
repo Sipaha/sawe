@@ -22,7 +22,7 @@ mod branch_actions;
 mod branch_submenu;
 
 use crate::handlers::{
-    branch, checkout, cherry_pick, compare, copy, drop as drop_handler, edit_message, fixup,
+    branch, checkout, cherry_pick, copy, drop as drop_handler, edit_message, fixup,
     patch as patch_handler, protection, reset, revert, show_at_revision, squash, tag,
 };
 use branch_actions::*;
@@ -297,18 +297,35 @@ fn build_copy_submenu(menu: ContextMenu, ctx: CommitContext) -> ContextMenu {
 }
 
 fn build_compare_submenu(menu: ContextMenu, ctx: CommitContext) -> ContextMenu {
-    let CommitContext { sha, workspace, .. } = ctx;
+    let CommitContext {
+        sha,
+        subject,
+        repository,
+        workspace,
+        ..
+    } = ctx;
 
+    // The commit against the working tree as it is now, in the git panel's
+    // Diff tab (FORK.md #208): the files that differ, each opening a live,
+    // editable diff of the local file against its copy at this commit.
     let menu = menu.entry(
         "Compare with Local Working Tree",
         None,
         move |window, cx| {
-            let sha = sha.clone();
-            workspace
-                .update(cx, |workspace, cx| {
-                    compare::compare_with_local_working_tree(workspace, &sha, window, cx);
-                })
-                .ok();
+            let Ok(base) = sha.parse::<git::Oid>() else {
+                log::error!("compare with local: {sha} is not a full commit sha");
+                return;
+            };
+            show_comparison_in_git_panel(
+                &workspace,
+                repository.clone(),
+                base,
+                crate::git_panel::DiffTabHead::WorkingTree,
+                subject.clone(),
+                SharedString::default(),
+                window,
+                cx,
+            );
         },
     );
     // "Compare with HEAD / Branch / Commit" need a true commit-vs-commit
@@ -1295,22 +1312,62 @@ fn multi_work_dir(ctx: &MultiCommitContext, cx: &App) -> PathBuf {
 }
 
 /// IDEA's "Compare Versions" — diff the two selected commits against each
-/// other, oldest as the base.
-fn compare_versions(ctx: MultiCommitContext, window: &mut Window, cx: &mut App) {
-    let (Some(base), Some(head)) = (ctx.shas.first(), ctx.shas.last()) else {
+/// other, oldest as the base. The comparison opens in the git panel's Diff
+/// tab as a list of changed files, each with its own diff (FORK.md #208),
+/// rather than as one editor tab holding every file's changes.
+pub(crate) fn compare_versions(ctx: MultiCommitContext, window: &mut Window, cx: &mut App) {
+    let [base, head] = ctx.shas.as_slice() else {
         return;
     };
-    if ctx.shas.len() != 2 {
+    let (Ok(base), Ok(head)) = (base.parse::<git::Oid>(), head.parse::<git::Oid>()) else {
+        log::error!("compare versions: {base} or {head} is not a full commit sha");
         return;
-    }
-    crate::commit_view::CommitView::open_range(
-        base.to_string(),
-        head.to_string(),
-        ctx.repository.downgrade(),
-        ctx.workspace.clone(),
+    };
+    let subject = |index: usize| ctx.subjects.get(index).cloned().unwrap_or_default();
+    show_comparison_in_git_panel(
+        &ctx.workspace,
+        ctx.repository.clone(),
+        base,
+        crate::git_panel::DiffTabHead::Commit(head),
+        subject(0),
+        subject(1),
         window,
         cx,
     );
+}
+
+/// Open the git panel's dock on its Diff tab, pointed at `base` against
+/// `head`.
+fn show_comparison_in_git_panel(
+    workspace: &WeakEntity<Workspace>,
+    repository: Entity<Repository>,
+    base: git::Oid,
+    head: crate::git_panel::DiffTabHead,
+    base_subject: SharedString,
+    head_subject: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace.open_panel::<crate::git_panel::GitPanel>(window, cx);
+        let Some(panel) = workspace.panel::<crate::git_panel::GitPanel>(cx) else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            panel.show_comparison(
+                repository,
+                base,
+                head,
+                base_subject,
+                head_subject,
+                window,
+                cx,
+            );
+        });
+    });
 }
 
 fn open_squash_prompt(ctx: MultiCommitContext, window: &mut Window, cx: &mut App) {
