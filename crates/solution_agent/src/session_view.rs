@@ -274,6 +274,11 @@ pub struct SolutionSessionView {
     /// paint and read at mouse-down; a frame-stale value is exactly what the
     /// gesture wants, so this deliberately raises no notify.
     pub(super) painted_compose_height: Option<Pixels>,
+    /// Where the whole view was last painted, in window coordinates, so a modal
+    /// opened from its status row can sit over the panel rather than at the top
+    /// of the window. Recorded during paint, no notify — same as
+    /// `painted_compose_height`.
+    pub(crate) painted_bounds: Option<Bounds<Pixels>>,
     /// `Markdown` entities reused across renders. Key is `(entry_idx,
     /// span_idx)` — same coords find_matches uses. Entries grow as the
     /// thread streams; we update an existing entity's source rather than
@@ -1612,6 +1617,17 @@ impl Render for SolutionSessionView {
         div()
             .id("solution-session-view")
             .key_context("SolutionSessionView")
+            .relative()
+            .child(
+                canvas(
+                    cx.processor(|this: &mut Self, bounds: Bounds<Pixels>, _window, _cx| {
+                        this.painted_bounds = Some(bounds);
+                    }),
+                    |_bounds, _state, _window, _cx| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
             .track_focus(&self.focus_handle)
             .capture_action(cx.listener(Self::paste_intercept))
             // capture (top-down) so the editor's own Ctrl-V handler

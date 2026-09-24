@@ -17044,6 +17044,75 @@ mod tests {
         }
     }
 
+    struct PlacedTestModal {
+        focus_handle: FocusHandle,
+        bottom_center: Option<Point<Pixels>>,
+    }
+
+    impl EventEmitter<DismissEvent> for PlacedTestModal {}
+
+    impl Focusable for PlacedTestModal {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl ModalView for PlacedTestModal {
+        fn bottom_center(&self) -> Option<Point<Pixels>> {
+            self.bottom_center
+        }
+    }
+
+    impl Render for PlacedTestModal {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .track_focus(&self.focus_handle)
+                .debug_selector(|| "placed-test-modal".to_string())
+                .w(px(200.))
+                .h(px(100.))
+        }
+    }
+
+    /// A modal opened from deep in the window (the session panel's compact
+    /// dialog) sits at the point it names instead of the usual top-centre.
+    #[gpui::test]
+    async fn test_modal_bottom_center_places_the_modal(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        // Modals are painted by the `MultiWorkspace` root, not by `Workspace`.
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        cx.simulate_resize(size(px(1200.), px(900.)));
+
+        let open = |bottom_center: Option<Point<Pixels>>, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, move |_, cx| PlacedTestModal {
+                    focus_handle: cx.focus_handle(),
+                    bottom_center,
+                });
+            });
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds("placed-test-modal")
+                .expect("the modal must paint")
+        };
+
+        let placed = open(Some(point(px(500.), px(800.))), cx);
+        assert_eq!(placed.bottom(), px(800.), "{placed:?}");
+        assert_eq!(placed.center().x, px(500.), "{placed:?}");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.modal_layer.update(cx, |layer, cx| layer.hide_modal(window, cx));
+        });
+        let default = open(None, cx);
+        assert!(
+            default.top() < px(200.),
+            "without a placement the modal stays near the top: {default:?}"
+        );
+    }
+
     #[gpui::test]
     async fn test_reopen_last_picker(cx: &mut gpui::TestAppContext) {
         init_test(cx);

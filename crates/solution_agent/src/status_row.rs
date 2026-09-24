@@ -533,41 +533,67 @@ pub(crate) fn render_status_row(
                 let compact_tooltip = compact_tooltip.clone();
                 let clear_tooltip = clear_tooltip.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    let compact_label: SharedString = if compact_enabled {
-                        "Compact context…".into()
-                    } else {
-                        format!("Compact context — {compact_tooltip}").into()
+                    let with_reason = |label: &str| -> SharedString {
+                        if compact_enabled {
+                            label.to_string().into()
+                        } else {
+                            format!("{label} — {compact_tooltip}").into()
+                        }
                     };
-                    let compact_entry = ui::ContextMenuEntry::new(compact_label)
+                    // Starts right away: the plain handoff needs nothing from
+                    // the user, so it gets no dialog to confirm.
+                    let compact_entry = ui::ContextMenuEntry::new(with_reason("Compact context"))
                         .icon(IconName::Archive)
                         .icon_color(Color::Muted)
                         .disabled(!compact_enabled)
                         .handler({
                             let weak_view = weak_view.clone();
-                            // Ask for the (optional) comment first: the modal
-                            // owns the actual start, so an escape here compacts
-                            // nothing.
                             move |window, cx| {
-                                let Some(weak_view) = weak_view.clone() else {
-                                    return;
-                                };
-                                let Some(workspace) = weak_view
-                                    .read_with(cx, |view, _| view.workspace_handle().clone())
-                                    .ok()
-                                    .and_then(|workspace| workspace.upgrade())
+                                let Some(view) = weak_view.as_ref().and_then(|v| v.upgrade())
                                 else {
                                     return;
                                 };
-                                workspace.update(cx, |workspace, cx| {
-                                    workspace.toggle_modal(window, cx, move |window, cx| {
-                                        crate::compact_comment_modal::CompactCommentModal::new(
-                                            weak_view, is_cold, window, cx,
-                                        )
-                                    });
+                                view.update(cx, |view, cx| {
+                                    if is_cold {
+                                        view.start_compact_from_cold(None, window, cx);
+                                    } else {
+                                        view.start_compact(None, cx);
+                                    }
                                 });
                             }
                         });
                     menu = menu.item(compact_entry);
+
+                    let compact_with_message_entry =
+                        ui::ContextMenuEntry::new(with_reason("Compact and message…"))
+                            .icon(IconName::Archive)
+                            .icon_color(Color::Muted)
+                            .disabled(!compact_enabled)
+                            .handler({
+                                let weak_view = weak_view.clone();
+                                // The modal owns the actual start, so an escape
+                                // there compacts nothing.
+                                move |window, cx| {
+                                    let Some(weak_view) = weak_view.clone() else {
+                                        return;
+                                    };
+                                    let Some(workspace) = weak_view
+                                        .read_with(cx, |view, _| view.workspace_handle().clone())
+                                        .ok()
+                                        .and_then(|workspace| workspace.upgrade())
+                                    else {
+                                        return;
+                                    };
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.toggle_modal(window, cx, move |window, cx| {
+                                            crate::compact_comment_modal::CompactCommentModal::new(
+                                                weak_view, is_cold, window, cx,
+                                            )
+                                        });
+                                    });
+                                }
+                            });
+                    menu = menu.item(compact_with_message_entry);
 
                     let clear_label: SharedString = if clear_enabled {
                         "Clear context".into()

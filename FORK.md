@@ -128,6 +128,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/workspace/src/welcome.rs` | `render_agent_card` gated off via `false &&` — fork uses `solution_agent`, not upstream agent panel. | `solution_agent` |
 | `crates/workspace/src/active_file_name.rs` | `ActiveFileName::new` now takes the `Workspace` (holds a `WeakEntity<Project>`); the status-bar label prefixes the worktree-relative path with the worktree's root name so it's unambiguous across a Solution's worktrees. (`status_bar.show_active_file` is back to upstream's `false` in `default.json`: on 2026-09-24 the maintainer asked for the path to go — *«убери вот этот путь. Он нам вкладки закрывает»* — because a deep path squeezed the session tabs that share the status bar. The label code stays for anyone who turns it on.) | rebrand / solutions |
 | `crates/editor/src/items.rs` | An editor tab's tooltip is the path from the project root (`language::File::full_path` → `sawe/Procfile.web`), not the `~`-compacted absolute path, which repeated the Solution's location on every tab — the maintainer, 2026-09-24: *«в подсказке показывать путь не от home, а от корня проекта»*. A file outside every visible worktree keeps its absolute path. Guarded by `test_tab_tooltip_shows_path_from_project_root`. | `editor` |
+| `crates/workspace/src/modal_layer.rs` | **Decision #214.** `ModalView::bottom_center()` lets a modal name its window-space bottom-centre; `ModalLayer` then anchors it there instead of at the top. | `workspace` |
 | `crates/git_ui/src/conflict_view.rs` | The merge-conflict status-bar indicator and the in-editor conflict block both dispatched agent actions whose only handler early-returns without an `AgentPanel`, which this fork never registers — two silent no-ops, one of which also dismissed itself as if it had worked. Both now open the fork's own conflict resolver (`git_conflict_ui::OpenConflictResolver`) and are relabelled accordingly; the indicator no longer self-dismisses, and neither is gated on `AgentSettings::enabled`, since neither involves the agent any more. | `git_conflict_ui` |
 | `crates/git_ui/src/commit_view.rs` | S-DET commit-view surface (header / parents / refs / contains / affected-files / footer decomposed into `commit_view::*` submodules). **(decision #136, 2026-09-02)** The `single_file: Option<RepoPath>` mode that used to live here is **deleted** — `open_file_diff`, `preview_holds_single_file_diff` and `open_internal` with it — and single-file commit diffs are served by `SoloDiffView`. What remains is the whole-commit view and the `base..head` compare-range view (#87). `open`'s `file_filter` parameter is *not* that mode and stays: it narrows which files the whole-commit diff shows while keeping the metadata chrome. | `git_ui` (S-DET) / `git_graph` |
 | `crates/git_ui/src/commit_blob.rs` | **New (decision #136).** The historic-blob loader extracted out of `CommitView`: `GitBlob` (a `DiskState::Historic` synthetic file), `build_buffer` / `build_buffer_diff`, and `load_commit_file_blob`, which turns one `CommitFile` into a `LoadedBlob { buffer, diff, status, excerpt_ranges, path_key, is_binary }`. Two callers: `CommitView`'s per-file loop and `SoloDiffView::open_commit_file`. Takes `&mut AsyncWindowContext` deliberately — narrowing to `AsyncApp` would trade five recoverable `?` short-circuits for a `.upgrade().expect(..)` panic. | `git_ui` |
@@ -5984,3 +5985,30 @@ any temp-file instruction returned the rule verbatim with the hook and `NONE` wi
 by `claude_settings::tests::sub_agents_are_told_to_keep_temp_files_in_the_solution`
 (mutation-checked: dropping the hook entry fails it) and the prompt assertions in
 `claude_adapter::tests`.
+
+### 214. The compact dialog opens over the session panel; plain "Compact context" has no dialog
+
+The maintainer, 2026-09-24: *«модалка с промптом при компакции показывалась над панелью сесии, а
+не где-то вверху. Далеко слишком тянуться надо для подтверждения. И давай еще пункт добавим
+"Compact And Message", который будет как раз с модалкой, а отдельным пунктом Compact Context будет
+безусловный запуск без модалки»*.
+
+What: the status row's cleanup menu has three items. **Compact context** starts the handoff
+straight away (`start_compact(None)` / `start_compact_from_cold(None, …)`). **Compact and
+message…** opens `CompactCommentModal`, whose text rides along in the compact prompt. **Clear
+context** is unchanged. The menu keeps its sentence case, so the maintainer's "Compact And
+Message" is spelled `Compact and message…`.
+
+Where the dialog goes: `workspace::ModalView` gained `bottom_center() -> Option<Point<Pixels>>`
+(default `None`). When a modal returns a point, `ModalLayer` renders it through `anchored()` with
+`Anchor::BottomCenter` at that point, snapped into the window with an 8px margin, instead of the
+usual `top_20` column. `SolutionSessionView` records its painted window bounds (`painted_bounds`,
+a zero-size `canvas` measure like `painted_compose_height`), and the compact modal asks for the
+panel's horizontal centre, 8px above its bottom edge. That puts the dialog over the status row and
+compose box, where the menu was clicked. Every other modal keeps the top-centre placement.
+
+Guarded by `workspace::tests::test_modal_bottom_center_places_the_modal`, a paint test through a
+real `MultiWorkspace` window (the modal layer is painted by `MultiWorkspace`, not `Workspace`, so
+a `Workspace`-rooted window never paints a modal at all). It is mutation-checked: ignoring
+`bottom_center` fails it. Checked in a probe: the menu shows the three items, and "Compact and
+message…" opens the dialog over the bottom of the session panel.

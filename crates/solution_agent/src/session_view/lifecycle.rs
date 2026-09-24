@@ -247,6 +247,7 @@ impl SolutionSessionView {
             resize_start_y: px(0.0),
             resize_start_height: px(DEFAULT_COMPOSE_HEIGHT),
             painted_compose_height: None,
+            painted_bounds: None,
             markdown_cache: HashMap::new(),
             entry_texts: Vec::new(),
             #[cfg(test)]

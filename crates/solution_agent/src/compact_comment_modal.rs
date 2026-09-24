@@ -1,9 +1,11 @@
-//! Modal that collects an optional comment to send along with a "Compact
-//! context" request. Triggered from the cleanup popover menu in the status row.
+//! Modal that collects a message to send along with a compaction request —
+//! the "Compact and message…" item of the status row's cleanup menu. The plain
+//! "Compact context" item starts a compaction without it.
 
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, Styled, WeakEntity, Window, div, rems,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Point, Render, Styled, WeakEntity,
+    Window, div, point, rems,
 };
 use ui::prelude::*;
 use ui::{Button, ButtonStyle, Label, LabelSize};
@@ -11,9 +13,8 @@ use workspace::ModalView;
 
 use crate::session_view::SolutionSessionView;
 
-/// Modal shown before a compaction starts. The comment is optional — confirming
-/// with an empty editor compacts exactly as the menu item used to, so the extra
-/// step never blocks a plain "just compact".
+/// Modal shown before a compaction that carries a message. Confirming with an
+/// empty editor still compacts, exactly like the plain "Compact context" item.
 ///
 /// A full multi-line editor (the same shape as
 /// [`crate::supervisor_instruction_modal`]): `Enter` inserts a newline, confirm
@@ -24,6 +25,10 @@ pub struct CompactCommentModal {
     /// Cold sessions go through the wake path; the menu knows which one applies
     /// at click time, so the modal carries the answer rather than re-deriving it.
     is_cold: bool,
+    /// Just above the bottom of the session panel it was opened from, so the
+    /// confirm button is a short reach from the status row rather than at the
+    /// top of the window.
+    bottom_center: Option<Point<Pixels>>,
     comment_editor: Entity<editor::Editor>,
     focus_handle: FocusHandle,
 }
@@ -42,16 +47,22 @@ impl CompactCommentModal {
             e.set_show_vertical_scrollbar(true, cx);
             e.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
             e.set_placeholder_text(
-                "Optional — what this handoff must not lose, what to do next…",
+                "What this handoff must not lose, what to do next…",
                 window,
                 cx,
             );
             e
         });
         let focus_handle = cx.focus_handle();
+        let bottom_center = view
+            .read_with(cx, |view, _| view.painted_bounds)
+            .ok()
+            .flatten()
+            .map(|bounds| point(bounds.center().x, bounds.bottom() - px(8.)));
         Self {
             view,
             is_cold,
+            bottom_center,
             comment_editor,
             focus_handle,
         }
@@ -90,6 +101,10 @@ impl ModalView for CompactCommentModal {
     fn debug_kind(&self) -> &'static str {
         "CompactComment"
     }
+
+    fn bottom_center(&self) -> Option<Point<Pixels>> {
+        self.bottom_center
+    }
 }
 
 impl Render for CompactCommentModal {
@@ -108,11 +123,11 @@ impl Render for CompactCommentModal {
             .border_1()
             .border_color(cx.theme().colors().border)
             .rounded_md()
-            .child(Label::new("Compact context").size(LabelSize::Large))
+            .child(Label::new("Compact and message").size(LabelSize::Large))
             .child(
                 Label::new(
                     "The agent dumps a handoff, then a fresh context continues. \
-                     A comment here goes into that request — leave it empty to just compact.",
+                     Your message goes into that request.",
                 )
                 .size(LabelSize::Small)
                 .color(Color::Muted),

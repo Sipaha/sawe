@@ -1,6 +1,6 @@
 use gpui::{
     AnyView, App, DismissEvent, Entity, EventEmitter, FocusHandle, Global, ManagedView,
-    MouseButton, Subscription, WeakFocusHandle,
+    MouseButton, Point, Subscription, WeakFocusHandle, anchored,
 };
 use ui::prelude::*;
 
@@ -80,6 +80,14 @@ pub trait ModalView: ManagedView {
     fn debug_kind(&self) -> &'static str {
         "Modal"
     }
+
+    /// Where the modal's bottom-centre sits, in window coordinates. `None`
+    /// keeps the usual top-centre placement; a modal opened from a control
+    /// deep in the window returns a point near that control, so confirming it
+    /// doesn't mean travelling to the top of the screen.
+    fn bottom_center(&self) -> Option<Point<Pixels>> {
+        None
+    }
 }
 
 trait ModalViewHandle {
@@ -91,6 +99,7 @@ trait ModalViewHandle {
     fn render_bare(&self, cx: &mut App) -> bool;
     fn dismiss_on_overlay_click(&self, cx: &App) -> bool;
     fn debug_kind(&self, cx: &App) -> &'static str;
+    fn bottom_center(&self, cx: &App) -> Option<Point<Pixels>>;
 }
 
 impl<V: ModalView> ModalViewHandle for Entity<V> {
@@ -126,6 +135,10 @@ impl<V: ModalView> ModalViewHandle for Entity<V> {
 
     fn debug_kind(&self, cx: &App) -> &'static str {
         self.read(cx).debug_kind()
+    }
+
+    fn bottom_center(&self, cx: &App) -> Option<Point<Pixels>> {
+        self.read(cx).bottom_center()
     }
 }
 
@@ -331,6 +344,13 @@ impl Render for ModalLayer {
         }
 
         let dismiss_on_overlay = active_modal.modal.dismiss_on_overlay_click(cx);
+        let bottom_center = active_modal.modal.bottom_center(cx);
+        let modal = h_flex()
+            .occlude()
+            .child(active_modal.modal.view())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            });
         div()
             .absolute()
             .size_full()
@@ -349,21 +369,27 @@ impl Render for ModalLayer {
                     }),
                 )
             })
-            .child(
-                v_flex()
-                    .h(px(0.0))
-                    .top_20()
-                    .items_center()
-                    .track_focus(&active_modal.focus_handle)
-                    .child(
-                        h_flex()
-                            .occlude()
-                            .child(active_modal.modal.view())
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            }),
-                    ),
-            )
+            .map(|this| match bottom_center {
+                Some(position) => this.child(
+                    anchored()
+                        .position(position)
+                        .anchor(gpui::Anchor::BottomCenter)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            div()
+                                .track_focus(&active_modal.focus_handle)
+                                .child(modal),
+                        ),
+                ),
+                None => this.child(
+                    v_flex()
+                        .h(px(0.0))
+                        .top_20()
+                        .items_center()
+                        .track_focus(&active_modal.focus_handle)
+                        .child(modal),
+                ),
+            })
             .into_any_element()
     }
 }
