@@ -2148,19 +2148,20 @@ mod tests {
         // A Solution whose root the test workspace's worktree lives under,
         // so `active_solution_id_for_workspace` resolves to `Some` and
         // `handle_new_chat` runs past its first guard.
-        let solution_root = cx.update(|cx| {
+        let (solution_id, solution_root) = cx.update(|cx| {
             let store = SolutionStore::for_test(std::path::PathBuf::from("/cfg.json"), cx);
-            let root = store.update(cx, |store, cx| {
+            let created = store.update(cx, |store, cx| {
                 let id = store.create_for_test_minimal("NewChatGuard", cx);
-                store
+                let root = store
                     .solutions()
                     .iter()
                     .find(|sol| sol.id == id)
                     .map(|sol| sol.root.clone())
-                    .expect("just-created solution")
+                    .expect("just-created solution");
+                (id, root)
             });
             solutions::install_global_for_test(store, cx);
-            root
+            created
         });
 
         let fs = FakeFs::new(cx.executor());
@@ -2169,16 +2170,35 @@ mod tests {
         let window_handle = cx.add_window(|window, cx| Workspace::test_new(project, window, cx));
         cx.run_until_parked();
 
+        // Opening a chat starts no agent (FORK.md #211): each action adds a
+        // tab for its own provider, cold and unstarted, and makes it the
+        // Solution's open dialog — and neither server is connected until a
+        // message is sent.
+        let newest_tab = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let store = SolutionAgentStore::global(cx);
+                let store = store.read(cx);
+                let active = store
+                    .active_dialog_session(solution_id)
+                    .expect("the new tab is the open dialog");
+                let session = store.session(active).expect("the open dialog exists");
+                let session = session.read(cx);
+                (session.agent_id.to_string(), session.is_unstarted())
+            })
+        };
+
         window_handle
             .update(cx, |workspace, window, cx| {
                 crate::handle_new_chat(workspace, &NewChat, window, cx);
             })
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(connect_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
-            codex_connect_count.load(std::sync::atomic::Ordering::SeqCst),
-            0
+            newest_tab(cx),
+            (
+                solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID.to_string(),
+                true
+            )
         );
 
         window_handle
@@ -2187,10 +2207,11 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(connect_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(newest_tab(cx), ("codex-native".to_string(), true));
+        assert_eq!(connect_count.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(
             codex_connect_count.load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
     }
 

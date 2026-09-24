@@ -7939,12 +7939,18 @@ fn a_default_session_title_is_the_provider_and_new() {
     use crate::codex_adapter::CODEX_AGENT_ID;
     use crate::store::{default_session_title_base, is_default_session_title};
 
-    assert_eq!(default_session_title_base(CLAUDE_ACP_AGENT_ID), "Claude New");
+    assert_eq!(
+        default_session_title_base(CLAUDE_ACP_AGENT_ID),
+        "Claude New"
+    );
     assert_eq!(default_session_title_base(CODEX_AGENT_ID), "Codex New");
     assert_eq!(default_session_title_base("someone-else"), "Agent New");
 
     for title in ["Claude New", "Claude New #1", "Claude New #12"] {
-        assert!(is_default_session_title(title, CLAUDE_ACP_AGENT_ID), "{title}");
+        assert!(
+            is_default_session_title(title, CLAUDE_ACP_AGENT_ID),
+            "{title}"
+        );
     }
     for title in [
         "Codex New",
@@ -7954,7 +7960,10 @@ fn a_default_session_title_is_the_provider_and_new() {
         "Claude Newer",
         "Fix the login flow",
     ] {
-        assert!(!is_default_session_title(title, CLAUDE_ACP_AGENT_ID), "{title}");
+        assert!(
+            !is_default_session_title(title, CLAUDE_ACP_AGENT_ID),
+            "{title}"
+        );
     }
 }
 
@@ -7988,7 +7997,16 @@ async fn new_sessions_take_the_first_free_default_title(cx: &mut TestAppContext)
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
                 store.create_session_with_parent(
-                    solution_id, agent_id, project, None, None, None, None, false, false, cx,
+                    solution_id,
+                    agent_id,
+                    project,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    cx,
                 )
             })
         })
@@ -8019,3 +8037,71 @@ async fn new_sessions_take_the_first_free_default_title(cx: &mut TestAppContext)
     assert_eq!(title_of(cx, fourth), format!("{base} #1"));
 }
 
+/// FORK.md #211: a tab opened from the "+" picker starts no agent — no
+/// connection, no provider session — and its first message starts a FRESH
+/// provider session rather than trying to resume the placeholder id.
+#[gpui::test]
+async fn a_new_tab_starts_its_agent_on_the_first_message(cx: &mut TestAppContext) {
+    let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
+    let agent_id = SharedString::from("mock-agent");
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    cx.update(|cx| {
+        SolutionAgentStore::init_global(cx, Arc::new(AdapterRegistry::new()));
+        SolutionAgentStore::global(cx).update(cx, |store, _| {
+            store.register_agent_server(
+                agent_id.clone(),
+                Rc::new(MockAgentServer::new(connect_count.clone())),
+            );
+        });
+    });
+
+    let session_id = cx
+        .update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.create_unstarted_session(solution_id, agent_id.clone(), project.clone(), cx)
+            })
+        })
+        .expect("the tab opens");
+    cx.run_until_parked();
+
+    let snapshot = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).expect("session exists");
+            let session = session.read(cx);
+            (
+                session.is_unstarted(),
+                session.acp_thread().is_some(),
+                session.acp_session_id.0.to_string(),
+                session.title.to_string(),
+                session.tab_order.is_some(),
+            )
+        })
+    };
+    let (unstarted, live, _, title, pinned) = snapshot(cx);
+    assert!(unstarted && !live, "the tab is cold and unstarted");
+    assert_eq!(title, "Agent New");
+    assert!(pinned, "the tab is in the strip");
+    assert_eq!(connect_count.load(Ordering::SeqCst), 0, "no agent was started");
+
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("hello".to_string()),
+            )];
+            store
+                .send_message_blocks(session_id, blocks, cx)
+                .detach_and_log_err(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let (unstarted, live, acp_session_id, _, _) = snapshot(cx);
+    assert_eq!(connect_count.load(Ordering::SeqCst), 1, "the first message started it");
+    assert!(live, "the tab is live now");
+    assert!(!unstarted, "and carries the provider's own session id");
+    assert!(
+        !acp_session_id.starts_with(crate::model::UNSTARTED_ACP_SESSION_PREFIX),
+        "a resume of the placeholder would have kept it: {acp_session_id}"
+    );
+}

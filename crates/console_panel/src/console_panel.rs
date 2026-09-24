@@ -128,35 +128,24 @@ fn create_chat(workspace: &mut Workspace, agent_id: &'static str, cx: &mut Conte
         return;
     };
     let project = workspace.project().clone();
-    let store = SolutionAgentStore::global(cx);
-    // A chat is always solution-scoped and rooted at `solution.root`
-    // (`cwd: None`) — never the active member's folder. Both agent actions
-    // and the "+" popover use this helper to preserve the same scope.
-    let task = store.update(cx, |store, cx| {
-        store.create_session_with_cwd(
+    // A chat is always solution-scoped and rooted at `solution.root` — never
+    // the active member's folder. Both agent actions and the "+" popover use
+    // this helper to preserve the same scope. The tab opens at once and its
+    // agent starts with the first message (FORK.md #211).
+    let created = SolutionAgentStore::global(cx).update(cx, |store, cx| {
+        let session_id = store.create_unstarted_session(
             solution_id,
             SharedString::from(agent_id),
             project,
-            None,
-            None,
-            None,
             cx,
-        )
+        )?;
+        store.set_active_dialog_session(solution_id, Some(session_id), cx);
+        anyhow::Ok(session_id)
     });
-    cx.spawn(async move |workspace, cx| match task.await {
-        Ok(session_id) => cx.update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, cx| {
-                store.set_active_dialog_session(solution_id, Some(session_id), cx);
-            });
-        }),
-        Err(error) => {
-            log::error!("console panel: failed to create {agent_id} chat: {error:#}");
-            workspace
-                .update(cx, |workspace, cx| workspace.show_error(error, cx))
-                .ok();
-        }
-    })
-    .detach();
+    if let Err(error) = created {
+        log::error!("console panel: failed to create {agent_id} chat: {error:#}");
+        workspace.show_error(error, cx);
+    }
 }
 
 /// `ShowSession` handler: selects `action.session_id` as its own solution's

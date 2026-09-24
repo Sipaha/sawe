@@ -176,7 +176,17 @@ pub(crate) fn render_status_row(
     // *within* `SolutionSessionView::render`, so the view entity is
     // already leased by GPUI's renderer.
     let (state_text, error_text): (SharedString, Option<SharedString>) = if is_resuming {
-        (SharedString::from("Resuming…"), None)
+        // A tab whose agent was never started is starting, not resuming.
+        let label = if s.is_unstarted() {
+            "Starting…"
+        } else {
+            "Resuming…"
+        };
+        (SharedString::from(label), None)
+    } else if s.is_unstarted() && !matches!(&s.state, SessionState::Errored(_)) {
+        // A new tab waits for its first message to start the agent
+        // (FORK.md #211); "Sleeping" would claim it had ever been awake.
+        (SharedString::from("New"), None)
     } else if is_cold && !matches!(&s.state, SessionState::Errored(_)) {
         // Preserve terminal errors even after the subprocess is unloaded.
         // The session was restored from disk and the subprocess

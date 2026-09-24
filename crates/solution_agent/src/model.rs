@@ -812,6 +812,14 @@ impl SolutionSession {
         self.acp_thread.is_none()
     }
 
+    /// `true` for a tab whose agent has never been started — a new tab waits
+    /// for its first message before spawning anything (FORK.md #211). Such a
+    /// session is also [`Self::is_cold`]; waking it starts a fresh provider
+    /// session instead of resuming one.
+    pub fn is_unstarted(&self) -> bool {
+        is_unstarted_acp_session_id(&self.acp_session_id)
+    }
+
     /// Live thread reference. `None` for cold tabs.
     pub fn acp_thread(&self) -> Option<&Entity<AcpThread>> {
         self.acp_thread.as_ref()
@@ -1517,4 +1525,19 @@ impl Default for BandState {
             height: DEFAULT_BAND_HEIGHT,
         }
     }
+}
+
+/// Prefix of the placeholder `acp_session_id` a tab carries until its agent is
+/// first started (FORK.md #211). A placeholder rather than an `Option`: the id
+/// is persisted, keyed on and passed around as required everywhere, and a
+/// prefix no provider mints keeps "never started" in the one column that
+/// already survives a restart.
+pub(crate) const UNSTARTED_ACP_SESSION_PREFIX: &str = "sawe-unstarted-";
+
+pub(crate) fn unstarted_acp_session_id(session_id: SolutionSessionId) -> acp::SessionId {
+    acp::SessionId::new(format!("{UNSTARTED_ACP_SESSION_PREFIX}{session_id}"))
+}
+
+pub(crate) fn is_unstarted_acp_session_id(id: &acp::SessionId) -> bool {
+    id.0.starts_with(UNSTARTED_ACP_SESSION_PREFIX)
 }

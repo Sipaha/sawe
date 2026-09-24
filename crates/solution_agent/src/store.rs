@@ -986,8 +986,8 @@ pub(crate) use queue::summarize_blocks_for_log;
 // `store/tests/{hydration,model_catalog}.rs` buckets.
 pub use hydration::PersistedSession;
 pub(crate) use hydration::{build_cold_session, entries_from_rows, is_wiped_row_native};
-use hydration::{extract_preview, unique_session_title};
 pub(crate) use hydration::{default_session_title_base, is_default_session_title};
+use hydration::{extract_preview, unique_session_title};
 // Every store.rs caller of `cold_entries_from_persisted` moved into `hydration`;
 // only the `store/tests/hydration.rs` bucket still reaches it via
 // `crate::store::cold_entries_from_persisted`, so gate the re-export to avoid a
@@ -1406,6 +1406,62 @@ impl SolutionAgentStore {
             false,
             cx,
         )
+    }
+
+    /// Open a new tab for `agent_id` without starting the agent (FORK.md
+    /// #211). The session is cold from birth, carrying a placeholder
+    /// `acp_session_id`; the first message — or anything else that wakes a
+    /// cold tab — goes through `resume_session`, which starts a fresh
+    /// provider session for it. A tab that is opened and never used costs no
+    /// subprocess and no tokens.
+    pub fn create_unstarted_session(
+        &mut self,
+        solution_id: SolutionId,
+        agent_id: AgentServerId,
+        project: Entity<project::Project>,
+        cx: &mut Context<Self>,
+    ) -> Result<SolutionSessionId> {
+        let solution_root = SolutionStore::try_global(cx)
+            .ok_or_else(|| anyhow!("SolutionStore global is not initialised"))?
+            .read(cx)
+            .solutions()
+            .iter()
+            .find(|s| s.id == solution_id)
+            .map(|solution| solution.root.clone())
+            .ok_or_else(|| anyhow!("solution {:?} not found", solution_id))?;
+        let session_id = SolutionSessionId::new();
+        let permission_mode = self.fresh_session_permission_mode(&agent_id, false);
+        let title_base = hydration::default_session_title_base(agent_id.as_ref());
+        let title = unique_session_title(&title_base, self, &solution_id, cx);
+        let entity = cx.new(|_| {
+            let mut s = SolutionSession::new_idle(
+                session_id,
+                solution_id,
+                agent_id.clone(),
+                crate::model::unstarted_acp_session_id(session_id),
+            );
+            s.title = title;
+            s.project = Some(project);
+            s.cwd = solution_root;
+            s.permission_mode = permission_mode;
+            s
+        });
+        self.sessions.insert(session_id, entity);
+        let by_solution = self.by_solution.entry(solution_id).or_default();
+        if !by_solution.contains(&session_id) {
+            by_solution.push(session_id);
+        }
+        self.ensure_agent_models(solution_id, agent_id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionCreated {
+            id: session_id,
+            parent_session_id: None,
+        });
+        // Pin before the only row write, so the row carries its `tab_order`
+        // (see the create path above for what a NULL `tab_order` costs).
+        self.open_session_in_strip(session_id, cx);
+        self.persist_session_row(session_id, cx);
+        cx.notify();
+        Ok(session_id)
     }
 
     /// Full variant. `parent_session_id` (F: sub-agent indication) marks
@@ -6170,4 +6226,3 @@ fn session_title_instruction(session_id: SolutionSessionId, agent_id: &str) -> S
          Do it once; don't rename the tab again unless the user asks.\n"
     )
 }
-

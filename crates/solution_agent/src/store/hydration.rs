@@ -579,6 +579,11 @@ impl SolutionAgentStore {
             };
             let acp_session_id = meta.acp_session_id.clone();
             let title_for_load = Some(meta.title.clone());
+            // A tab whose agent was never started (FORK.md #211) has no
+            // provider session to resume: skip straight to the new-session
+            // branch below, which is also where a session the provider lost
+            // ends up.
+            let never_started = crate::model::is_unstarted_acp_session_id(&acp_session_id);
 
             // Resume cwd resolution. claude code keys session JSONL files
             // by the cwd of its subprocess at session-creation time
@@ -607,7 +612,9 @@ impl SolutionAgentStore {
             // whose `meta.cwd` was empty (treated as solution.root by
             // the `primary_cwd` initialiser above) — that branch is a
             // no-op, since the loop just runs the one candidate.
-            let attempts: Vec<PathBuf> = if primary_cwd != solution.root {
+            let attempts: Vec<PathBuf> = if never_started {
+                Vec::new()
+            } else if primary_cwd != solution.root {
                 vec![primary_cwd.clone(), solution.root.clone()]
             } else {
                 vec![primary_cwd.clone()]
@@ -627,12 +634,12 @@ impl SolutionAgentStore {
             // meta into `open_session`, so a model the user picked while this
             // session was cold would otherwise be lost — `open_session`
             // consults `desired_models` when the ACP meta has no `modelId`.
-            this.update(cx, |store, cx| {
+            if !never_started { this.update(cx, |store, cx| {
                 let desired = store.session(meta.id).and_then(|s| s.read(cx).desired_model.clone());
                 let effort = store.session(meta.id).and_then(|s| s.read(cx).desired_effort.clone());
                 crate::native_controls::set_model(connection.clone(), &acp_session_id, desired, false);
                 crate::native_controls::set_effort(connection.clone(), &acp_session_id, effort, false);
-            })?;
+            })?; }
 
             let resume_meta = this.update(cx, |store, cx| {
                 let mut native_meta = store.build_session_meta(&pair.1, &solution, Some(meta.id), None, cx).unwrap_or_default();
@@ -729,15 +736,23 @@ impl SolutionAgentStore {
                 let work_dirs = util::path_list::PathList::new(&[fallback_cwd
                     .to_string_lossy()
                     .into_owned()]);
-                log::warn!(
-                    target: "solution_agent::resume",
-                    "session={} every cwd candidate returned Resource not found — \
-                     claude-acp lost session {}; minting a NEW ACP session on the \
-                     same connection (conversation history will appear empty to the \
-                     agent on the next turn)",
-                    meta.id,
-                    acp_session_id.0,
-                );
+                if never_started {
+                    log::info!(
+                        target: "solution_agent::resume",
+                        "session={} starting its agent for the first time",
+                        meta.id,
+                    );
+                } else {
+                    log::warn!(
+                        target: "solution_agent::resume",
+                        "session={} every cwd candidate returned Resource not found — \
+                         claude-acp lost session {}; minting a NEW ACP session on the \
+                         same connection (conversation history will appear empty to the \
+                         agent on the next turn)",
+                        meta.id,
+                        acp_session_id.0,
+                    );
+                }
                 let new_session_task: Task<Result<Entity<acp_thread::AcpThread>>> =
                     cx.update(|cx| {
                         connection.clone().new_session_with_meta(

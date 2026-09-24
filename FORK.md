@@ -5867,3 +5867,37 @@ the wire markdown on its own and is unaffected. `solution_agent.seed_cold_sessio
 `"thought"` role so the block can be painted in a probe. Guarded by
 `a_thought_span_is_the_thought_verbatim`; the block carries `THINKING_BLOCK_SELECTOR`.
 
+### 211. A new tab starts its agent with the first message, not when it opens
+
+The maintainer, 2026-09-24: *«Сессию стартовать нет смысла до первого сообщения, а первое
+сообщение может быть только в существующую вкладку»*, then *«мы точно раньше делали ленивый старт
+агента при переоткрытии редактора. Думаю надо это и с новой вкладкой использовать»*.
+
+What: the "+" picker (`console_panel::create_chat`, behind `NewChat` / `NewCodexChat`) calls
+`SolutionAgentStore::create_unstarted_session`, which opens the tab synchronously — titled (#209),
+pinned, persisted, the open dialog — with **no connection and no provider session**. It is cold
+from birth and carries a placeholder `acp_session_id`, `sawe-unstarted-<session id>`
+(`model::unstarted_acp_session_id`; `SolutionSession::is_unstarted`). Anything that wakes a cold
+tab — the compose box, a queued/MCP/peer send, the status badge — goes through
+`resume_session`, which for a placeholder skips the resume attempts and goes straight to its
+existing new-session branch (until now only the fallback for a provider that lost the session),
+and the in-place graft writes the provider's real id over the placeholder. The status row says
+`New` for such a tab and `Starting…` while it wakes, not `Sleeping` / `Resuming…`.
+
+Why a placeholder and not `Option<acp::SessionId>`: the id is required by the model, the DB row
+and every metadata struct, and "never started" has to survive a restart. A prefix no provider
+mints keeps that fact in the column that already persists, with no migration. Why not resume a
+pre-minted id instead: `claude --resume <id>` does not fail when there is no transcript — the spawn
+succeeds and "No conversation found" arrives on the first prompt — so the wake must know it is a
+first start.
+
+Only the user's "+" is lazy. `solution_agent.create_session` (MCP and the phone, whose
+`initial_message` is sent right away), supervisor judges, ephemeral helpers and sub-agents keep the
+eager `create_session_with_parent`.
+
+Guarded by `a_new_tab_starts_its_agent_on_the_first_message` (no connection until the first
+message; then a live thread with the provider's id — mutation-checked: resuming the placeholder
+keeps it) and `console_panel`'s `new_chat_action_does_not_double_lease_the_workspace`, which now
+asserts both actions open an unstarted tab and connect nothing. Checked in a probe: "+" → Claude
+opens `Claude New`, status `New`, and the editor has no child process.
+
