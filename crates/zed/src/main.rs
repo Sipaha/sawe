@@ -726,6 +726,27 @@ fn main() {
         }
     }
 
+    // `sawe --subagent-start-hook` is claude's `SubagentStart` hook: it adds the
+    // temp-dir rule to every sub-agent's context. Exits early for the same
+    // reasons as `--worktree-hook`.
+    if args.subagent_start_hook {
+        let Some(temp_dir) = &args.temp_dir else {
+            eprintln!("--subagent-start-hook requires --temp-dir");
+            process::exit(1);
+        };
+        // claude writes the hook payload to stdin; drain it so the writer never
+        // sees a broken pipe.
+        let mut payload = Vec::new();
+        if let Err(err) = io::Read::read_to_end(&mut io::stdin().lock(), &mut payload) {
+            eprintln!("--subagent-start-hook: reading stdin: {err}");
+        }
+        println!(
+            "{}",
+            claude_native::claude_settings::subagent_start_hook_output(temp_dir)
+        );
+        process::exit(0);
+    }
+
     // `sawe --git-rebase-helper <todo-path>` runs as `GIT_SEQUENCE_EDITOR`
     // during programmatic interactive rebase (S-RBL). The implementation lives
     // in `git::operations::helpers` so it can be exercised by unit tests
@@ -2646,6 +2667,16 @@ struct Args {
     /// Base directory for `--worktree-hook` — `<solution_root>/.agents/worktrees`.
     #[arg(long, hide = true, value_name = "DIR")]
     worktree_base: Option<PathBuf>,
+
+    /// Runs the editor binary as claude's `SubagentStart` hook, printing the
+    /// temp-dir rule as the sub-agent's additional context.
+    #[arg(long, hide = true)]
+    subagent_start_hook: bool,
+
+    /// The Solution temp directory named by `--subagent-start-hook` —
+    /// `<solution_root>/.agents/tmp`.
+    #[arg(long, hide = true, value_name = "DIR")]
+    temp_dir: Option<PathBuf>,
 
     /// Used for recording minidumps on crashes by having Sawe run a separate
     /// process communicating over a socket.

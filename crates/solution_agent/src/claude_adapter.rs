@@ -103,6 +103,11 @@ pub(crate) fn solution_system_prompt(solution: &Solution, instruction_file: &str
              whatever you need\" or blanket up-front permission does not \
              count — confirm each out-of-scope action.\n",
     );
+    let temp_dir =
+        claude_native::claude_settings::solution_temp_dir(&solution.root.join(".agents"));
+    buf.push('\n');
+    buf.push_str(&claude_native::claude_settings::temp_dir_rule(&temp_dir));
+    buf.push('\n');
     buf.push_str(
         "\nHow to work (standing rules for this session):\n\
              - Quality over speed. Do the task correctly and robustly, not just \
@@ -170,6 +175,8 @@ mod tests {
         assert!(prompt.contains("CLAUDE.md"));
         assert!(prompt.contains("Stay inside the solution"));
         assert!(prompt.contains("per-action go-ahead"));
+        assert!(prompt.contains("under /tmp/sol-x/.agents/tmp/"));
+        assert!(prompt.contains("mktemp -d -p /tmp/sol-x/.agents/tmp"));
         // Catalog / project-management awareness: the agent must know the
         // solution id and the tools to list + add projects to it.
         assert!(prompt.contains("solution's id is `14`"));
@@ -188,6 +195,7 @@ mod tests {
         assert!(prompt.contains("Solution root: /tmp/sol-x"));
         assert!(prompt.contains("solutions.add_member"));
         assert!(prompt.contains("Stay inside the solution"));
+        assert!(prompt.contains("under /tmp/sol-x/.agents/tmp/"));
     }
 
     /// Every backticked `namespace.tool` the prompt names, in the order it

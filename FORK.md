@@ -5956,3 +5956,31 @@ producing token changes must opt out the same way — `editor_tests::init_test` 
 `ctrl-alt-l` on `name: 'app'` / `version:    2` / `items:` + unindented list re-indented the list,
 left `'app'` alone — and left `version:    2` too, because it shares a hunk with the requoted line —
 and `ctrl-s` wrote the file byte for byte.
+
+### 213. Agents keep scratch files in `<solution_root>/.agents/tmp`, and sub-agents hear it from a hook
+
+The maintainer, 2026-09-24, after a sub-agent's `rm -rf "$(cat /tmp/…)"` stopped a whole turn on an
+"Approval needed — target outside the Solution" prompt: *«Наверное не норм, что агенты общий tmp
+мучают. Может в промпте жестко прописать, чтобы {solution root}/.agents/tmp использовали для
+временных файлов? тогда и вопросов не будет с подтверждением»*, and then, on relaying it through
+the parent: *«общий промпт то не надо наверное всем передавать. Может прехук какой-нибудь
+сделать?»*
+
+What: `claude_native::claude_settings::temp_dir_rule` words the rule once — never a system temp
+directory; every scratch file, log, screenshot, pid file and throwaway profile goes under
+`<solution_root>/.agents/tmp/` (`mktemp -d -p` it), which is inside the Solution, so cleaning up
+needs no approval. `solution_system_prompt` (Claude and Codex sessions, fresh and resumed) appends
+it. Built-in Claude sub-agents never see the appended system prompt, so the editor-owned claude
+settings layer adds a `SubagentStart` hook, `sawe --subagent-start-hook --temp-dir <dir>`, which
+prints the same rule as `hookSpecificOutput.additionalContext`. It exits before any GPUI init,
+like `--worktree-hook` (~40 ms). `EditorClaudeSettings::write_to` creates the directory.
+
+Why a hook and not the prompt: asking the parent to copy the rule into every delegation spends
+its context on boilerplate and still depends on the model remembering. Why not `TMPDIR`: it moves
+claude's own task-output directory too and still misses the literal `/tmp/...` paths agents type.
+
+Verified against claude 2.1.281: a `claude -p` whose `general-purpose` sub-agent was asked to quote
+any temp-file instruction returned the rule verbatim with the hook and `NONE` without it. Guarded
+by `claude_settings::tests::sub_agents_are_told_to_keep_temp_files_in_the_solution`
+(mutation-checked: dropping the hook entry fails it) and the prompt assertions in
+`claude_adapter::tests`.

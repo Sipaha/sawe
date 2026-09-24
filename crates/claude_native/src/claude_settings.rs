@@ -44,6 +44,10 @@ impl EditorClaudeSettings {
         self.agents_dir.join("memory")
     }
 
+    pub fn temp_dir(&self) -> PathBuf {
+        solution_temp_dir(&self.agents_dir)
+    }
+
     pub fn to_json(&self) -> Value {
         let mut hooks = existing_hooks(&self.work_dir);
         for (event, mode) in [("WorktreeCreate", "create"), ("WorktreeRemove", "remove")] {
@@ -57,6 +61,18 @@ impl EditorClaudeSettings {
                 entries.push(entry);
             }
         }
+        // Built-in sub-agents never see the session's appended system prompt,
+        // so the temp-dir rule reaches them through their start hook instead of
+        // through the parent agent re-typing it into every delegation.
+        let subagent_start = json!({
+            "hooks": [ { "type": "command", "command": self.subagent_start_hook_command() } ]
+        });
+        let slot = hooks
+            .entry("SubagentStart".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(entries) = slot.as_array_mut() {
+            entries.push(subagent_start);
+        }
         json!({
             "autoMemoryDirectory": self.memory_dir().to_string_lossy(),
             "hooks": Value::Object(hooks),
@@ -66,7 +82,7 @@ impl EditorClaudeSettings {
     pub fn write_to(&self, path: &Path) -> Result<()> {
         // claude does not create `autoMemoryDirectory` for us, and the hook's
         // base dir has to exist before the first `git worktree add`.
-        for dir in [self.memory_dir(), self.worktrees_dir()] {
+        for dir in [self.memory_dir(), self.worktrees_dir(), self.temp_dir()] {
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         if let Some(parent) = path.parent() {
@@ -85,6 +101,44 @@ impl EditorClaudeSettings {
             shell_quote(&self.worktrees_dir().to_string_lossy()),
         )
     }
+
+    fn subagent_start_hook_command(&self) -> String {
+        format!(
+            "{} --subagent-start-hook --temp-dir {}",
+            shell_quote(&self.editor_exe.to_string_lossy()),
+            shell_quote(&self.temp_dir().to_string_lossy()),
+        )
+    }
+}
+
+/// `<solution_root>/.agents/tmp` — where agents keep scratch files, so cleaning
+/// them up stays inside the Solution and needs no approval.
+pub fn solution_temp_dir(agents_dir: &Path) -> PathBuf {
+    agents_dir.join("tmp")
+}
+
+/// The temp-dir rule, worded once for both the session's system prompt and the
+/// sub-agent start hook.
+pub fn temp_dir_rule(temp_dir: &Path) -> String {
+    let temp = temp_dir.display();
+    format!(
+        "Temporary files: never use /tmp or any other system temp directory. Put every \
+         scratch file, temp directory, log, screenshot, pid file and throwaway profile \
+         under {temp}/ (`mkdir -p {temp}` if it is missing; `mktemp -d -p {temp}` for a \
+         fresh directory). It is inside the solution, so cleaning it up needs no approval."
+    )
+}
+
+/// What `sawe --subagent-start-hook` prints: claude's `SubagentStart` hook
+/// output, adding the temp-dir rule to the sub-agent's context.
+pub fn subagent_start_hook_output(temp_dir: &Path) -> String {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SubagentStart",
+            "additionalContext": temp_dir_rule(temp_dir),
+        }
+    })
+    .to_string()
 }
 
 /// `<runtime>/solutions/<id>/claude-settings.json` — beside that Solution's MCP
@@ -217,6 +271,32 @@ mod tests {
     }
 
     #[test]
+    fn sub_agents_are_told_to_keep_temp_files_in_the_solution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let json = settings(tmp.path()).to_json();
+
+        let command = json["hooks"]["SubagentStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("SubagentStart command");
+        assert!(
+            command.starts_with("'/opt/my apps/sawe' --subagent-start-hook --temp-dir "),
+            "got: {command}"
+        );
+        assert!(command.ends_with(".agents/tmp'"), "got: {command}");
+
+        let output: serde_json::Value = serde_json::from_str(&subagent_start_hook_output(
+            Path::new("/sol/.agents/tmp"),
+        ))
+        .expect("hook output is JSON");
+        assert_eq!(output["hookSpecificOutput"]["hookEventName"], "SubagentStart");
+        let context = output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext");
+        assert!(context.contains("never use /tmp"), "got: {context}");
+        assert!(context.contains("under /sol/.agents/tmp/"), "got: {context}");
+    }
+
+    #[test]
     fn keeps_the_users_own_hooks() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let project_settings = tmp.path().join("sol/member/.claude");
@@ -259,6 +339,7 @@ mod tests {
             "autoMemoryDirectory must exist"
         );
         assert!(settings.worktrees_dir().is_dir());
+        assert!(settings.temp_dir().is_dir());
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
         assert_eq!(written, settings.to_json());

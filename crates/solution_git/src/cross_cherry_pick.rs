@@ -860,7 +860,7 @@ impl CrossCherryPickModal {
                                 let msg = match &o.commit_sha {
                                     Some(sha) => format!(
                                         "Cherry-pick succeeded; new commit {}",
-                                        &sha.chars().take(7).collect::<String>()
+                                        sha.chars().take(7).collect::<String>()
                                     ),
                                     None => "Cherry-pick applied (--no-commit)".to_string(),
                                 };
