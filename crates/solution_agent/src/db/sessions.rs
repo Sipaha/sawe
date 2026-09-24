@@ -338,7 +338,7 @@ pub(crate) fn insert_or_update_metadata(
     // SQLite resolves the conflict-target row rather than the bare name.
     //
     // Nested tuple shape because `sqlez::Bind` only implements tuples up to
-    // size 10; we have 17 columns now (5 + 7 + 5).
+    // size 10; we have 18 columns now (5 + 7 + 6).
     let mut insert = connection.exec_bound::<(
         (String, i64, String, Arc<str>, String),
         (
@@ -356,20 +356,23 @@ pub(crate) fn insert_or_update_metadata(
             Option<String>,
             Option<i64>,
             Option<String>,
+            Option<String>,
         ),
     )>(indoc! {"
         INSERT INTO solution_sessions (
             id, solution_id, agent_id, acp_session_id, title,
             created_at, last_activity_at, preview, total_tokens,
             context_count, cwd, parent_session_id,
-            desired_model, desired_effort, cached_models, tab_order, permission_mode
+            desired_model, desired_effort, cached_models, tab_order, permission_mode,
+            title_source
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
         ON CONFLICT(id) DO UPDATE SET
             solution_id        = excluded.solution_id,
             agent_id           = excluded.agent_id,
             acp_session_id     = excluded.acp_session_id,
             title              = excluded.title,
+            title_source       = excluded.title_source,
             created_at         = excluded.created_at,
             last_activity_at   = excluded.last_activity_at,
             preview            = COALESCE(excluded.preview, preview),
@@ -418,6 +421,7 @@ pub(crate) fn insert_or_update_metadata(
             cached_models_json,
             meta.tab_order,
             Some(meta.permission_mode.as_str().to_owned()),
+            Some(meta.title_source.as_str().to_owned()),
         ),
     ))?;
 
@@ -693,6 +697,7 @@ type MetadataRow = (
         Option<String>,
         Option<i64>,
         Option<String>,
+        Option<String>,
     ),
 );
 
@@ -704,7 +709,8 @@ const METADATA_SELECT_LIST: &str = indoc! {"
     id, solution_id, agent_id, acp_session_id, title,
     created_at, last_activity_at, preview, total_tokens,
     context_count, cwd, parent_session_id,
-    desired_model, desired_effort, cached_models, tab_order, permission_mode
+    desired_model, desired_effort, cached_models, tab_order, permission_mode,
+    title_source
 "};
 
 fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
@@ -719,7 +725,14 @@ fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
             cwd,
             parent_session_id,
         ),
-        (desired_model, desired_effort, cached_models_json, tab_order, permission_mode),
+        (
+            desired_model,
+            desired_effort,
+            cached_models_json,
+            tab_order,
+            permission_mode,
+            title_source,
+        ),
     ) = row;
     let id = SolutionSessionId::parse(&id)
         .map_err(|e| anyhow!("invalid SolutionSessionId in db: {e}"))?;
@@ -749,6 +762,8 @@ fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
         })
         .unwrap_or_default();
 
+    let title_source =
+        crate::model::TitleSource::from_persisted(title_source.as_deref(), &title, &agent_id);
     Ok(SolutionSessionMetadata {
         id,
         solution_id: SolutionId(solution_id),
@@ -767,6 +782,7 @@ fn metadata_from_row(row: MetadataRow) -> Result<SolutionSessionMetadata> {
         permission_mode: crate::model::SessionPermissionMode::from_persisted(
             permission_mode.as_deref(),
         ),
+        title_source,
         cached_models,
         tab_order,
     })

@@ -5842,16 +5842,32 @@ placeholder and to name it — 2–5 words, in the user's language — once the 
 task clear, by calling `solution_agent.rename_session` with its session id and
 `only_if_default: true`, once.
 
-`only_if_default` is the part that makes the prompt safe: `rename_session` then renames only while
-`is_default_session_title` holds (`{Provider} New` or `{Provider} New #<digits>`) and otherwise
-answers `kept: …` without error. The prompt is sent when the ACP session is created, so it cannot
-know whether the user renames the tab later; the guard lives where the current title does. The
-tool also trims the title now. A plain rename (the user, the phone) is unaffected.
+**Who named the tab is recorded** — `SolutionSession::title_source: TitleSource { Default, Agent,
+User }`, persisted in `solution_sessions.title_source` (a row from before the column reads as
+`Default` if its title has the placeholder shape, else `User`). `rename_session` takes the source:
+the tab menu, the phone and a plain MCP rename are `User`; `only_if_default: true` renames only
+while the source is `Default` and records `Agent`, otherwise it answers `kept: …` without error.
+The source decides, not the text — a person who types `Claude New #9` has still named the tab. The
+guard lives in the tool because a prompt can't know about a rename made after it was sent. The
+tool also trims the title.
+
+**The prompt names the exact title** when the session already exists as the prompt is built — a
+tab woken for its first message (#211), `/clear`, `/compact`: `Your Sawe tab is titled \`X\`, a
+placeholder …` with the rename request, or `… a name already chosen for it. Don't rename …`
+without one. An eagerly created session (MCP, the phone) has no entity yet and gets the general
+rule.
+
+**A Solution's socket can only rename its own sessions.** `rename_session` gained `solution_id`,
+which a per-Solution socket injects; a session of another Solution is refused with
+`session_in_different_solution`. The global (operator) socket passes none and is unchecked.
 
 Guarded by `a_default_session_title_is_the_provider_and_new`,
 `new_sessions_take_the_first_free_default_title` (through the real create path, including a freed
-number being reused), `rename_session_only_if_default_spares_a_chosen_title`, and the prompt
-assertions in `build_session_meta_emits_correct_json_shape`.
+number being reused), `rename_session_only_if_default_spares_a_chosen_title` (agent naming, a
+second attempt refused, a person's rename, a placeholder-shaped person's title, another Solution
+refused — the source and scope checks each mutation-checked),
+`title_source_round_trips_and_legacy_rows_derive_it`, and the prompt assertions in
+`build_session_meta_emits_correct_json_shape` (general rule, placeholder, named).
 
 ### 210. A reasoning chunk renders as a Thinking block, not as prefixed prose
 

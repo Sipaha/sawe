@@ -1827,7 +1827,15 @@ impl SolutionAgentStore {
                 prompt.push_str(&format!(
                     "\nYour stable Sawe session ID is `{id}`. Use this exact ID as from_session_id for agent messages; it is not the provider thread ID.\n"
                 ));
-                prompt.push_str(&session_title_instruction(id, agent_id.as_ref()));
+                let current_title = self.sessions.get(&id).map(|session| {
+                    let session = session.read(cx);
+                    (session.title.clone(), session.title_source)
+                });
+                prompt.push_str(&session_title_instruction(
+                    id,
+                    agent_id.as_ref(),
+                    current_title,
+                ));
             }
             if !prompt.is_empty() {
                 meta.insert(
@@ -1943,6 +1951,7 @@ impl SolutionAgentStore {
             desired_model: s.desired_model.clone(),
             desired_effort: s.desired_effort.clone(),
             permission_mode: s.permission_mode,
+            title_source: s.title_source,
             cached_models: s.cached_models.clone(),
             // Carried through so the INSERT's ON CONFLICT path COALESCEs it
             // against any value a concurrent `persist_tab_order` already wrote;
@@ -2794,6 +2803,7 @@ impl SolutionAgentStore {
             desired_model: s.desired_model.clone(),
             desired_effort: s.desired_effort.clone(),
             permission_mode: mode,
+            title_source: s.title_source,
             cached_models: s.cached_models.clone(),
             tab_order: s.tab_order,
         };
@@ -3231,6 +3241,7 @@ impl SolutionAgentStore {
         &mut self,
         session_id: SolutionSessionId,
         title: SharedString,
+        source: crate::model::TitleSource,
         cx: &mut Context<Self>,
     ) -> Result<()> {
         let session = self
@@ -3238,7 +3249,10 @@ impl SolutionAgentStore {
             .get(&session_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
-        session.update(cx, |s, _| s.title = title.clone());
+        session.update(cx, |s, _| {
+            s.title = title.clone();
+            s.title_source = source;
+        });
         // Reuse `persist_session_row` so preview + token columns get
         // populated from the live thread instead of being NULL'd by this
         // title-only write path.
@@ -3345,6 +3359,7 @@ impl SolutionAgentStore {
                 desired_model: s.desired_model.clone(),
                 desired_effort: s.desired_effort.clone(),
                 permission_mode: s.permission_mode,
+                title_source: s.title_source,
                 cached_models: s.cached_models.clone(),
                 tab_order: s.tab_order,
             }
@@ -6210,19 +6225,44 @@ mod permission_tests {
     }
 }
 
-/// The system-prompt line asking an agent to name its own tab (FORK.md #209).
+/// The system-prompt line about the agent's own tab title (FORK.md #209).
 ///
-/// A new session's tab reads `{Provider} New` until someone names it, and the
-/// agent is the one that knows what the conversation is about. The rename goes
-/// through `only_if_default`, so an agent can never overwrite a title the user
-/// chose — including one chosen after this prompt was sent.
-fn session_title_instruction(session_id: SolutionSessionId, agent_id: &str) -> String {
-    let default_title = default_session_title_base(agent_id);
-    format!(
-        "\nYour Sawe tab title starts as the placeholder `{default_title}` (possibly with a ` #N` suffix). \
-         Once the user's first request makes the task clear, give the tab a short, specific title \
-         (2-5 words, in the language the user writes in) by calling `solution_agent.rename_session` \
-         with session_id `{session_id}`, your title, and `only_if_default: true`. \
-         Do it once; don't rename the tab again unless the user asks.\n"
-    )
+/// A new tab reads `{Provider} New` until someone names it, and the agent is
+/// the one that knows what the conversation is about. `current` is the tab's
+/// title and who gave it, when the session already exists as the prompt is
+/// built — a tab woken for its first message (#211), `/clear`, `/compact` —
+/// so the line can name the exact title and say whether it is still the
+/// placeholder. An eagerly created session has no entity yet and gets the
+/// general rule. The rename goes through `only_if_default` either way, so the
+/// agent can never overwrite a title someone chose after the prompt was sent.
+fn session_title_instruction(
+    session_id: SolutionSessionId,
+    agent_id: &str,
+    current: Option<(SharedString, crate::model::TitleSource)>,
+) -> String {
+    let rename_call = format!(
+        "calling `solution_agent.rename_session` with session_id `{session_id}`, your title, \
+         and `only_if_default: true`"
+    );
+    let naming = "a short, specific title (2-5 words, in the language the user writes in)";
+    match current {
+        Some((title, crate::model::TitleSource::Default)) => format!(
+            "\nYour Sawe tab is titled `{title}`, a placeholder. Once the user's first request \
+             makes the task clear, give the tab {naming} by {rename_call}. Do it once; don't \
+             rename the tab again unless the user asks.\n"
+        ),
+        Some((title, _)) => format!(
+            "\nYour Sawe tab is titled `{title}`, a name already chosen for it. Don't rename \
+             the tab unless the user asks.\n"
+        ),
+        None => {
+            let default_title = default_session_title_base(agent_id);
+            format!(
+                "\nYour Sawe tab title starts as the placeholder `{default_title}` (possibly \
+                 with a ` #N` suffix). Once the user's first request makes the task clear, give \
+                 the tab {naming} by {rename_call}. Do it once; don't rename the tab again \
+                 unless the user asks.\n"
+            )
+        }
+    }
 }

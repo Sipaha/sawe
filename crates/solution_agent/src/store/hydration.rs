@@ -499,6 +499,7 @@ pub(crate) fn build_cold_session(
         s.desired_model = restored_desired_model;
         s.desired_effort = restored_desired_effort;
         s.permission_mode = meta.permission_mode;
+        s.title_source = meta.title_source;
         s
     });
     ColdSessionBuild {
@@ -1101,6 +1102,7 @@ impl SolutionAgentStore {
                         s.desired_model = meta.desired_model.clone();
                         s.desired_effort = meta.desired_effort.clone();
                         s.permission_mode = meta.permission_mode;
+                        s.title_source = meta.title_source;
                         s.cached_models = meta.cached_models.clone();
                         s.entries =
                             entries.into_iter().map(std::sync::Arc::new).collect();

@@ -53,7 +53,12 @@ impl RenameSessionModal {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
                 store
-                    .rename_session(self.session_id, SharedString::from(new_title), cx)
+                    .rename_session(
+                        self.session_id,
+                        SharedString::from(new_title),
+                        crate::model::TitleSource::User,
+                        cx,
+                    )
                     .log_err();
             });
         }

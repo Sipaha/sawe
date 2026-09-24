@@ -133,51 +133,97 @@ async fn list_agents_returns_empty_when_no_adapters_registered(cx: &mut gpui::Te
 }
 
 /// An agent names its own tab with `only_if_default: true` (FORK.md #209):
-/// the rename lands while the tab still has its `{Provider} New` title and is
-/// refused once anyone has chosen a title, so an agent can never overwrite
-/// the user's.
+/// the rename lands while the tab's title is still the placeholder and is
+/// refused once anyone has named it — the agent itself included — so an agent
+/// can never overwrite the user's choice. A plain rename is a person's, and
+/// a Solution's socket can only reach its own sessions.
 #[gpui::test]
 async fn rename_session_only_if_default_spares_a_chosen_title(cx: &mut gpui::TestAppContext) {
+    use crate::model::TitleSource;
+
     let (session_id, _img, _tmp) = seed_session_with_image(cx).await;
-    let (agent_id, title_of) = cx.update(|cx| {
+    let (solution_id, session) = cx.update(|cx| {
         let store = crate::store::SolutionAgentStore::global(cx);
         let session = store.read(cx).session(session_id).expect("seeded");
-        (session.read(cx).agent_id.to_string(), session.clone())
+        (session.read(cx).solution_id.0, session.clone())
     });
-    let default_title = format!(
-        "{} #2",
-        crate::store::default_session_title_base(&agent_id)
+    let rename =
+        |title: &str, only_if_default: bool, solution_id: Option<i64>| RenameSessionParams {
+            solution_id,
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            only_if_default,
+        };
+    let state = |cx: &mut gpui::TestAppContext| {
+        cx.update(|cx| {
+            let session = session.read(cx);
+            (session.title.to_string(), session.title_source)
+        })
+    };
+    assert_eq!(
+        state(cx).1,
+        TitleSource::Default,
+        "precondition: never named"
     );
-    let rename = |title: &str, only_if_default: bool| RenameSessionParams {
-        session_id: session_id.to_string(),
-        title: title.to_string(),
-        only_if_default,
-    };
-    let title = |cx: &mut gpui::TestAppContext| {
-        cx.update(|cx| title_of.read(cx).title.to_string())
-    };
 
     RenameSessionTool
-        .run(rename(&default_title, false), &mut cx.to_async())
+        .run(
+            rename("  Fix the login flow  ", true, None),
+            &mut cx.to_async(),
+        )
         .await
-        .expect("a plain rename always applies");
-    assert_eq!(title(cx), default_title);
-
-    RenameSessionTool
-        .run(rename("  Fix the login flow  ", true), &mut cx.to_async())
-        .await
-        .expect("the agent names its default tab");
-    assert_eq!(title(cx), "Fix the login flow", "renamed, and trimmed");
+        .expect("the agent names its placeholder tab");
+    assert_eq!(
+        state(cx),
+        ("Fix the login flow".to_string(), TitleSource::Agent),
+        "renamed, trimmed, and recorded as the agent's"
+    );
 
     let result = RenameSessionTool
-        .run(rename("Something else", true), &mut cx.to_async())
+        .run(rename("Something else", true, None), &mut cx.to_async())
         .await
         .expect("a refused rename is not an error");
-    assert_eq!(title(cx), "Fix the login flow", "a chosen title is kept");
+    assert_eq!(state(cx).0, "Fix the login flow", "a named tab is kept");
     match &result.content[0] {
         ToolResponseContent::Text { text } => assert!(text.starts_with("kept"), "{text}"),
         _ => panic!("expected text content"),
     }
+
+    RenameSessionTool
+        .run(
+            rename("Auth work", false, Some(solution_id)),
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("a person may always rename");
+    assert_eq!(state(cx), ("Auth work".to_string(), TitleSource::User));
+
+    let error = RenameSessionTool
+        .run(
+            rename("Hijack", false, Some(solution_id + 1)),
+            &mut cx.to_async(),
+        )
+        .await
+        .expect_err("another Solution's socket cannot reach this session");
+    assert!(
+        error.to_string().contains("session_in_different_solution"),
+        "{error}"
+    );
+    assert_eq!(state(cx).0, "Auth work");
+
+    // A person's title that merely looks like the placeholder is still a
+    // person's: the source decides, not the shape of the text.
+    let agent_id = cx.update(|cx| session.read(cx).agent_id.to_string());
+    let lookalike = format!("{} #9", crate::store::default_session_title_base(&agent_id));
+    RenameSessionTool
+        .run(rename(&lookalike, false, None), &mut cx.to_async())
+        .await
+        .expect("a person may always rename");
+    RenameSessionTool
+        .run(rename("Agent's idea", true, None), &mut cx.to_async())
+        .await
+        .expect("a refused rename is not an error");
+    assert_eq!(state(cx), (lookalike, TitleSource::User));
 }
 
 #[gpui::test]
@@ -2581,6 +2627,7 @@ async fn read_session_history_closed_row_native_returns_entries(cx: &mut gpui::T
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -2710,6 +2757,7 @@ async fn read_session_history_distinguishes_a_wiped_session_from_a_legacy_one(
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -3858,6 +3906,7 @@ async fn seed_closed_db_only_session(
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: Some(0),
     };
@@ -4330,6 +4379,7 @@ async fn get_session_legacy_blob_closed_session_serves_bumped_epoch(cx: &mut gpu
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -4478,6 +4528,7 @@ async fn get_session_refuses_to_serve_an_undecodable_blob_as_empty(cx: &mut gpui
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -4684,6 +4735,7 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -4727,6 +4779,7 @@ async fn a_corrupt_session_is_refused_hot_as_well_as_cold(cx: &mut gpui::TestApp
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -5058,6 +5111,7 @@ async fn get_session_ignores_the_blob_of_a_wiped_row_native_session(cx: &mut gpu
             desired_model: None,
             desired_effort: None,
             permission_mode: Default::default(),
+            title_source: Default::default(),
             cached_models: vec![],
             tab_order: None,
         })
@@ -5137,6 +5191,7 @@ async fn get_session_ignores_the_blob_of_a_wiped_row_native_session(cx: &mut gpu
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -5228,6 +5283,7 @@ async fn seed_closed_session_with_entries(
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: Some(0),
     })
@@ -5298,6 +5354,7 @@ async fn add_closed_session(
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: Some(0),
     })

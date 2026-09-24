@@ -173,7 +173,9 @@ impl McpServerTool for CreateSessionTool {
                 let title = SharedString::from(trimmed.to_string());
                 cx.update(|cx| -> Result<()> {
                     let store = SolutionAgentStore::global(cx);
-                    store.update(cx, |store, cx| store.rename_session(session_id, title, cx))?;
+                    store.update(cx, |store, cx| {
+                        store.rename_session(session_id, title, crate::model::TitleSource::User, cx)
+                    })?;
                     Ok(())
                 })?;
             }
@@ -318,6 +320,11 @@ impl McpServerTool for DeleteSessionTool {
 /// Rename a session's user-visible title.
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct RenameSessionParams {
+    /// Injected by a Solution's own socket (the field must stay a schema
+    /// property for that). When present the session must belong to that
+    /// Solution, so an agent cannot rename another Solution's tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solution_id: Option<i64>,
     pub session_id: String,
     pub title: String,
     /// Rename only while the tab still has its default `{Provider} New`
@@ -332,12 +339,14 @@ impl<'de> Deserialize<'de> for RenameSessionParams {
         #[derive(Deserialize, Default)]
         #[serde(default, deny_unknown_fields)]
         struct Inner {
+            solution_id: Option<i64>,
             session_id: String,
             title: String,
             only_if_default: bool,
         }
         let inner = Option::<Inner>::deserialize(de)?.unwrap_or_default();
         Ok(Self {
+            solution_id: inner.solution_id,
             session_id: inner.session_id,
             title: inner.title,
             only_if_default: inner.only_if_default,
@@ -374,19 +383,27 @@ impl McpServerTool for RenameSessionTool {
         let renamed = cx.update(|cx| -> Result<bool> {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                if input.only_if_default {
-                    let session = store
-                        .session(session_id)
-                        .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
-                    let session = session.read(cx);
-                    if !crate::store::is_default_session_title(
-                        &session.title,
-                        session.agent_id.as_ref(),
-                    ) {
+                let session = store
+                    .session(session_id)
+                    .ok_or_else(|| anyhow!("unknown session {session_id}"))?;
+                let session = session.read(cx);
+                if let Some(solution_id) = input.solution_id {
+                    anyhow::ensure!(
+                        session.solution_id.0 == solution_id,
+                        "session_in_different_solution: {session_id} is not in solution {solution_id}"
+                    );
+                }
+                // An agent naming its own tab (the prompt's `only_if_default`)
+                // may only replace the placeholder; a plain rename is a person's.
+                let source = if input.only_if_default {
+                    if session.title_source != crate::model::TitleSource::Default {
                         return Ok(false);
                     }
-                }
-                store.rename_session(session_id, title, cx)?;
+                    crate::model::TitleSource::Agent
+                } else {
+                    crate::model::TitleSource::User
+                };
+                store.rename_session(session_id, title, source, cx)?;
                 Ok(true)
             })
         })?;

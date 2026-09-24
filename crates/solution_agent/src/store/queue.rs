@@ -1365,6 +1365,7 @@ impl SolutionAgentStore {
                 desired_model: s.desired_model.clone(),
                 desired_effort: s.desired_effort.clone(),
                 permission_mode: s.permission_mode,
+                title_source: s.title_source,
                 cached_models: s.cached_models.clone(),
                 tab_order: s.tab_order,
             };

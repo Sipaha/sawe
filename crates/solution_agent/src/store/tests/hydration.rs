@@ -47,6 +47,7 @@ async fn hydrate_all_hydrates_cold_sessions(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -340,6 +341,7 @@ async fn cold_restore_populates_entries_directly(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -593,6 +595,7 @@ async fn cold_restore_loads_from_rows_and_reads_epoch(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -710,6 +713,7 @@ async fn cold_restore_anchors_change_seq_on_persisted_value(cx: &mut TestAppCont
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -848,6 +852,7 @@ async fn cold_restore_legacy_null_change_seq_falls_back_to_max_mod_seq(cx: &mut 
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -957,6 +962,7 @@ async fn v2_blob_migrates_to_rows_and_is_idempotent(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -1119,6 +1125,7 @@ async fn an_undecodable_blob_is_not_migrated_away(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -1259,6 +1266,7 @@ async fn hydrate_all_restores_model_and_effort(cx: &mut TestAppContext) {
         desired_model: Some("opus".into()),
         desired_effort: Some("high".into()),
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![acp_thread::NativeAgentModelInfo {
             value: "opus".into(),
             display_name: "Opus".into(),
@@ -1345,6 +1353,7 @@ async fn migrated_session_retains_model_on_second_restore(cx: &mut TestAppContex
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -1487,6 +1496,7 @@ async fn legacy_v1_blob_migrates_losslessly(cx: &mut TestAppContext) {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -1911,6 +1921,7 @@ fn resume_session_fresh_entity_copies_model_from_meta(cx: &mut TestAppContext) {
         desired_model: Some("claude-opus-4-5".to_string()),
         desired_effort: Some("high".to_string()),
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -2251,6 +2262,7 @@ async fn resume_of_a_wiped_session_does_not_repaint_the_blob(cx: &mut TestAppCon
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -2381,6 +2393,7 @@ async fn a_failed_epoch_read_on_reopen_does_not_un_wipe_the_session(cx: &mut Tes
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -2573,6 +2586,7 @@ async fn resume_of_an_undecodable_blob_leaves_the_row_recoverable(cx: &mut TestA
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -2725,6 +2739,7 @@ async fn a_failed_row_read_on_reopen_does_not_delete_the_rows(cx: &mut TestAppCo
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -3338,6 +3353,7 @@ async fn a_flagged_wiped_session_never_rewinds_its_epoch(cx: &mut TestAppContext
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -3636,6 +3652,7 @@ async fn a_permanently_undecodable_transcript_refuses_with_permanent_advice(
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -3775,6 +3792,7 @@ async fn a_failed_blob_read_on_reopen_does_not_wipe_the_session(cx: &mut TestApp
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -3916,6 +3934,7 @@ async fn resume_of_a_legacy_blob_session_still_restores_it(cx: &mut TestAppConte
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };
@@ -4205,6 +4224,7 @@ async fn mock_agent_server_composes_a_prompt_gate_with_resume_support(cx: &mut T
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };

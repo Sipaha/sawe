@@ -89,6 +89,7 @@ fn make_meta(seq: u32, sol: i64) -> SolutionSessionMetadata {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     }
@@ -1794,5 +1795,42 @@ async fn permission_default_survives_restart_without_rewriting_existing_chats(
     assert_eq!(
         reopened.load_default_permission_mode().unwrap(),
         SessionPermissionMode::ReadOnly
+    );
+}
+
+/// FORK.md #209: who named a tab survives a restart, and a row written before
+/// the column existed is read as what its title says — the placeholder is
+/// still unnamed, anything else was a person's choice.
+#[gpui::test]
+async fn title_source_round_trips_and_legacy_rows_derive_it(cx: &mut gpui::TestAppContext) {
+    use crate::model::TitleSource;
+
+    let db = SolutionAgentDb::open(cx.executor()).unwrap();
+    let mut named = make_meta(1, 7);
+    named.title = "Fix the login flow".into();
+    named.title_source = TitleSource::Agent;
+    let named_id = named.id;
+    db.save_metadata(named).await.unwrap();
+    let stored = db.list_for_solution(SolutionId(7)).await.unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .find(|m| m.id == named_id)
+            .map(|m| m.title_source),
+        Some(TitleSource::Agent)
+    );
+
+    assert_eq!(
+        TitleSource::from_persisted(None, "Claude New #3", "claude-acp"),
+        TitleSource::Default
+    );
+    assert_eq!(
+        TitleSource::from_persisted(None, "Sawe1 2", "claude-acp"),
+        TitleSource::User
+    );
+    assert_eq!(
+        TitleSource::from_persisted(Some("agent"), "Claude New", "claude-acp"),
+        TitleSource::Agent,
+        "a persisted value wins over the title's shape"
     );
 }

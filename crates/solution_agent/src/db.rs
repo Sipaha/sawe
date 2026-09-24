@@ -257,6 +257,9 @@ impl SolutionAgentDb {
         apply_idempotent_add_column(&connection, "desired_model TEXT");
         apply_idempotent_add_column(&connection, "desired_effort TEXT");
         apply_idempotent_add_column(&connection, "permission_mode TEXT");
+        // FORK.md #209: who named the tab. NULL on older rows, read back as
+        // whatever the title itself implies (`TitleSource::from_persisted`).
+        apply_idempotent_add_column(&connection, "title_source TEXT");
         apply_idempotent_add_column(&connection, "cached_models TEXT");
         // Phase 1 (rename/identity) added this column to stamp a session's
         // project as a fact rather than an inference; the 2026-08-26

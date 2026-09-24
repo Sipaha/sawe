@@ -16,6 +16,42 @@ use crate::background_agent;
 use crate::background_shell;
 use crate::session_entry::SessionEntry;
 
+/// Who gave a session's tab its title (FORK.md #209). An agent may name its own
+/// tab only while it is `Default`; the user's choice is never overwritten.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TitleSource {
+    /// The `{Provider} New` placeholder a new tab starts with.
+    #[default]
+    Default,
+    /// Named by the session's agent.
+    Agent,
+    /// Named by a person — the tab menu, the phone, an MCP client.
+    User,
+}
+
+impl TitleSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Agent => "agent",
+            Self::User => "user",
+        }
+    }
+
+    /// The persisted value, or — for a row written before the column existed
+    /// — what the title itself says: a `{Provider} New` title is still the
+    /// placeholder, and anything else was chosen by someone.
+    pub fn from_persisted(value: Option<&str>, title: &str, agent_id: &str) -> Self {
+        match value {
+            Some("default") => Self::Default,
+            Some("agent") => Self::Agent,
+            Some("user") => Self::User,
+            _ if crate::store::is_default_session_title(title, agent_id) => Self::Default,
+            _ => Self::User,
+        }
+    }
+}
+
 /// Effective native tool permissions, changed only while the session is idle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -567,6 +603,8 @@ pub struct SolutionSession {
     /// `apply_flag_settings`. `None` → claude's default.
     pub desired_effort: Option<String>,
     pub permission_mode: SessionPermissionMode,
+    /// Who gave [`Self::title`] (FORK.md #209). Persisted.
+    pub title_source: TitleSource,
     /// F: parent session reference for sub-agent indication. `None` for
     /// top-level sessions. Set at creation time via
     /// `solution_agent.create_session({parent_session_id})` and
@@ -772,6 +810,7 @@ impl SolutionSession {
             desired_model: None,
             desired_effort: None,
             permission_mode: Default::default(),
+            title_source: TitleSource::Default,
             parent_session_id: None,
             stopping_safety_net: None,
             teammate_labels: HashMap::new(),
@@ -1366,6 +1405,8 @@ pub struct SolutionSessionMetadata {
     /// sessions where the user hasn't made an effort selection yet.
     pub desired_effort: Option<String>,
     pub permission_mode: SessionPermissionMode,
+    /// Persisted copy of [`SolutionSession::title_source`].
+    pub title_source: TitleSource,
     /// Persisted copy of [`SolutionSession::cached_models`]. Empty for
     /// sessions that haven't yet fetched the model list from the agent.
     pub cached_models: Vec<acp_thread::NativeAgentModelInfo>,

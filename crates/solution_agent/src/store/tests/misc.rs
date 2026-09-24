@@ -2908,6 +2908,42 @@ fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
                 assert!(prompt.contains("only_if_default: true"));
             }
 
+            // An existing tab — woken for its first message, cleared or
+            // compacted — gets its exact title, and the rename request only
+            // while that title is still the placeholder.
+            let tab = SolutionSessionId::new();
+            let entity = cx.new(|_| {
+                let mut session = crate::model::SolutionSession::new_idle(
+                    tab,
+                    solution.id,
+                    SharedString::from(CLAUDE_ACP_AGENT_ID),
+                    crate::model::unstarted_acp_session_id(tab),
+                );
+                session.title = "Claude New #2".into();
+                session
+            });
+            store.sessions.insert(tab, entity.clone());
+            let prompt_for = |store: &SolutionAgentStore, cx: &mut gpui::Context<SolutionAgentStore>| {
+                let meta = store
+                    .build_session_meta(&SharedString::from(CLAUDE_ACP_AGENT_ID), &solution, Some(tab), None, cx)
+                    .unwrap();
+                meta["systemPrompt"]["append"].as_str().unwrap().to_string()
+            };
+            let placeholder = prompt_for(store, cx);
+            assert!(placeholder.contains("`Claude New #2`, a placeholder"), "{placeholder}");
+            assert!(placeholder.contains("solution_agent.rename_session"));
+
+            entity.update(cx, |session, _| {
+                session.title = "Fix the login flow".into();
+                session.title_source = crate::model::TitleSource::User;
+            });
+            let named = prompt_for(store, cx);
+            assert!(named.contains("`Fix the login flow`, a name already chosen"), "{named}");
+            assert!(
+                !named.contains("solution_agent.rename_session"),
+                "a named tab is not to be renamed: {named}"
+            );
+
             // Unknown agent → None (registry lookup fails)
             let none_meta =
                 store.build_session_meta(
@@ -8016,7 +8052,12 @@ async fn new_sessions_take_the_first_free_default_title(cx: &mut TestAppContext)
     // the numbering below starts from a known state.
     cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.rename_session(first, base.clone().into(), cx)
+            store.rename_session(
+                first,
+                base.clone().into(),
+                crate::model::TitleSource::Default,
+                cx,
+            )
         })
     })
     .expect("rename");
@@ -8029,7 +8070,12 @@ async fn new_sessions_take_the_first_free_default_title(cx: &mut TestAppContext)
     // `#1` is named by its agent; the next new tab takes the freed number.
     cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.rename_session(second, "Fix the login flow".into(), cx)
+            store.rename_session(
+                second,
+                "Fix the login flow".into(),
+                crate::model::TitleSource::Agent,
+                cx,
+            )
         })
     })
     .expect("rename");
@@ -8082,7 +8128,11 @@ async fn a_new_tab_starts_its_agent_on_the_first_message(cx: &mut TestAppContext
     assert!(unstarted && !live, "the tab is cold and unstarted");
     assert_eq!(title, "Agent New");
     assert!(pinned, "the tab is in the strip");
-    assert_eq!(connect_count.load(Ordering::SeqCst), 0, "no agent was started");
+    assert_eq!(
+        connect_count.load(Ordering::SeqCst),
+        0,
+        "no agent was started"
+    );
 
     cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, cx| {
@@ -8097,7 +8147,11 @@ async fn a_new_tab_starts_its_agent_on_the_first_message(cx: &mut TestAppContext
     cx.run_until_parked();
 
     let (unstarted, live, acp_session_id, _, _) = snapshot(cx);
-    assert_eq!(connect_count.load(Ordering::SeqCst), 1, "the first message started it");
+    assert_eq!(
+        connect_count.load(Ordering::SeqCst),
+        1,
+        "the first message started it"
+    );
     assert!(live, "the tab is live now");
     assert!(!unstarted, "and carries the provider's own session id");
     assert!(

@@ -249,6 +249,7 @@ async fn purge_session_hard_removes_entity_disk_tree_and_rows(cx: &mut gpui::Tes
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -333,6 +334,7 @@ async fn purge_solution_fully_clears_sessions_disk_and_rows(cx: &mut gpui::TestA
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -415,6 +417,7 @@ async fn close_session_is_soft_keeps_archive_dir_and_supervisor_row(cx: &mut gpu
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -484,6 +487,7 @@ async fn cold_close_solution_keeps_sessions_restorable(cx: &mut gpui::TestAppCon
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     })
@@ -1200,6 +1204,7 @@ fn stale_archive_dirs_gates_on_count_then_age() {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         cached_models: vec![],
         tab_order: None,
     };

@@ -122,6 +122,7 @@ fn build_session() -> SolutionSession {
         desired_model: None,
         desired_effort: None,
         permission_mode: Default::default(),
+        title_source: Default::default(),
         parent_session_id: None,
         stopping_safety_net: None,
         teammate_labels: HashMap::new(),

@@ -2021,6 +2021,7 @@ mod tests {
             desired_model: None,
             desired_effort: None,
             permission_mode: Default::default(),
+            title_source: Default::default(),
             cached_models: vec![],
             tab_order: None,
         };
