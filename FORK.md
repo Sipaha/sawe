@@ -5853,3 +5853,17 @@ Guarded by `a_default_session_title_is_the_provider_and_new`,
 number being reused), `rename_session_only_if_default_spares_a_chosen_title`, and the prompt
 assertions in `build_session_meta_emits_correct_json_shape`.
 
+### 210. A reasoning chunk renders as a Thinking block, not as prefixed prose
+
+The maintainer, 2026-09-24, on a thought-only assistant turn: the grey `thinking…` header was hard
+to make out, and the `thinking:` prefix in the text had no purpose.
+
+What: `render_assistant_message` draws each thought as a block with a 2px left rule (the tool
+cards' idiom) under a header of `IconName::ToolThink` in the accent colour and `Thinking` at
+`LabelSize::Small` in the default colour; the header used to be an XSmall muted italic label.
+`entry_text_spans` hands the thought over verbatim — it used to prepend `thinking: `, which is
+what put the word into the rendered markdown. Only the desktop reads those spans; the phone parses
+the wire markdown on its own and is unaffected. `solution_agent.seed_cold_session` gained a
+`"thought"` role so the block can be painted in a probe. Guarded by
+`a_thought_span_is_the_thought_verbatim`; the block carries `THINKING_BLOCK_SELECTOR`.
+

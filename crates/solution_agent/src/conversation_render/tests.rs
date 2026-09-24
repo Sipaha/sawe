@@ -491,3 +491,28 @@ fn no_in_progress_tool_call_when_all_terminal() {
     .collect();
     assert!(!entries_have_in_progress_tool_call(&entries));
 }
+
+/// A thought is shown verbatim under the Thinking block's header; the text no
+/// longer repeats it with a `thinking:` prefix (maintainer, 2026-09-24).
+#[test]
+fn a_thought_span_is_the_thought_verbatim() {
+    let entry = SessionEntry {
+        created_ms: 0,
+        mod_seq: 0,
+        subagent_id: None,
+        kind: SessionEntryKind::AssistantMessage {
+            chunks: vec![
+                AssistantChunk::Thought("Read the config first.".to_string()),
+                AssistantChunk::Thought(String::new()),
+                AssistantChunk::Thought("Then run the tests.".to_string()),
+            ],
+        },
+    };
+    assert_eq!(
+        entry_text_spans(&entry),
+        vec![
+            "Read the config first.".to_string(),
+            "Then run the tests.".to_string()
+        ]
+    );
+}

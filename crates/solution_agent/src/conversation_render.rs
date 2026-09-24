@@ -121,13 +121,15 @@ pub(crate) fn entry_text_spans(entry: &SessionEntry) -> Vec<String> {
                 }
             } else {
                 // Thought-only (mid-turn reasoning before the answer streams):
-                // keep one span per thought, each rendered under its own
-                // "thinking…" label.
+                // keep one span per thought, each rendered in its own Thinking
+                // block. The span is the thought verbatim — the block's header
+                // says what it is, and a `thinking:` prefix in the text only
+                // repeated it (maintainer, 2026-09-24).
                 let mut spans = Vec::new();
                 for chunk in chunks {
                     if let AssistantChunk::Thought(text) = chunk {
                         if !text.is_empty() {
-                            spans.push(format!("thinking: {text}"));
+                            spans.push(text.clone());
                         }
                     }
                 }
@@ -425,6 +427,7 @@ pub(crate) fn render_entry(
             style,
             assistant_label,
             workspace,
+            cx,
         ),
         SessionEntryKind::ToolCall {
             id,
@@ -603,6 +606,9 @@ pub(crate) fn assistant_message_selector(entry_idx: usize) -> String {
     format!("solution-session-assistant-message-{entry_idx}")
 }
 
+/// `debug_selector` on a Thinking block.
+pub(crate) const THINKING_BLOCK_SELECTOR: &str = "SESSION-THINKING-BLOCK";
+
 pub(crate) fn render_assistant_message(
     entry_idx: usize,
     chunks: &[AssistantChunk],
@@ -612,6 +618,7 @@ pub(crate) fn render_assistant_message(
     style: &MarkdownStyle,
     _assistant_label: &SharedString,
     workspace: &gpui::WeakEntity<workspace::Workspace>,
+    cx: &App,
 ) -> AnyElement {
     let group_name = SharedString::from(format!("assistant-msg-{entry_idx}"));
     // No "<Adapter>" header above assistant messages either — the absence of
@@ -671,7 +678,10 @@ pub(crate) fn render_assistant_message(
             ));
         }
     } else {
-        // Thought-only: one "thinking…" block per reasoning chunk.
+        // Thought-only: one Thinking block per reasoning chunk — a left rule
+        // like a tool card's and a readable header, so reasoning reads as
+        // apart from the answer. The header used to be an XSmall muted italic
+        // "thinking…" that was hard to see (maintainer, 2026-09-24).
         let mut span_idx = 0;
         for chunk in chunks {
             if let AssistantChunk::Thought(text) = chunk {
@@ -681,12 +691,22 @@ pub(crate) fn render_assistant_message(
                 let element =
                     render_span((entry_idx, span_idx), text, markdown_for, style, workspace);
                 container = container.child(
-                    div()
+                    v_flex()
+                        .debug_selector(|| THINKING_BLOCK_SELECTOR.to_string())
+                        .my_1()
+                        .pl_2()
+                        .gap_0p5()
+                        .border_l_2()
+                        .border_color(cx.theme().colors().border)
                         .child(
-                            Label::new("thinking…")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .italic(),
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::ToolThink)
+                                        .size(IconSize::Small)
+                                        .color(Color::Accent),
+                                )
+                                .child(Label::new("Thinking").size(LabelSize::Small)),
                         )
                         .child(element),
                 );

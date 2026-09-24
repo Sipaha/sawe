@@ -28,7 +28,9 @@ pub struct SeedColdSessionEntry {
     /// whose raw command is `text`), `"observer"`/`"system"` (an
     /// agent-invisible Observer `System` bubble — FORK.md #29), or `"nudge"` (an
     /// agent-VISIBLE observer nudge — a UserMessage carrying the observer-nudge
-    /// `_meta` marker; renders the "Observer · to the agent" plaque).
+    /// `_meta` marker; renders the "Observer · to the agent" plaque), or
+    /// `"thought"` (an assistant turn holding only reasoning — the Thinking
+    /// block).
     pub role: String,
     /// `toolu_…` teammate id, or omitted/empty for a Main entry.
     pub subagent_id: Option<String>,
@@ -168,6 +170,10 @@ impl McpServerTool for SeedColdSessionTool {
                         tool_name: Some("shell".to_string()),
                         locations: vec![],
                         status_started_at: None,
+                    }
+                } else if e.role.eq_ignore_ascii_case("thought") {
+                    crate::session_entry::SessionEntryKind::AssistantMessage {
+                        chunks: vec![crate::session_entry::AssistantChunk::Thought(text)],
                     }
                 } else if e.role.eq_ignore_ascii_case("user") {
                     crate::session_entry::SessionEntryKind::UserMessage {
