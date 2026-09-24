@@ -1942,6 +1942,10 @@ impl LocalLspStore {
             .flatten()
             .chain(formatters);
 
+        let text_before_formatters = settings
+            .format_whitespace_only
+            .then(|| buffer.handle.read_with(cx, |buffer, _| buffer.text()));
+
         // Only explicitly configured formatters surface their failures;
         // auto-resolved ones stay silent so a missing optional tool
         // (e.g. prettier) does not warn on every save.
@@ -1980,10 +1984,64 @@ impl LocalLspStore {
             }
         }
 
+        if let Some(text_before_formatters) = text_before_formatters {
+            Self::revert_content_changes(
+                buffer,
+                formatting_transaction_id,
+                text_before_formatters,
+                logger,
+                cx,
+            )
+            .await?;
+        }
+
         match format_error {
             Some(err) => Err(err),
             None => Ok(()),
         }
+    }
+
+    /// Undoes every formatter hunk that changes more than whitespace, so a
+    /// formatter can re-indent and re-wrap but never rewrite a token — prettier
+    /// requoting YAML strings is the case that motivated it. Whole hunks are
+    /// reverted rather than filtered token by token: a hunk's whitespace only
+    /// means something together with the tokens it was produced alongside, and
+    /// keeping half of it can break indentation-sensitive files.
+    async fn revert_content_changes(
+        buffer: &FormattableBuffer,
+        formatting_transaction_id: clock::Lamport,
+        text_before_formatters: String,
+        logger: zlog::Logger,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let (text_after_formatters, version, line_ending) =
+            buffer.handle.read_with(cx, |buffer, _| {
+                (buffer.text(), buffer.version(), buffer.line_ending())
+            });
+        if text_after_formatters == text_before_formatters {
+            return Ok(());
+        }
+        let edits = cx
+            .background_spawn(async move {
+                content_changing_hunk_reverts(&text_before_formatters, &text_after_formatters)
+            })
+            .await;
+        if edits.is_empty() {
+            return Ok(());
+        }
+        zlog::info!(
+            logger =>
+            "discarding {} formatter hunk(s) that change more than whitespace",
+            edits.len()
+        );
+        let diff = Diff {
+            base_version: version,
+            line_ending,
+            edits,
+        };
+        extend_formatting_transaction(buffer, formatting_transaction_id, cx, |buffer, cx| {
+            buffer.apply_diff(diff, cx);
+        })
     }
 
     async fn apply_formatter(
@@ -17004,6 +17062,37 @@ pub fn ensure_uniform_list_compatible_label(label: &mut CodeLabel) {
 
 /// Apply edits to the buffer that will become part of the formatting transaction.
 /// Fails if the buffer has been edited since the start of that transaction.
+/// Returns edits against `after` that restore, from `before`, every line
+/// hunk whose non-whitespace characters differ between the two texts.
+fn content_changing_hunk_reverts(before: &str, after: &str) -> Vec<(Range<usize>, Arc<str>)> {
+    fn line_starts(text: &str) -> Vec<usize> {
+        std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(index, _)| index + 1))
+            .collect()
+    }
+    fn byte_range(line_starts: &[usize], text_len: usize, rows: Range<u32>) -> Range<usize> {
+        let offset = |row: u32| line_starts.get(row as usize).copied().unwrap_or(text_len);
+        offset(rows.start)..offset(rows.end)
+    }
+    fn non_whitespace(text: &str) -> impl Iterator<Item = char> + '_ {
+        text.chars().filter(|character| !character.is_whitespace())
+    }
+
+    let before_line_starts = line_starts(before);
+    let after_line_starts = line_starts(after);
+    language::line_diff(before, after)
+        .into_iter()
+        .filter_map(|(before_rows, after_rows)| {
+            let before_range = byte_range(&before_line_starts, before.len(), before_rows);
+            let after_range = byte_range(&after_line_starts, after.len(), after_rows);
+            let before_hunk = &before[before_range];
+            let after_hunk = &after[after_range.clone()];
+            (!non_whitespace(before_hunk).eq(non_whitespace(after_hunk)))
+                .then(|| (after_range, Arc::from(before_hunk)))
+        })
+        .collect()
+}
+
 fn extend_formatting_transaction(
     buffer: &FormattableBuffer,
     formatting_transaction_id: text::TransactionId,
@@ -17027,6 +17116,51 @@ fn extend_formatting_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn apply_reverts(before: &str, after: &str) -> String {
+        let mut text = after.to_string();
+        for (range, replacement) in content_changing_hunk_reverts(before, after)
+            .into_iter()
+            .rev()
+        {
+            text.replace_range(range, &replacement);
+        }
+        text
+    }
+
+    #[test]
+    fn content_changing_hunk_reverts_keeps_whitespace_only_hunks() {
+        let before = "list:\n- a\n- b\nkey:   value\n";
+        let after = "list:\n  - a\n  - b\nkey: value\n";
+        assert!(content_changing_hunk_reverts(before, after).is_empty());
+        assert_eq!(apply_reverts(before, after), after);
+    }
+
+    #[test]
+    fn content_changing_hunk_reverts_restores_requoted_hunks_only() {
+        let before = "first: 'a'\nkept: x\nsecond:   b\nkept: y\nthird: 'c'\n";
+        let after = "first: \"a\"\nkept: x\nsecond: b\nkept: y\nthird: \"c\"\n";
+        assert_eq!(
+            apply_reverts(before, after),
+            "first: 'a'\nkept: x\nsecond: b\nkept: y\nthird: 'c'\n"
+        );
+    }
+
+    #[test]
+    fn content_changing_hunk_reverts_restores_a_whole_mixed_hunk() {
+        // Keeping the re-indented line while restoring its requoted neighbour
+        // would nest `- b` under `- 'a'` and change what the YAML means.
+        let before = "list:\n- 'a'\n- b\n";
+        let after = "list:\n  - \"a\"\n  - b\n";
+        assert_eq!(apply_reverts(before, after), before);
+    }
+
+    #[test]
+    fn content_changing_hunk_reverts_handles_text_without_final_newline() {
+        assert_eq!(apply_reverts("a = 'x'", "a = \"x\"\n"), "a = 'x'");
+        assert_eq!(apply_reverts("f( x )", "f(x)\n"), "f(x)\n");
+        assert_eq!(apply_reverts("x\n", "x\ny = 1\n"), "x\n");
+    }
 
     #[test]
     fn should_log_lsp_request_failure_suppresses_known_noise() {

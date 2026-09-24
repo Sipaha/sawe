@@ -136,6 +136,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/gpui_tokio/src/gpui_tokio.rs` | Adds `Tokio::try_handle(cx) -> Option<tokio::runtime::Handle>` — the non-panicking analogue of `Tokio::handle`, used by `remote_control::store::start_listener_async` to short-circuit when the runtime isn't installed (rather than panic deep in the bootstrap path). | `remote_control` (R-2) |
 | `assets/keymaps/default-*.json` | Default shortcuts for Solutions / sessions. Adds `alt-shift-f10` → `run_config::Run`, `alt-shift-f9` → `run_config::Debug`, `alt-shift-f2` → `run_config::Stop` (Workspace context; IntelliJ-style — `alt-shift` variants chosen because `shift-f10`/`shift-f9`/`ctrl-f2` are already bound in Editor context). | `solutions_ui` / `run_config_ui` |
 | `assets/settings/default.json`, `assets/settings/initial_user_settings.json`, `assets/fonts/jetbrains-mono/` | Default `solutions.root`; default `icon_theme: "Material Icon Theme"` + auto-install of the matching extension (colored project tree, IDEA-like, vs upstream's monochrome `Zed (Default)`); default `toolbar.{breadcrumbs,quick_actions,selections_menu}: false` (IDEA-style — no toolbar row under the tab bar; whole row disappears when all items hidden, Ctrl+F search bars unaffected; re-enable per-user in settings or per-editor via `editor::ToggleBreadcrumb`); default `project_panel.{sticky_scroll,auto_fold_dirs}: false` (the pinned ancestor rows cover the tree while scrolling, and the folded `a/b/c` chains hide real directory levels — both are opt-in here, doc-comment defaults in `settings_content/src/workspace.rs` updated to match); **decision #184** — the editor is sized and shaped against IDEA: bundled JetBrains Mono as `buffer_font_family` **and, since #205, as `ui_font_family`**, `buffer_font_size: 13`, `buffer_line_height: {custom: 1.662}`, `ui_font_size: 16`, `agent_ui_font_size: 14` (#206), and the seed template pins no font size at all. | `solutions` / rebrand |
+| `crates/project/src/lsp_store.rs`, `crates/language/src/language_settings.rs`, `crates/settings_content/src/language.rs`, `crates/settings/src/vscode_import.rs`, `crates/settings_ui/src/page_data.rs`, `crates/editor/src/editor_tests.rs`, `crates/agent/src/tools/write_file_tool.rs`, `crates/collab/tests/integration/test_server.rs`, `assets/settings/default.json`, `assets/keymaps/default-{linux,windows}.json` | **Decision #212.** `format_on_save` defaults to `off` with no per-language `on` overrides; the new `format_whitespace_only` language setting (default `true`) makes `format_buffer_locally` revert every formatter line hunk that changes non-whitespace characters (`revert_content_changes` / `content_changing_hunk_reverts`). The editor and collab test harnesses and the agent's format-on-save test pin upstream's semantics for the formatting tests written against them; `ctrl-alt-l` → `editor::Format` in full editors. | `project` |
 | `crates/zed/Cargo.toml` `[[bin]]` | Binary name overridden to `sawe` (cargo crate `zed` unchanged). | rebrand |
 | `.cargo/config.toml` | `[target.x86_64-unknown-linux-gnu]` block forcing `-fuse-ld=mold`. See decision 15. | build |
 | `crates/terminal_view/src/terminal_panel.rs` | Dropped the now-unused `TerminalDockPosition` import (a local edit had removed its only use, leaving a dead import that failed `clippy -D warnings`). | upstream-fix |
@@ -5917,3 +5918,40 @@ keeps it) and `console_panel`'s `new_chat_action_does_not_double_lease_the_works
 asserts both actions open an unstarted tab and connect nothing. Checked in a probe: "+" → Claude
 opens `Claude New`, status `New`, and the editor has no child process.
 
+### 212. Formatting runs only when asked, and may only change whitespace
+
+The maintainer, 2026-09-24: *«Надо отключить автоформатирование файлов при сохранении. Оставить
+форматирование при нажатии ctrl+alt+l но при этом менять содержимое НЕЛЬЗЯ (у меня редактор yaml
+зачем-то кавычки все перелопатил)»*, then *«убирание лишних пробельных символов можно оставить»*.
+
+What: `format_on_save` defaults to `off`, and the twelve upstream per-language `"on"` overrides
+(Astro, Dart, EEx, Elixir, Elm, Go, GraphQL, HEEx, Kotlin, Rust, Starlark, Zig) are gone, so every
+language inherits it. `editor::Format` is now bound to `ctrl-alt-l` in the `Editor && mode == full`
+block of `default-linux.json` and `default-windows.json` — Sawe's base keymap is VSCode, where that
+chord was only the workspace-level `lsp_tool::ToggleMenu`, which still answers it outside a full
+editor. Format still runs the configured formatter, but with the new language setting `format_whitespace_only` (default `true`)
+`format_buffer_locally` snapshots the text before the formatter chain and, after it, line-diffs
+the two and restores every hunk whose non-whitespace characters differ. The restore joins the
+formatting transaction, so one undo takes back the whole format. `remove_trailing_whitespace_on_save`
+and `ensure_final_newline_on_save` are untouched and still run on save.
+
+Why a guard on the result rather than formatter options: the YAML case is prettier, which has no
+"preserve quotes" option — `singleQuote` only flips which quote it rewrites to — and the same class
+of rewrite comes from LSP formatters, external commands and `code_actions_on_format`. Checking the
+output is the one place that covers all of them. Why whole hunks rather than per-token filtering:
+a hunk's whitespace is only correct together with the tokens it was produced alongside. Keeping
+the re-indent of `  - b` while restoring the requoted `- 'a'` above it would nest one list item
+under the other and change what the YAML means. The cost is that a hunk mixing layout and
+requoting keeps neither, so in a YAML file full of single quotes prettier will often change
+nothing. That is the intended trade: formatting must not change content.
+
+How to apply: the guard is a per-language setting, so a project that wants a code-rewriting
+formatter sets `"format_whitespace_only": false` for that language. Tests that exercise formatters
+producing token changes must opt out the same way — `editor_tests::init_test` pins
+`format_on_save: on` / `format_whitespace_only: false` for the upstream-written suite, and
+`test_document_format_whitespace_only_discards_content_changes` turns the guard back on
+(mutation-checked: skipping the revert fails it). The pure hunk logic is covered by
+`lsp_store::tests::content_changing_hunk_reverts_*`. Checked in a probe with the real prettier:
+`ctrl-alt-l` on `name: 'app'` / `version:    2` / `items:` + unindented list re-indented the list,
+left `'app'` alone — and left `version:    2` too, because it shares a hunk with the requoted line —
+and `ctrl-s` wrote the file byte for byte.

@@ -137,6 +137,9 @@
   {
     "context": "Editor && mode == full",
     "bindings": {
+      // IDEA's "Reformat Code"; outranks the workspace-level `lsp_tool::ToggleMenu`
+      // binding only while a full editor is focused.
+      "ctrl-alt-l": "editor::Format",
       "shift-enter": "editor::Newline",
       "enter": "editor::Newline",
       "ctrl-enter": "editor::NewlineBelow",

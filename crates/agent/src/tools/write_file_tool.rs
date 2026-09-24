@@ -603,6 +603,9 @@ mod tests {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.project.all_languages.defaults.format_on_save = Some(FormatOnSave::On);
+                    // The fake formatter replaces the whole text, which the
+                    // whitespace-only guard would rightly undo.
+                    settings.project.all_languages.defaults.format_whitespace_only = Some(false);
                     settings.project.all_languages.defaults.formatter =
                         Some(language::language_settings::FormatterList::default());
                 });

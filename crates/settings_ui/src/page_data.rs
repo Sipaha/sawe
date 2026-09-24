@@ -9612,7 +9612,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
         ]
     }
 
-    fn formatting_section() -> [SettingsPageItem; 8] {
+    fn formatting_section() -> [SettingsPageItem; 9] {
         [
             SettingsPageItem::SectionHeader("Formatting"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -9639,6 +9639,26 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
                         },
                     },
                 ),
+                metadata: None,
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Format Whitespace Only",
+                description: "Keep only the whitespace changes a formatter makes, discarding any change to quotes, punctuation or other characters.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("languages.$(language).format_whitespace_only"),
+                    pick: |settings_content| {
+                        language_settings_field(settings_content, |language| {
+                            language.format_whitespace_only.as_ref()
+                        })
+                    },
+                    write: |settings_content, value, _| {
+                        language_settings_field_mut(settings_content, value, |language, value| {
+                            language.format_whitespace_only = value;
+                        })
+                    },
+                }),
                 metadata: None,
                 files: USER | PROJECT,
             }),

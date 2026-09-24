@@ -582,6 +582,7 @@ impl VsCodeSettings {
             extend_comment_on_newline: None,
             extend_list_on_newline: None,
             indent_list_on_tab: None,
+            format_whitespace_only: None,
             // In VS Code, `editor.formatOnSaveMode` only applies when `editor.formatOnSave` is enabled.
             format_on_save: self.read_bool("editor.formatOnSave").map(|enabled| {
                 if enabled {

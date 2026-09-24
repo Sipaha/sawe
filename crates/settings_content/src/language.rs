@@ -564,8 +564,15 @@ pub struct LanguageSettingsContent {
     pub indent_guides: Option<IndentGuideSettingsContent>,
     /// Whether or not to perform a buffer format before saving.
     ///
-    /// Default: on
+    /// Default: off
     pub format_on_save: Option<FormatOnSave>,
+    /// Whether formatting may only change whitespace. When enabled, every part
+    /// of a formatter's result that would change anything other than
+    /// whitespace (quotes, trailing commas, parentheses, reordered imports) is
+    /// discarded, and only the layout changes are kept.
+    ///
+    /// Default: true
+    pub format_whitespace_only: Option<bool>,
     /// Whether or not to remove any trailing whitespace from lines of a buffer
     /// before saving it.
     ///

@@ -79,6 +79,8 @@ pub struct LanguageSettings {
     pub indent_guides: IndentGuideSettings,
     /// Whether or not to perform a buffer format before saving.
     pub format_on_save: FormatOnSave,
+    /// Whether formatting may only change whitespace.
+    pub format_whitespace_only: bool,
     /// Whether or not to remove any trailing whitespace from lines of a buffer
     /// before saving it.
     pub remove_trailing_whitespace_on_save: bool,
@@ -851,6 +853,7 @@ impl settings::Settings for AllLanguageSettings {
                     background_coloring: indent_guides.background_coloring.unwrap(),
                 },
                 format_on_save: settings.format_on_save.unwrap(),
+                format_whitespace_only: settings.format_whitespace_only.unwrap(),
                 remove_trailing_whitespace_on_save: settings
                     .remove_trailing_whitespace_on_save
                     .unwrap(),

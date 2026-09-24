@@ -2204,7 +2204,7 @@ Non-negative `integer` values
 - Setting: `format_on_save`
 - Default: `off`
 
-Zed ships `"format_on_save": "on"` as a per-language default for Astro, Dart, EEx, Elixir, Elm, Go, GraphQL, HEEx, Kotlin, Rust, Starlark, and Zig. Every other language uses the top-level default above. Use [`languages`](#languages) to configure individual languages differently.
+Sawe ships no per-language override, so every language uses the top-level default above: nothing is reformatted unless you ask for it (`editor: format`, `ctrl-alt-l` in the JetBrains keymap). Use [`languages`](#languages) to configure individual languages differently. Whatever runs the formatter, [`format_whitespace_only`](#format-whitespace-only) decides how much of its result is kept.
 
 **Options**
 
@@ -2243,6 +2243,20 @@ This mode requires source control and LSP range formatting support. If no git di
 ```
 
 Similar to `modifications`, but behaves like `on` when range formatting cannot be applied: when no git diff is available (e.g., when source control is unavailable) or when the language server does not support range formatting. When a git diff is available but contains no unstaged changes, nothing is formatted.
+
+## Format Whitespace Only {#format-whitespace-only}
+
+- Description: Whether formatting may only change whitespace.
+- Setting: `format_whitespace_only`
+- Default: `true`
+
+When `true`, the formatter's result is compared with the buffer line hunk by line hunk, and every hunk that changes anything other than whitespace — requoted strings, added trailing commas, inserted parentheses, reordered imports — is discarded whole. Re-indentation, line wrapping and spacing are kept. This applies to every formatter, including `code_actions_on_format`, which therefore cannot rewrite code either while it is on. Set it to `false` to accept whatever the formatter produces:
+
+```json [settings]
+{
+  "format_whitespace_only": false
+}
+```
 
 ## Formatter
 
@@ -3394,6 +3408,7 @@ The following settings can be overridden for each specific language:
 - [`ensure_final_newline_on_save`](#ensure-final-newline-on-save)
 - [`line_ending`](#line-ending)
 - [`format_on_save`](#format-on-save)
+- [`format_whitespace_only`](#format-whitespace-only)
 - [`formatter`](#formatter)
 - [`hard_tabs`](#hard-tabs)
 - [`preferred_line_length`](#preferred-line-length)

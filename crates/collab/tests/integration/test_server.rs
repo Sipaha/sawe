@@ -180,7 +180,12 @@ impl TestServer {
             if cx.has_global::<SettingsStore>() {
                 panic!("Same cx used to create two test clients")
             }
-            let settings = SettingsStore::test(cx);
+            let mut settings = SettingsStore::test(cx);
+            // The formatting tests were written against formatters that may
+            // rewrite tokens; Sawe's default keeps only whitespace changes.
+            settings.update_user_settings(cx, |settings| {
+                settings.project.all_languages.defaults.format_whitespace_only = Some(false);
+            });
             cx.set_global(settings);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
         });

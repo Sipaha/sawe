@@ -20967,6 +20967,89 @@ async fn test_range_format_respects_language_tab_size_override(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_document_format_whitespace_only_discards_content_changes(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |settings| {
+        settings.defaults.formatter = Some(FormatterList::Single(Formatter::LanguageServer(
+            settings::LanguageServerFormatterSpecifier::Current,
+        )));
+        settings.defaults.format_whitespace_only = Some(true);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/file.rs"), Default::default()).await;
+    let project = Project::test(fs, [path!("/").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                document_formatting_provider: Some(lsp::OneOf::Left(true)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/file.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), buffer, window, cx)
+    });
+    let original_text = "a = 'x'\nkeep\nb   = 1\n";
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_text(original_text, window, cx)
+    });
+    let fake_server = fake_servers.next().await.unwrap();
+
+    let format = editor
+        .update_in(cx, |editor, window, cx| {
+            editor.perform_format(
+                project.clone(),
+                FormatTrigger::Manual,
+                FormatTarget::Buffers(editor.buffer().read(cx).all_buffers()),
+                window,
+                cx,
+            )
+        })
+        .unwrap();
+    fake_server
+        .set_request_handler::<lsp::request::Formatting, _, _>(move |_, _| async move {
+            Ok(Some(vec![
+                lsp::TextEdit::new(
+                    lsp::Range::new(lsp::Position::new(0, 4), lsp::Position::new(0, 7)),
+                    "\"x\"".to_string(),
+                ),
+                lsp::TextEdit::new(
+                    lsp::Range::new(lsp::Position::new(2, 1), lsp::Position::new(2, 4)),
+                    " ".to_string(),
+                ),
+            ]))
+        })
+        .next()
+        .await;
+    format.await;
+    assert_eq!(
+        editor.update(cx, |editor, cx| editor.text(cx)),
+        "a = 'x'\nkeep\nb = 1\n",
+        "the requoting hunk is discarded, the whitespace-only hunk is kept"
+    );
+
+    editor.update_in(cx, |editor, window, cx| editor.undo(&Undo, window, cx));
+    assert_eq!(
+        editor.update(cx, |editor, cx| editor.text(cx)),
+        original_text,
+        "the kept formatting and the discarded hunks undo as one step"
+    );
+}
+
+#[gpui::test]
 async fn test_document_format_manual_trigger(cx: &mut TestAppContext) {
     init_test(cx, |settings| {
         settings.defaults.formatter = Some(FormatterList::Single(Formatter::LanguageServer(
@@ -41677,6 +41760,13 @@ pub(crate) fn init_test(cx: &mut TestAppContext, f: fn(&mut AllLanguageSettingsC
         crate::init(cx);
     });
     zlog::init_test();
+    // The formatting tests below were written against formatters that run on
+    // save and may rewrite tokens; Sawe's defaults do neither, so pin them here
+    // and let the whitespace-only guard be exercised explicitly.
+    update_test_language_settings(cx, &|settings| {
+        settings.defaults.format_on_save = Some(FormatOnSave::On);
+        settings.defaults.format_whitespace_only = Some(false);
+    });
     update_test_language_settings(cx, &f);
 }
 

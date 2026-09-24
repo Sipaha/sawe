@@ -1800,7 +1800,12 @@
   //   "modifications_if_available" — same, but falls back to formatting the whole
   //     buffer when range formatting cannot be used
   // Keep in mind, if the autosave with delay is enabled, format_on_save will be ignored
-  "format_on_save": "on",
+  "format_on_save": "off",
+  // Whether formatting may only change whitespace. When true, every part of a
+  // formatter's result that would change anything other than whitespace
+  // (quotes, trailing commas, parentheses, reordered imports) is discarded and
+  // only the layout changes are kept.
+  "format_whitespace_only": true,
   // How to perform a buffer format. This setting can take multiple values:
   //
   // 1. Default. Format files using Zed's Prettier integration (if applicable),
@@ -2587,7 +2592,6 @@
   // Different settings for specific languages.
   "languages": {
     "Astro": {
-      "format_on_save": "on",
       "language_servers": ["astro-language-server", "..."],
       "prettier": {
         "allowed": true,
@@ -2622,7 +2626,6 @@
       },
     },
     "Dart": {
-      "format_on_save": "on",
       "tab_size": 2,
     },
     "Diff": {
@@ -2631,15 +2634,12 @@
       "ensure_final_newline_on_save": false,
     },
     "EEx": {
-      "format_on_save": "on",
       "language_servers": ["elixir-ls", "!expert", "!dexter", "!next-ls", "!lexical", "..."],
     },
     "Elixir": {
-      "format_on_save": "on",
       "language_servers": ["elixir-ls", "!expert", "!dexter", "!next-ls", "!lexical", "!emmet-language-server", "..."],
     },
     "Elm": {
-      "format_on_save": "on",
       "tab_size": 4,
     },
     "Erlang": {
@@ -2651,7 +2651,6 @@
       "preferred_line_length": 72,
     },
     "Go": {
-      "format_on_save": "on",
       "hard_tabs": true,
       "code_actions_on_format": {
         "source.organizeImports": true,
@@ -2659,13 +2658,11 @@
       "debuggers": ["Delve"],
     },
     "GraphQL": {
-      "format_on_save": "on",
       "prettier": {
         "allowed": true,
       },
     },
     "HEEx": {
-      "format_on_save": "on",
       "language_servers": ["elixir-ls", "!expert", "!dexter", "!next-ls", "!lexical", "..."],
     },
     "HTML": {
@@ -2702,7 +2699,6 @@
       "language_servers": ["!ruby-lsp", "..."],
     },
     "Kotlin": {
-      "format_on_save": "on",
       "language_servers": ["!kotlin-language-server", "kotlin-lsp", "..."],
     },
     "LaTeX": {
@@ -2769,7 +2765,6 @@
       ],
     },
     "Rust": {
-      "format_on_save": "on",
       "debuggers": ["CodeLLDB"],
     },
     "SCSS": {
@@ -2778,7 +2773,6 @@
       },
     },
     "Starlark": {
-      "format_on_save": "on",
       "language_servers": ["starpls", "!buck2-lsp", "!tilt", "..."],
     },
     "Svelte": {
@@ -2831,7 +2825,6 @@
       "language_servers": ["!ruby-lsp", "..."],
     },
     "Zig": {
-      "format_on_save": "on",
       "language_servers": ["zls", "..."],
     },
   },
