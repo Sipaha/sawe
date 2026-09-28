@@ -1,5 +1,5 @@
 use crate::git::{GitProgress, clone_from_remote, fetch_all};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -51,8 +51,39 @@ pub async fn ensure_cache(
             );
         }
     }
-    clone_from_remote(remote_url, &path, on_progress).await?;
+    // Clone beside the cache and move it into place only once it is whole.
+    // `git clone --bare` writes `HEAD` in its first milliseconds, so a clone
+    // that dies half-way (cancelled add, crash, power loss) left a directory
+    // that `is_usable_mirror` accepts — and every later add of the project
+    // was cut from an empty or partial repository.
+    let partial = partial_path(&path);
+    if partial.exists() {
+        let doomed = partial.clone();
+        smol::unblock(move || std::fs::remove_dir_all(&doomed))
+            .await
+            .with_context(|| format!("removing stale {}", partial.display()))?;
+    }
+    clone_from_remote(remote_url, &partial, on_progress).await?;
+    if path.exists() {
+        // The wipe above failed and was only logged; `rename` onto a
+        // non-empty directory would fail with a far less useful message.
+        let doomed = path.clone();
+        smol::unblock(move || std::fs::remove_dir_all(&doomed))
+            .await
+            .with_context(|| format!("removing stale {}", path.display()))?;
+    }
+    std::fs::rename(&partial, &path).with_context(|| {
+        format!("moving {} into place at {}", partial.display(), path.display())
+    })?;
     Ok(path)
+}
+
+/// Where [`ensure_cache`] clones before the result is complete. A sibling of
+/// the cache, so the final `rename` stays on one filesystem.
+fn partial_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    path.with_file_name(name)
 }
 
 pub async fn refresh_cache(
@@ -158,6 +189,40 @@ mod tests {
     use super::*;
     use crate::git::test_support;
     use tempfile::tempdir;
+
+    /// A clone that fails must leave nothing `ensure_cache` would later
+    /// mistake for a usable mirror — a bare clone writes `HEAD` long before
+    /// it has any objects.
+    #[test]
+    fn a_failed_clone_leaves_no_cache_behind() {
+        let dir = tempdir().expect("tempdir");
+        let cache_root = dir.path().join("cache");
+        let missing = dir.path().join("no-such-repo.git");
+        let url = missing.to_str().expect("path to str").to_string();
+
+        let result = smol::block_on(ensure_cache(&cache_root, &url, |_| {}));
+        assert!(result.is_err(), "cloning a missing repo must fail");
+        let path = cache_path(&cache_root, &url);
+        assert!(!path.exists(), "left {}", path.display());
+        assert!(!partial_path(&path).exists(), "left the partial clone");
+    }
+
+    /// The leftover of a clone that was killed mid-way (a `.partial` dir) is
+    /// wiped, not tripped over, by the next attempt.
+    #[test]
+    fn ensure_cache_clears_a_stale_partial_clone() {
+        let dir = tempdir().expect("tempdir");
+        let bare = smol::block_on(test_support::make_bare_with_one_commit(dir.path()));
+        let cache_root = dir.path().join("cache");
+        let url = bare.to_str().expect("path to str").to_string();
+        let partial = partial_path(&cache_path(&cache_root, &url));
+        std::fs::create_dir_all(&partial).expect("mkdir partial");
+        std::fs::write(partial.join("HEAD"), "ref: refs/heads/master\n").expect("write junk");
+
+        let path = smol::block_on(ensure_cache(&cache_root, &url, |_| {})).expect("ensure_cache");
+        assert!(is_usable_mirror(&path));
+        assert!(!partial.exists(), "the partial clone was not consumed");
+    }
 
     #[test]
     fn repo_key_is_stable_across_runs() {

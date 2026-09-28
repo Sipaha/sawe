@@ -29,6 +29,7 @@ git.workspace = true
 globset.workspace = true
 gpui.workspace = true
 image.workspace = true
+libc.workspace = true
 language.workspace = true
 log.workspace = true
 lsp.workspace = true

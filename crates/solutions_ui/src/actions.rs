@@ -68,9 +68,10 @@ pub struct RenameSolution {
 }
 
 /// Open the edit modal for a catalog project (Name / Remote URL / default
-/// branch). Triggered from the failed in-flight add row in the Solutions
-/// panel — the most common reason an add fails is a wrong URL, and this
-/// is the path the user clicks to fix it before retrying.
+/// branch). Triggered from the pencil on every catalog row of the add-project
+/// pickers, and from the right-click menu of an in-flight or failed add tab —
+/// the most common reason an add fails is a wrong URL, and this is the path
+/// the user clicks to fix it before retrying.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = solutions)]
 pub struct EditCatalogProject {

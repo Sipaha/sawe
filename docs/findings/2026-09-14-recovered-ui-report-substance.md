@@ -69,11 +69,11 @@ Verified against the tree at `5f44405591`, not merely copied from the reports.
 
 - **No UI can delete a catalog project.** `DeleteCatalogProject` is registered in
   `solutions_ui::modals` (`modals.rs:64`) and has a modal, but **no dispatch site anywhere** —
-  `grep` outside its own module finds only the registration. `EditCatalogProject` has exactly
-  one, the failed-add ghost tab (`project_tab.rs:461`), so a catalog row added successfully
-  and later needing a URL change is reachable only through the `catalog.*` MCP tools. The
-  2026-09-04 report flagged this; `clear_failed_add` / `cancel_add_member` got their callers
-  (`project_tab.rs:445,468,513`), the catalog-management surface never did.
+  `grep` outside its own module finds only the registration. (Edit got its surface on
+  2026-09-28: a pencil on every catalog row of both add-project pickers, `secondary-enter` on
+  the selected row, and "Edit Project…" on the in-flight add tab as well as the failed one.
+  Before that the only dispatch site was the failed-add tab, so a clone that hung instead of
+  failing left no way to fix its URL.)
 - **`normalize_remote_url` runs on edit as well as add**, so a pre-existing catalog row whose
   URL would now be refused cannot be re-saved unchanged through the Edit modal. Intentional,
   but it is a behaviour change for any bad row already on disk.

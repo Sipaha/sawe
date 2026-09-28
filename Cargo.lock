@@ -18259,6 +18259,7 @@ dependencies = [
  "gpui",
  "image",
  "language",
+ "libc",
  "log",
  "lsp",
  "paths",

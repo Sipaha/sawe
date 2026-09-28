@@ -6,11 +6,11 @@ use gpui::{
 use picker::{Picker, PickerDelegate};
 use settings::Settings as _;
 use solutions::{CatalogId, SolutionId, SolutionStore, SolutionsSettings, default_cache_root};
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
-use crate::actions::AddCatalogProject;
+use crate::actions::{AddCatalogProject, EditCatalogProject};
 
 pub struct AddMemberPicker {
     picker: Entity<Picker<AddMemberDelegate>>,
@@ -187,7 +187,7 @@ impl PickerDelegate for AddMemberDelegate {
         Task::ready(())
     }
 
-    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+    fn confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let Some(&idx) = self.matches.get(self.selected_index) else {
             return;
         };
@@ -195,6 +195,18 @@ impl PickerDelegate for AddMemberDelegate {
             return;
         };
         match entry {
+            // `secondary-enter` / the row's pencil: fix the project (usually
+            // its remote URL) instead of cloning it.
+            PickerEntry::Catalog(catalog) if secondary => {
+                let id = catalog.id.0;
+                self.dismissed(window, cx);
+                let Some(workspace) = self.workspace.upgrade() else {
+                    return;
+                };
+                workspace.update(cx, |_, cx| {
+                    window.dispatch_action(Box::new(EditCatalogProject { id }), cx);
+                });
+            }
             PickerEntry::Catalog(catalog) => {
                 let cat_id = catalog.id;
                 let sol_id = self.solution_id;
@@ -239,7 +251,7 @@ impl PickerDelegate for AddMemberDelegate {
         ix: usize,
         selected: bool,
         _: &mut Window,
-        _: &mut Context<Picker<Self>>,
+        cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let entry_idx = *self.matches.get(ix)?;
         let entry = self.candidates.get(entry_idx)?;
@@ -249,9 +261,27 @@ impl PickerDelegate for AddMemberDelegate {
             .toggle_state(selected);
         let item = match entry {
             PickerEntry::Catalog(c) => item.child(Label::new(c.name.clone())).end_slot(
-                Label::new(c.remote_url.clone())
-                    .color(Color::Muted)
-                    .size(LabelSize::Small),
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        Label::new(c.remote_url.clone())
+                            .color(Color::Muted)
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
+                    .child(
+                        IconButton::new(("edit-catalog-project", ix), IconName::Pencil)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Edit Project…"))
+                            .on_click(cx.listener(move |picker, _, window, cx| {
+                                cx.stop_propagation();
+                                window.prevent_default();
+                                picker.delegate.set_selected_index(ix, window, cx);
+                                picker.delegate.confirm(true, window, cx);
+                            })),
+                    ),
             ),
             PickerEntry::AddNew => item
                 .start_slot(

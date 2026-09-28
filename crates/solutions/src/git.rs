@@ -10,12 +10,39 @@ pub struct GitProgress {
     pub percent: Option<u8>,
 }
 
+/// A `git` command for the background jobs of this crate (clone, fetch,
+/// config). Nobody can answer a prompt from one of these: they run behind a
+/// spinner, with no terminal the user can see. So a prompt is made to FAIL
+/// instead of wait:
+///
+/// - `GIT_TERMINAL_PROMPT=0` makes git's own credential prompt ("Username for
+///   'https://github.com':") an immediate error. Without it a private https
+///   remote hung the add forever: git found the editor's controlling tty and
+///   sat reading a username from it.
+/// - A new session (`setsid`) takes the controlling tty away altogether, so
+///   `ssh` asking for a key passphrase or a host-key confirmation fails too —
+///   without overriding the user's `core.sshCommand` / `GIT_SSH_COMMAND`
+///   the way forcing `ssh -o BatchMode=yes` would. It also makes the child a
+///   process-group leader, which is what lets [`drain_command`] take the
+///   transport helpers down with it on cancel.
+/// - stdin is closed, so nothing can be read from the editor's stdin either.
+fn git_command() -> Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    util::set_pre_exec_to_start_new_session(&mut cmd);
+    // stdin is set on the async wrapper, not above: `Command::from` forgets
+    // the std command's stdio and would spawn with an inherited stdin.
+    let mut cmd = Command::from(cmd);
+    cmd.stdin(Stdio::null());
+    cmd
+}
+
 pub async fn run_git(
     cwd: &Path,
     args: &[&str],
     on_progress: impl FnMut(GitProgress),
 ) -> Result<()> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("-C").arg(cwd);
     cmd.args(args);
     drain_command(&mut cmd, on_progress, &format!("git {}", args.join(" "))).await
@@ -30,7 +57,7 @@ pub async fn clone_local(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("clone").arg("--local").arg("--progress");
     cmd.arg(source);
     cmd.arg(target);
@@ -56,7 +83,7 @@ pub async fn clone_from_remote(
     // WITHOUT the server-side `refs/pull/*` (GitHub) / `refs/merge-requests/*`
     // (GitLab) / pipeline refs that `--mirror` (`+refs/*:refs/*`) would drag in
     // and bloat the cache with.
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("clone")
         .arg("--bare")
         .arg("--progress")
@@ -94,7 +121,7 @@ pub async fn checkout(repo: &Path, branch: &str) -> Result<()> {
 
 #[allow(dead_code)]
 pub async fn fetch_all(repo: &Path, on_progress: impl FnMut(GitProgress)) -> Result<()> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("-C")
         .arg(repo)
         .arg("fetch")
@@ -112,9 +139,15 @@ async fn drain_command(
     cmd.stderr(Stdio::piped());
     cmd.stdout(Stdio::null());
 
+    // Dropping this future (a cancelled add) must stop git, not leave it
+    // running detached: an orphaned clone kept the add's `fs_lock` busy for
+    // as long as it lived, and every later add queued behind it.
+    #[cfg(not(unix))]
+    cmd.kill_on_drop(true);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning `{label}` — is `git` in PATH?"))?;
+    let mut group = TerminateGroupOnDrop(Some(child.id()));
     let stderr = child.stderr.take().context("no stderr handle")?;
     let mut reader = BufReader::new(stderr).lines();
     let mut last_err_line = String::new();
@@ -127,6 +160,7 @@ async fn drain_command(
         last_err_line = line;
     }
     let status = child.status().await.context("awaiting git exit")?;
+    group.0 = None;
     if !status.success() {
         let exit_suffix = status
             .code()
@@ -135,6 +169,28 @@ async fn drain_command(
         bail!("{label} failed: {last_err_line}{exit_suffix}");
     }
     Ok(())
+}
+
+/// SIGTERMs the process group of a `git` child that is still running when
+/// its [`drain_command`] future is dropped. The whole group, because a clone
+/// does its network work in a `git-remote-https` / `ssh` grandchild; and
+/// SIGTERM rather than SIGKILL, because git's handler for it removes the
+/// half-written clone directory and reaps the helpers on the way out.
+struct TerminateGroupOnDrop(Option<u32>);
+
+impl Drop for TerminateGroupOnDrop {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.take()
+            && let Ok(pid) = libc::pid_t::try_from(pid)
+        {
+            // SAFETY: plain syscall. The child was spawned by `git_command`
+            // into its own session, so `pid` is its process group id.
+            unsafe {
+                libc::killpg(pid, libc::SIGTERM);
+            }
+        }
+    }
 }
 
 fn parse_progress(line: &str) -> Option<GitProgress> {
@@ -205,6 +261,85 @@ pub mod test_support {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Nothing a background git starts may be able to prompt: not git's own
+    /// credential prompt, not `ssh` reading a passphrase from `/dev/tty`, not
+    /// anything reading stdin. Probed from inside a git alias, so the checks
+    /// run in exactly the environment git hands its helpers.
+    #[cfg(unix)]
+    #[test]
+    fn background_git_cannot_prompt() {
+        let probe = r#"!sh -c 'test "$GIT_TERMINAL_PROMPT" = 0 || { echo prompt-enabled; exit 1; }; if (: </dev/tty) 2>/dev/null; then echo has-tty; exit 1; fi; test "$(readlink /proc/self/fd/0)" = /dev/null || { echo stdin-open; exit 1; }'"#;
+        let mut cmd = git_command();
+        cmd.arg("-c")
+            .arg(format!("alias.probe={probe}"))
+            .arg("probe")
+            .stdout(Stdio::piped());
+        let output = smol::block_on(cmd.output()).expect("run git probe");
+        assert!(
+            output.status.success(),
+            "background git could prompt: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Dropping a running git step (what a cancelled add does) must take the
+    /// whole git process group down — including the grandchild doing the
+    /// actual work, as `git-remote-https` does for a clone. It used to keep
+    /// running, and a clone stuck on a credential prompt outlived its cancel
+    /// indefinitely.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_git_step_terminates_its_process_group() {
+        let dir = tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        // `$$` of the `sh` git spawns for the alias: a grandchild of ours,
+        // i.e. what a transport helper is to a clone.
+        let alias = format!(
+            "alias.hang=!sh -c 'echo $$ > {}; exec sleep 60'",
+            pid_file.display()
+        );
+        smol::block_on(async {
+            let args = ["-c", alias.as_str(), "hang"];
+            let step = run_git(dir.path(), &args, |_| {});
+            let started = async {
+                while !pid_file.exists() {
+                    smol::unblock(|| std::thread::sleep(std::time::Duration::from_millis(20)))
+                        .await;
+                }
+                Ok(())
+            };
+            // Resolves once the helper is up; `step` is dropped here.
+            smol::future::or(started, step)
+                .await
+                .expect("git step started");
+        });
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("read pid")
+            .trim()
+            .parse()
+            .expect("pid");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // Gone, or a zombie waiting for init to reap it: either way the
+            // process no longer runs.
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+            let running = state.is_some_and(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
+            });
+            if !running {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "git's helper {pid} survived the drop of its step"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn run_git_status_succeeds() {

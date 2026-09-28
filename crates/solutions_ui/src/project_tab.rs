@@ -388,7 +388,7 @@ impl RenderOnce for PendingProjectTab {
         let tooltip_meta: SharedString = if failed {
             "Right-click to retry, edit or dismiss".into()
         } else {
-            "Right-click to cancel".into()
+            "Right-click to cancel or edit".into()
         };
         let trailing = if failed {
             Icon::new(IconName::Warning)
@@ -440,11 +440,19 @@ impl RenderOnce for PendingProjectTab {
             .menu(move |window, cx| {
                 ContextMenu::build(window, cx, move |menu, _, _| {
                     if !failed {
-                        return menu.entry("Cancel Clone", None, move |_window, cx| {
-                            SolutionStore::global(cx).update(cx, |store, cx| {
-                                store.cancel_add_member(solution_id, catalog_id, cx);
-                            });
-                        });
+                        // Edit is offered while the clone runs too: a clone of
+                        // a wrong or unreachable URL can take a long while to
+                        // fail, and fixing the URL is the next thing to do.
+                        return menu
+                            .entry("Cancel Clone", None, move |_window, cx| {
+                                SolutionStore::global(cx).update(cx, |store, cx| {
+                                    store.cancel_add_member(solution_id, catalog_id, cx);
+                                });
+                            })
+                            .action(
+                                "Edit Project…",
+                                Box::new(EditCatalogProject { id: catalog_id.0 }),
+                            );
                     }
                     menu.entry("Retry Clone", None, move |_window, cx| {
                         let cache_root = solutions::default_cache_root();

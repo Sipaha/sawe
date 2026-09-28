@@ -8,7 +8,10 @@
 //!
 //! `up`/`down` move the selection and `enter` confirms it; typing parks
 //! the selection on the first matching catalog row so `enter` adds a
-//! match rather than one of the two action rows.
+//! match rather than one of the two action rows. Each catalog row carries a
+//! pencil button (and `secondary-enter`) that opens the catalog project's
+//! edit modal — the only way to fix a project's remote URL before a clone of
+//! it has failed.
 
 use gpui::{
     AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -17,7 +20,7 @@ use gpui::{
 use picker::{Picker, PickerDelegate};
 use solutions::{CatalogId, CatalogProject, SolutionId, SolutionStore, default_cache_root};
 use std::sync::Arc;
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 /// Cap for the scrollable match list — the registry can hold dozens of
@@ -92,6 +95,7 @@ enum ConfirmTarget {
     CreateEmptyProject,
     AddProjectFromGit,
     AddCatalog(CatalogId),
+    EditCatalog(CatalogId),
 }
 
 pub struct AddProjectDelegate {
@@ -150,11 +154,16 @@ impl AddProjectDelegate {
             .unwrap_or(0)
     }
 
-    fn confirm_target(&self) -> Option<ConfirmTarget> {
+    /// `secondary` (`secondary-enter`) edits the selected catalog project
+    /// instead of adding it; on the action rows it changes nothing.
+    fn confirm_target(&self, secondary: bool) -> Option<ConfirmTarget> {
         let candidate_index = *self.matches.get(self.selected_index)?;
         match self.candidates.get(candidate_index)? {
             PickerEntry::CreateEmptyProject => Some(ConfirmTarget::CreateEmptyProject),
             PickerEntry::AddProjectFromGit => Some(ConfirmTarget::AddProjectFromGit),
+            PickerEntry::Catalog(catalog_project) if secondary => {
+                Some(ConfirmTarget::EditCatalog(catalog_project.id))
+            }
             PickerEntry::Catalog(catalog_project) => {
                 Some(ConfirmTarget::AddCatalog(catalog_project.id))
             }
@@ -238,8 +247,8 @@ impl PickerDelegate for AddProjectDelegate {
         Task::ready(())
     }
 
-    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(target) = self.confirm_target() else {
+    fn confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(target) = self.confirm_target(secondary) else {
             return;
         };
         let solution_id = self.solution_id.0;
@@ -259,6 +268,10 @@ impl PickerDelegate for AddProjectDelegate {
                 cx,
             ),
             ConfirmTarget::AddCatalog(catalog_id) => self.add_catalog(catalog_id, cx),
+            ConfirmTarget::EditCatalog(catalog_id) => window.dispatch_action(
+                Box::new(crate::actions::EditCatalogProject { id: catalog_id.0 }),
+                cx,
+            ),
         }
     }
 
@@ -273,7 +286,7 @@ impl PickerDelegate for AddProjectDelegate {
         ix: usize,
         selected: bool,
         _window: &mut Window,
-        _cx: &mut Context<Picker<Self>>,
+        cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let candidate_index = *self.matches.get(ix)?;
         let item = ListItem::new(ix)
@@ -299,14 +312,37 @@ impl PickerDelegate for AddProjectDelegate {
                 let label = SharedString::from(catalog_project.name.clone());
                 let url = SharedString::from(catalog_project.remote_url.clone());
                 item.child(Label::new(label).truncate()).end_slot(
-                    Label::new(url)
-                        .color(Color::Muted)
-                        .size(LabelSize::Small)
-                        .truncate(),
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            Label::new(url)
+                                .color(Color::Muted)
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        )
+                        .child(edit_catalog_button(ix, cx)),
                 )
             }
         })
     }
+}
+
+/// The pencil at the end of a catalog row: opens the project's edit modal
+/// (name / remote URL / default branch). Selecting the row first and going
+/// through `confirm(secondary = true)` keeps the click and `secondary-enter`
+/// on one path.
+fn edit_catalog_button(ix: usize, cx: &mut Context<Picker<AddProjectDelegate>>) -> IconButton {
+    IconButton::new(("edit-catalog-project", ix), IconName::Pencil)
+        .icon_size(IconSize::Small)
+        .icon_color(Color::Muted)
+        .tooltip(Tooltip::text("Edit Project…"))
+        .on_click(cx.listener(move |picker, _, window, cx| {
+            cx.stop_propagation();
+            window.prevent_default();
+            picker.delegate.set_selected_index(ix, window, cx);
+            picker.delegate.confirm(true, window, cx);
+        }))
 }
 
 #[cfg(test)]
@@ -377,9 +413,39 @@ mod tests {
                 "the two action rows plus the two `bun` catalog entries survive the filter"
             );
             assert_eq!(
-                picker.delegate.confirm_target(),
+                picker.delegate.confirm_target(false),
                 Some(ConfirmTarget::AddCatalog(CatalogId(2))),
                 "enter must add the FIRST matching catalog entry, not an action row"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn secondary_enter_edits_the_catalog_row_instead_of_adding_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (picker, _dir, cx) = build_picker(vec![catalog(1, "alpha"), catalog(2, "bundles")], cx);
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.update_matches("bun".into(), window, cx);
+        });
+
+        picker.update(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.confirm_target(true),
+                Some(ConfirmTarget::EditCatalog(CatalogId(2))),
+            );
+        });
+
+        // On an action row there is nothing to edit: secondary behaves like
+        // a plain confirm.
+        picker.update_in(cx, |picker, window, cx| {
+            picker.update_matches("zzz-no-such-project".into(), window, cx);
+        });
+        picker.update(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.confirm_target(true),
+                Some(ConfirmTarget::CreateEmptyProject),
             );
         });
     }
@@ -402,7 +468,7 @@ mod tests {
 
         picker.update(cx, |picker, _| {
             assert_eq!(
-                picker.delegate.confirm_target(),
+                picker.delegate.confirm_target(false),
                 Some(ConfirmTarget::AddCatalog(CatalogId(3))),
                 "down must move from the first matching catalog entry to the second"
             );
@@ -425,7 +491,7 @@ mod tests {
                 "up from the first catalog row must land on the git action row, not off the list"
             );
             assert_eq!(
-                picker.delegate.confirm_target(),
+                picker.delegate.confirm_target(false),
                 Some(ConfirmTarget::AddProjectFromGit)
             );
         });
@@ -446,7 +512,7 @@ mod tests {
         picker.update(cx, |picker, _| {
             assert_eq!(picker.delegate.match_count(), 2);
             assert_eq!(
-                picker.delegate.confirm_target(),
+                picker.delegate.confirm_target(false),
                 Some(ConfirmTarget::CreateEmptyProject),
                 "with nothing matched, enter must fall back to the create row rather than adding an arbitrary project"
             );

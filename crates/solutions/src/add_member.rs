@@ -93,13 +93,17 @@ pub(crate) struct InFlightAdd {
     /// `Some(_)` once the spawned task has completed with an error and is
     /// waiting for the user to either Retry or Dismiss the failure row.
     pub(crate) error: Option<String>,
-    /// Soft-cancel signal: spawned task polls between git steps. We keep
-    /// "soft" cancel because git child processes are not killable mid-step
-    /// without losing the freshly-cloned `.git` directory in an inconsistent
-    /// state — but the in-flight entry is removed from the map immediately
-    /// in `cancel_add_member`, so the UI is free at once even if the
-    /// background git keeps churning briefly.
+    /// Set by `cancel_add_member`. Checked after the last git step so a
+    /// cancel that lands while the checkout is being finished doesn't
+    /// publish a member anyway.
     pub(crate) cancel_flag: Arc<AtomicBool>,
+    /// Never sent on — its DROP is the signal. Whatever removes this entry
+    /// (Cancel, or the catalog row being deleted mid-clone) drops the
+    /// sender, and the spawned task drops its in-progress git step, which
+    /// kills the git process group. A cancel that only flipped a flag used
+    /// to leave a clone blocked on a network or credential wait running
+    /// forever, holding `fs_lock` so every later add queued behind it.
+    pub(crate) _abort: smol::channel::Sender<()>,
 }
 
 /// Public read-only view of an in-flight add for the UI panel.
@@ -236,6 +240,7 @@ impl SolutionStore {
         let default_branch = cat.default_branch.clone();
         let lock = Arc::clone(&self.fs_lock);
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let (abort_tx, abort_rx) = smol::channel::bounded::<()>(1);
 
         self.in_flight_adds.insert(
             key,
@@ -246,6 +251,7 @@ impl SolutionStore {
                 percent: Some(0),
                 error: None,
                 cancel_flag: Arc::clone(&cancel_flag),
+                _abort: abort_tx,
             },
         );
         cx.emit(SolutionStoreEvent::MemberAddProgress {
@@ -298,7 +304,7 @@ impl SolutionStore {
                     }
                 });
 
-                let work_result: Result<()> = async {
+                let work = async {
                     let _guard = lock.lock().await;
 
                     // Forward the same `tx` into both git steps so progress lines
@@ -345,8 +351,17 @@ impl SolutionStore {
                         git::checkout(&target, branch).await.ok();
                     }
                     Ok(())
-                }
-                .await;
+                };
+                // Race the git steps against the entry going away. `work` is
+                // polled first, so an abort never pre-empts a step that has
+                // already finished; losing the race drops `work`, and with it
+                // the running git (see `InFlightAdd::_abort`) and `fs_lock`.
+                let aborted = async {
+                    // Only ever resolves by the sender being dropped.
+                    abort_rx.recv().await.ok();
+                    Err(anyhow::anyhow!("cancelled"))
+                };
+                let work_result: Result<()> = smol::future::or(work, aborted).await;
 
                 // Close the channel so the pump task drains and exits.
                 drop(tx);
@@ -630,13 +645,15 @@ impl SolutionStore {
             .collect()
     }
 
-    /// Soft-cancel the in-flight add. The UI row is removed immediately and
-    /// the spawned task bails at the next git boundary check — including the
-    /// one *after* the last git step, so a cancel that lands during
+    /// Cancel the in-flight add. The UI row is removed immediately, and
+    /// removing the entry drops its abort sender, which stops the spawned
+    /// task at once: the running git process group is terminated and
+    /// `fs_lock` released (see `InFlightAdd::_abort`). The flag also covers
+    /// the window *after* the last git step, so a cancel that lands during
     /// `set_remote_url` / `checkout` no longer publishes a member anyway.
     /// A task that got far enough to produce a checkout deletes it on its way
     /// out ([`discard_abandoned_clone`]); a directory left half-written by an
-    /// earlier bail is wiped by the next add for the same
+    /// interrupted clone is wiped by the next add for the same
     /// `(solution, catalog)`.
     pub fn cancel_add_member(
         &mut self,
