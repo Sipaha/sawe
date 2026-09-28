@@ -457,6 +457,12 @@ pub struct SolutionSession {
     pub(crate) peer_messages_held: bool,
     /// Transient cooperative compaction request; never restored after a crash.
     pub(crate) pending_compaction: Option<u64>,
+    /// A handoff accepted by `compact_session` while the agent's turn was
+    /// still running (the agent calls it from inside that turn). Holds the
+    /// continuation prompt; the in-place rotation runs, and the prompt is sent,
+    /// when the turn ends — `/clear` can only be issued to an idle process.
+    /// Dropped if the user stops the turn. Transient, like `pending_compaction`.
+    pub(crate) pending_rotation: Option<String>,
     pub(crate) compact_reset_observer_memory: bool,
     compact_request_serial: u64,
     /// One-shot signal set by `interrupt_and_flush_pending`: tells the
@@ -787,6 +793,7 @@ impl SolutionSession {
             pending_messages: VecDeque::new(),
             peer_messages_held: false,
             pending_compaction: None,
+            pending_rotation: None,
             compact_reset_observer_memory: false,
             compact_request_serial: 0,
             flush_after_cancel: false,
@@ -886,6 +893,18 @@ impl SolutionSession {
             .any(|agent| agent.vouches_for_parent(now))
     }
 
+    /// How many Managed Agents dispatched by this session are still working
+    /// for it (by [`crate::background_agent::BackgroundAgent::vouches_for_parent`],
+    /// so an agent gone silent past its budget no longer counts). Every one of
+    /// them is a child of the session's `claude` process, which a compaction
+    /// closes — see [`crate::compact::background_agents_block_reason`].
+    pub fn running_background_agents(&self, now: chrono::DateTime<chrono::Utc>) -> usize {
+        self.background_agents
+            .values()
+            .filter(|agent| agent.vouches_for_parent(now))
+            .count()
+    }
+
     pub(crate) fn is_compaction_pending(&self) -> bool {
         self.pending_compaction.is_some()
     }
@@ -928,6 +947,27 @@ impl SolutionSession {
         thread: Option<Entity<AcpThread>>,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.replace_acp_thread(thread, false, cx)
+    }
+
+    /// [`Self::set_acp_thread`] for a thread that continues in the SAME agent
+    /// process — the in-place `/clear` rotation. Background agents are
+    /// children of that process and are still running, so they are NOT
+    /// marked killed; their completions arrive in the new thread.
+    pub fn set_acp_thread_same_process(
+        &mut self,
+        thread: Entity<AcpThread>,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_acp_thread(Some(thread), true, cx);
+    }
+
+    fn replace_acp_thread(
+        &mut self,
+        thread: Option<Entity<AcpThread>>,
+        process_survives: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Losing the live thread means the owning `claude` subprocess is gone
         // (the reconnect cold-ize; a crash) or is about to be closed (`/compact`
         // and `/clear` swap in a thread on a FRESH acp session and then
@@ -949,7 +989,8 @@ impl SolutionSession {
         if replaced_live_thread {
             self.clear_compaction_request();
         }
-        let killed_background_agents = replaced_live_thread && self.mark_background_agents_killed();
+        let killed_background_agents =
+            replaced_live_thread && !process_survives && self.mark_background_agents_killed();
         self.live_base = if thread.is_some() {
             self.entries.len()
         } else {
@@ -1020,8 +1061,30 @@ impl SolutionSession {
     /// clear/extend/truncate/slot-write sites) or the mirror drifts.
     pub fn rebuild_streams(&mut self) {
         let mut streams = crate::stream::demux(&self.entries);
+        // A question the operator has to answer is never hidden. A teammate
+        // stream that was closed — its agent finished, then the main agent woke
+        // it again with `SendMessage` — can come back holding a tool call that
+        // waits for confirmation; suppressing that stream left the session
+        // `AwaitingInput` with no button anywhere (2026-09-28). While such a
+        // call is pending, the stream stays in the mirror whatever closed it.
+        let asking: std::collections::HashSet<crate::stream::StreamId> = self
+            .entries
+            .iter()
+            .filter_map(|entry| match (&entry.subagent_id, &entry.kind) {
+                (
+                    Some(toolu),
+                    crate::session_entry::SessionEntryKind::ToolCall {
+                        status: crate::session_entry::ToolStatus::WaitingForConfirmation,
+                        ..
+                    },
+                ) => Some(crate::stream::StreamId::Teammate(toolu.clone())),
+                _ => None,
+            })
+            .collect();
         for id in self.closed_streams.keys() {
-            streams.shift_remove(id); // Main is never inserted into closed_streams
+            if !asking.contains(id) {
+                streams.shift_remove(id); // Main is never inserted into closed_streams
+            }
         }
         // Hydration orphans: suppressed unless a live resume is streaming fresh
         // activity for them. An orphan whose entries all sit below the hydration
@@ -1040,7 +1103,7 @@ impl SolutionSession {
                 }
             }
             for id in &self.hydration_orphan_streams {
-                if !streamed_anew.contains(id) {
+                if !streamed_anew.contains(id) && !asking.contains(id) {
                     streams.shift_remove(id);
                 }
             }

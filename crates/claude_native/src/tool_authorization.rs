@@ -74,6 +74,17 @@ pub fn decide(
     let assignments = literal_assignments(command);
     let flagged = flagged_targets(reason);
 
+    // `rm -rf "$(cat <file>)"`: claude cannot resolve a command substitution
+    // statically, so it names no path at all. The substitution is a file the
+    // agent wrote itself, though, and reading it answers the question claude
+    // could not.
+    if flagged.is_empty()
+        && reason.contains("command substitution")
+        && substitutions_land_inside(command, &assignments, work_dirs)
+    {
+        return AuthorizationDecision::Allow;
+    }
+
     // Nothing extractable to reason about: we cannot prove containment, so ask.
     if flagged.is_empty() {
         return AuthorizationDecision::Ask {
@@ -282,6 +293,79 @@ fn resolve_prefix(target: &str, assignments: &HashMap<String, (String, bool)>) -
     Some(path)
 }
 
+/// Whether EVERY command substitution in `command` provably yields a path
+/// strictly inside a work directory.
+///
+/// Only the file-read forms are understood — `$(cat <file>)` and `$(< <file>)`
+/// with a literal (or literally-assigned) file path. The file is read now, and
+/// its content must be exactly one absolute path with no glob or whitespace
+/// characters (so neither word splitting nor globbing can widen it), strictly
+/// BELOW a work directory — never the Solution root itself. Any other
+/// substitution anywhere in the command (`$(date)`, backticks, a nested
+/// `$(…)`), an unreadable file, or content that fails a check means "cannot
+/// prove it", and the operator is asked.
+///
+/// The file can change between this read and the command running; it is a
+/// file inside the Solution, where the agent already has full rights, so that
+/// is no wider than what the operator granted.
+fn substitutions_land_inside(
+    command: &str,
+    assignments: &HashMap<String, (String, bool)>,
+    work_dirs: &[PathBuf],
+) -> bool {
+    if command.contains('`') {
+        return false;
+    }
+    let mut found = false;
+    let mut rest = command;
+    while let Some(start) = rest.find("$(") {
+        let body_start = start + 2;
+        let Some(len) = rest[body_start..].find(')') else {
+            return false;
+        };
+        let body = rest[body_start..body_start + len].trim();
+        if body.contains("$(") {
+            return false;
+        }
+        let file = if let Some(file) = body.strip_prefix("cat ") {
+            file
+        } else if let Some(file) = body.strip_prefix('<') {
+            file
+        } else {
+            return false;
+        };
+        let file = file.trim();
+        if file.is_empty() || file.contains(char::is_whitespace) {
+            return false;
+        }
+        let (file, complete) = expand_prefix(file, assignments);
+        if !complete || !file.starts_with('/') {
+            return false;
+        }
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            return false;
+        };
+        let target = content.trim_end_matches('\n');
+        if target.is_empty()
+            || !target.starts_with('/')
+            || target.contains(|c: char| c.is_whitespace() || matches!(c, '*' | '?' | '[' | '$' | '`'))
+            || target.split('/').any(|component| component == "..")
+        {
+            return false;
+        }
+        let target = Path::new(target);
+        if !work_dirs
+            .iter()
+            .any(|root| target.starts_with(root) && target != root.as_path())
+        {
+            return false;
+        }
+        found = true;
+        rest = &rest[body_start + len + 1..];
+    }
+    found
+}
+
 fn is_inside(path: &Path, work_dirs: &[PathBuf]) -> bool {
     !work_dirs.is_empty() && work_dirs.iter().any(|root| path.starts_with(root))
 }
@@ -423,6 +507,53 @@ mod tests {
                 "wording must not change the verdict: {reason}"
             );
         }
+    }
+
+    const SUBSTITUTION_REASON: &str =
+        "Dangerous rm operation on statically-unresolvable target: command substitution output";
+
+    /// The wording claude 2.1.282 uses for `rm -rf "$(cat file)"` (captured
+    /// from a live `can_use_tool`), resolved by reading the file.
+    #[test]
+    fn a_substituted_rm_target_read_from_a_file_inside_is_allowed() {
+        let root = tempfile::tempdir().expect("root");
+        let roots = vec![root.path().to_path_buf()];
+        let doomed = root.path().join(".agents/tmp/tmp.Ru3jifhqK7");
+        std::fs::create_dir_all(&doomed).expect("doomed");
+        let pointer = root.path().join(".agents/tmp/appdir.txt");
+        let write = |content: &str| std::fs::write(&pointer, content).expect("pointer");
+        let decide_for = |cmd: String| {
+            decide(&bash(&cmd), Some(SUBSTITUTION_REASON), &roots, SessionPolicy::FullAccess)
+        };
+        let quoted = format!("rm -rf \"$(cat {})\"", pointer.display());
+
+        write(&format!("{}\n", doomed.display()));
+        assert_eq!(decide_for(quoted.clone()), AuthorizationDecision::Allow);
+        assert_eq!(
+            decide_for(format!("P={}; rm -rf \"$(< $P)\"", pointer.display())),
+            AuthorizationDecision::Allow,
+            "`$(< file)` through a literal assignment"
+        );
+
+        // Everything below must still reach the operator.
+        let asks = |cmd: String| matches!(decide_for(cmd), AuthorizationDecision::Ask { .. });
+        write("/etc\n");
+        assert!(asks(quoted.clone()), "content outside the Solution");
+        write(&format!("{}\n", root.path().display()));
+        assert!(asks(quoted.clone()), "the Solution root itself");
+        write(&format!("{}/*\n", doomed.display()));
+        assert!(asks(quoted.clone()), "a glob in the content");
+        write(&format!("{}/../../..\n", doomed.display()));
+        assert!(asks(quoted.clone()), "`..` climbing out");
+        write(&format!("{} /etc\n", doomed.display()));
+        assert!(asks(quoted), "two words");
+        write(&format!("{}\n", doomed.display()));
+        assert!(
+            asks(format!("rm -rf \"$(cat {})\" \"$(date)\"", pointer.display())),
+            "any other substitution in the command"
+        );
+        assert!(asks(format!("rm -rf \"$(cat {}.missing)\"", pointer.display())), "unreadable");
+        assert!(asks("rm -rf \"`cat /x`\"".to_string()), "backticks");
     }
 
     #[test]

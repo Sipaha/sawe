@@ -175,6 +175,31 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Closing sessions is not supported")))
     }
 
+    /// Whether this agent can clear a session's conversation inside the
+    /// process that is already running it — see [`Self::clear_session_in_place`].
+    fn supports_in_place_clear(&self) -> bool {
+        false
+    }
+
+    /// Wipe `session_id`'s conversation without replacing the agent process.
+    ///
+    /// Whatever that process runs in the background (sub-agents, shells) keeps
+    /// running and reports into the new conversation, which is the point:
+    /// replacing the process to get a fresh context kills them. The agent may
+    /// give the new conversation a new session id; the returned thread is bound
+    /// to it, and the old id and thread are retired — NOT to be passed to
+    /// [`Self::close_session`], which would now find nothing (or, worse, a
+    /// reused id). Must only be called while no turn is in flight.
+    fn clear_session_in_place(
+        self: Rc<Self>,
+        _session_id: &acp::SessionId,
+        _cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        Task::ready(Err(anyhow::Error::msg(
+            "Clearing a session in place is not supported",
+        )))
+    }
+
     /// Reap every session this connection still owns, **synchronously**.
     ///
     /// For app quit, where neither a `Task` nor a `Drop` can be relied on. GPUI

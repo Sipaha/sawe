@@ -3667,3 +3667,37 @@ async fn the_tick_does_not_re_tail_a_freshly_observed_agent(cx: &mut TestAppCont
         });
     });
 }
+
+/// A resumed async agent is found again from claude's files: the spawn
+/// `toolu` (its teammate stream key) from `meta.json`, and the transcript's
+/// current END as the read offset — the lines before it close with the first
+/// run's `stop_reason`, which would retire the agent on the next tick.
+#[test]
+fn resumed_agent_files_read_the_spawn_toolu_and_start_at_the_end() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id = crate::background_agent::BackgroundAgentId::new("a46a185507c801651");
+    std::fs::write(
+        dir.path().join("agent-a46a185507c801651.meta.json"),
+        r#"{"agentType":"general-purpose","toolUseId":"toolu_01YBnicQcs8pFAsiegGSSPK2"}"#,
+    )
+    .expect("meta");
+    std::fs::write(dir.path().join("agent-a46a185507c801651.jsonl"), "{}\n{}\n").expect("jsonl");
+
+    let files = crate::store::teammate_reconciler::resumed_agent_files(dir.path(), &id).expect("found");
+    assert_eq!(files.parent_toolu.as_ref(), "toolu_01YBnicQcs8pFAsiegGSSPK2");
+    assert_eq!(files.offset, 6);
+    assert!(files.jsonl_path.ends_with("agent-a46a185507c801651.jsonl"));
+
+    let other = crate::background_agent::BackgroundAgentId::new("b000000000000000b");
+    assert!(crate::store::teammate_reconciler::resumed_agent_files(dir.path(), &other).is_none(), "no meta → nothing to reopen");
+}
+
+#[test]
+fn parses_the_agent_a_send_message_resumed() {
+    let result = r#"{"success":true,"message":"Resuming agent a46a185","resumedAgentId":"a46a185507c801651","pin":{"id":"a46a185507c801651"}}"#;
+    assert_eq!(
+        crate::background_agent::parse_resumed_agent_id(result).as_deref(),
+        Some("a46a185507c801651")
+    );
+    assert!(crate::background_agent::parse_resumed_agent_id(r#"{"success":true}"#).is_none());
+}

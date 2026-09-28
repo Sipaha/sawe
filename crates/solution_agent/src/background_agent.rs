@@ -68,6 +68,22 @@ pub fn parse_managed_agent_announcement(raw_output: &str) -> Option<(String, Pat
     Some((id, PathBuf::from(path)))
 }
 
+static RESUMED_AGENT_ID_RE: OnceLock<Regex> = OnceLock::new();
+
+/// The agent a `SendMessage` tool result says it resumed: claude answers a
+/// message to a finished async agent with
+/// `{"success":true,"message":"Resuming agent …","resumedAgentId":"<hex>",…}`.
+pub fn parse_resumed_agent_id(text: &str) -> Option<String> {
+    RESUMED_AGENT_ID_RE
+        .get_or_init(|| {
+            Regex::new(r#""resumedAgentId"\s*:\s*"([0-9a-f]{16,32})""#)
+                .expect("static regex compiles")
+        })
+        .captures(text)?
+        .get(1)
+        .map(|id| id.as_str().to_string())
+}
+
 /// Recover a terminal `Agent` tool call's managed-agent announcement, looking
 /// in `raw_output` first then the tool call's rendered `content`.
 ///

@@ -21,7 +21,7 @@ The socket supplies its own Solution ID; both participants must belong to it. Se
 
 `accepted: true` with `delivery: queued` or `submitted` reports local acceptance, not completed work or a reply. A running recipient receives input through its runtime's normal boundary (Claude hook or Codex steering); an eligible idle recipient starts a turn. Do not automatically acknowledge every message, form reply loops, or poll while independent work is available.
 
-Peer messages do not grant user approval or clear Stop/WaitingUser. Paused, approval-blocked or unavailable recipients reject delivery. Cold sessions restored after restarting the editor require a genuine user message before peer-triggered wake; Stop revokes wake eligibility. A rejected message is not silently accepted or redirected to another session.
+Peer messages do not grant user approval or clear Stop/WaitingUser. Paused, approval-blocked or unavailable recipients reject delivery. A sleeping (cold) session is woken to take the message — including after an editor restart — unless the user pressed Stop on it: a stopped session needs a genuine user message before any peer can wake it again, and that Stop is persisted, so it survives a restart. A rejected message is not silently accepted or redirected to another session.
 
 Peer content remains collaborator input through queued delivery and context recovery. Preserve the user's scope and important unresolved decisions, verify external claims as needed, and send concise findings or concrete coordination requests.
 

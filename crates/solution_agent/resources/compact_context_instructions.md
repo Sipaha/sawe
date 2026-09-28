@@ -5,7 +5,17 @@ headroom or recovery; do not assume the context is full or that a human is
 watching. Capture the essential state of this conversation in durable files,
 then ask the editor to rotate to a fresh context that can continue the same task.
 If work is already running, finish the current safe step first. Do not cancel
-an in-flight tool or abandon an operation with an uncertain outcome. Respect
+an in-flight tool or abandon an operation with an uncertain outcome. Background
+sub-agents you dispatched keep running across the handoff and deliver their
+results into the next context: list each one still running in the handoff —
+what it is doing and what to do with its result — so the next context knows to
+expect it. A command a sub-agent is running in the foreground at the moment of
+the handoff is interrupted (it sees exit code 137 and carries on), so a report
+that mentions such a failure may just need that step repeated. (If `compact_session` refuses because sub-agents are running, this
+agent cannot keep them alive across a handoff: collect their results first.)
+Once `compact_session` accepts the handoff, the editor rotates the context when
+your turn ends. Anything you do after that point is not in the handoff, so wrap
+the turn up rather than starting new work. Respect
 pending approvals and any newer user instructions; record unresolved work and
 operation status in the handoff. Then perform the standard workflow below.
 Do not start unrelated new implementation work before preparing the handoff.

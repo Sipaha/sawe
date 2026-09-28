@@ -22,9 +22,15 @@ impl SolutionAgentStore {
                 "Recipient cannot accept peer messages while stopped, awaiting input, errored, or unavailable"
             ));
         }
-        if s.acp_thread().is_none() && !self.peer_wake_sessions.contains(&id) {
+        // A sleeping (cold) chat is woken for a peer unless the user STOPPED
+        // it: Stop means "leave this alone", and only the user's next message
+        // lifts it. It used to be the other way round — only chats the user
+        // had written to since the editor started could be woken — because
+        // Stop was not persisted, so after a restart every sleeping chat was
+        // refused, including all the ones nobody had stopped.
+        if s.acp_thread().is_none() && self.peer_wake_blocked.contains(&id) {
             return Err(anyhow!(
-                "Cold recipient requires a user message in this app session before peer-triggered wake"
+                "Recipient was stopped by the user; it needs a message from the user before a peer can wake it"
             ));
         }
         if self.supervisor_states.get(&id).is_some_and(|state| {
@@ -38,6 +44,28 @@ impl SolutionAgentStore {
             return Err(anyhow!("Recipient is paused and requires user input"));
         }
         Ok(())
+    }
+
+    /// The user stopped `id`: peers may not wake it until they write to it.
+    pub(super) fn block_peer_wake(&mut self, id: SolutionSessionId) {
+        if self.peer_wake_blocked.insert(id) {
+            self.persist_peer_wake_block(id, true);
+        }
+    }
+
+    /// The user wrote to `id`: a Stop no longer holds peers off it.
+    pub(super) fn allow_peer_wake(&mut self, id: SolutionSessionId) {
+        if self.peer_wake_blocked.remove(&id) {
+            self.persist_peer_wake_block(id, false);
+        }
+    }
+
+    fn persist_peer_wake_block(&self, id: SolutionSessionId, blocked: bool) {
+        if let Some(db) = &self.persistence
+            && let Err(error) = db.set_peer_wake_blocked(id, blocked)
+        {
+            log::error!("Could not persist peer-wake block for {id}: {error}");
+        }
     }
 
     pub fn send_peer_message(
@@ -79,7 +107,7 @@ impl SolutionAgentStore {
             let was_cold = wake.is_some();
             if let Some(wake) = wake { wake.await?; }
             this.update(cx, |store, cx| {
-                if was_cold && !store.peer_wake_sessions.contains(&to_session_id) {
+                if was_cold && store.peer_wake_blocked.contains(&to_session_id) {
                     return Err(anyhow!("Recipient was stopped while waking; user must resume it first"));
                 }
                 for id in [from_session_id, to_session_id] {
@@ -158,20 +186,45 @@ mod tests {
         vec![acp::ContentBlock::Text(acp::TextContent::new(value))]
     }
 
+    /// A sleeping chat is wakeable by a peer unless the user stopped it — and
+    /// a Stop outlives the cold entity it was pressed on.
     #[gpui::test]
-    async fn cold_peer_wake_requires_current_user_eligibility(cx: &mut gpui::TestAppContext) {
+    async fn cold_peer_wake_is_refused_only_after_a_stop(cx: &mut gpui::TestAppContext) {
         let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
         store.update(cx, |store, cx| {
-            assert!(store.peer_recipient_ready(id, cx).is_err());
-            store.peer_wake_sessions.insert(id);
-            assert!(store.peer_recipient_ready(id, cx).is_ok());
+            assert!(
+                store.peer_recipient_ready(id, cx).is_ok(),
+                "a sleeping chat nobody stopped must accept a peer wake"
+            );
             let session = store.session(id).unwrap();
             store.cancel_turn(id, cx).unwrap();
             assert!(store.peer_recipient_ready(id, cx).is_err());
             // Recreating a cold entity after Stop cannot restore eligibility.
             session.update(cx, |s, _| s.peer_messages_held = false);
             assert!(store.peer_recipient_ready(id, cx).is_err());
+            // Only the user writing to it does.
+            store.allow_peer_wake(id);
+            assert!(store.peer_recipient_ready(id, cx).is_ok());
         });
+    }
+
+    /// The Stop has to survive a restart — that is what lets every OTHER
+    /// sleeping chat be wakeable after one. A second store over the same DB
+    /// stands in for the next editor run.
+    #[gpui::test]
+    async fn a_stop_is_remembered_across_restarts(cx: &mut gpui::TestAppContext) {
+        let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
+        let db = store.update(cx, |store, cx| {
+            store.cancel_turn(id, cx).unwrap();
+            store.persistence.clone().expect("seeded store has a DB")
+        });
+        assert_eq!(db.load_peer_wake_blocked().unwrap(), vec![id]);
+
+        store.update(cx, |store, _| store.allow_peer_wake(id));
+        assert!(
+            db.load_peer_wake_blocked().unwrap().is_empty(),
+            "the user's next message must lift the persisted block too"
+        );
     }
 
     /// "Send now" shares `cancel_turn` with Stop, but it is the opposite
@@ -183,7 +236,6 @@ mod tests {
     async fn send_now_is_not_a_stop_and_keeps_peer_eligibility(cx: &mut gpui::TestAppContext) {
         let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
         store.update(cx, |store, cx| {
-            store.peer_wake_sessions.insert(id);
             let session = store.session(id).unwrap();
             session.update(cx, |s, _| {
                 s.state = SessionState::Running {
@@ -203,13 +255,13 @@ mod tests {
                 !session.read(cx).peer_messages_held,
                 "Send now must not hold peer messaging"
             );
-            assert!(store.peer_wake_sessions.contains(&id));
+            assert!(!store.peer_wake_blocked.contains(&id));
 
             // …whereas a real Stop still does.
             session.update(cx, |s, _| s.flush_after_cancel = false);
             store.cancel_turn(id, cx).ok();
             assert!(session.read(cx).peer_messages_held);
-            assert!(!store.peer_wake_sessions.contains(&id));
+            assert!(store.peer_wake_blocked.contains(&id));
         });
     }
 
@@ -217,7 +269,6 @@ mod tests {
     async fn peer_queue_preserves_origin_and_cannot_resume_a_hold(cx: &mut gpui::TestAppContext) {
         let (store, id, _tmp) = super::super::test_support::seed_store_with_session(cx).await;
         let task = store.update(cx, |store, cx| {
-            store.peer_wake_sessions.insert(id);
             let session = store.session(id).unwrap();
             session.update(cx, |s, _| {
                 s.state = SessionState::Running {
@@ -275,7 +326,7 @@ mod tests {
         store.update(cx, |store, cx| {
             let session = store.session(id).unwrap();
             assert!(!session.read(cx).peer_messages_held);
-            assert!(store.peer_wake_sessions.contains(&id));
+            assert!(!store.peer_wake_blocked.contains(&id));
             assert_eq!(session.read(cx).pending_messages.len(), 2);
             assert_eq!(
                 session.read(cx).pending_messages.back().unwrap().origin,

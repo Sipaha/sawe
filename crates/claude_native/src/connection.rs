@@ -34,7 +34,7 @@ use crate::command::{ClaudeCommandSpec, SessionArg, mcp_config_json};
 use crate::process::ClaudeProcess;
 use crate::protocol::{
     ControlRequestKind, ControlRequestOut, HookConfig, InputMessage, ModelInfo, OutputMessage,
-    StreamEvent,
+    StreamEvent, System,
 };
 use crate::translate::{
     DEFAULT_CONTEXT_WINDOW, TurnEnd, apply_stream_usage, apply_usage, assistant_usage_update,
@@ -432,12 +432,38 @@ struct SessionShared {
     /// Read by the store to refresh the session's persisted cache.
     available_models: RefCell<Vec<ModelInfo>>,
     /// The session's own id, so the hook arm can pass it to the store pull.
-    session_id: acp::SessionId,
+    /// A `RefCell` because an in-place `/clear` moves the session to the new
+    /// id claude reports for the fresh conversation.
+    session_id: RefCell<acp::SessionId>,
+    /// The thread the pump delivers into. Swapped by an in-place `/clear`, which
+    /// keeps the process (and the pump reading it) but starts a new thread.
+    thread: RefCell<WeakEntity<AcpThread>>,
+    /// Set while an in-place `/clear` waits for claude to confirm it — see
+    /// [`ClaudeNativeConnection::clear_session_in_place`].
+    pending_clear: RefCell<Option<PendingClear>>,
     /// Shared cell holding the store's follow-up pull (see `ClaudeNativeConnection::store_pull`).
     /// A clone of the connection's `Rc`, so a `set_store_pull` AFTER this session
     /// was created is still visible here.
     pending_pull: std::rc::Rc<std::cell::RefCell<Option<HookPull>>>,
 }
+
+/// An in-place `/clear` in flight. claude answers it with an `init` carrying the
+/// NEW conversation's session id and then the `/clear` turn's own (empty)
+/// `result`; the pump consumes both and resolves `tx` with that id.
+struct PendingClear {
+    tx: oneshot::Sender<Result<acp::SessionId>>,
+    new_id: Option<acp::SessionId>,
+    /// Resolved (or dropped) once the new thread is installed. The pump waits
+    /// on it after confirming the clear: output claude produces right after
+    /// the `/clear` — a sub-agent's completion turn — would otherwise be
+    /// delivered into the retiring thread in the gap before the swap.
+    swapped: oneshot::Receiver<()>,
+}
+
+/// How long an in-place `/clear` may take before it is given up. It is a local
+/// command — claude answers in well under a second — so this only bounds a
+/// process that stopped reading its stdin.
+const CLEAR_IN_PLACE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Everything needed to respawn a session's `claude` process under the same
 /// session id (Stop-escalation kill+resume, and — in Phase 7.2 — the watchdog's
@@ -1179,7 +1205,9 @@ impl ClaudeNativeConnection {
                 stream_used_total: Cell::new(None),
                 active_model: RefCell::new(None),
                 available_models: RefCell::new(Vec::new()),
-                session_id: session_id.clone(),
+                session_id: RefCell::new(session_id.clone()),
+                thread: RefCell::new(WeakEntity::new_invalid()),
+                pending_clear: RefCell::new(None),
                 pending_pull: self.store_pull.clone(),
             });
 
@@ -1430,7 +1458,9 @@ impl ClaudeNativeConnection {
                 stream_used_total: Cell::new(None),
                 active_model: RefCell::new(None),
                 available_models: RefCell::new(Vec::new()),
-                session_id: session_id.clone(),
+                session_id: RefCell::new(session_id.clone()),
+                thread: RefCell::new(WeakEntity::new_invalid()),
+                pending_clear: RefCell::new(None),
                 pending_pull: self.store_pull.clone(),
             });
 
@@ -1530,10 +1560,13 @@ async fn run_update_pump(
     mut critical_stderr: futures::channel::mpsc::UnboundedReceiver<crate::process::CriticalStderr>,
     exited: impl std::future::Future<Output = Option<std::process::ExitStatus>>,
     outgoing: futures::channel::mpsc::UnboundedSender<InputMessage>,
-    thread: WeakEntity<AcpThread>,
+    initial_thread: WeakEntity<AcpThread>,
     shared: Rc<SessionShared>,
     cx: &mut gpui::AsyncApp,
 ) {
+    // The pump outlives the thread it was started for when an in-place `/clear`
+    // swaps in a new one, so every message is routed through `shared.thread`.
+    shared.thread.replace(initial_thread);
     let mut exited = std::pin::pin!(exited.fuse());
     // Per-turn diagnostic accumulator. Reset after each terminating `Result`
     // and logged alongside the turn_end summary so a "no response where I
@@ -1613,6 +1646,9 @@ async fn run_update_pump(
                     );
                     sender.send(Err(anyhow!(detail))).ok();
                 }
+                if let Some(clear) = shared.pending_clear.borrow_mut().take() {
+                    clear.tx.send(Err(anyhow!("claude exited during /clear"))).ok();
+                }
                 return;
             }
         };
@@ -1628,12 +1664,59 @@ async fn run_update_pump(
                     .send(Err(anyhow!("claude output stream closed")))
                     .ok();
             }
+            if let Some(clear) = shared.pending_clear.borrow_mut().take() {
+                clear
+                    .tx
+                    .send(Err(anyhow!("claude output stream closed during /clear")))
+                    .ok();
+            }
             return;
         };
 
         // Any output (partial delta or control request) is progress — reset the
         // silence watchdog's baseline before dispatching the message.
         shared.last_output.set(cx.background_executor().now());
+
+        // Resolved per message: an in-place `/clear` swaps it mid-stream.
+        let thread = shared.thread.borrow().clone();
+
+        // An in-place `/clear` is answered by an `init` for the NEW conversation
+        // and then the `/clear` turn's own empty `result`. Both belong to the
+        // clear, not to any turn of the thread: consumed here, so the `result`
+        // is not mistaken for an orphan and stamped onto the retiring thread.
+        if shared.pending_clear.borrow().is_some() {
+            match &message {
+                OutputMessage::System(System::Init { session_id, .. })
+                    if session_id.as_str() != &*shared.session_id.borrow().0 =>
+                {
+                    if let Some(clear) = shared.pending_clear.borrow_mut().as_mut() {
+                        clear.new_id = Some(acp::SessionId::new(session_id.clone()));
+                    }
+                    continue;
+                }
+                OutputMessage::Result(_)
+                    if shared
+                        .pending_clear
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|clear| clear.new_id.is_some()) =>
+                {
+                    let clear = shared.pending_clear.borrow_mut().take();
+                    if let Some(clear) = clear
+                        && let Some(new_id) = clear.new_id
+                    {
+                        clear.tx.send(Ok(new_id)).ok();
+                        // Everything after this point belongs to the new
+                        // thread; hold the stream until it is installed. A
+                        // dropped sender (the swap failed) resumes the pump on
+                        // whatever thread is current.
+                        clear.swapped.await.ok();
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
 
         if let OutputMessage::Result(result) = &message {
             // Pass the per-turn stream/message-derived `used` so
@@ -1829,7 +1912,10 @@ async fn run_update_pump(
                     let agent_id = input.get("agent_id").and_then(|v| v.as_str());
                     let pull = shared.pending_pull.borrow().clone();
                     let mut pending = match pull {
-                        Some(pull) => pull(&shared.session_id, agent_id, is_end_of_turn, cx),
+                        Some(pull) => {
+                            let session_id = shared.session_id.borrow().clone();
+                            pull(&session_id, agent_id, is_end_of_turn, cx)
+                        }
                         None => shared.pending_inject.borrow_mut().take(),
                     };
                     // Self-heal a degraded turn: the main agent occasionally
@@ -1855,7 +1941,7 @@ async fn run_update_pump(
                             target: "claude_native",
                             "session={:?} degraded turn: assistant wrote a tool call as text; \
                              nudging retry ({}/{})",
-                            shared.session_id,
+                            shared.session_id.borrow(),
                             degenerate_tool_call_nudges,
                             MAX_DEGENERATE_NUDGES,
                         );
@@ -2683,6 +2769,130 @@ impl AgentConnection for ClaudeNativeConnection {
             session.escalation = Some(escalation);
             self.escalations_armed.set(self.escalations_armed.get() + 1);
         }
+    }
+
+    fn supports_in_place_clear(&self) -> bool {
+        true
+    }
+
+    /// `/clear` sent as an ordinary user message: claude wipes the conversation
+    /// inside the running process, reports the new conversation's session id in
+    /// a fresh `init`, and keeps every background sub-agent and shell alive —
+    /// their completions arrive in the NEW conversation (verified against
+    /// claude 2.1.282 in stream-json mode). The session is re-keyed to that id,
+    /// so a later respawn `--resume`s the new conversation, not the wiped one.
+    fn clear_session_in_place(
+        self: Rc<Self>,
+        session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        let old_id = session_id.clone();
+        let (rx, swapped_tx, project, work_dirs, old_thread) = {
+            let sessions = self.sessions.borrow();
+            let Some(state) = sessions.get(&old_id) else {
+                return Task::ready(Err(anyhow!("no live claude process for {old_id:?}")));
+            };
+            if state.shared.prompt_tx.borrow().is_some() {
+                return Task::ready(Err(anyhow!(
+                    "cannot clear {old_id:?} in place while a turn is in flight"
+                )));
+            }
+            if state.shared.pending_clear.borrow().is_some() {
+                return Task::ready(Err(anyhow!("{old_id:?} is already being cleared")));
+            }
+            let (tx, rx) = oneshot::channel();
+            let (swapped_tx, swapped) = oneshot::channel();
+            state.shared.pending_clear.replace(Some(PendingClear {
+                tx,
+                new_id: None,
+                swapped,
+            }));
+            let clear = [acp::ContentBlock::Text(acp::TextContent::new("/clear"))];
+            if let Err(error) = state.process.send_user_blocks(&clear) {
+                state.shared.pending_clear.take();
+                return Task::ready(Err(error));
+            }
+            (
+                rx,
+                swapped_tx,
+                state.blueprint.project.clone(),
+                state.blueprint.work_dirs.clone(),
+                state.thread.clone(),
+            )
+        };
+        cx.spawn(async move |cx| {
+            let timeout = cx.background_executor().timer(CLEAR_IN_PLACE_TIMEOUT);
+            let confirmed = select_biased! {
+                confirmed = rx.fuse() => confirmed,
+                _ = timeout.fuse() => {
+                    if let Some(state) = self.sessions.borrow().get(&old_id) {
+                        state.shared.pending_clear.take();
+                    }
+                    return Err(anyhow!("claude did not confirm /clear within {CLEAR_IN_PLACE_TIMEOUT:?}"));
+                }
+            };
+            let new_id = confirmed.map_err(|_| anyhow!("/clear was abandoned"))??;
+
+            let thread: Entity<AcpThread> = cx.update(|cx| {
+                let action_log = cx.new(|_| ActionLog::new(project.clone()));
+                let connection: Rc<dyn AgentConnection> = self.clone();
+                let thread = cx.new(|cx| {
+                    AcpThread::new(
+                        None,
+                        None,
+                        Some(work_dirs),
+                        connection,
+                        project,
+                        action_log,
+                        new_id.clone(),
+                        watch::Receiver::constant(acp::PromptCapabilities::new().image(true)),
+                        cx,
+                    )
+                });
+                // The slash-command list is per process, not per conversation,
+                // and claude does not re-announce it after a `/clear`.
+                if let Some(commands) = old_thread
+                    .upgrade()
+                    .map(|old| old.read(cx).available_commands().to_vec())
+                    .filter(|commands| !commands.is_empty())
+                {
+                    thread.update(cx, |thread, cx| {
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::AvailableCommandsUpdate(
+                                    acp::AvailableCommandsUpdate::new(commands),
+                                ),
+                                cx,
+                            )
+                            .log_err();
+                    });
+                }
+                thread
+            });
+
+            let mut sessions = self.sessions.borrow_mut();
+            let mut state = sessions
+                .remove(&old_id)
+                .ok_or_else(|| anyhow!("{old_id:?} went away during /clear"))?;
+            state.thread = thread.downgrade();
+            state.shared.thread.replace(thread.downgrade());
+            state.shared.session_id.replace(new_id.clone());
+            sessions.insert(new_id.clone(), state);
+            drop(sessions);
+            swapped_tx.send(()).ok();
+            for map in [&self.desired_models, &self.desired_efforts] {
+                let mut map = map.borrow_mut();
+                if let Some(value) = map.remove(&old_id) {
+                    map.insert(new_id.clone(), value);
+                }
+            }
+            log::info!(
+                target: "claude_native",
+                "cleared {old_id:?} in place; the conversation continues as {new_id:?} \
+                 in the same process"
+            );
+            Ok(thread)
+        })
     }
 
     fn close_session(

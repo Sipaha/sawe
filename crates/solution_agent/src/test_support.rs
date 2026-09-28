@@ -52,6 +52,19 @@ pub struct MockConnection {
     /// ids, which is enough to assert that the app-quit reaper asked for them.
     live_sessions: Arc<parking_lot::Mutex<Vec<agent_client_protocol::schema::v1::SessionId>>>,
     reaped: Arc<AtomicUsize>,
+    /// OPT-IN, default `false`: whether `clear_session_in_place` is offered.
+    /// Off by default so every existing rotation test keeps exercising the
+    /// process-replacing path it was written against.
+    in_place_clear: Cell<bool>,
+    in_place_clears: Cell<usize>,
+    /// Each live session's project, which the post-`/clear` thread is built
+    /// against (the native backend keeps it in its per-process blueprint).
+    projects: std::cell::RefCell<
+        std::collections::HashMap<
+            agent_client_protocol::schema::v1::SessionId,
+            gpui::Entity<project::Project>,
+        >,
+    >,
 }
 
 impl MockConnection {
@@ -86,7 +99,20 @@ impl MockConnection {
             supports_resume,
             live_sessions: Default::default(),
             reaped: Default::default(),
+            in_place_clear: Cell::new(false),
+            in_place_clears: Cell::new(0),
+            projects: Default::default(),
         }
+    }
+
+    /// Offer the in-place `/clear` (see `AgentConnection::clear_session_in_place`).
+    pub fn set_in_place_clear(&self, supported: bool) {
+        self.in_place_clear.set(supported);
+    }
+
+    /// How many in-place clears ran.
+    pub fn in_place_clears(&self) -> usize {
+        self.in_place_clears.get()
     }
 
     pub fn new() -> Self {
@@ -146,6 +172,9 @@ impl acp_thread::AgentConnection for MockConnection {
         self.next_session.set(n + 1);
         let session_id = agent_client_protocol::schema::v1::SessionId::new(format!("mock-{n}"));
         self.live_sessions.lock().push(session_id.clone());
+        self.projects
+            .borrow_mut()
+            .insert(session_id.clone(), project.clone());
         let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
         let connection: Rc<dyn acp_thread::AgentConnection> = self;
         let thread = cx.new(|cx| {
@@ -175,6 +204,56 @@ impl acp_thread::AgentConnection for MockConnection {
     }
     fn supports_close_session(&self) -> bool {
         true
+    }
+    fn supports_in_place_clear(&self) -> bool {
+        self.in_place_clear.get()
+    }
+    /// Mirrors the native backend: the conversation moves to a NEW id
+    /// (`<old>-cleared`) in the same "process" — the old id leaves
+    /// `live_sessions` without anything being closed.
+    fn clear_session_in_place(
+        self: Rc<Self>,
+        session_id: &agent_client_protocol::schema::v1::SessionId,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<gpui::Entity<acp_thread::AcpThread>>> {
+        if !self.in_place_clear.get() {
+            return Task::ready(Err(anyhow::anyhow!("in-place clear not offered")));
+        }
+        let mut live = self.live_sessions.lock();
+        let Some(position) = live.iter().position(|id| id == session_id) else {
+            return Task::ready(Err(anyhow::anyhow!("no live session {session_id:?}")));
+        };
+        let new_id = agent_client_protocol::schema::v1::SessionId::new(format!(
+            "{}-cleared",
+            session_id.0
+        ));
+        live[position] = new_id.clone();
+        drop(live);
+        self.in_place_clears.set(self.in_place_clears.get() + 1);
+        let Some(project) = self.projects.borrow_mut().remove(session_id) else {
+            return Task::ready(Err(anyhow::anyhow!("no project for {session_id:?}")));
+        };
+        self.projects
+            .borrow_mut()
+            .insert(new_id.clone(), project.clone());
+        let action_log = cx.new(|_| action_log::ActionLog::new(project.clone()));
+        let connection: Rc<dyn acp_thread::AgentConnection> = self;
+        let thread = cx.new(|cx| {
+            acp_thread::AcpThread::new(
+                None,
+                None,
+                None,
+                connection,
+                project,
+                action_log,
+                new_id,
+                watch::Receiver::constant(
+                    agent_client_protocol::schema::v1::PromptCapabilities::new(),
+                ),
+                cx,
+            )
+        });
+        Task::ready(Ok(thread))
     }
     fn close_session(
         self: Rc<Self>,

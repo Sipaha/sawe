@@ -380,7 +380,12 @@ impl PersistChains {
 
 pub struct SolutionAgentStore {
     active_steers: HashMap<SolutionSessionId, steering::PendingSteer>,
-    peer_wake_sessions: std::collections::HashSet<SolutionSessionId>,
+    /// Sessions a peer agent may NOT wake while they are cold: the user
+    /// pressed Stop and has not written to them since. Persisted
+    /// (`peer_wake_blocked` column) and loaded in `set_persistence`, so a
+    /// restart keeps honouring a Stop without refusing every other sleeping
+    /// chat. Mutated only through `block_peer_wake` / `allow_peer_wake`.
+    peer_wake_blocked: std::collections::HashSet<SolutionSessionId>,
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
     /// Cold sessions whose member directory is gone, and the member list they
@@ -1152,7 +1157,7 @@ impl SolutionAgentStore {
         });
         Self {
             active_steers: HashMap::new(),
-            peer_wake_sessions: Default::default(),
+            peer_wake_blocked: Default::default(),
             sessions: HashMap::new(),
             by_solution: HashMap::new(),
             cold_orphan_warnings: HashMap::new(),
@@ -1241,6 +1246,17 @@ impl SolutionAgentStore {
                     log::error!("Could not load default session permissions: {error}");
                     self.default_permission_mode
                 });
+        }
+        // A Stop pressed before the DB landed is only in memory: write it
+        // through, then take in what earlier runs recorded.
+        for id in &self.peer_wake_blocked {
+            if let Err(error) = db.set_peer_wake_blocked(*id, true) {
+                log::error!("Could not persist peer-wake block for {id}: {error}");
+            }
+        }
+        match db.load_peer_wake_blocked() {
+            Ok(ids) => self.peer_wake_blocked.extend(ids),
+            Err(error) => log::error!("Could not load peer-wake blocks: {error}"),
         }
         self.persistence = Some(db.clone());
         // One-time load: merge persisted band geometry into the in-memory map,
@@ -3813,7 +3829,236 @@ impl SolutionAgentStore {
     ///      conversation, just freed up the context window").
     ///   2. Reuses the same pooled subprocess (restart_agent drops
     ///      the pool entry to force a subprocess respawn).
+    ///
+    /// When the session's live agent can clear its conversation inside the
+    /// running process ([`AgentConnection::supports_in_place_clear`] — claude
+    /// does, via `/clear`), that is used instead: the process, and every
+    /// background sub-agent it is running, survives the rotation, and their
+    /// results arrive in the new context. Replacing the process killed them.
     pub fn rotate_context(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<u32>> {
+        if let Some(connection) = self.in_place_clear_connection(session_id, cx) {
+            return self.rotate_context_in_place(session_id, connection, cx);
+        }
+        self.rotate_context_replacing_process(session_id, cx)
+    }
+
+    /// Rotate `session_id` into a fresh context and continue it with `prompt`
+    /// (the handoff written by the agent). An in-place rotation can only run
+    /// between turns, and `compact_session` is called from INSIDE the agent's
+    /// turn, so while a turn is running the handoff is parked on the session
+    /// and started by the `Stopped` that ends it
+    /// ([`Self::start_deferred_rotation`]). Returns whether it was deferred.
+    pub(crate) fn rotate_and_continue(
+        &mut self,
+        session_id: SolutionSessionId,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.session(session_id) else {
+            return false;
+        };
+        if self.main_turn_in_flight(session_id, cx) {
+            session.update(cx, |s, _| s.pending_rotation = Some(prompt));
+            return true;
+        }
+        self.run_rotation_and_continue(session_id, prompt, cx);
+        false
+    }
+
+    /// Called on every `Stopped`: runs a handoff [`Self::rotate_and_continue`]
+    /// parked while the turn ran. Returns whether one was started — the caller
+    /// then leaves the follow-up queue for the continued context to pick up.
+    /// A turn the user STOPPED abandons the handoff: they interrupted the
+    /// agent, and wiping its context now would act on a request they cut off.
+    pub(crate) fn start_deferred_rotation(
+        &mut self,
+        session_id: SolutionSessionId,
+        reason: &acp::StopReason,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.session(session_id) else {
+            return false;
+        };
+        let Some(prompt) = session.update(cx, |s, _| s.pending_rotation.take()) else {
+            return false;
+        };
+        if matches!(reason, acp::StopReason::Cancelled) {
+            log::warn!(
+                target: "solution_agent::store",
+                "session={session_id} turn was stopped; abandoning the pending context handoff"
+            );
+            self.push_system_note(
+                session_id,
+                acp_thread::SystemNoteLevel::Info,
+                "Context handoff cancelled: the turn was stopped. The handoff files are kept.",
+                cx,
+            );
+            return false;
+        }
+        self.run_rotation_and_continue(session_id, prompt, cx);
+        true
+    }
+
+    fn run_rotation_and_continue(
+        &mut self,
+        session_id: SolutionSessionId,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let rotation = self.rotate_context(session_id, cx);
+        cx.spawn(async move |this, cx: &mut AsyncApp| match rotation.await {
+            Ok(_) => {
+                this.update(cx, |store, cx| {
+                    store.send_message(session_id, prompt, cx).detach_and_log_err(cx);
+                })
+                .log_err();
+            }
+            Err(error) => {
+                log::error!(
+                    target: "solution_agent::store",
+                    "session={session_id} context handoff failed: {error:#}"
+                );
+                this.update(cx, |store, cx| {
+                    store.push_system_note(
+                        session_id,
+                        acp_thread::SystemNoteLevel::Error,
+                        format!(
+                            "Context handoff failed: {error:#}. The handoff files are written; \
+                             the agent can call compact_session again."
+                        ),
+                        cx,
+                    );
+                })
+                .log_err();
+            }
+        })
+        .detach();
+    }
+
+    /// Whether the agent's own turn is in flight on `session_id`'s live thread.
+    ///
+    /// Deliberately NOT `SessionState`: a background sub-agent's streaming
+    /// entries flip the session to `Running` (`resume_on_activity`) while the
+    /// main agent sits idle, and an in-place clear is only blocked by the MAIN
+    /// turn — the sub-agents are exactly what it exists to keep running.
+    pub(crate) fn main_turn_in_flight(&self, session_id: SolutionSessionId, cx: &App) -> bool {
+        self.session(session_id)
+            .and_then(|session| session.read(cx).acp_thread().cloned())
+            .is_some_and(|thread| {
+                matches!(thread.read(cx).status(), acp_thread::ThreadStatus::Generating)
+            })
+    }
+
+    /// The live agent connection of `session_id`, if it can clear the
+    /// session's conversation in place (see [`Self::rotate_context`]).
+    pub(crate) fn in_place_clear_connection(
+        &self,
+        session_id: SolutionSessionId,
+        cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentConnection>> {
+        let session = self.session(session_id)?;
+        let thread = session.read(cx).acp_thread()?.clone();
+        let connection = thread.read(cx).connection().clone();
+        connection
+            .supports_in_place_clear()
+            .then_some(connection)
+    }
+
+    fn rotate_context_in_place(
+        &mut self,
+        session_id: SolutionSessionId,
+        connection: Rc<dyn acp_thread::AgentConnection>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<u32>> {
+        let Some(session_entity) = self.sessions.get(&session_id).cloned() else {
+            return Task::ready(Err(anyhow!("unknown session {session_id}")));
+        };
+        let (expected_permission_mode, expected_context, current_count) = {
+            let s = session_entity.read(cx);
+            (
+                s.permission_mode,
+                (s.epoch, s.acp_session_id.clone(), s.pending_compaction),
+                s.context_count,
+            )
+        };
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            // Same steering-receipt guard as the process-replacing path, but
+            // BEFORE the clear: a clear cannot be taken back, so a follow-up
+            // still waiting for its receipt must settle first.
+            for attempt in 0.. {
+                let ready = this.update(cx, |store, cx| {
+                    if store
+                        .session(session_id)
+                        .is_none_or(|s| s.read(cx).permission_mode != expected_permission_mode)
+                    {
+                        return Err(anyhow!("Session permissions changed while rotating context"));
+                    }
+                    store.rotation_steering_ready(session_id, &expected_context, cx)
+                })??;
+                if ready {
+                    break;
+                }
+                if attempt >= 600 {
+                    return Err(anyhow!(
+                        "Context rotation is waiting for a follow-up delivery receipt; retry after it resolves"
+                    ));
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+            }
+            let old_acp_session_id = this.update(cx, |store, cx| {
+                if store.main_turn_in_flight(session_id, cx) {
+                    return Err(anyhow!(
+                        "session {session_id} is running a turn; an in-place rotation must wait \
+                         for it to end"
+                    ));
+                }
+                Ok(session_entity.read(cx).acp_session_id.clone())
+            })??;
+            let cleared = cx
+                .update(|cx| connection.clone().clear_session_in_place(&old_acp_session_id, cx))
+                .await;
+            let new_thread = match cleared {
+                Ok(thread) => thread,
+                Err(error) => {
+                    // The process could not clear itself (it died, stopped
+                    // reading stdin, …). Replacing it still rotates the
+                    // context — at the old price for anything it was running.
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "session={session_id} in-place /clear failed ({error:#}); \
+                         rotating by replacing the agent process instead"
+                    );
+                    return this
+                        .update(cx, |store, cx| {
+                            store.rotate_context_replacing_process(session_id, cx)
+                        })?
+                        .await;
+                }
+            };
+            this.update(cx, |store, cx| {
+                let (new_count, _, _) =
+                    store.commit_rotation(session_id, new_thread, current_count, true, cx);
+                log::info!(
+                    target: "solution_agent::store",
+                    "session={session_id} rotated in place into context c{new_count:02}; \
+                     the agent process and its background work carry on"
+                );
+                new_count
+            })
+        })
+    }
+
+    /// The rotation for agents that cannot clear in place (and the fallback
+    /// when an in-place clear fails): a fresh ACP session on the pooled
+    /// connection, then the pre-rotation one is closed — which kills its
+    /// process and anything that process was running.
+    fn rotate_context_replacing_process(
         &mut self,
         session_id: SolutionSessionId,
         cx: &mut Context<Self>,
@@ -3925,81 +4170,8 @@ impl SolutionAgentStore {
                     store.pool_release_session(pair.clone(), cx);
                     return Err(anyhow!("Session permissions changed while rotating context"));
                 }
-                // The PRE-rotation ACP session id, captured before the graft
-                // overwrites it — needed to tear down its now-orphaned subprocess.
-                // Only meaningful if the session was actually live (a cold session
-                // never spawned an old child and never held a pool refcount slot).
-                let reset_observer_memory = session_entity.read(cx).compact_reset_observer_memory;
-                let old_acp_session_id = session_entity.read(cx).acp_session_id.clone();
-                let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
-                let new_acp_session_id = new_thread.read(cx).session_id().clone();
-                let new_count = current_count.saturating_add(1);
-                let background_agents_killed = session_entity.update(cx, |s, cx| {
-                    s.acp_session_id = new_acp_session_id;
-                    s.context_count = new_count;
-                    s.state = SessionState::Idle;
-                    s.last_activity_at = Utc::now();
-                    // Status-row meter falls back to `cached_total_tokens`
-                    // when the live thread has no `token_usage` yet (the
-                    // freshly-spawned thread does not). Without a reset,
-                    // the meter would keep reading the pre-rotation count
-                    // until the agent emits its first `TokenUsageUpdated`
-                    // — confusing right after a context rotation. Same
-                    // story for `last_turn_duration` (the "Done in Xs"
-                    // hint should not survive past the rotation).
-                    s.cached_total_tokens = None;
-                    s.last_turn_duration = None;
-                    s.entries.clear();
-                    s.clear_closed_streams();
-                    s.rebuild_streams();
-                    s.clear_compaction_request();
-                    s.bump_epoch();
-                    // `set_acp_thread` emits ThreadReplaced + notify;
-                    // last so SessionView re-attaches against a fully
-                    // updated session struct. It also flips every still-running
-                    // background agent to `killed` — the pre-rotation subprocess
-                    // they were children of is closed a few lines below.
-                    s.set_acp_thread(Some(new_thread.clone()), cx)
-                });
-                if reset_observer_memory {
-                    store.wipe_supervisor_memory(session_id, cx);
-                }
-                // A fresh context has never been asked to hand off, so the next
-                // `compact` verdict starts the ladder at "ask" again.
-                store.reset_compaction_ladder(session_id);
-                if background_agents_killed {
-                    cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
-                        session_id,
-                    ));
-                }
-                // The epoch bump invalidates every cursor the clients held, so
-                // nothing dispatched before the rotation can be a meaningful
-                // duplicate of anything sent after it.
-                store.forget_client_send_ids(session_id);
-                // Re-subscribe to the new AcpThread's event stream.
-                // Dropping the old subscription unhooks us from the
-                // dead thread automatically.
-                let new_sub = store.subscribe_to_session(session_id, new_thread, cx);
-                session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
-                store.persist_session_row(session_id, cx);
-                // The metadata write COALESCEs `total_tokens`, so the row still
-                // carries the PRE-rotation count after the write above. Anything
-                // that later reads it back (a cold load, a reopen) would hand the
-                // meter a number belonging to the conversation we just archived —
-                // the "context stayed at 797k right after a compaction" report.
-                if let Some(db) = store.db() {
-                    db.clear_total_tokens(session_id).detach_and_log_err(cx);
-                }
-                // /compact cleared+rebuilt `entries` and bumped the epoch above.
-                // Rewrite the rows wholesale (deleting the now-stale pre-rotation
-                // idx>0 rows) so the next cold load doesn't see new idx 0 + stale
-                // idx 1..N. Targeted upserts alone would leak the old rows.
-                // `persist_context_wipe`, not `persist_all_rows`: for a session
-                // old enough to still carry an `acp_thread_blob`, the rewrite can
-                // leave zero rows, and the read paths fall back to the blob in
-                // exactly that case — so the rows have to go with the blob.
-                store.persist_context_wipe(session_id, cx);
-                store.mark_state_changed(session_id, cx);
+                let (new_count, old_acp_session_id, old_thread_was_live) =
+                    store.commit_rotation(session_id, new_thread, current_count, false, cx);
                 // Compact reused the pooled connection for a FRESH ACP session
                 // but left the PRE-rotation session live in the connection's
                 // `sessions` map — its `claude` subprocess would leak one process
@@ -4018,23 +4190,124 @@ impl SolutionAgentStore {
                     }
                     store.pool_release_session(pair.clone(), cx);
                 }
-                // Bound disk: the pre-rotation transcript is now orphaned —
-                // keep only the most recent few of this session's transcripts.
-                store.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
-                // The pre-rotation context (with any attached-image path
-                // references) is wiped, so the inbox files can never be `Read`
-                // again — purge them. Pixels live on as base64 in entries.
-                store.purge_session_attachments(session_id, cx);
-                cx.emit(SolutionAgentStoreEvent::SessionContextReset {
-                    id: session_id,
-                    context_count: new_count,
-                });
-                cx.notify();
                 Ok(new_count)
             })??;
 
             Ok(new_count)
         })
+    }
+
+    /// Graft `new_thread` onto `session_id` as its next context: bump the
+    /// context count and epoch, wipe the transcript rows, re-subscribe, and
+    /// announce the reset. Shared by both rotation paths; tearing down the
+    /// pre-rotation process is left to the caller, because only the
+    /// replace-the-process path has one to tear down. `same_process` = the
+    /// thread continues in the process that ran the old context (in-place
+    /// `/clear`), so its background agents are still alive and are not marked
+    /// killed. Returns the new context count and the pre-rotation ACP session id
+    /// and liveness.
+    fn commit_rotation(
+        &mut self,
+        session_id: SolutionSessionId,
+        new_thread: Entity<acp_thread::AcpThread>,
+        current_count: u32,
+        same_process: bool,
+        cx: &mut Context<Self>,
+    ) -> (u32, acp::SessionId, bool) {
+        let session_entity = self.sessions[&session_id].clone();
+        // The PRE-rotation ACP session id, captured before the graft
+        // overwrites it — needed to tear down its now-orphaned subprocess.
+        // Only meaningful if the session was actually live (a cold session
+        // never spawned an old child and never held a pool refcount slot).
+        let reset_observer_memory = session_entity.read(cx).compact_reset_observer_memory;
+        let old_acp_session_id = session_entity.read(cx).acp_session_id.clone();
+        let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
+        let new_acp_session_id = new_thread.read(cx).session_id().clone();
+        let new_count = current_count.saturating_add(1);
+        let background_agents_killed = session_entity.update(cx, |s, cx| {
+            s.acp_session_id = new_acp_session_id;
+            s.context_count = new_count;
+            s.state = SessionState::Idle;
+            s.last_activity_at = Utc::now();
+            // Status-row meter falls back to `cached_total_tokens`
+            // when the live thread has no `token_usage` yet (the
+            // freshly-spawned thread does not). Without a reset,
+            // the meter would keep reading the pre-rotation count
+            // until the agent emits its first `TokenUsageUpdated`
+            // — confusing right after a context rotation. Same
+            // story for `last_turn_duration` (the "Done in Xs"
+            // hint should not survive past the rotation).
+            s.cached_total_tokens = None;
+            s.last_turn_duration = None;
+            s.entries.clear();
+            s.clear_closed_streams();
+            s.rebuild_streams();
+            s.clear_compaction_request();
+            s.bump_epoch();
+            // `set_acp_thread` emits ThreadReplaced + notify;
+            // last so SessionView re-attaches against a fully
+            // updated session struct. It also flips every still-running
+            // background agent to `killed` — the pre-rotation subprocess
+            // they were children of is closed a few lines below.
+            if same_process {
+                s.set_acp_thread_same_process(new_thread.clone(), cx);
+                false
+            } else {
+                s.set_acp_thread(Some(new_thread.clone()), cx)
+            }
+        });
+        if reset_observer_memory {
+            self.wipe_supervisor_memory(session_id, cx);
+        }
+        // A fresh context has never been asked to hand off, so the next
+        // `compact` verdict starts the ladder at "ask" again.
+        self.reset_compaction_ladder(session_id);
+        if background_agents_killed {
+            cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
+                session_id,
+            ));
+        }
+        // The epoch bump invalidates every cursor the clients held, so
+        // nothing dispatched before the rotation can be a meaningful
+        // duplicate of anything sent after it.
+        self.forget_client_send_ids(session_id);
+        // Re-subscribe to the new AcpThread's event stream.
+        // Dropping the old subscription unhooks us from the
+        // dead thread automatically.
+        let new_sub = self.subscribe_to_session(session_id, new_thread, cx);
+        session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
+        self.persist_session_row(session_id, cx);
+        // The metadata write COALESCEs `total_tokens`, so the row still
+        // carries the PRE-rotation count after the write above. Anything
+        // that later reads it back (a cold load, a reopen) would hand the
+        // meter a number belonging to the conversation we just archived —
+        // the "context stayed at 797k right after a compaction" report.
+        if let Some(db) = self.db() {
+            db.clear_total_tokens(session_id).detach_and_log_err(cx);
+        }
+        // /compact cleared+rebuilt `entries` and bumped the epoch above.
+        // Rewrite the rows wholesale (deleting the now-stale pre-rotation
+        // idx>0 rows) so the next cold load doesn't see new idx 0 + stale
+        // idx 1..N. Targeted upserts alone would leak the old rows.
+        // `persist_context_wipe`, not `persist_all_rows`: for a session
+        // old enough to still carry an `acp_thread_blob`, the rewrite can
+        // leave zero rows, and the read paths fall back to the blob in
+        // exactly that case — so the rows have to go with the blob.
+        self.persist_context_wipe(session_id, cx);
+        self.mark_state_changed(session_id, cx);
+        // Bound disk: the pre-rotation transcript is now orphaned —
+        // keep only the most recent few of this session's transcripts.
+        self.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
+        // The pre-rotation context (with any attached-image path
+        // references) is wiped, so the inbox files can never be `Read`
+        // again — purge them. Pixels live on as base64 in entries.
+        self.purge_session_attachments(session_id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionContextReset {
+            id: session_id,
+            context_count: new_count,
+        });
+        cx.notify();
+        (new_count, old_acp_session_id, old_thread_was_live)
     }
 
     /// Reset the session's conversation context: drop the current
@@ -4053,6 +4326,68 @@ impl SolutionAgentStore {
     /// the call site can chain "reset then dispatch follow-up" without
     /// re-plumbing the id).
     pub fn reset_context(
+        &mut self,
+        session_id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SolutionSessionId>> {
+        if let Some(connection) = self.in_place_clear_connection(session_id, cx) {
+            return self.reset_context_in_place(session_id, connection, cx);
+        }
+        self.reset_context_replacing_process(session_id, cx)
+    }
+
+    /// `/clear` inside the running agent process (see [`Self::rotate_context`]
+    /// for why): background sub-agents survive the wipe. Falls back to
+    /// replacing the process when the in-place clear fails.
+    fn reset_context_in_place(
+        &mut self,
+        session_id: SolutionSessionId,
+        connection: Rc<dyn acp_thread::AgentConnection>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SolutionSessionId>> {
+        let Some(session_entity) = self.sessions.get(&session_id).cloned() else {
+            return Task::ready(Err(anyhow!("unknown session {session_id}")));
+        };
+        if self.main_turn_in_flight(session_id, cx) {
+            return Task::ready(Err(anyhow!(
+                "session is busy; wait for the current turn to finish"
+            )));
+        }
+        let (old_acp_session_id, project) = {
+            let s = session_entity.read(cx);
+            let Some(project) = s.project.clone() else {
+                return self.reset_context_replacing_process(session_id, cx);
+            };
+            (s.acp_session_id.clone(), project)
+        };
+        let cleared = connection.clear_session_in_place(&old_acp_session_id, cx);
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let new_thread = match cleared.await {
+                Ok(thread) => thread,
+                Err(error) => {
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "session={session_id} in-place /clear failed ({error:#}); \
+                         clearing by replacing the agent process instead"
+                    );
+                    return this
+                        .update(cx, |store, cx| {
+                            store.reset_context_replacing_process(session_id, cx)
+                        })?
+                        .await;
+                }
+            };
+            // No "did the conversation change meanwhile" check here, unlike the
+            // process-replacing path: the process has ALREADY wiped it, so the
+            // only honest thing left is to show that.
+            this.update(cx, |store, cx| {
+                store.commit_reset(session_id, new_thread, project, true, cx);
+            })?;
+            Ok(session_id)
+        })
+    }
+
+    fn reset_context_replacing_process(
         &mut self,
         session_id: SolutionSessionId,
         cx: &mut Context<Self>,
@@ -4160,96 +4495,8 @@ impl SolutionAgentStore {
                     store.pool_release_session(pair.clone(), cx);
                     return Err(anyhow!("session changed while clearing; retry after the current turn finishes"));
                 }
-                // Only wipe observer memory once the replacement exists and
-                // the reset can commit successfully.
-                store.wipe_supervisor_memory(session_id, cx);
-                store.reset_compaction_ladder(session_id);
-                // Capture the PRE-clear ACP session id + liveness before the graft
-                // overwrites them, so we can reap its orphaned subprocess + release
-                // the pool slot it held (skipped for a cold session — it never
-                // spawned an old child nor took a refcount slot).
-                let old_acp_session_id = session_entity.read(cx).acp_session_id.clone();
-                let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
-                let new_acp_session_id = new_thread.read(cx).session_id().clone();
-                let (had_pending, background_agents_killed) = session_entity.update(cx, |s, cx| {
-                    let had_pending = !s.pending_messages.is_empty();
-                    if had_pending {
-                        // `/clear` wipes the session's conversation —
-                        // queued follow-ups are tied to the OLD context
-                        // and don't apply to a freshly-empty thread, so
-                        // discard. WARN log so post-mortem of "I typed
-                        // a follow-up then hit /clear and lost it" is
-                        // recoverable from the log.
-                        let previews: Vec<String> = s
-                            .pending_messages
-                            .iter()
-                            .map(|b| queue::summarize_blocks_for_log(&b.blocks))
-                            .collect();
-                        log::warn!(
-                            target: "solution_agent::queue",
-                            "session={session_id} dropped {} queued bundle(s) on /clear (reset_context) — content: [{}]",
-                            s.pending_messages.len(),
-                            previews.join(" | "),
-                        );
-                    }
-                    s.acp_session_id = new_acp_session_id;
-                    s.state = SessionState::Idle;
-                    s.last_activity_at = Utc::now();
-                    s.pending_messages.clear();
-                    s.flush_after_cancel = false;
-                    // Status-row meter falls back to `cached_total_tokens`
-                    // when the live thread has no `token_usage` yet — the
-                    // freshly-spawned thread does not. Without a reset
-                    // here the meter would keep reading the pre-`/clear`
-                    // count (the bug this whole change exists to fix).
-                    // `last_turn_duration` is cleared for the same reason
-                    // — "Done in Xs" must not survive a context wipe.
-                    s.cached_total_tokens = None;
-                    s.last_turn_duration = None;
-                    s.entries.clear();
-                    s.clear_closed_streams();
-                    s.rebuild_streams();
-                    s.clear_compaction_request();
-                    s.bump_epoch();
-                    // Cache the (possibly freshly-built headless) project so
-                    // a subsequent reset/restart on this now-live session
-                    // doesn't have to rebuild it.
-                    s.project = Some(project.clone());
-                    // `set_acp_thread` emits ThreadReplaced + notify;
-                    // last so SessionView re-attaches against a fully
-                    // wiped session struct. It also flips every still-running
-                    // background agent to `killed` — the pre-clear subprocess
-                    // they were children of is closed a few lines below.
-                    let background_agents_killed = s.set_acp_thread(Some(new_thread.clone()), cx);
-                    (had_pending, background_agents_killed)
-                });
-                if background_agents_killed {
-                    cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
-                        session_id,
-                    ));
-                }
-                // A `/clear` means nothing that preceded it can be a
-                // meaningful duplicate; see `rotate_context`.
-                store.forget_client_send_ids(session_id);
-                let new_sub = store.subscribe_to_session(session_id, new_thread, cx);
-                session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
-                store.persist_session_row(session_id, cx);
-                // Same COALESCE story as `rotate_context`: the persisted count
-                // has to be cleared explicitly or the wiped conversation's
-                // number outlives it.
-                if let Some(db) = store.db() {
-                    db.clear_total_tokens(session_id).detach_and_log_err(cx);
-                }
-                // /clear cleared `entries` and bumped the epoch above. Rewrite
-                // the rows wholesale (here that deletes ALL rows + saves the
-                // bumped epoch) so the next cold load doesn't replay the stale
-                // pre-clear transcript. Targeted upserts can't delete; this must
-                // run on the empty-entries clear path. Deleting the rows is only
-                // half a wipe for a session old enough to carry a legacy
-                // `acp_thread_blob` — with zero rows every read path falls back
-                // to that blob — so this goes through `persist_context_wipe`,
-                // which drops the blob in the same savepoint.
-                store.persist_context_wipe(session_id, cx);
+                let (old_acp_session_id, old_thread_was_live) =
+                    store.commit_reset(session_id, new_thread, project.clone(), false, cx);
                 // Reap the pre-clear ACP session's subprocess + balance the pool
                 // refcount that `get_or_spawn_connection` re-incremented above
                 // (same leak/double-count as `rotate_context`).
@@ -4262,30 +4509,143 @@ impl SolutionAgentStore {
                     }
                     store.pool_release_session(pair.clone(), cx);
                 }
-                // Bound disk: the pre-clear transcript is now orphaned — keep
-                // only the most recent few of this session's transcripts.
-                store.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
-                // `/clear` wipes the context, so the inbox attachment paths are
-                // unreachable — purge the files + rows. Pixels survive as base64.
-                store.purge_session_attachments(session_id, cx);
-                // `reset_context` does not bump `context_count` (only
-                // `rotate_context` does), so read the current value to
-                // forward as-is on the wire.
-                let context_count = session_entity.read(cx).context_count;
-                store.mark_state_changed(session_id, cx);
-                cx.emit(SolutionAgentStoreEvent::SessionContextReset {
-                    id: session_id,
-                    context_count,
-                });
-                if had_pending {
-                    store.mark_queue_changed(session_id, cx);
-                }
-                cx.notify();
                 Ok(())
             })??;
 
             Ok(session_id)
         })
+    }
+
+    /// Graft `new_thread` onto `session_id` as a wiped conversation (the
+    /// `/clear` half of [`Self::reset_context`]; `context_count` is kept).
+    /// Tearing down the pre-clear process is left to the caller — an in-place
+    /// clear (`same_process`) has none, and its background agents are still
+    /// running, so they are not marked killed. Returns the pre-clear ACP session
+    /// id and whether it was live.
+    fn commit_reset(
+        &mut self,
+        session_id: SolutionSessionId,
+        new_thread: Entity<acp_thread::AcpThread>,
+        project: Entity<project::Project>,
+        same_process: bool,
+        cx: &mut Context<Self>,
+    ) -> (acp::SessionId, bool) {
+        let session_entity = self.sessions[&session_id].clone();
+        // Only wipe observer memory once the replacement exists and
+        // the reset can commit successfully.
+        self.wipe_supervisor_memory(session_id, cx);
+        self.reset_compaction_ladder(session_id);
+        // Capture the PRE-clear ACP session id + liveness before the graft
+        // overwrites them, so we can reap its orphaned subprocess + release
+        // the pool slot it held (skipped for a cold session — it never
+        // spawned an old child nor took a refcount slot).
+        let old_acp_session_id = session_entity.read(cx).acp_session_id.clone();
+        let old_thread_was_live = session_entity.read(cx).acp_thread().is_some();
+        let new_acp_session_id = new_thread.read(cx).session_id().clone();
+        let (had_pending, background_agents_killed) = session_entity.update(cx, |s, cx| {
+            let had_pending = !s.pending_messages.is_empty();
+            if had_pending {
+                // `/clear` wipes the session's conversation —
+                // queued follow-ups are tied to the OLD context
+                // and don't apply to a freshly-empty thread, so
+                // discard. WARN log so post-mortem of "I typed
+                // a follow-up then hit /clear and lost it" is
+                // recoverable from the log.
+                let previews: Vec<String> = s
+                    .pending_messages
+                    .iter()
+                    .map(|b| queue::summarize_blocks_for_log(&b.blocks))
+                    .collect();
+                log::warn!(
+                    target: "solution_agent::queue",
+                    "session={session_id} dropped {} queued bundle(s) on /clear (reset_context) — content: [{}]",
+                    s.pending_messages.len(),
+                    previews.join(" | "),
+                );
+            }
+            s.acp_session_id = new_acp_session_id;
+            s.state = SessionState::Idle;
+            s.last_activity_at = Utc::now();
+            s.pending_messages.clear();
+            s.flush_after_cancel = false;
+            // Status-row meter falls back to `cached_total_tokens`
+            // when the live thread has no `token_usage` yet — the
+            // freshly-spawned thread does not. Without a reset
+            // here the meter would keep reading the pre-`/clear`
+            // count (the bug this whole change exists to fix).
+            // `last_turn_duration` is cleared for the same reason
+            // — "Done in Xs" must not survive a context wipe.
+            s.cached_total_tokens = None;
+            s.last_turn_duration = None;
+            s.entries.clear();
+            s.clear_closed_streams();
+            s.rebuild_streams();
+            s.clear_compaction_request();
+            s.bump_epoch();
+            // Cache the (possibly freshly-built headless) project so
+            // a subsequent reset/restart on this now-live session
+            // doesn't have to rebuild it.
+            s.project = Some(project.clone());
+            // `set_acp_thread` emits ThreadReplaced + notify;
+            // last so SessionView re-attaches against a fully
+            // wiped session struct. It also flips every still-running
+            // background agent to `killed` — the pre-clear subprocess
+            // they were children of is closed a few lines below.
+            let background_agents_killed = if same_process {
+                s.set_acp_thread_same_process(new_thread.clone(), cx);
+                false
+            } else {
+                s.set_acp_thread(Some(new_thread.clone()), cx)
+            };
+            (had_pending, background_agents_killed)
+        });
+        if background_agents_killed {
+            cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
+                session_id,
+            ));
+        }
+        // A `/clear` means nothing that preceded it can be a
+        // meaningful duplicate; see `rotate_context`.
+        self.forget_client_send_ids(session_id);
+        let new_sub = self.subscribe_to_session(session_id, new_thread, cx);
+        session_entity.update(cx, |s, _| s._acp_subscription = Some(new_sub));
+        self.persist_session_row(session_id, cx);
+        // Same COALESCE story as `rotate_context`: the persisted count
+        // has to be cleared explicitly or the wiped conversation's
+        // number outlives it.
+        if let Some(db) = self.db() {
+            db.clear_total_tokens(session_id).detach_and_log_err(cx);
+        }
+        // /clear cleared `entries` and bumped the epoch above. Rewrite
+        // the rows wholesale (here that deletes ALL rows + saves the
+        // bumped epoch) so the next cold load doesn't replay the stale
+        // pre-clear transcript. Targeted upserts can't delete; this must
+        // run on the empty-entries clear path. Deleting the rows is only
+        // half a wipe for a session old enough to carry a legacy
+        // `acp_thread_blob` — with zero rows every read path falls back
+        // to that blob — so this goes through `persist_context_wipe`,
+        // which drops the blob in the same savepoint.
+        self.persist_context_wipe(session_id, cx);
+        // Bound disk: the pre-clear transcript is now orphaned — keep
+        // only the most recent few of this session's transcripts.
+        self.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
+        // `/clear` wipes the context, so the inbox attachment paths are
+        // unreachable — purge the files + rows. Pixels survive as base64.
+        self.purge_session_attachments(session_id, cx);
+        // `reset_context` does not bump `context_count` (only
+        // `rotate_context` does), so read the current value to
+        // forward as-is on the wire.
+        let context_count = session_entity.read(cx).context_count;
+        self.mark_state_changed(session_id, cx);
+        cx.emit(SolutionAgentStoreEvent::SessionContextReset {
+            id: session_id,
+            context_count,
+        });
+        if had_pending {
+            self.mark_queue_changed(session_id, cx);
+        }
+        cx.notify();
+        (old_acp_session_id, old_thread_was_live)
     }
 
     /// Returns a clone of the persistence handle if one was configured

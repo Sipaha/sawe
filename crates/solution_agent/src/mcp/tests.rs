@@ -1821,6 +1821,143 @@ async fn start_compact_queues_prompt_when_idle(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// Put one Managed Agent on the session that is still working for it (fresh
+/// transcript, no `stop_reason`).
+fn insert_running_background_agent(session_id: SolutionSessionId, cx: &mut gpui::TestAppContext) {
+    let bg_id = crate::background_agent::BackgroundAgentId::new("a5ub4g3n7w0rk1ng");
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        session.update(cx, |s, _| {
+            s.background_agents.insert(
+                bg_id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: bg_id.clone(),
+                    jsonl_path: "/nonexistent".into(),
+                    registered_at: chrono::Utc::now(),
+                    latest: Some(crate::background_agent::BackgroundAgentSnapshot {
+                        mtime: std::time::SystemTime::now(),
+                        activity_label: SharedString::from("Editing files"),
+                        stop_reason: None,
+                        usage_limited: false,
+                    }),
+                    last_offset: 0,
+                    parent_tool_use_id: None,
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+        });
+    });
+}
+
+/// A compaction closes the `claude` process every background sub-agent is a
+/// child of — six executors died mid-work that way on 2026-09-28 when an
+/// observer-requested handoff ran over them. So both halves of the handoff
+/// wait for them: `start_compact` does not even queue the prompt, and
+/// `compact_session` (which does the actual rotation) refuses too, for an agent
+/// that dispatched more work while writing its handoff files.
+#[gpui::test]
+async fn compaction_waits_for_running_background_agents(cx: &mut gpui::TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: 250_000,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+    });
+    insert_running_background_agent(session_id, cx);
+    cx.executor().run_until_parked();
+
+    let result = StartCompactTool
+        .run(
+            StartCompactParams {
+                session_id: session_id.to_string(),
+                comment: None,
+                initiator: Some("agent".into()),
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("start_compact dispatches");
+    assert!(
+        !result.structured_content.queued,
+        "compaction must not be queued over a running sub-agent"
+    );
+    let message = result.structured_content.message.unwrap_or_default();
+    assert!(
+        message.starts_with(crate::compact::BACKGROUND_AGENTS_RUNNING),
+        "expected the running-sub-agents refusal; got {message:?}"
+    );
+
+    let error = CompactSessionTool
+        .run(
+            CompactSessionParams {
+                session_id: session_id.to_string(),
+                prompt_file: "/nonexistent/continue.md".into(),
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .err()
+        .expect("compact_session must refuse to rotate over a running sub-agent");
+    assert!(
+        error.to_string().starts_with(crate::compact::BACKGROUND_AGENTS_RUNNING),
+        "the refusal must name the sub-agents, before any file validation; got {error:#}"
+    );
+}
+
+/// When the agent can clear its context inside the running process, the
+/// rotation no longer touches its sub-agents — so running ones must not hold
+/// the handoff up.
+#[gpui::test]
+async fn in_place_compaction_does_not_wait_for_background_agents(cx: &mut gpui::TestAppContext) {
+    let (session_id, acp_thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        acp_thread.update(cx, |t, cx| {
+            t.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: 250_000,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            t.connection()
+                .clone()
+                .into_any()
+                .downcast::<crate::test_support::MockConnection>()
+                .expect("mock connection")
+                .set_in_place_clear(true);
+        });
+    });
+    insert_running_background_agent(session_id, cx);
+    cx.executor().run_until_parked();
+
+    let result = StartCompactTool
+        .run(
+            StartCompactParams {
+                session_id: session_id.to_string(),
+                comment: None,
+                initiator: Some("agent".into()),
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("start_compact dispatches");
+    assert!(
+        result.structured_content.queued,
+        "an in-place rotation leaves sub-agents running, so it must not wait for them; got {:?}",
+        result.structured_content.message
+    );
+}
+
 // -----------------------------------------------------------------
 // upload_{init,status,finish,abort} + send_message_blocks resolution
 // -----------------------------------------------------------------

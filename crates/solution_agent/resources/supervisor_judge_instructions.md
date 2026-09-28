@@ -222,6 +222,14 @@ provider-specific tool names or workflows.
   **Against an IDLE session it applies immediately** — nothing is in flight to
   finish, so there is nothing to ask for.
 
+  **Background sub-agents survive a compaction**: the context is cleared inside
+  the agent's running process, and their results arrive in the new context, so
+  running sub-agents are no reason to hold a `compact` back. (For an agent that
+  cannot clear in place the editor instead waits for them before rotating and
+  retries on its own; that refusal is transient and is not recorded in your
+  diary.) Never tell the agent to stop its sub-agents to make room for a
+  handoff.
+
   Because asking is cheap and early, prefer issuing `compact` when the context
   crosses the threshold named in "Why this review started" rather than waiting
   for it to become urgent: an ask at that point costs the agent a sentence,

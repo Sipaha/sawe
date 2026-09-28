@@ -326,7 +326,12 @@ impl SolutionAgentStore {
                 // rather than N independent prompts. A Cancelled stop
                 // (user pressed Stop) is treated as "abandon what I
                 // queued too": the queue is cleared without sending.
-                if let acp_thread::AcpThreadEvent::Stopped(reason) = event {
+                // A handoff accepted mid-turn rotates now, between turns; the
+                // queue waits for the continued context (see
+                // `rotate_and_continue`).
+                if let acp_thread::AcpThreadEvent::Stopped(reason) = event
+                    && !self.start_deferred_rotation(session_id, reason, cx)
+                {
                     // `flush_after_cancel` (set by `interrupt_and_flush_pending`)
                     // flips Cancelled's default semantics from "abandon the
                     // queue too" to "cancel the current turn but immediately

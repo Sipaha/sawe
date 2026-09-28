@@ -273,6 +273,19 @@ impl SolutionAgentDb {
         // hazard. Do not resurrect a write path for it.
         apply_idempotent_add_column(&connection, "member_id INTEGER");
 
+        // A row = the user pressed Stop on this chat and has not written to it
+        // since, so a peer agent may not wake it while it is cold. Persisted
+        // because the point is to survive a restart: without it every restored
+        // chat had to be refused, since nothing said which ones were stopped.
+        // Its own table rather than a `solution_sessions` column so a Stop is
+        // recorded even before the session's metadata row has been written.
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS solution_session_peer_wake_block (
+                solution_session_id TEXT PRIMARY KEY NOT NULL
+            )
+        "})?()
+        .map_err(|e| anyhow!("Failed to create solution_session_peer_wake_block table: {}", e))?;
+
         connection.exec(indoc! {"
             CREATE TABLE IF NOT EXISTS solution_session_background_agent (
                 solution_session_id TEXT NOT NULL,
@@ -753,6 +766,7 @@ fn purge_session_fn(connection: &Connection, id: SolutionSessionId) -> Result<()
             "DELETE FROM solution_session_attachment WHERE session_id = ?",
             "DELETE FROM solution_session_background_agent WHERE solution_session_id = ?",
             "DELETE FROM solution_session_background_shell WHERE solution_session_id = ?",
+            "DELETE FROM solution_session_peer_wake_block WHERE solution_session_id = ?",
             "DELETE FROM supervisor_state WHERE session_id = ?",
         ] {
             let mut stmt = connection.exec_bound::<String>(sql)?;
@@ -785,6 +799,8 @@ fn delete_by_solution(connection: &Connection, solution_id: SolutionId) -> Resul
             "DELETE FROM solution_session_background_agent
              WHERE solution_session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
             "DELETE FROM solution_session_background_shell
+             WHERE solution_session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
+            "DELETE FROM solution_session_peer_wake_block
              WHERE solution_session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
             "DELETE FROM supervisor_state
              WHERE session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",

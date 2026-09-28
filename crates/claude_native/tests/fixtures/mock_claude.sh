@@ -26,6 +26,15 @@
 #                           in `additionalContext`, the final `result.result`
 #                           text echoes that marker. Lets the integration test
 #                           assert the agent "saw" the injected context.
+#   MOCK_CLAUDE_LATE_AFTER_CLEAR
+#                         - if set, a `/clear` is followed by a turn claude runs
+#                           on its own (what a background sub-agent's completion
+#                           notification triggers): text `LATE_AFTER_CLEAR` and a
+#                           `result`, with no user message to prompt it.
+#
+# A user message whose text is exactly `/clear` is answered the way the real
+# binary answers it: `conversation_reset`, an `init` carrying a NEW session id
+# (`<old id>-cleared`), then the command's own empty `result`.
 #
 # Faithful to the real `claude --input-format stream-json` binary: it does NOT
 # emit `system/init` on startup — it blocks on stdin and emits `init` (echoing
@@ -54,6 +63,16 @@ while IFS= read -r line; do
 
   # Only react to user turns; ignore control responses for stream sequencing.
   case "$line" in
+    *'"type":"user"'*'"text":"/clear"'*)
+      session_id="${session_id}-cleared"
+      emit '{"type":"conversation_reset","uuid":"u-reset"}'
+      emit '{"type":"system","subtype":"init","session_id":"'"$session_id"'","uuid":"u-init-cleared"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"result":"","stop_reason":null,"usage":{"input_tokens":0,"output_tokens":0},"uuid":"u-clear","session_id":"'"$session_id"'"}'
+      if [ -n "${MOCK_CLAUDE_LATE_AFTER_CLEAR:-}" ]; then
+        emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"LATE_AFTER_CLEAR"}},"uuid":"u-late","session_id":"'"$session_id"'"}'
+        emit '{"type":"result","subtype":"success","is_error":false,"result":"LATE_AFTER_CLEAR","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1},"uuid":"u-late-r","session_id":"'"$session_id"'"}'
+      fi
+      ;;
     *'"type":"user"'*)
       # Real `claude` emits `init` only once the first turn begins.
       if [ -z "$emitted_init" ]; then

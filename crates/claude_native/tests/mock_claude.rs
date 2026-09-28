@@ -996,3 +996,116 @@ async fn close_session_kills_process_and_removes_session(cx: &mut TestAppContext
         }
     }
 }
+
+/// `/clear` inside the running process — the compaction path that keeps
+/// background sub-agents alive. The conversation moves to the new session id
+/// claude reports, in the SAME process; the `/clear`'s own `result` is not
+/// stamped onto either thread; and output claude produces on its own afterwards
+/// (a sub-agent's completion turn) lands in the NEW thread.
+#[gpui::test]
+async fn clear_in_place_keeps_the_process_and_moves_to_the_new_session(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test(cx).await;
+    let connection = connect_mock(
+        &project,
+        vec![("MOCK_CLAUDE_LATE_AFTER_CLEAR".into(), "1".into())],
+        cx,
+    )
+    .await;
+    assert!(connection.supports_in_place_clear());
+
+    let task = cx.update(|cx| {
+        Rc::clone(&connection).new_session(
+            project.clone(),
+            PathList::new(&[std::env::temp_dir().as_path()]),
+            cx,
+        )
+    });
+    let old_thread = await_thread(task, cx).await;
+    let old_id = old_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    // One ordinary turn first, as a real session would have had.
+    let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))];
+    let prompt_task = cx.update(|cx| {
+        connection.prompt(acp::PromptRequest::new(old_id.clone(), prompt), cx)
+    });
+    await_prompt(prompt_task, cx, Duration::from_secs(10)).await;
+    let pid = connection
+        .session_process_id_for_test(&old_id)
+        .expect("live process");
+    let old_markdown = old_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+
+    let clear = cx.update(|cx| Rc::clone(&connection).clear_session_in_place(&old_id, cx));
+    let new_thread = await_thread(clear, cx).await;
+    let new_id = new_thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+    assert_eq!(&*new_id.0, format!("{}-cleared", old_id.0).as_str());
+    assert_eq!(
+        connection.session_process_id_for_test(&new_id),
+        Some(pid),
+        "the conversation must continue in the SAME process"
+    );
+    assert!(
+        connection.session_process_id_for_test(&old_id).is_none(),
+        "the old id is retired"
+    );
+
+    // The unprompted turn after the clear is routed to the new thread.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let markdown = new_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        if markdown.contains("LATE_AFTER_CLEAR") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "output after /clear never reached the new thread: {markdown}"
+        );
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    assert_eq!(
+        old_thread.read_with(cx, |thread, cx| thread.to_markdown(cx)),
+        old_markdown,
+        "nothing after the /clear may land in the retired thread"
+    );
+
+    // And the new thread is a working session: a prompt on its id resolves.
+    let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new("again"))];
+    let prompt_task =
+        cx.update(|cx| connection.prompt(acp::PromptRequest::new(new_id.clone(), prompt), cx));
+    let response = await_prompt(prompt_task, cx, Duration::from_secs(10)).await;
+    assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+}
+
+/// A clear must wait for an idle session: mid-turn, claude would queue the
+/// command behind the running turn and the caller would graft a thread that
+/// the rest of that turn never reaches.
+#[gpui::test]
+async fn clear_in_place_refuses_while_a_turn_is_running(cx: &mut TestAppContext) {
+    let project = init_test(cx).await;
+    let connection = connect_mock(
+        &project,
+        vec![("MOCK_CLAUDE_NO_RESULT".into(), "1".into())],
+        cx,
+    )
+    .await;
+    let task = cx.update(|cx| {
+        Rc::clone(&connection).new_session(
+            project.clone(),
+            PathList::new(&[std::env::temp_dir().as_path()]),
+            cx,
+        )
+    });
+    let thread = await_thread(task, cx).await;
+    let id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))];
+    let _running = cx.update(|cx| connection.prompt(acp::PromptRequest::new(id.clone(), prompt), cx));
+    cx.run_until_parked();
+
+    let clear = cx.update(|cx| Rc::clone(&connection).clear_session_in_place(&id, cx));
+    let error = clear.await.expect_err("a running turn must refuse the clear");
+    assert!(error.to_string().contains("turn is in flight"), "{error:#}");
+    assert!(connection.session_process_id_for_test(&id).is_some());
+}

@@ -38,6 +38,33 @@ impl SolutionAgentDb {
         })
     }
 
+    /// Record whether the user's Stop currently bars peers from waking this
+    /// session (see `SolutionAgentStore::peer_recipient_ready`).
+    pub fn set_peer_wake_blocked(&self, id: SolutionSessionId, blocked: bool) -> Result<()> {
+        let connection = self.connection.lock();
+        if blocked {
+            connection.exec_bound::<String>(
+                "INSERT OR IGNORE INTO solution_session_peer_wake_block (solution_session_id) \
+                 VALUES (?1)",
+            )?(id.to_string())
+        } else {
+            connection.exec_bound::<String>(
+                "DELETE FROM solution_session_peer_wake_block WHERE solution_session_id = ?1",
+            )?(id.to_string())
+        }
+    }
+
+    /// Every session the user stopped and has not written to since.
+    pub fn load_peer_wake_blocked(&self) -> Result<Vec<SolutionSessionId>> {
+        let ids = self.connection.lock().select::<String>(
+            "SELECT solution_session_id FROM solution_session_peer_wake_block",
+        )?()?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| SolutionSessionId::parse(id).ok())
+            .collect())
+    }
+
     pub fn load_default_permission_mode(&self) -> Result<crate::model::SessionPermissionMode> {
         let connection = self.connection.lock();
         let values = connection.select::<String>(

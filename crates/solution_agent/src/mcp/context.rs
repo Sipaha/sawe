@@ -156,17 +156,33 @@ impl McpServerTool for CompactSessionTool {
         //    root and require the prompt path to live underneath
         //    `<solution_root>/.agents/<session_id>/` so an agent can't
         //    point us at /etc/passwd or some other unrelated file.
-        let (solution_id, agent_id) = cx
+        let (solution_id, agent_id, running_agents, in_place) = cx
             .update(|cx| {
                 let store = SolutionAgentStore::global(cx);
                 store.read_with(cx, |store, cx| {
                     store.session(old_session_id).map(|entity| {
                         let s = entity.read(cx);
-                        (s.solution_id, s.agent_id.clone())
+                        (
+                            s.solution_id,
+                            s.agent_id.clone(),
+                            s.running_background_agents(chrono::Utc::now()),
+                            store.in_place_clear_connection(old_session_id, cx).is_some(),
+                        )
                     })
                 })
             })
             .ok_or_else(|| anyhow!("unknown session {old_session_id}"))?;
+        // Only a rotation that REPLACES the agent process kills its background
+        // sub-agents; an in-place one keeps them. `start_compact` already
+        // refused while sub-agents ran, but the agent can dispatch more while
+        // writing the handoff — and this is the call that would close the
+        // process they are children of.
+        anyhow::ensure!(
+            in_place || running_agents == 0,
+            "{}. The handoff files can stay as they are; call compact_session again once \
+             the sub-agents have reported back.",
+            crate::compact::background_agents_block_reason(running_agents)
+        );
 
         let solution_root = cx
             .update(|cx| {
@@ -268,6 +284,38 @@ impl McpServerTool for CompactSessionTool {
             }
         }
 
+        // 2a. In place: the agent is calling us from inside its own turn, and
+        //     the process can only clear itself between turns — so the
+        //     rotation (and the continuation prompt) is started by the end of
+        //     this turn. Tell the agent to end it.
+        if in_place {
+            let deferred = cx.update(|cx| {
+                let store = SolutionAgentStore::global(cx);
+                store.update(cx, |store, cx| {
+                    store.rotate_and_continue(old_session_id, prompt_text, cx)
+                })
+            });
+            let text = if deferred {
+                format!(
+                    "Handoff accepted ({prompt_bytes} bytes). When your current turn ends, the \
+                     editor clears this conversation inside the same agent process — background \
+                     sub-agents keep running and report into the new context — and continues it \
+                     from your handoff prompt. Finish the turn when you are ready; whatever you \
+                     do after this point stays in the context being cleared and is not in the \
+                     handoff."
+                )
+            } else {
+                format!("rotating {old_session_id} in place ({prompt_bytes} bytes)")
+            };
+            return Ok(ToolResponse {
+                content: vec![ToolResponseContent::Text { text }],
+                structured_content: CompactSessionResult {
+                    new_session_id: old_session_id.to_string(),
+                    prompt_bytes,
+                },
+            });
+        }
+
         // 2. Rotate the in-flight ACP thread under the SAME
         //    SolutionSessionId. Subprocess pool entry stays, tab stays,
         //    only the conversation history is swapped out. Returns the
@@ -317,6 +365,11 @@ impl McpServerTool for CompactSessionTool {
 /// message; the agent then writes its handoff files and calls back
 /// into the lower-level `solution_agent.compact_session` to rotate.
 ///
+/// Background sub-agents survive the handoff when the agent can clear its
+/// context in place (claude does). Only for an agent that cannot is the
+/// request refused while sub-agents run — its rotation replaces the process
+/// and would kill them; `compact_session` enforces the same.
+///
 /// Surface contract: this tool is what a human client (e.g. the phone)
 /// invokes from a "Compact" button. `compact_session` is what the running
 /// agent invokes after producing the handoff dump. Don't mix
@@ -362,8 +415,10 @@ pub struct StartCompactResult {
     /// `true` when the compact prompt was enqueued on the agent. A cold
     /// (sleeping) session is woken first, then the prompt is queued.
     /// `false` when a precondition wasn't met (e.g. awaiting approval,
-    /// stopping, compaction already pending, context below 10%, or less than 30k tokens of headroom) — `message`
-    /// carries the reason.
+    /// stopping, compaction already pending, background sub-agents running on
+    /// an agent that cannot rotate in place, context below 10%, or less than
+    /// 30k tokens of headroom) —
+    /// `message` carries the reason.
     pub queued: bool,
     /// Human-readable explanation when `queued == false`. `None` on
     /// success.

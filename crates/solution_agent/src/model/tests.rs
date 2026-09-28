@@ -99,6 +99,7 @@ fn build_session() -> SolutionSession {
         pending_messages: VecDeque::new(),
         peer_messages_held: false,
         pending_compaction: None,
+        pending_rotation: None,
         compact_request_serial: 0,
         compact_reset_observer_memory: false,
         flush_after_cancel: false,
@@ -380,6 +381,55 @@ fn clear_closed_streams_reopens(cx: &mut TestAppContext) {
         s.clear_closed_streams();
         s.rebuild_streams();
         assert!(s.streams.contains_key(&t1), "cleared overlay → reopened");
+    });
+}
+
+/// A closed teammate stream that comes back holding a tool call waiting for
+/// confirmation stays visible: the question needs a button (2026-09-28 — a
+/// resumed agent's approval sat hidden while the session showed "Awaiting
+/// input"). Once answered, the Done-close applies again.
+#[gpui::test]
+fn a_closed_teammate_asking_for_approval_stays_visible(cx: &mut TestAppContext) {
+    use crate::session_entry::{SessionEntryKind, ToolStatus};
+    use crate::stream::StreamId;
+    let t1 = StreamId::Teammate(SharedString::from("T1"));
+    let tool_call = |status: ToolStatus| SessionEntry {
+        created_ms: 0,
+        mod_seq: 2,
+        subagent_id: Some(SharedString::from("T1")),
+        kind: SessionEntryKind::ToolCall {
+            id: "toolu_rm".into(),
+            label_md: "rm -rf".into(),
+            kind: agent_client_protocol::schema::v1::ToolKind::Execute,
+            status,
+            content_md: vec![],
+            raw_input: None,
+            raw_output: None,
+            tool_name: Some("Bash".into()),
+            locations: vec![],
+            status_started_at: None,
+        },
+    };
+    let session = cx.update(|cx| cx.new(|_| build_session()));
+    session.update(cx, |s, cx| {
+        s.set_entries(vec![msg_tagged("sub", Some("T1"))], cx);
+        s.close_stream(t1.clone(), SharedString::new_static("done"));
+        assert!(!s.streams.contains_key(&t1));
+
+        s.set_entries(
+            vec![
+                msg_tagged("sub", Some("T1")),
+                tool_call(ToolStatus::WaitingForConfirmation),
+            ],
+            cx,
+        );
+        assert!(s.streams.contains_key(&t1), "a pending approval must be reachable");
+
+        s.set_entries(
+            vec![msg_tagged("sub", Some("T1")), tool_call(ToolStatus::Completed)],
+            cx,
+        );
+        assert!(!s.streams.contains_key(&t1), "answered → the Done-close holds again");
     });
 }
 

@@ -128,6 +128,10 @@ fn compact_unavailable_reason(session_id: SolutionSessionId, cx: &App) -> Result
                 "session is awaiting approval; resolve it before compacting".into(),
             ));
         }
+        let running_agents = s.running_background_agents(chrono::Utc::now());
+        if running_agents > 0 && store.read(cx).in_place_clear_connection(session_id, cx).is_none() {
+            return Ok(Some(background_agents_block_reason(running_agents)));
+        }
         if !matches!(
             s.state,
             SessionState::Idle | SessionState::Errored(_) | SessionState::Running { .. }
@@ -176,6 +180,37 @@ fn compact_unavailable_reason(session_id: SolutionSessionId, cx: &App) -> Result
     }
 
     Ok(None)
+}
+
+/// Start of the refusal [`background_agents_block_reason`] returns — matched
+/// by the observer's compaction path to tell this transient refusal from the
+/// ones that hold until the transcript rotates.
+pub(crate) const BACKGROUND_AGENTS_RUNNING: &str = "background sub-agents are still running";
+
+/// Why a session with `running` live background agents must not compact yet —
+/// on an agent that cannot clear its context in place.
+///
+/// Such a rotation opens a FRESH agent process and closes the old one
+/// (`rotate_context_replacing_process` → `close_session`), and every Managed
+/// Agent is a child of that process: it dies mid-work, and its final report is
+/// lost. That is what happened to six executors on 2026-09-28. claude now
+/// rotates in place (`/clear`, see `SolutionAgentStore::rotate_context`), which
+/// keeps them alive, so this guard only applies where that is unavailable:
+/// every initiator is refused, and `compact_session` refuses the final
+/// rotation too. A sub-agent that has gone silent past its budget stops
+/// counting (`vouches_for_parent`), so a hung one cannot hold the handoff
+/// forever.
+pub(crate) fn background_agents_block_reason(running: usize) -> String {
+    let agents = if running == 1 {
+        "1 is".to_string()
+    } else {
+        format!("{running} are")
+    };
+    format!(
+        "{BACKGROUND_AGENTS_RUNNING} ({agents} working) — wait for their results, or stop them, \
+         before compacting: the handoff restarts the agent process, which kills them and loses \
+         their work"
+    )
 }
 
 pub(crate) fn is_compaction_blocks(

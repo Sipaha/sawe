@@ -86,6 +86,35 @@ pub(crate) fn push_and_evict_transcripts(
     evicted
 }
 
+/// What re-registering a resumed async agent needs from claude's files.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ResumedAgentFiles {
+    pub(crate) jsonl_path: PathBuf,
+    /// The original `Agent` spawn's tool_use id — the teammate stream key.
+    pub(crate) parent_toolu: SharedString,
+    /// The transcript's current length: the resumed run is read from here on.
+    pub(crate) offset: u64,
+}
+
+/// `agent-<id>.jsonl` + the `toolUseId` from `agent-<id>.meta.json` in a
+/// session's `subagents/` dir. `None` when the meta file is missing or has no
+/// `toolUseId` — without it there is no stream to reopen.
+pub(crate) fn resumed_agent_files(
+    subagents_dir: &std::path::Path,
+    id: &crate::background_agent::BackgroundAgentId,
+) -> Option<ResumedAgentFiles> {
+    let meta = std::fs::read_to_string(subagents_dir.join(format!("agent-{id}.meta.json"))).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&meta).ok()?;
+    let parent_toolu = SharedString::from(meta.get("toolUseId")?.as_str()?.to_string());
+    let jsonl_path = subagents_dir.join(format!("agent-{id}.jsonl"));
+    let offset = std::fs::metadata(&jsonl_path).map(|m| m.len()).unwrap_or(0);
+    Some(ResumedAgentFiles {
+        jsonl_path,
+        parent_toolu,
+        offset,
+    })
+}
+
 /// Defensive per-tick read cap for the parent-JSONL scan. A single JSONL
 /// message line is small; this only bounds a pathological burst.
 pub(crate) const PARENT_JSONL_READ_CAP: u64 = 1024 * 1024;
@@ -706,7 +735,9 @@ impl SolutionAgentStore {
             // `.raw_input(..)`, never `.raw_output(..)`, so `call.raw_output` is
             // always `None` and `raw_output_text` is always empty. Skip the
             // string-building for every other tool.
-            let content_text = if is_terminal && (is_task_like || tool_name == "Bash") {
+            let content_text = if is_terminal
+                && (is_task_like || tool_name == "Bash" || tool_name == "SendMessage")
+            {
                 let mut text = String::new();
                 for content in &call.content {
                     if let acp_thread::ToolCallContent::ContentBlock(block) = content {
@@ -895,6 +926,24 @@ impl SolutionAgentStore {
                     );
                 }
             }
+        }
+
+        // A finished async agent woken again by the main agent (`SendMessage`
+        // to its id) works on under its original teammate stream — which was
+        // closed, with the agent dropped from `background_agents`, when it
+        // first finished. Re-register it so its tab comes back and its
+        // liveness counts again; without this it worked invisibly, and a tool
+        // approval it asked for had no button anywhere (2026-09-28). Runs
+        // BEFORE the `is_task_like` early-return, like the shell branches.
+        if snapshot.is_terminal
+            && snapshot.tool_name.as_deref() == Some("SendMessage")
+            && let Some(agent_id) = snapshot
+                .content_text
+                .as_deref()
+                .or(snapshot.raw_output_text.as_deref())
+                .and_then(crate::background_agent::parse_resumed_agent_id)
+        {
+            self.reregister_resumed_agent(session_id, agent_id, cx);
         }
 
         if !snapshot.is_task_like {
@@ -1101,6 +1150,115 @@ impl SolutionAgentStore {
         // the `is_terminal` branch). It is SELECTIVE, so a still-live teammate
         // in this session is untouched.
         self.reconcile_finished_teammate_streams(session_id, cx);
+    }
+
+    /// Bring a resumed async agent back: reopen its teammate stream and track
+    /// it again, reading its transcript only from the current end (the lines
+    /// before it end in the FIRST run's `stop_reason`, which would retire it
+    /// again on the next tick). Its original spawn `toolu` — the teammate
+    /// stream's key — comes from the `agent-<id>.meta.json` claude writes next
+    /// to the transcript. A no-op for an agent that is still tracked and live.
+    pub(crate) fn reregister_resumed_agent(
+        &mut self,
+        session_id: SolutionSessionId,
+        agent_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+        let id = crate::background_agent::BackgroundAgentId::new(agent_id);
+        // Nothing to do only if the agent is tracked, live AND its tab is
+        // open. A still-tracked record is not enough: the `SubagentStop` hook
+        // closes the tab while the record lingers with its last snapshot, so
+        // a record alone would leave the resumed run just as invisible.
+        let already_visible = {
+            let s = session.read(cx);
+            s.background_agents.get(&id).is_some_and(|agent| {
+                !agent.killed
+                    && agent.renders_stream()
+                    && agent.parent_tool_use_id.as_ref().is_some_and(|toolu| {
+                        !s.closed_streams
+                            .contains_key(&crate::stream::StreamId::Teammate(toolu.clone()))
+                    })
+            })
+        };
+        if already_visible {
+            return;
+        }
+        let (cwd, acp_session_id) = {
+            let s = session.read(cx);
+            (s.cwd.clone(), s.acp_session_id.clone())
+        };
+        let Some(dir) = background_agent_dir_for(&cwd, acp_session_id.0.as_ref()) else {
+            return;
+        };
+        let Some(ResumedAgentFiles {
+            jsonl_path,
+            parent_toolu,
+            offset,
+        }) = resumed_agent_files(&dir, &id)
+        else {
+            log::info!(
+                target: "solution_agent::background_agents",
+                "session={session_id} resumed agent {id}: no readable meta.json in {} — \
+                 not re-registered",
+                dir.display()
+            );
+            return;
+        };
+        session.update(cx, |s, _| {
+            s.closed_streams
+                .remove(&crate::stream::StreamId::Teammate(parent_toolu.clone()));
+            s.background_agents.insert(
+                id.clone(),
+                crate::background_agent::BackgroundAgent {
+                    id: id.clone(),
+                    jsonl_path: jsonl_path.clone(),
+                    registered_at: chrono::Utc::now(),
+                    latest: None,
+                    last_offset: offset,
+                    parent_tool_use_id: Some(parent_toolu),
+                    latest_seq: 0,
+                    killed: false,
+                },
+            );
+            if !s.background_agent_order.contains(&id) {
+                s.background_agent_order.push(id.clone());
+            }
+            s.rebuild_streams();
+        });
+        log::info!(
+            target: "solution_agent::background_agents",
+            "session={session_id} resumed agent {id} re-registered"
+        );
+        cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
+            session_id,
+        ));
+        if let Some(db) = self.persistence.clone() {
+            let row = crate::db::BackgroundAgentRow {
+                solution_session_id: session_id.to_string(),
+                agent_id: id.as_str().to_string(),
+                jsonl_path: jsonl_path.to_string_lossy().into_owned(),
+                registered_at_ms: chrono::Utc::now().timestamp_millis(),
+                last_seen_label: None,
+                last_mtime_ms: None,
+                stop_reason: None,
+            };
+            cx.background_spawn(async move {
+                db.save_background_agent(row).await.log_err();
+            })
+            .detach();
+        }
+        if let Some(fs) = session
+            .read(cx)
+            .project
+            .as_ref()
+            .map(|p| p.read(cx).fs().clone())
+        {
+            self.ensure_background_agent_watcher(session_id, fs, cx);
+        }
+        cx.notify();
     }
 
     /// Tail the JSONL of every registered background agent the `fs.watch`

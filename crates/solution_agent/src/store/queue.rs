@@ -403,7 +403,7 @@ impl SolutionAgentStore {
         // peer messages, which never clear it.
         if !session.read(cx).flush_after_cancel {
             session.update(cx, |s, _| s.peer_messages_held = true);
-            self.peer_wake_sessions.remove(&session_id);
+            self.block_peer_wake(session_id);
         }
         // Idempotent: only an in-flight turn can be stopped. A cancel in
         // Stopping/Idle/Errored is a safe no-op (covers repeated taps and the
@@ -873,7 +873,7 @@ impl SolutionAgentStore {
         // incremented).
         if from_user {
             session_entity.update(cx, |s, _| s.peer_messages_held = false);
-            self.peer_wake_sessions.insert(session_id);
+            self.allow_peer_wake(session_id);
             self.reset_supervisor_continue_counter(session_id, cx);
             // A reply mid-`Judging` supersedes the in-flight judge so its stale
             // verdict can't nudge the agent after the user already steered it

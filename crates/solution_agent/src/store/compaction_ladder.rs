@@ -149,7 +149,12 @@ impl SolutionAgentStore {
                         // to do with transcript rotation, so don't mislead the
                         // judge into deferring compaction. Only diary the
                         // rotation-relevant refusals (too short / no headroom).
-                        if reason.starts_with("session is busy") {
+                        // Running sub-agents are the same kind of transient
+                        // refusal: the handoff is only waiting for them, and
+                        // the ladder retries after its back-off.
+                        if reason.starts_with("session is busy")
+                            || reason.starts_with(crate::compact::BACKGROUND_AGENTS_RUNNING)
+                        {
                             None
                         } else {
                             Some(format!(
@@ -294,7 +299,9 @@ impl SolutionAgentStore {
             "{opening} Finish the step you are on — do not start new work — then hand off: \
              call the `solution_agent.start_compact` tool on the `sawe` MCP server with \
              {{\"session_id\": \"{id}\", \"initiator\": \"agent\"}}. It gives you the standard \
-             handoff instructions to follow. {closing}"
+             handoff instructions to follow. Sub-agents still running keep running across the \
+             handoff and report into the next context, so you need not wait for them. \
+             {closing}"
         );
         if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             message.push_str("\n\nWhat this handoff must not lose: ");

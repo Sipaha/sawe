@@ -6020,3 +6020,85 @@ real `MultiWorkspace` window (the modal layer is painted by `MultiWorkspace`, no
 a `Workspace`-rooted window never paints a modal at all). It is mutation-checked: ignoring
 `bottom_center` fails it. Checked in a probe: the menu shows the three items, and "Compact and
 message…" opens the dialog over the bottom of the session panel.
+
+### 215. Claude rotates its context in place with `/clear`; the process and its sub-agents survive
+
+The maintainer, 2026-09-28, after six executors died in a compaction: *«А нельзя делать не через
+перезапуск, а через /clear комманду?»* — and then: *«сессия как и раньше должна инициировать /clear
+сама когда посчитает что весь нужный контекст зафиксирован в файлах. не надо принудительно
+слать»*.
+
+Why: rotating by replacing the `claude` process killed every Agent-tool sub-agent (they are its
+children) and lost their reports. `/clear` sent in stream-json mode wipes the conversation
+**inside** the running process. claude answers `conversation_reset` → `init` with a **new session
+id** → an empty `result`, and background sub-agents and shells keep running and report into the
+new conversation. This was verified live against 2.1.282.
+
+How to apply:
+- `AgentConnection::clear_session_in_place` defaults to unsupported; `claude_native` implements
+  it.
+- `SolutionAgentStore::rotate_context` / `reset_context` prefer it. They fall back to the
+  process-replacing path (`*_replacing_process`) when it is missing or fails.
+- The agent still decides when its context is saved and calls `compact_session` itself.
+  Because that call comes from inside its turn, the rotation is parked (`pending_rotation`) and
+  runs on the `Stopped` that ends the turn. A Cancelled stop abandons it.
+- Nothing orders the agent to stop at once.
+- "Is a turn running" is `AcpThread::status()`, never `SessionState`: sub-agent activity flips the
+  session to `Running`.
+- Caveat to keep in mind: `/clear` interrupts a sub-agent's in-flight foreground command
+  (exit 137). The sub-agent itself carries on.
+- The old "refuse while sub-agents run" guard now applies only to the fallback path.
+- Finding: `docs/findings/2026-09-28-compaction-killed-running-subagents.md`.
+
+### 216. A user's Stop is persisted; sleeping chats accept peer messages otherwise
+
+The maintainer, 2026-09-28: *«для sleeping сессий нельзя отправлять сообщения»*.
+
+Why: `peer_wake_sessions` ("chats the user wrote to during this app run") lived only in memory.
+After any restart, no sleeping chat could receive `send_agent_message`, because nothing recorded
+which ones the user had stopped.
+
+How to apply:
+- The inverse set, `peer_wake_blocked`, is persisted in `solution_session_peer_wake_block`. It is
+  a separate table so a Stop is recorded even before the session's metadata row exists, and it is
+  purged with the session.
+- A cold chat is woken for a peer unless it is in that set.
+- Stop adds the chat (`block_peer_wake`); the user's next message removes it (`allow_peer_wake`).
+- ADR-0005 is amended accordingly.
+
+### 217. A pending approval is never hidden, and a resumed sub-agent gets its tab back
+
+The maintainer, 2026-09-28, about a session stuck on "Awaiting input": *«саб агентов при этом нету
+в интерфейсе»*, then *«а мы не можем в такой команде сами понять что она безопасна и сделать
+автоапрув?»*.
+
+Why: a finished async sub-agent's teammate stream is closed for good. Once `SendMessage` woke it
+again, its entries — including a safety-hook approval question — were suppressed with that
+stream.
+
+How to apply:
+- `rebuild_streams` keeps a closed teammate stream visible while it holds a `WaitingForConfirmation`
+  call.
+- A terminal `SendMessage` with `resumedAgentId` re-registers the agent
+  (`reregister_resumed_agent`: `toolUseId` from `agent-<id>.meta.json`, transcript offset at the
+  end). That branch must sit above `apply_subagent_lifecycle`'s `Task|Agent` early return.
+- `tool_authorization` auto-allows `rm` targets given as `$(cat <file>)` / `$(< <file>)` when the
+  file holds exactly one path strictly inside the Solution. It asks for anything else.
+- Finding: `docs/findings/2026-09-28-resumed-subagent-approval-was-invisible.md`.
+
+### 218. Background git in `solutions` cannot prompt, and cancelling an add kills it
+
+The maintainer, 2026-09-28: *«а почему повис клон?»* — a private https remote left the clone
+waiting for a username on the editor's tty. Cancel only set a flag, so the git process lived on
+and held `fs_lock` for every later add.
+
+How to apply:
+- Every git that `solutions` runs goes through `git_command()`: `GIT_TERMINAL_PROMPT=0`, stdin
+  `/dev/null`, `setsid`.
+- Dropping a `drain_command` future SIGTERMs the child's process group.
+- `InFlightAdd._abort` is a sender whose drop aborts the add's git step.
+- `ensure_cache` clones into `<key>.partial` and renames it into place on success.
+- Note that `smol::process::Command::from(std::process::Command)` forgets the std command's stdio,
+  so set stdio after the conversion.
+- Catalog rows are editable from the add pickers (a pencil, or `secondary-enter`).
+- Finding: `docs/findings/2026-09-28-catalog-clone-hung-on-a-credential-prompt.md`.
