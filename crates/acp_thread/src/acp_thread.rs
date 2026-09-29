@@ -397,11 +397,14 @@ pub fn meta_with_observer_nudge() -> acp::Meta {
     acp::Meta::from_iter([(SPK_OBSERVER_NUDGE_META_KEY.into(), true.into())])
 }
 
-/// Key stamped on an editor RECOVERY message — the "your process hung, the
-/// editor restarted it" continuation the stuck-session watchdog injects after a
-/// reconnect (`solution_agent::store::maybe_send_reconnect_continuation`). Like
-/// the observer nudge it is a `role==user` message that is NOT the human's
-/// voice, so consumers that reason about "the user's goal" must exclude it:
+/// Key stamped on a message the EDITOR itself sends the agent: the "your
+/// process hung, the editor restarted it" continuation the stuck-session
+/// watchdog injects after a reconnect
+/// (`solution_agent::store::maybe_send_reconnect_continuation`), and the
+/// auto-compaction ask (`solution_agent::store::compaction_ladder`). The name
+/// predates the second use and is kept because it is on the wire. Like the
+/// observer nudge it is a `role==user` message that is NOT the human's voice,
+/// so consumers that reason about "the user's goal" must exclude it:
 /// otherwise the supervisor distills "your process hung" into `user_intent.md`,
 /// and `tail_is_unanswered_user_message` mistakes a prior recovery prompt for an
 /// unanswered human message on a second consecutive hang.

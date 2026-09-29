@@ -2320,6 +2320,111 @@ async fn get_session_surfaces_auth_options_while_waiting(cx: &mut gpui::TestAppC
     );
 }
 
+/// The waiting call is also listed session-wide, with its stream, so a client
+/// can answer it from the compose bar; answering clears the list.
+#[gpui::test]
+async fn pending_approvals_list_the_waiting_call_until_answered(cx: &mut gpui::TestAppContext) {
+    let (session_id, tool_call_id, _auth_task, _tmp) =
+        seed_session_with_pending_authorization(cx).await;
+    let get = |cx: &mut gpui::TestAppContext| {
+        let session_id = session_id.to_string();
+        let mut async_cx = cx.to_async();
+        async move {
+            GetSessionTool
+                .run(
+                    GetSessionParams {
+                        session_id,
+                        ..Default::default()
+                    },
+                    &mut async_cx,
+                )
+                .await
+                .expect("get_session")
+                .structured_content
+        }
+    };
+
+    let result = get(cx).await;
+    assert_eq!(result.pending_approvals.len(), 1);
+    let approval = &result.pending_approvals[0];
+    assert_eq!(approval.tool_call_id, tool_call_id);
+    assert_eq!(approval.stream_id, StreamIdDto::Main);
+    assert_eq!(approval.stream_label, "Main");
+    assert_eq!(approval.options.len(), 2);
+
+    AuthorizeToolCallTool
+        .run(
+            AuthorizeToolCallParams {
+                session_id: session_id.to_string(),
+                tool_call_id,
+                option_id: "opt-allow".to_string(),
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("authorize");
+    cx.executor().run_until_parked();
+    assert!(get(cx).await.pending_approvals.is_empty());
+}
+
+/// `set_auto_compact` changes what `get_session` reports; `0` returns to the
+/// window default.
+#[gpui::test]
+async fn set_auto_compact_round_trips_through_get_session(cx: &mut gpui::TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let get = |cx: &mut gpui::TestAppContext| {
+        let session_id = session_id.to_string();
+        let mut async_cx = cx.to_async();
+        async move {
+            GetSessionTool
+                .run(
+                    GetSessionParams {
+                        session_id,
+                        ..Default::default()
+                    },
+                    &mut async_cx,
+                )
+                .await
+                .expect("get_session")
+                .structured_content
+                .auto_compact
+        }
+    };
+    let set = |enabled: Option<bool>, threshold_pct: Option<u8>, cx: &mut gpui::TestAppContext| {
+        let session_id = session_id.to_string();
+        let mut async_cx = cx.to_async();
+        async move {
+            crate::mcp::context::SetAutoCompactTool
+                .run(
+                    crate::mcp::context::SetAutoCompactParams {
+                        session_id,
+                        enabled,
+                        threshold_pct,
+                    },
+                    &mut async_cx,
+                )
+                .await
+        }
+    };
+
+    let initial = get(cx).await;
+    assert!(initial.enabled, "on by default");
+    assert_eq!(initial.threshold_pct, None);
+    assert_eq!(initial.presets, vec![30, 40, 50, 60, 70, 80]);
+
+    set(Some(false), Some(60), cx).await.expect("set");
+    let changed = get(cx).await;
+    assert!(!changed.enabled);
+    assert_eq!(changed.threshold_pct, Some(60));
+
+    set(None, Some(0), cx).await.expect("reset threshold");
+    let reset = get(cx).await;
+    assert!(!reset.enabled, "enabled untouched when omitted");
+    assert_eq!(reset.threshold_pct, None);
+
+    assert!(set(None, Some(5), cx).await.is_err(), "out of range");
+}
+
 #[gpui::test]
 async fn authorize_tool_call_resolves_waiting_call(cx: &mut gpui::TestAppContext) {
     let (session_id, tool_call_id, _auth_task, _tmp) =

@@ -31,6 +31,7 @@ use crate::pool::SubprocessPool;
 use crate::teammate_watchers::TeammateWatchers;
 
 mod acp_event;
+mod auto_compact;
 pub(crate) mod compaction_ladder;
 mod connection_pool;
 mod hydration;
@@ -386,6 +387,12 @@ pub struct SolutionAgentStore {
     /// restart keeps honouring a Stop without refusing every other sleeping
     /// chat. Mutated only through `block_peer_wake` / `allow_peer_wake`.
     peer_wake_blocked: std::collections::HashSet<SolutionSessionId>,
+    /// Sessions whose auto-compaction differs from the default (on, default
+    /// threshold). Persisted; see `store::auto_compact`.
+    auto_compact: HashMap<SolutionSessionId, crate::model::AutoCompactSetting>,
+    /// The context each session's auto-compaction last fired in, so it fires
+    /// once per context. Transient.
+    auto_compact_fired: HashMap<SolutionSessionId, crate::model::SessionContextCount>,
     sessions: HashMap<SolutionSessionId, Entity<SolutionSession>>,
     by_solution: HashMap<SolutionId, Vec<SolutionSessionId>>,
     /// Cold sessions whose member directory is gone, and the member list they
@@ -1146,6 +1153,7 @@ impl SolutionAgentStore {
                         this.reconcile_all_finished_teammate_streams(cx);
                         this.scan_parent_jsonls_for_completions(cx);
                         this.tick_background_shells(cx);
+                        this.tick_context_handoffs(cx);
                         this.tick_supervisor(cx);
                         this.tick_stuck_sessions(cx);
                     })
@@ -1158,6 +1166,8 @@ impl SolutionAgentStore {
         Self {
             active_steers: HashMap::new(),
             peer_wake_blocked: Default::default(),
+            auto_compact: HashMap::new(),
+            auto_compact_fired: HashMap::new(),
             sessions: HashMap::new(),
             by_solution: HashMap::new(),
             cold_orphan_warnings: HashMap::new(),
@@ -1257,6 +1267,21 @@ impl SolutionAgentStore {
         match db.load_peer_wake_blocked() {
             Ok(ids) => self.peer_wake_blocked.extend(ids),
             Err(error) => log::error!("Could not load peer-wake blocks: {error}"),
+        }
+        // Same shape: a change made before the DB landed is written through,
+        // then earlier runs' settings fill in the rest.
+        for (id, setting) in &self.auto_compact {
+            if let Err(error) = db.set_auto_compact(*id, *setting) {
+                log::error!("Could not persist auto-compaction for {id}: {error}");
+            }
+        }
+        match db.load_auto_compact() {
+            Ok(rows) => {
+                for (id, setting) in rows {
+                    self.auto_compact.entry(id).or_insert(setting);
+                }
+            }
+            Err(error) => log::error!("Could not load auto-compaction settings: {error}"),
         }
         self.persistence = Some(db.clone());
         // One-time load: merge persisted band geometry into the in-memory map,

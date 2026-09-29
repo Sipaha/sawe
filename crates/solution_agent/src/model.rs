@@ -388,8 +388,8 @@ pub struct PendingBundle {
 /// A request that the agent hand its context off, being escalated: ask it to
 /// finish its step and compact itself, ask again, then send the compaction
 /// prompt (see `store::compaction_ladder`). One ladder serves both the
-/// observer's `compact` verdict and the user's Compact on a working session;
-/// only who is asking differs. Counted per CONTEXT: a rotation clears it.
+/// editor's auto-compaction and the user's Compact on a working session; only
+/// who is asking differs. Counted per CONTEXT: a rotation clears it.
 /// Transient — a restart means nobody is mid-handoff any more.
 #[derive(Clone, Debug)]
 pub(crate) struct HandoffLadder {
@@ -411,11 +411,61 @@ pub(crate) struct HandoffLadder {
     pub claims_user: bool,
 }
 
+/// A session's auto-compaction: when its context crosses the threshold while
+/// the agent works, the editor asks it to hand off (the handoff ladder). On by
+/// default; `threshold_pct: None` follows the window size
+/// ([`AutoCompactSetting::default_threshold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoCompactSetting {
+    pub enabled: bool,
+    pub threshold_pct: Option<u8>,
+}
+
+impl Default for AutoCompactSetting {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_pct: None,
+        }
+    }
+}
+
+impl AutoCompactSetting {
+    /// The thresholds offered in the UI. Below 20% a handoff costs more than
+    /// it frees; above 90% there is no room left to write it.
+    pub const PRESETS: [u8; 6] = [30, 40, 50, 60, 70, 80];
+
+    pub fn valid_threshold(pct: u8) -> bool {
+        (10..=95).contains(&pct)
+    }
+
+    /// The threshold for a context window of `max` tokens when the user has
+    /// not chosen one. Large windows start early: 40% of 1M leaves 600k to
+    /// finish a step and write the handoff, which is what lets the agent pick
+    /// its own boundary. Small windows are bound by absolute headroom, not by
+    /// the fraction, so they wait longer.
+    pub fn default_threshold(max: u64) -> u8 {
+        match max {
+            0..=128_000 => 80,
+            128_001..=256_000 => 75,
+            256_001..=512_000 => 65,
+            _ => 40,
+        }
+    }
+
+    pub fn effective_threshold(&self, max: u64) -> u8 {
+        self.threshold_pct
+            .unwrap_or_else(|| Self::default_threshold(max))
+    }
+}
+
 /// Who a handoff request speaks for. The wording, the delivery and where a
 /// refusal is reported differ; the escalation does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HandoffAsker {
-    Observer,
+    /// The editor's auto-compaction: the context crossed the session's
+    /// threshold while the agent worked.
+    Auto,
     /// A human's Compact: the desktop button (`User`) or a client's (`Client`).
     User(crate::compact::CompactInitiator),
 }

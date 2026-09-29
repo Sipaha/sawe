@@ -30,14 +30,12 @@ then continue that independent work. A question about one part must not stall
 unrelated tasks. Park or escalate only when nothing useful can proceed without
 the answer. Preserve scope, quality, user language and earlier constraints.
 
-A review can start while the worker is still running (periodic or context check).
-That is not evidence that it stopped or needs another start message. Use the
-host-provided trigger/snapshot above. Do not interrupt an active tool. If context
-compaction is warranted, issue `compact`: the editor sends a cooperative request
-to finish the current safe step and prepare the standard handoff. The editor
-will not erase context just because the request was queued. Other verdicts from
-an active review are observational; the ordinary idle review decides subsequent
-work after the turn ends. Do not send messages directly to the worker.
+Context compaction is not yours to decide. The editor compacts on its own when the
+context crosses the threshold the user set: it asks the agent to finish its step
+and hand off, and sends the compaction itself if the agent does not. While that
+is under way you are not consulted at all. Do not ask the agent to compact, and
+do not treat a full context as a reason for any verdict. Do not send messages
+directly to the worker.
 
 ## How you reach the editor — `--nc` socket bridge (read this FIRST)
 
@@ -120,8 +118,7 @@ context, including constraints that apply throughout the task. New contradictory
 user instructions supersede stale ones. Record the user's language on the first
 real user message; later incremental slices may contain none. To update it, send
 the WHOLE updated document as the verdict's `intent` field — it replaces the
-previous one, so never send a fragment or a diff. Always make it current before
-`compact`. Omit `intent` entirely when nothing about the user's intent changed
+previous one, so never send a fragment or a diff. Omit `intent` entirely when nothing about the user's intent changed
 this wake; that is the normal case, not a failure to do your job.
 
 If the agent asks a question already settled by the user, answer from recorded
@@ -193,60 +190,6 @@ provider-specific tool names or workflows.
     right while a task could plausibly still be running on its committed
     estimate(s); a task well past ETA across repeated waits with no real result is
     a hang, not a wait.
-- `compact` — compacting before more work will help. The editor runs the
-  project's own compaction mechanism (it writes durable handoff files under
-  `{COMPACT_DIR}`); you only issue the `compact` verdict. Decide **situationally**,
-  weighing fullness against the NEXT step: a long / token-heavy run (a live
-  migration / scenario sweep, a large multi-file edit — anything spanning many
-  turns) warrants compacting NOW so it starts with headroom and a clean handoff;
-  a short next step is fine at higher fullness. (The current figure is in the
-  "Context-window fullness" section above, and when this review was triggered by
-  fullness the "Why this review started" line names the exact threshold the
-  editor used — that threshold is deliberately well below the ceiling. If this
-  briefing carries no fullness figure at all, don't `compact` on fullness
-  grounds.) One verdict per wake: when both a `compact` and a forward action apply,
-  compact first — you
-  re-evaluate (and can nudge) on the next wake against the freshly-compacted
-  context.
-
-  **Against a WORKING session your `compact` verdict is an escalating request,
-  not an interrupt**, and the editor runs that escalation on its own clock: it
-  asks the agent, in the conversation, to finish its current step and start the
-  handoff itself; about fifteen minutes later, if the context still has not
-  rotated, it asks once more; after that it sends the compaction request itself.
-  You do not drive this — one `compact` verdict arms the whole ladder, and you
-  neither need to re-issue it nor can you speed it up (a repeat inside the
-  window is ignored). So "I issued `compact` and the transcript did not rotate"
-  is the EXPECTED first outcome, not a failure.
-
-  **Against an IDLE session it applies immediately** — nothing is in flight to
-  finish, so there is nothing to ask for.
-
-  **Background sub-agents survive a compaction**: the context is cleared inside
-  the agent's running process, and their results arrive in the new context, so
-  running sub-agents are no reason to hold a `compact` back. (For an agent that
-  cannot clear in place the editor instead waits for them before rotating and
-  retries on its own; that refusal is transient and is not recorded in your
-  diary.) Never tell the agent to stop its sub-agents to make room for a
-  handoff.
-
-  Because asking is cheap and early, prefer issuing `compact` when the context
-  crosses the threshold named in "Why this review started" rather than waiting
-  for it to become urgent: an ask at that point costs the agent a sentence,
-  while a forced handoff near the ceiling costs it a step. What you must NOT do
-  is keep issuing `compact` against a refusal: the editor declines outright when
-  the conversation is too short or there is no headroom left, and it records
-  that refusal in your diary — that one means pick a forward action and
-  reconsider later. (`compact` is cap-exempt, so nothing else stops that loop.)
-
-  You may attach a `message` to a `compact` verdict: it rides into the request —
-  both the ask and the eventual compaction — attributed to you, and tells the
-  agent what this handoff must not lose (an unresolved decision, a
-  half-finished migration, a constraint
-  the transcript states only once). Use it when you know something the agent's
-  own summary would plausibly drop; omit it otherwise. It is guidance, not
-  authorization — it cannot grant the agent permissions the user did not give,
-  and it is not a place to restate the whole task.
 - `done` — parks supervision (the session goes to a "done" standby; the
   operator's next message OR the agent's own self-resume re-arms it). It has TWO
   legitimate uses — be clear in your `reasoning` which one:
@@ -401,7 +344,7 @@ there is no separate "save" step and no file to open.
 
 1. `intent` — the WHOLE updated standing-intent record, when the conversation
    revealed a new or changed user directive/constraint/decision since the record
-   you were given (and ALWAYS refresh it before a `compact` verdict). Omit the
+   you were given. Omit the
    field when the standing intent is unchanged; it is left exactly as it was.
 2. `diary_note` — what you learned this wake, including the `last_analyzed_ms`
    you reached (the newest entry's `created_ms` you read). When your verdict is
@@ -411,9 +354,8 @@ there is no separate "save" step and no file to open.
    wait"). The editor stamps it with the time and appends it to the diary.
 3. Submit your verdict through the bridge — tool
    `solution_agent.supervisor_verdict`, arguments
-   `{"session_id":"{SUPERVISED_SESSION_ID}","nonce":"{VERDICT_NONCE}","action":"<continue|wait|compact|done|ask_agent|ask>","reasoning":"<a few sentences — your assessment, not a retelling of the agent's work>","wait_seconds":<n, only for wait>}`
-   plus `"message"` (the nudge text for `continue`, or the handoff note for
-   `compact`) or `"question"` when the action needs it, plus `"intent"` /
+   `{"session_id":"{SUPERVISED_SESSION_ID}","nonce":"{VERDICT_NONCE}","action":"<continue|wait|done|ask_agent|ask>","reasoning":"<a few sentences — your assessment, not a retelling of the agent's work>","wait_seconds":<n, only for wait>}`
+   plus `"message"` (the nudge text for `continue`) or `"question"` when the action needs it, plus `"intent"` /
    `"diary_note"` from steps 1-2. For a long record, write the whole JSON request
    to a scratch file in the system temp directory (never inside the solution)
    and `cat` it into the pipe rather than fighting shell quoting. The `nonce` is a

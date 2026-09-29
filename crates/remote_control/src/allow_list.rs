@@ -48,6 +48,7 @@ pub fn translate(method: &str) -> Option<&'static str> {
         "remote.solution_agent.restart_agent" => Some("solution_agent.restart_agent"),
         "remote.solution_agent.reset_context" => Some("solution_agent.reset_context"),
         "remote.solution_agent.start_compact" => Some("solution_agent.start_compact"),
+        "remote.solution_agent.set_auto_compact" => Some("solution_agent.set_auto_compact"),
         "remote.solution_agent.set_supervisor_enabled" => {
             Some("solution_agent.set_supervisor_enabled")
         }
@@ -192,6 +193,10 @@ mod tests {
             (
                 "remote.solution_agent.start_compact",
                 "solution_agent.start_compact",
+            ),
+            (
+                "remote.solution_agent.set_auto_compact",
+                "solution_agent.set_auto_compact",
             ),
             (
                 "remote.solution_agent.set_supervisor_enabled",

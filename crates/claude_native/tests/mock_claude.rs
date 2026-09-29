@@ -298,6 +298,12 @@ async fn prompt_resolves_on_result_and_streams_text(cx: &mut TestAppContext) {
         markdown.contains("Hi"),
         "streamed assistant text missing from thread: {markdown}"
     );
+    // The mock's `result` carries no `modelUsage`: the window comes from the
+    // `init`'s `…[1m]` model, as it must during a process's first turn.
+    let max_tokens = thread.read_with(cx, |thread, _| {
+        thread.token_usage().map(|usage| usage.max_tokens)
+    });
+    assert_eq!(max_tokens, Some(1_000_000));
 }
 
 #[gpui::test]

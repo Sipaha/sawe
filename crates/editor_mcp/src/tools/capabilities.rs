@@ -90,6 +90,14 @@ pub const FEATURE_QUIET_MESSAGE_APPENDED: &str = "quiet_message_appended";
 /// the question; one that hasn't still gets the buttons, just unexplained —
 /// which is why this is a feature token and not a schema bump.
 pub const FEATURE_TOOL_AUTH_REASON: &str = "tool_auth_reason";
+/// `auto_compact` on `get_session` / `get_session_changes` and the
+/// `solution_agent.set_auto_compact` tool: the per-session auto-compaction
+/// toggle and threshold.
+pub const FEATURE_AUTO_COMPACT: &str = "auto_compact";
+/// `pending_approvals` on `get_session` / `get_session_changes`: every tool call
+/// waiting on a human, across all streams, so a client can answer it without
+/// finding its card.
+pub const FEATURE_PENDING_APPROVALS: &str = "pending_approvals";
 
 /// How long a `spk_client_send_id` stays deduplicated. 24 h — exactly the
 /// mobile offline queue's TTL, which is the longest a message can sit on the
@@ -110,6 +118,8 @@ pub fn wire_features() -> Vec<String> {
         FEATURE_CSID_DEDUPE.to_string(),
         FEATURE_QUIET_MESSAGE_APPENDED.to_string(),
         FEATURE_TOOL_AUTH_REASON.to_string(),
+        FEATURE_AUTO_COMPACT.to_string(),
+        FEATURE_PENDING_APPROVALS.to_string(),
     ]
 }
 

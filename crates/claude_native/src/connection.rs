@@ -1680,6 +1680,24 @@ async fn run_update_pump(
         // Resolved per message: an in-place `/clear` swaps it mid-stream.
         let thread = shared.thread.borrow().clone();
 
+        // Seed the context window from the `init`'s model (`…[1m]` → 1M, else
+        // the 200k default) until a `result` states the real one. Without it
+        // the first turn of every process reports usage against an unknown
+        // window, and a long autonomous turn never learns how full it is —
+        // auto-compaction cannot fire in it.
+        if let OutputMessage::System(System::Init {
+            model: Some(model), ..
+        }) = &message
+            && shared
+                .sticky_window
+                .get()
+                .is_none_or(|w| w == 0 || w == DEFAULT_CONTEXT_WINDOW)
+        {
+            shared.sticky_window.set(Some(
+                infer_context_window_from_model(model).unwrap_or(DEFAULT_CONTEXT_WINDOW),
+            ));
+        }
+
         // An in-place `/clear` is answered by an `init` for the NEW conversation
         // and then the `/clear` turn's own empty `result`. Both belong to the
         // clear, not to any turn of the thread: consumed here, so the `result`

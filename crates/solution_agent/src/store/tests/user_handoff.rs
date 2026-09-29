@@ -1,6 +1,6 @@
-//! The user's "Compact context" on a running session: ask the agent to hand
-//! off, ask again, then send the compaction prompt — the observer's ladder,
-//! driven by the user's request instead of a verdict.
+//! The handoff ladder: ask the agent to hand off, ask again, then send the
+//! compaction prompt — started by the user's "Compact context" on a running
+//! session, or by auto-compaction when the context crosses its threshold.
 
 use super::in_place_rotation::{create_gated_session, start_turn};
 use crate::compact::{CompactInitiator, request_compact_for_session, start_compact_for_session};
@@ -86,7 +86,7 @@ fn age_last_ask(session_id: SolutionSessionId, cx: &mut TestAppContext) {
 
 fn tick(cx: &mut TestAppContext) {
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, cx| store.tick_supervisor(cx));
+        SolutionAgentStore::global(cx).update(cx, |store, cx| store.tick_context_handoffs(cx));
     });
     cx.executor().run_until_parked();
 }
@@ -230,38 +230,227 @@ async fn an_idle_session_is_compacted_directly(cx: &mut TestAppContext) {
     assert!(compaction_state(session_id, cx).0);
 }
 
-fn observer_requests(session_id: SolutionSessionId, cx: &mut TestAppContext) {
+fn set_usage(thread: &Entity<acp_thread::AcpThread>, used: u64, cx: &mut TestAppContext) {
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.request_handoff(
-                session_id,
-                crate::model::HandoffAsker::Observer,
-                false,
-                Some("observer note".into()),
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    used_tokens: used,
+                    max_tokens: 1_000_000,
+                    ..Default::default()
+                }),
                 cx,
-            )
-        })
+            );
+        });
     });
     cx.executor().run_until_parked();
 }
 
-/// One ladder per session: the user's request takes over an observer's from
+fn set_auto_compact(
+    session_id: SolutionSessionId,
+    setting: crate::model::AutoCompactSetting,
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx)
+            .update(cx, |store, cx| store.set_auto_compact(session_id, setting, cx));
+    });
+}
+
+fn system_notes(session_id: SolutionSessionId, needle: &str, cx: &mut TestAppContext) -> usize {
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let thread = session.read(cx).acp_thread().cloned().expect("live thread");
+        thread
+            .read(cx)
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(entry, acp_thread::AgentThreadEntry::SystemNote(note) if note.text.contains(needle))
+            })
+            .count()
+    })
+}
+
+/// Crossing the threshold while the agent works asks it to hand off, in the
+/// editor's voice and marked as the editor's — once, not every tick.
+#[gpui::test]
+async fn auto_compaction_asks_when_the_context_crosses_the_threshold(cx: &mut TestAppContext) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 390_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    assert!(handoff(session_id, cx).is_none(), "39% is below the 40% default");
+
+    set_usage(&thread, 410_000, cx);
+    tick(cx);
+    let ladder = handoff(session_id, cx).expect("armed at the threshold");
+    assert_eq!(
+        (ladder.asker, ladder.asks, ladder.claims_user),
+        (crate::model::HandoffAsker::Auto, 1, false)
+    );
+    let texts = queued_texts(session_id, cx);
+    assert!(
+        texts.iter().any(|t| t.starts_with("Your context is 41% full.")),
+        "the editor's wording: {texts:?}"
+    );
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        let bundle = session.read(cx).pending_messages.front().cloned().expect("queued");
+        assert!(
+            acp_thread::is_editor_recovery_blocks(&bundle.blocks),
+            "marked as the editor's, not the user's"
+        );
+    });
+
+    tick(cx);
+    assert_eq!(handoff(session_id, cx).map(|l| l.asks), Some(1), "one ask per rung");
+}
+
+/// Once per context: a user who stops the handoff is not asked again in the
+/// same context.
+#[gpui::test]
+async fn auto_compaction_fires_once_per_context(cx: &mut TestAppContext) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 500_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    assert!(handoff(session_id, cx).is_some());
+
+    thread.update(cx, |_, cx| {
+        cx.emit(acp_thread::AcpThreadEvent::Stopped(acp::StopReason::Cancelled))
+    });
+    cx.executor().run_until_parked();
+    assert!(handoff(session_id, cx).is_none(), "the Stop dropped it");
+    start_turn(session_id, cx);
+    tick(cx);
+    assert!(handoff(session_id, cx).is_none(), "not re-armed in the same context");
+}
+
+/// Off means off; and an idle session above its threshold (say, restored so)
+/// is left alone — only a working agent is asked.
+#[gpui::test]
+async fn auto_compaction_waits_for_work_and_respects_off(cx: &mut TestAppContext) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 500_000, cx);
+    tick(cx);
+    assert!(handoff(session_id, cx).is_none(), "idle: nothing to hand off from");
+
+    set_auto_compact(
+        session_id,
+        crate::model::AutoCompactSetting {
+            enabled: false,
+            threshold_pct: None,
+        },
+        cx,
+    );
+    start_turn(session_id, cx);
+    tick(cx);
+    assert!(handoff(session_id, cx).is_none(), "switched off");
+
+    set_auto_compact(session_id, crate::model::AutoCompactSetting::default(), cx);
+    tick(cx);
+    assert!(handoff(session_id, cx).is_some(), "switched back on");
+    set_auto_compact(
+        session_id,
+        crate::model::AutoCompactSetting {
+            enabled: false,
+            threshold_pct: None,
+        },
+        cx,
+    );
+    tick(cx);
+    assert!(
+        handoff(session_id, cx).is_none(),
+        "switching off stands down a handoff it started"
+    );
+}
+
+/// The user's threshold replaces the window default.
+#[gpui::test]
+async fn auto_compaction_follows_the_chosen_threshold(cx: &mut TestAppContext) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 300_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    assert!(handoff(session_id, cx).is_none(), "30% is below the 40% default");
+
+    set_auto_compact(
+        session_id,
+        crate::model::AutoCompactSetting {
+            enabled: true,
+            threshold_pct: Some(30),
+        },
+        cx,
+    );
+    tick(cx);
+    assert!(handoff(session_id, cx).is_some(), "at the chosen 30%");
+}
+
+/// A refused force (no headroom left) is reported once and retried only after
+/// the back-off, not every tick.
+#[gpui::test]
+async fn a_refused_force_backs_off_instead_of_retrying_every_tick(cx: &mut TestAppContext) {
+    let (session_id, thread, gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 500_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    set_usage(&thread, 999_000, cx);
+    gate.send(()).await.expect("release the turn");
+    cx.executor().run_until_parked();
+
+    const REFUSED: &str = "Context compaction could not start";
+    tick(cx);
+    assert_eq!(system_notes(session_id, REFUSED, cx), 1, "refused, and said so");
+    for _ in 0..3 {
+        tick(cx);
+    }
+    assert_eq!(system_notes(session_id, REFUSED, cx), 1, "not retried every tick");
+
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).expect("session");
+        session.update(cx, |s, _| {
+            let ladder = s.handoff_ladder.as_mut().expect("still armed");
+            ladder.last_force_ms = ladder.last_force_ms.map(|at| at - ESCALATION_MS - 1000);
+        });
+    });
+    tick(cx);
+    assert_eq!(system_notes(session_id, REFUSED, cx), 2, "tried again after the back-off");
+}
+
+/// The setting survives a restart: stored when it differs from the default,
+/// and a return to the default removes the row.
+#[gpui::test]
+async fn the_auto_compaction_setting_is_persisted(cx: &mut TestAppContext) {
+    let db = crate::db::SolutionAgentDb::open(cx.executor()).expect("open db");
+    let id = SolutionSessionId::new();
+    let custom = crate::model::AutoCompactSetting {
+        enabled: false,
+        threshold_pct: Some(60),
+    };
+    db.set_auto_compact(id, custom).expect("write");
+    assert_eq!(db.load_auto_compact().expect("load"), vec![(id, custom)]);
+    db.set_auto_compact(id, crate::model::AutoCompactSetting::default())
+        .expect("write default");
+    assert!(db.load_auto_compact().expect("load").is_empty());
+}
+
+/// One ladder per session: the user's request takes over an automatic one from
 /// the first rung (the user has not asked yet), in the user's voice.
 #[gpui::test]
-async fn the_users_request_takes_over_the_observers_ladder(cx: &mut TestAppContext) {
+async fn the_users_request_takes_over_an_automatic_ladder(cx: &mut TestAppContext) {
     let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
-    fill_context(&thread, cx);
+    set_usage(&thread, 500_000, cx);
     start_turn(session_id, cx);
-    cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, cx| {
-            store.set_supervision_enabled(session_id, true, cx);
-        })
-    });
-    observer_requests(session_id, cx);
-    let ladder = handoff(session_id, cx).expect("observer armed the ladder");
+    tick(cx);
+    let ladder = handoff(session_id, cx).expect("auto-compaction armed the ladder");
     assert_eq!(
         (ladder.asker, ladder.asks),
-        (crate::model::HandoffAsker::Observer, 1)
+        (crate::model::HandoffAsker::Auto, 1)
     );
     deliver_queue(session_id, cx);
 
@@ -279,20 +468,21 @@ async fn the_users_request_takes_over_the_observers_ladder(cx: &mut TestAppConte
     );
 }
 
-/// An observer verdict does not reword or re-time a ladder the user started.
+/// Auto-compaction does not reword or re-time a ladder the user started.
 #[gpui::test]
-async fn an_observer_verdict_leaves_the_users_ladder_alone(cx: &mut TestAppContext) {
+async fn auto_compaction_leaves_the_users_ladder_alone(cx: &mut TestAppContext) {
     let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
     fill_context(&thread, cx);
     start_turn(session_id, cx);
     assert!(request(session_id, cx));
     deliver_queue(session_id, cx);
 
-    observer_requests(session_id, cx);
+    set_usage(&thread, 500_000, cx);
+    tick(cx);
     let ladder = handoff(session_id, cx).expect("still the user's");
     assert_eq!(
-        (ladder.asker, ladder.asks, ladder.note),
-        (crate::model::HandoffAsker::User(CompactInitiator::User), 1, None)
+        (ladder.asker, ladder.asks),
+        (crate::model::HandoffAsker::User(CompactInitiator::User), 1)
     );
     assert!(queued_texts(session_id, cx).is_empty(), "nothing new was sent");
 }

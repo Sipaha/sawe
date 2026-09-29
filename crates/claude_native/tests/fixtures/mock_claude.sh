@@ -76,7 +76,7 @@ while IFS= read -r line; do
     *'"type":"user"'*)
       # Real `claude` emits `init` only once the first turn begins.
       if [ -z "$emitted_init" ]; then
-        emit '{"type":"system","subtype":"init","session_id":"'"$session_id"'","uuid":"u-init"}'
+        emit '{"type":"system","subtype":"init","session_id":"'"$session_id"'","uuid":"u-init","model":"claude-mock[1m]"}'
         emitted_init="1"
       fi
 

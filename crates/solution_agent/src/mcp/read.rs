@@ -691,6 +691,12 @@ pub struct GetSessionResult {
     /// `seq` in `streams`; each other stream's cursor is seeded from its own
     /// descriptor `seq`.
     pub current_seq: u64,
+    /// Tool calls waiting on a human answer, across ALL streams — see
+    /// [`PendingApprovalDto`]. Always sent, even empty: a client tells an
+    /// older desktop (field absent) from "nothing waits" (empty) by it.
+    pub pending_approvals: Vec<PendingApprovalDto>,
+    /// The session's auto-compaction — see [`AutoCompactDto`].
+    pub auto_compact: AutoCompactDto,
 }
 
 #[derive(Clone)]
@@ -945,6 +951,8 @@ fn build_get_session_result(
         streams: build_streams_vec(session),
         epoch,
         current_seq,
+        pending_approvals: pending_approvals_for_session(session, &live_auth_options),
+        auto_compact: AutoCompactDto::for_session(session, cx),
     }
 }
 
@@ -1232,6 +1240,14 @@ pub struct GetSessionChangesResult {
     /// request's `stream_id`, default Main), so the client attributes the delta
     /// to the right per-stream cursor even if it multiplexes polls.
     pub selected_stream_id: StreamIdDto,
+    /// ALWAYS present on a non-`reset` response, like `pending_bundles`: the
+    /// authoritative list of tool calls waiting on a human, across ALL streams
+    /// (an empty Vec means none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_approvals: Option<Vec<PendingApprovalDto>>,
+    /// ALWAYS present on a non-`reset` response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_compact: Option<AutoCompactDto>,
 }
 
 /// Max `changed_entries` returned per `get_session_changes` call. A client
@@ -1367,6 +1383,8 @@ fn build_get_session_changes_result(
             pending_bundles: None,
             streams: build_streams_vec(session),
             selected_stream_id,
+            pending_approvals: None,
+            auto_compact: None,
         };
     }
 
@@ -1526,6 +1544,8 @@ fn build_get_session_changes_result(
         pending_bundles,
         streams: build_streams_vec(session),
         selected_stream_id,
+        pending_approvals: Some(pending_approvals_for_session(session, &live_auth_options)),
+        auto_compact: Some(AutoCompactDto::for_session(session, cx)),
     }
 }
 

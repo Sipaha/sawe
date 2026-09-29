@@ -286,6 +286,20 @@ impl SolutionAgentDb {
         "})?()
         .map_err(|e| anyhow!("Failed to create solution_session_peer_wake_block table: {}", e))?;
 
+        // A row = the user changed this session's auto-compaction from the
+        // default (on, at the window's default threshold). `threshold_pct` NULL
+        // means the default threshold. Its own table for the same reason as
+        // the peer-wake block: the setting may change before the session's
+        // metadata row exists.
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS solution_session_auto_compact (
+                solution_session_id TEXT PRIMARY KEY NOT NULL,
+                enabled             INTEGER NOT NULL,
+                threshold_pct       INTEGER
+            )
+        "})?()
+        .map_err(|e| anyhow!("Failed to create solution_session_auto_compact table: {}", e))?;
+
         connection.exec(indoc! {"
             CREATE TABLE IF NOT EXISTS solution_session_background_agent (
                 solution_session_id TEXT NOT NULL,
@@ -767,6 +781,7 @@ fn purge_session_fn(connection: &Connection, id: SolutionSessionId) -> Result<()
             "DELETE FROM solution_session_background_agent WHERE solution_session_id = ?",
             "DELETE FROM solution_session_background_shell WHERE solution_session_id = ?",
             "DELETE FROM solution_session_peer_wake_block WHERE solution_session_id = ?",
+            "DELETE FROM solution_session_auto_compact WHERE solution_session_id = ?",
             "DELETE FROM supervisor_state WHERE session_id = ?",
         ] {
             let mut stmt = connection.exec_bound::<String>(sql)?;
@@ -801,6 +816,8 @@ fn delete_by_solution(connection: &Connection, solution_id: SolutionId) -> Resul
             "DELETE FROM solution_session_background_shell
              WHERE solution_session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
             "DELETE FROM solution_session_peer_wake_block
+             WHERE solution_session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
+            "DELETE FROM solution_session_auto_compact
              WHERE solution_session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",
             "DELETE FROM supervisor_state
              WHERE session_id IN (SELECT id FROM solution_sessions WHERE solution_id = ?)",

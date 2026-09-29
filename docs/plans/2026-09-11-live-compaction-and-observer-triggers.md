@@ -1,6 +1,6 @@
 # Cooperative live compaction and proactive observer checks
 
-Status: complete
+Status: complete; the observer parts are retired by FORK.md #220 (2026-09-29): compaction is the editor's auto-compaction now, and the observer no longer reviews running work.
 
 ## Goal
 Allow context compaction during active work, and make an enabled observer sustain autonomous progress with periodic/context-driven checks.

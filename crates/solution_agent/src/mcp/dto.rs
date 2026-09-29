@@ -671,6 +671,97 @@ pub struct ToolCallSummary {
     pub authorization_reason: Option<String>,
 }
 
+/// A tool call waiting on a human answer, wherever it sits: the Main stream or
+/// a sub-agent's. The client shows these above the compose bar, so a question
+/// can be answered without finding its card — which may be far up the
+/// transcript or in a tab the user is not looking at. Gated by the
+/// `pending_approvals` `wire_features` token.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PendingApprovalDto {
+    pub tool_call_id: String,
+    /// The stream whose transcript holds the call.
+    pub stream_id: StreamIdDto,
+    /// That stream's tab label ("Main", or the sub-agent's name).
+    pub stream_label: String,
+    /// The tool call's one-line title, as its card shows it.
+    pub title: String,
+    /// Why it is being asked, when the editor raised it — see
+    /// [`ToolCallSummary::authorization_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The choices; answer via `solution_agent.authorize_tool_call`.
+    pub options: Vec<ToolCallAuthOption>,
+}
+
+/// Every tool call in `session` waiting on a human, in stream order (Main
+/// first). A call appears once even if two streams mirror it.
+pub(crate) fn pending_approvals_for_session(
+    session: &crate::model::SolutionSession,
+    live_auth_options: &HashMap<String, LiveToolAuth>,
+) -> Vec<PendingApprovalDto> {
+    if live_auth_options.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut approvals = Vec::new();
+    for stream in session.streams.values() {
+        for entry in &stream.entries {
+            let crate::session_entry::SessionEntryKind::ToolCall { id, label_md, .. } = &entry.kind
+            else {
+                continue;
+            };
+            let Some(live) = live_auth_options.get(id) else {
+                continue;
+            };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            approvals.push(PendingApprovalDto {
+                tool_call_id: id.clone(),
+                stream_id: StreamIdDto::from_model(&stream.id),
+                stream_label: stream.label.to_string(),
+                title: label_md.clone(),
+                reason: live.reason.clone(),
+                options: live.options.clone(),
+            });
+        }
+    }
+    approvals
+}
+
+/// A session's auto-compaction, as the client's toggle and threshold menu need
+/// it. Gated by the `auto_compact` `wire_features` token; change it with
+/// `solution_agent.set_auto_compact`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AutoCompactDto {
+    pub enabled: bool,
+    /// The threshold the user chose, as a percentage of the context window.
+    /// Absent: the default for the window size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_pct: Option<u8>,
+    /// The default for this session's window. Absent while the window size is
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_threshold_pct: Option<u8>,
+    /// The thresholds to offer.
+    pub presets: Vec<u8>,
+}
+
+impl AutoCompactDto {
+    pub(crate) fn for_session(session: &crate::model::SolutionSession, cx: &App) -> Self {
+        let setting = crate::store::SolutionAgentStore::try_global(cx)
+            .map(|store| store.read(cx).auto_compact_setting(session.id))
+            .unwrap_or_default();
+        Self {
+            enabled: setting.enabled,
+            threshold_pct: setting.threshold_pct,
+            default_threshold_pct: crate::model::session_context_usage(session, cx)
+                .map(|(_, max)| crate::model::AutoCompactSetting::default_threshold(max)),
+            presets: crate::model::AutoCompactSetting::PRESETS.to_vec(),
+        }
+    }
+}
+
 /// A live `WaitingForConfirmation` call's prompt, harvested off the thread:
 /// the choices plus, when the editor raised it, why it is being asked.
 #[derive(Debug, Clone, Default)]

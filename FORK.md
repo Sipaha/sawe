@@ -4050,6 +4050,10 @@ inventory and structural checks live under `script/prompt_checks`.
 
 ### 166. Active observation requests cooperative compaction
 
+**Retired by #220 (2026-09-29).** Active reviews and the `compact` verdict are gone; the thresholds
+below now drive the editor's auto-compaction instead. Kept for the history of the thresholds and the
+handoff reserve, which still apply.
+
 Enabled observers also inspect Running sessions after one hour since their last
 launch and on context threshold crossings: 80% through 128k, 75% through 256k,
 65% through 512k, and 50% above. Unknown capacity never invents a threshold.
@@ -4516,6 +4520,9 @@ How to apply: when the observer needs to persist something new, add a field to
 the verdict and a writer in the store — never a file for the judge to open.
 
 ### 183. A `compact` verdict asks the agent twice before the editor takes over
+
+**Since #220 the asker is the editor's auto-compaction, not the observer's verdict**; the ladder
+itself — ask, ask again after 15 minutes, then send — is unchanged.
 
 A `compact` verdict used to drop the full compaction prompt into the session the
 moment the judge issued it — including mid-turn, which is a deliberate feature
@@ -6118,33 +6125,72 @@ so it landed mid-step, the same interrupt #183 removed for the observer.
 
 How to apply:
 - There is one ladder per session: `SolutionSession::handoff_ladder` (`model::HandoffLadder`). It is
-  no longer stored in `SupervisorState`. `HandoffAsker::{Observer, User(initiator)}` says whose
-  request it is. It changes only the ask's wording, how the ask is delivered (the observer sends a
-  nudge; the user's ask goes as the user's own message), and where a refused force is reported
-  (the observer's diary, or a system note in the chat).
-- `request_handoff` is the only way in. The observer's `compact` verdict and
+  no longer stored in `SupervisorState`. `HandoffAsker::{Auto, User(initiator)}` says whose request
+  it is (`Auto` was `Observer` until #220). It changes only the ask's wording and how the ask is
+  delivered: the editor's ask carries the editor marker, and the user's ask goes as the user's own
+  message. A refused force is reported as a system note in the chat.
+- `request_handoff` is the only way in. Auto-compaction (#220) and
   `compact::request_compact_for_session` both call it. The desktop button and `start_compact` with
   the `user` initiator use `request_compact_for_session`; the agent's own `"initiator": "agent"`
   call skips the ladder.
-- `tick_compaction_ladders` (called from `tick_supervisor`) climbs every ladder. It climbs an
-  observer's ladder only while the session is supervised, and a user's always.
+- `tick_compaction_ladders` climbs every ladder, from the store's 5-second timer
+  (`tick_context_handoffs`). Switching auto-compaction off drops an automatic ladder.
 - Rules when requests meet:
   - A user who asks again means "now": the prompt is sent at once.
-  - A user's request takes over an observer's ladder and starts it from the first rung.
-  - An observer's verdict does not touch a user's ladder.
+  - A user's request takes over an automatic ladder and starts it from the first rung.
+  - Auto-compaction does not touch a user's ladder.
   - An idle session is compacted at once, as before.
   - The session's turn ending without a handoff also triggers the compaction at the next tick.
 - Queuing the compaction prompt consumes the ladder. `claims_user`, the authority to reset the
   observer (#37), is decided when the ladder is armed. The agent's own later
   `start_compact(initiator: agent)` inherits it, so a handoff the user asked for is the user's.
-- The user's Stop drops any ladder. Before this change, a stopped session with an observer ladder was
+- The user's Stop drops any ladder. Before this change, a stopped session with an armed ladder was
   compacted on the next tick, because it looked idle.
 - A force waits while a permission prompt is pending, instead of being refused.
 - The maintainer, same day: *«если запустился режим компактной лестницы, то надо исключать запуск
   обсервера до тех пор пока сжатие не будет произведено (не важно кто триггер лестницы)»*. No judge
   fires while a handoff is under way (`SolutionSession::is_handing_off`: the ladder is armed, the
-  compaction prompt is out, or the rotation is parked). A judge already running when a user's
-  ladder is armed, or when any non-observer compaction starts, is superseded (`supersede_judge`),
-  and its verdict is dropped. The review it would have run is not lost: the trigger stays armed and
+  compaction prompt is out, or the rotation is parked). A judge already running when a ladder is
+  armed, or when any compaction starts, is superseded (`supersede_judge`), and its verdict is
+  dropped. The review it would have run is not lost: the trigger stays armed and
   fires on the next context.
+
+### 220. Auto-compaction replaces the observer's `compact` verdict
+
+The maintainer, 2026-09-29: *«а может мы вообще уберем функцию триггера компакции у обсервера?
+Добавим кнопку рядом с ластиком для вкл/выкл автокомпакции (по умолчанию вкл)»*, then *«и там же
+настройку порогов по ПКМ»*, and asked for the phone to get it too.
+
+Why: a threshold the user sets is a better trigger than a judge reading the transcript, and it
+works on sessions nobody supervises. With the `compact` verdict gone, the observer's reviews of
+RUNNING work (context crossings, hourly) had nothing left to do — `compact` was the only verdict
+they were allowed to act on — so they were removed too. Idle reviews are unchanged.
+
+How to apply:
+- The setting is per session (`model::AutoCompactSetting`): on by default, threshold `None` = the
+  window default (40% above 512k, 65/75/80% for smaller windows — the old observer thresholds).
+  It is persisted only when it differs from the default (`solution_session_auto_compact`).
+- `store::auto_compact::tick_auto_compaction` arms the handoff ladder (#219) as
+  `HandoffAsker::Auto` once per context, only while the agent's turn is running. An idle session
+  restored above its threshold is never compacted on startup, and a user who stops the handoff is
+  not asked again in that context. A new threshold may fire again.
+- The editor's ask carries the editor marker (`spk_editor_recovery`; the name predates this use and
+  is kept because it is on the wire). The desktop and the phone render it as an "Editor" plaque, and
+  a hook-pulled delivery is prefixed `[From the editor, NOT the user…]`. It does not claim the
+  user's authority to reset the observer.
+- UI: a bolt next to the cleanup eraser. Click toggles; right-click picks the threshold (presets
+  30–80%, the default, and a custom value if one was set over MCP). The phone has the same control
+  in its status strip: tap toggles, long-press opens the menu.
+- Wire: `solution_agent.set_auto_compact` (global and shared, remote-allow-listed), and
+  `auto_compact` on `get_session` / `get_session_changes`, behind the `auto_compact` feature token.
+- The judge prompt says compaction is not its to decide. The MCP verdict tool refuses `compact`.
+  `VerdictAction::Compact` stays only so old verdict records parse.
+- The context window has to be known during a process's FIRST turn, or a long autonomous turn never
+  learns how full it is. claude states the window only in a `result`, so `claude_native` now seeds
+  it from the `init` message's model (`claude-opus-5-5[1m]` → 1M, else the 200k default).
+- Same change, phone: approvals are answerable in place. `pending_approvals` (feature token
+  `pending_approvals`, always sent on `get_session`) lists every tool call waiting on the user,
+  across all streams. The phone shows them with their buttons above the status strip instead of
+  "open SPK Editor on your computer". The old banner stays only for an older desktop.
+- Finding: `docs/findings/2026-09-29-auto-compaction-replaces-observer-compact.md`.
 

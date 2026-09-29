@@ -940,6 +940,11 @@ pub(crate) fn render_status_row(
             // subagent (you don't compact a subagent's borrowed context).
             .when(!is_subagent_tab && !is_task_tab, |this| {
                 this.child(div().flex_none().child(cleanup_button))
+                    .child(div().flex_none().child(render_auto_compact_button(
+                        session_id,
+                        max,
+                        cx,
+                    )))
             })
             .child(
                 Label::new(agent_label)
@@ -1229,6 +1234,112 @@ pub(crate) fn render_status_row(
             })
             .into_any_element(),
     )
+}
+
+/// The auto-compaction toggle next to the cleanup button: a click switches it,
+/// a right-click picks the threshold. Lit while on.
+fn render_auto_compact_button(
+    session_id: crate::model::SolutionSessionId,
+    max: u64,
+    cx: &App,
+) -> gpui::AnyElement {
+    let setting = SolutionAgentStore::global(cx)
+        .read(cx)
+        .auto_compact_setting(session_id);
+    let threshold = setting.effective_threshold(max);
+    let tooltip: SharedString = if setting.enabled {
+        format!(
+            "Auto-compaction on: at {threshold}% of the context the agent is asked to hand off. \
+             Click to turn off, right-click for the threshold"
+        )
+        .into()
+    } else {
+        format!(
+            "Auto-compaction off (threshold {threshold}%). Click to turn on, right-click for \
+             the threshold"
+        )
+        .into()
+    };
+    let button = ui::IconButton::new(
+        "solution-status-auto-compact",
+        if setting.enabled {
+            IconName::BoltFilled
+        } else {
+            IconName::BoltOutlined
+        },
+    )
+    .icon_size(IconSize::Small)
+    .icon_color(if setting.enabled {
+        Color::Accent
+    } else {
+        Color::Muted
+    })
+    .tooltip(ui::Tooltip::text(tooltip))
+    .on_click(move |_, _, cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let mut setting = store.auto_compact_setting(session_id);
+            setting.enabled = !setting.enabled;
+            store.set_auto_compact(session_id, setting, cx);
+        });
+    })
+    .into_any_element();
+    let trigger = std::cell::RefCell::new(Some(button));
+    right_click_menu("solution-status-auto-compact-menu")
+        .trigger(move |_, _, _| {
+            trigger
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| div().into_any_element())
+        })
+        .menu(move |window, cx| {
+            let setting = SolutionAgentStore::global(cx)
+                .read(cx)
+                .auto_compact_setting(session_id);
+            let default = crate::model::AutoCompactSetting::default_threshold(max);
+            ContextMenu::build(window, cx, move |menu, _, _| {
+                let choose = move |threshold_pct: Option<u8>| {
+                    move |_: &mut gpui::Window, cx: &mut App| {
+                        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                            let mut setting = store.auto_compact_setting(session_id);
+                            setting.threshold_pct = threshold_pct;
+                            store.set_auto_compact(session_id, setting, cx);
+                        });
+                    }
+                };
+                let mut menu = menu.header("Auto-compaction threshold").toggleable_entry(
+                    format!("Default for this window ({default}%)"),
+                    setting.threshold_pct.is_none(),
+                    IconPosition::Start,
+                    None,
+                    choose(None),
+                );
+                // A threshold set outside the presets (over MCP) still shows
+                // as the one in force.
+                if let Some(custom) = setting
+                    .threshold_pct
+                    .filter(|pct| !crate::model::AutoCompactSetting::PRESETS.contains(pct))
+                {
+                    menu = menu.toggleable_entry(
+                        format!("{custom}% (custom)"),
+                        true,
+                        IconPosition::Start,
+                        None,
+                        choose(Some(custom)),
+                    );
+                }
+                for pct in crate::model::AutoCompactSetting::PRESETS {
+                    menu = menu.toggleable_entry(
+                        format!("{pct}%"),
+                        setting.threshold_pct == Some(pct),
+                        IconPosition::Start,
+                        None,
+                        choose(Some(pct)),
+                    );
+                }
+                menu
+            })
+        })
+        .into_any_element()
 }
 
 fn supervisor_popover_menu(

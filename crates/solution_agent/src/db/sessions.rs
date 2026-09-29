@@ -65,6 +65,55 @@ impl SolutionAgentDb {
             .collect())
     }
 
+    /// Store a session's auto-compaction setting; the default (on, default
+    /// threshold) is stored as no row.
+    pub fn set_auto_compact(
+        &self,
+        id: SolutionSessionId,
+        setting: crate::model::AutoCompactSetting,
+    ) -> Result<()> {
+        let connection = self.connection.lock();
+        if setting == crate::model::AutoCompactSetting::default() {
+            connection.exec_bound::<String>(
+                "DELETE FROM solution_session_auto_compact WHERE solution_session_id = ?1",
+            )?(id.to_string())
+        } else {
+            connection.exec_bound::<(String, bool, Option<i64>)>(
+                "INSERT OR REPLACE INTO solution_session_auto_compact \
+                 (solution_session_id, enabled, threshold_pct) VALUES (?1, ?2, ?3)",
+            )?((
+                id.to_string(),
+                setting.enabled,
+                setting.threshold_pct.map(i64::from),
+            ))
+        }
+    }
+
+    /// Every session whose auto-compaction differs from the default.
+    pub fn load_auto_compact(
+        &self,
+    ) -> Result<Vec<(SolutionSessionId, crate::model::AutoCompactSetting)>> {
+        let rows = self.connection.lock().select::<(String, bool, Option<i64>)>(
+            "SELECT solution_session_id, enabled, threshold_pct FROM solution_session_auto_compact",
+        )?()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, enabled, threshold_pct)| {
+                let id = SolutionSessionId::parse(&id).ok()?;
+                let threshold_pct = threshold_pct
+                    .and_then(|pct| u8::try_from(pct).ok())
+                    .filter(|pct| crate::model::AutoCompactSetting::valid_threshold(*pct));
+                Some((
+                    id,
+                    crate::model::AutoCompactSetting {
+                        enabled,
+                        threshold_pct,
+                    },
+                ))
+            })
+            .collect())
+    }
+
     pub fn load_default_permission_mode(&self) -> Result<crate::model::SessionPermissionMode> {
         let connection = self.connection.lock();
         let values = connection.select::<String>(

@@ -4,12 +4,11 @@
 //! Dropping the compaction prompt into a working session the moment it is
 //! requested lands it mid-step, so the request escalates instead: ask the agent
 //! to hand off itself, ask once more after [`COMPACT_ESCALATION_SECS`], then
-//! send the prompt. The same ladder serves the observer's `compact` verdict and
-//! the user's Compact button; only who is asking differs ([`HandoffAsker`]). The
+//! send the prompt. The same ladder serves the editor's auto-compaction and the
+//! user's Compact button; only who is asking differs ([`HandoffAsker`]). The
 //! rungs are counted per CONTEXT (reset on rotation) and advanced on the
-//! editor's own clock by `tick_supervisor` — a judge reviewing running work is
-//! on an hourly cadence and wakes with no memory of having asked, and nobody
-//! re-clicks a button to move a ladder along.
+//! editor's own clock by `tick_supervisor`: nobody re-clicks a button to move a
+//! ladder along.
 
 use gpui::{App, Context, TaskExt as _};
 
@@ -29,10 +28,9 @@ pub(crate) enum HandoffRequest {
 }
 
 impl SolutionAgentStore {
-    /// Arm the ladder as if the observer had already asked once. Test-only: the
-    /// production path arms it through a `compact` verdict, which needs a live
-    /// judge, and what this fixture exercises is the consequence of an armed
-    /// ladder rather than how it got armed.
+    /// Arm the ladder as if auto-compaction had already asked once. Test-only:
+    /// what this fixture exercises is the consequence of an armed ladder rather
+    /// than how it got armed.
     #[cfg(test)]
     pub(crate) fn arm_compaction_ladder_for_test(
         &mut self,
@@ -42,7 +40,7 @@ impl SolutionAgentStore {
         if let Some(session) = self.session(id) {
             session.update(cx, |session, _| {
                 session.handoff_ladder = Some(HandoffLadder {
-                    asker: HandoffAsker::Observer,
+                    asker: HandoffAsker::Auto,
                     asks: 1,
                     last_ask_ms: Some(chrono::Utc::now().timestamp_millis()),
                     last_force_ms: None,
@@ -66,14 +64,16 @@ impl SolutionAgentStore {
         }
     }
 
-    /// A new request to hand off — a `compact` verdict, or the user's Compact.
-    /// Arms the ladder if nothing is climbing it yet, and moves it one rung.
+    /// A new request to hand off — the context crossing the auto-compaction
+    /// threshold, or the user's Compact. Arms the ladder if nothing is climbing
+    /// it yet, and moves it one rung.
     ///
-    /// A repeat from the same asker is a clock tick with a fresh note: the
-    /// judge wakes with no memory of having asked, so its next verdict must not
-    /// restart the count. A user asking again means "now". A user's request
-    /// takes over an observer's ladder from the first rung — the user has not
-    /// asked yet — and an observer's verdict leaves a user's ladder alone.
+    /// A user asking again means "now". A user's request takes over an
+    /// automatic ladder from the first rung — the user has not asked yet — and
+    /// auto-compaction leaves a user's ladder alone. No observer judge runs
+    /// while a handoff is under way (see `tick_supervisor`), so one already
+    /// reading the transcript is dropped here: it would rule on a conversation
+    /// about to be replaced.
     pub(crate) fn request_handoff(
         &mut self,
         id: SolutionSessionId,
@@ -104,16 +104,12 @@ impl SolutionAgentStore {
                 set_note(note, cx);
                 return HandoffRequest::CompactNow;
             }
-            (Some(HandoffAsker::User(_)), HandoffAsker::Observer) => {
+            (Some(HandoffAsker::User(_)), HandoffAsker::Auto) => {
                 return HandoffRequest::Handled;
             }
-            (Some(HandoffAsker::Observer), HandoffAsker::Observer) => set_note(note, cx),
-            (None, _) | (Some(HandoffAsker::Observer), HandoffAsker::User(_)) => {
-                // The observer's own request comes from the verdict of the
-                // judge being applied right now; anything else outdates it.
-                if asker != HandoffAsker::Observer {
-                    self.supersede_judge(id, cx);
-                }
+            (Some(HandoffAsker::Auto), HandoffAsker::Auto) => set_note(note, cx),
+            (None, _) | (Some(HandoffAsker::Auto), HandoffAsker::User(_)) => {
+                self.supersede_judge(id, cx);
                 session.update(cx, |s, cx| {
                     s.handoff_ladder = Some(HandoffLadder {
                         asker,
@@ -134,8 +130,9 @@ impl SolutionAgentStore {
         }
     }
 
-    /// Per-tick escalation for every session climbing the ladder. An observer's
-    /// ladder only moves while the session is supervised; the user's always.
+    /// Per-tick escalation for every session climbing the ladder. An automatic
+    /// ladder whose session had auto-compaction switched off since is dropped;
+    /// the user's always climbs.
     pub(crate) fn tick_compaction_ladders(&mut self, cx: &mut Context<Self>) {
         let climbing: Vec<(SolutionSessionId, HandoffAsker)> = self
             .sessions
@@ -149,9 +146,8 @@ impl SolutionAgentStore {
             })
             .collect();
         for (id, asker) in climbing {
-            if asker == HandoffAsker::Observer
-                && !self.supervisor_states.get(&id).is_some_and(|s| s.enabled)
-            {
+            if asker == HandoffAsker::Auto && !self.auto_compact_setting(id).enabled {
+                self.reset_compaction_ladder(id, cx);
                 continue;
             }
             if self.climb_compaction_ladder(id, cx) {
@@ -234,25 +230,26 @@ impl SolutionAgentStore {
                     }
                     cx.notify();
                 });
-                match ladder.asker {
-                    HandoffAsker::Observer => self.send_supervisor_nudge(id, ask, cx).detach(),
-                    // The user's own request, so it travels as the user's
-                    // message: steered into the running turn where the agent
-                    // supports that, queued for the turn's end where it does not.
-                    HandoffAsker::User(_) => {
-                        let blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
-                            agent_client_protocol::schema::v1::TextContent::new(ask),
-                        )];
-                        self.send_message_blocks_targeted(
-                            id,
-                            blocks,
-                            crate::model::QueueTarget::Main,
-                            true,
-                            cx,
-                        )
-                        .detach_and_log_err(cx);
+                // Steered into the running turn where the agent supports that,
+                // queued for the turn's end where it does not. The user's own
+                // request travels as the user's message; the editor's carries
+                // the editor marker, so neither the agent nor the reader takes
+                // it for something the user typed.
+                let text = agent_client_protocol::schema::v1::TextContent::new(ask);
+                let (text, from_user) = match ladder.asker {
+                    HandoffAsker::Auto => {
+                        (text.meta(Some(acp_thread::meta_with_editor_recovery())), false)
                     }
-                }
+                    HandoffAsker::User(_) => (text, true),
+                };
+                self.send_message_blocks_targeted(
+                    id,
+                    vec![agent_client_protocol::schema::v1::ContentBlock::Text(text)],
+                    crate::model::QueueTarget::Main,
+                    from_user,
+                    cx,
+                )
+                .detach_and_log_err(cx);
                 false
             }
         }
@@ -261,10 +258,9 @@ impl SolutionAgentStore {
     /// The ladder's last rung: send the compaction prompt on the asker's behalf.
     ///
     /// Deferred: `start_compact_for_session` re-acquires the global store and
-    /// `read_with`s it, and this runs inside a store update (the verdict's MCP
-    /// lease, the tick) — calling it inline panicked the editor on every
-    /// observer `compact` verdict ("cannot read SolutionAgentStore while it is
-    /// already being updated").
+    /// `read_with`s it, and this runs inside a store update (the tick) — calling
+    /// it inline panicked the editor ("cannot read SolutionAgentStore while it
+    /// is already being updated").
     pub(crate) fn run_ladder_compaction(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
         let Some(ladder) = self
             .session(id)
@@ -273,7 +269,7 @@ impl SolutionAgentStore {
             return;
         };
         let initiator = match ladder.asker {
-            HandoffAsker::Observer => CompactInitiator::Observer,
+            HandoffAsker::Auto => CompactInitiator::Auto,
             HandoffAsker::User(initiator) => initiator,
         };
         cx.defer(move |cx| {
@@ -299,22 +295,13 @@ impl SolutionAgentStore {
                 "session={id} handoff ladder ({:?}): compaction refused: {reason}",
                 ladder.asker
             );
-            SolutionAgentStore::global(cx).update(cx, |store, cx| match ladder.asker {
-                // Where the judge reads it each wake-up, so the "don't re-issue
-                // compact until the transcript rotates" rule can fire.
-                HandoffAsker::Observer => store.append_supervisor_diary_note(
-                    id,
-                    &format!(
-                        "compact verdict REFUSED ({reason}); do not re-issue compact until the transcript rotates"
-                    ),
-                    cx,
-                ),
-                HandoffAsker::User(_) => store.push_system_note(
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.push_system_note(
                     id,
                     acp_thread::SystemNoteLevel::Info,
                     format!("Context compaction could not start: {reason}."),
                     cx,
-                ),
+                );
             });
         });
     }

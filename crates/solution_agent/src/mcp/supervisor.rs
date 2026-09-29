@@ -11,13 +11,10 @@ use crate::model::SolutionSessionId;
 use crate::store::SolutionAgentStore;
 
 /// Record the judge's verdict for a supervised session and execute the
-/// corresponding action (`continue`, `wait`, `compact`, `done`, `ask_agent`,
-/// or `ask`).
+/// corresponding action (`continue`, `wait`, `done`, `ask_agent`, or `ask`).
 ///
 /// - `continue`: increment the guard counter, send a nudge message, and
 ///   return the session to `Watching`.
-/// - `compact`: queue a compact-context prompt on the session, carrying the
-///   optional `message` into it as an observer-authored handoff note.
 /// - `done`: park supervision in `Held` (the "done" standby — the operator's
 ///   next message OR the agent's own self-resume re-arms it) and log completion.
 /// - `ask`: pause supervision in `WaitingUser` and escalate the question
@@ -32,14 +29,13 @@ pub struct SupervisorVerdictParams {
     /// Echo it verbatim — a verdict without the matching nonce is rejected as
     /// unauthorized.
     pub nonce: String,
-    /// One of: "continue", "compact", "done", "ask", "ask_agent", "wait".
+    /// One of: "continue", "done", "ask", "ask_agent", "wait". ("compact" is
+    /// retired: the editor's auto-compaction owns context handoffs.)
     pub action: String,
     pub reasoning: String,
     /// Optional message. For action == "continue" it is the nudge text sent to
-    /// the session (defaults to "Continue." when absent). For action ==
-    /// "compact" it is a note carried INSIDE the compaction request — what this
-    /// handoff must not lose — attributed to you, the observer. Ignored by the
-    /// other actions.
+    /// the session (defaults to "Continue." when absent). Ignored by the other
+    /// actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// Required when action == "ask". The question to surface to the operator.
@@ -117,7 +113,10 @@ impl McpServerTool for SupervisorVerdictTool {
         );
         let action = match input.action.as_str() {
             "continue" => crate::supervisor::VerdictAction::Continue,
-            "compact" => crate::supervisor::VerdictAction::Compact,
+            "compact" => anyhow::bail!(
+                "invalid_params: \"compact\" is no longer a verdict — the editor compacts \
+                 the context on its own (auto-compaction); pick another action"
+            ),
             "done" => crate::supervisor::VerdictAction::Done,
             "ask" => crate::supervisor::VerdictAction::Ask,
             "ask_agent" => crate::supervisor::VerdictAction::AskAgent,

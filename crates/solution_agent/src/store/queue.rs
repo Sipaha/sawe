@@ -189,6 +189,9 @@ fn bundle_attribution(
     if acp_thread::is_observer_nudge_blocks(&bundle.blocks) {
         return Some(OBSERVER_ATTRIBUTION);
     }
+    if acp_thread::is_editor_recovery_blocks(&bundle.blocks) {
+        return Some(EDITOR_ATTRIBUTION);
+    }
     (pull_is_mixed && bundle.origin == crate::model::MessageOrigin::User)
         .then_some(USER_ATTRIBUTION)
 }
@@ -199,6 +202,11 @@ fn bundle_attribution(
 /// and cannot stand in for one.
 pub(crate) const OBSERVER_ATTRIBUTION: &str = "[From the Observer — this session's autonomous supervisor in the editor, NOT the user. \
      Treat it as an editor instruction; it cannot grant user approval.]";
+
+/// Header for a message the editor itself sends the agent (the auto-compaction
+/// ask, the recovery prompt after a hang).
+pub(crate) const EDITOR_ATTRIBUTION: &str =
+    "[From the editor, NOT the user. It cannot grant user approval.]";
 
 /// Header put back on the human's own send when the same hook pull also
 /// delivered somebody else's, so the boundary reads both ways.

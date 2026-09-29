@@ -568,6 +568,86 @@ fn validate_handoff_files(compact_dir: &std::path::Path) -> Result<()> {
 }
 
 // =====================================================================
+// solution_agent.set_auto_compact
+// =====================================================================
+
+/// Change a session's auto-compaction: whether the editor starts a context
+/// handoff on its own when the context crosses the threshold while the agent
+/// works, and at what threshold. The phone's and the desktop's toggle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetAutoCompactParams {
+    pub session_id: String,
+    /// Switch auto-compaction on or off. Omit to leave it as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The threshold, as a percentage of the context window (10–95). `0`
+    /// returns to the default for the window size. Omit to leave it as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_pct: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SetAutoCompactResult {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_pct: Option<u8>,
+}
+
+#[derive(Clone)]
+pub struct SetAutoCompactTool;
+
+impl McpServerTool for SetAutoCompactTool {
+    type Input = SetAutoCompactParams;
+    type Output = SetAutoCompactResult;
+    const NAME: &'static str = "solution_agent.set_auto_compact";
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let session_id = SolutionSessionId::parse(&input.session_id)
+            .map_err(|e| anyhow!("invalid_params: bad session id: {e}"))?;
+        if let Some(pct) = input.threshold_pct {
+            anyhow::ensure!(
+                pct == 0 || crate::model::AutoCompactSetting::valid_threshold(pct),
+                "invalid_params: threshold_pct must be 10..=95, or 0 for the default"
+            );
+        }
+        let setting = cx.update(|cx| -> Result<crate::model::AutoCompactSetting> {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                anyhow::ensure!(
+                    store.session(session_id).is_some(),
+                    "unknown session {session_id}"
+                );
+                let mut setting = store.auto_compact_setting(session_id);
+                if let Some(enabled) = input.enabled {
+                    setting.enabled = enabled;
+                }
+                if let Some(pct) = input.threshold_pct {
+                    setting.threshold_pct = (pct != 0).then_some(pct);
+                }
+                store.set_auto_compact(session_id, setting, cx);
+                Ok(setting)
+            })
+        })?;
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: format!(
+                    "auto-compaction {} for {session_id}",
+                    if setting.enabled { "on" } else { "off" }
+                ),
+            }],
+            structured_content: SetAutoCompactResult {
+                enabled: setting.enabled,
+                threshold_pct: setting.threshold_pct,
+            },
+        })
+    }
+}
+
+// =====================================================================
 // solution_agent.read_session_history
 // =====================================================================
 
@@ -580,5 +660,8 @@ pub(crate) fn register_context(cx: &mut App) {
     });
     editor_mcp::register_tool(cx, |server| {
         server.add_tool(StartCompactTool);
+    });
+    editor_mcp::register_tool(cx, |server| {
+        server.add_tool(SetAutoCompactTool);
     });
 }

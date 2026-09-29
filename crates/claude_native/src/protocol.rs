@@ -37,6 +37,12 @@ pub enum System {
         session_id: String,
         #[serde(default)]
         uuid: String,
+        /// The configured model, WITH its window suffix — `claude-opus-5-5[1m]`
+        /// — where every later message names the bare API id. The only
+        /// early statement of the context window: `result.modelUsage` carries
+        /// the real figure, but only once a turn ends.
+        #[serde(default)]
+        model: Option<String>,
     },
     SessionStateChanged {
         state: String,
@@ -397,6 +403,22 @@ impl InputMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parses_the_init_model_with_its_window_suffix() {
+        let v = r#"{"type":"system","subtype":"init","session_id":"abc","model":"claude-opus-5-5[1m]"}"#;
+        match OutputMessage::parse(v).unwrap() {
+            OutputMessage::System(System::Init { model, .. }) => {
+                assert_eq!(model.as_deref(), Some("claude-opus-5-5[1m]"));
+                assert_eq!(
+                    crate::translate::infer_context_window_from_model(model.as_deref().unwrap()),
+                    Some(1_000_000),
+                    "the suffix is what tells a 1M window from the 200k default"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn parses_init_session_id() {
         let v = r#"{"type":"system","subtype":"init","session_id":"abc","uuid":"u1"}"#;

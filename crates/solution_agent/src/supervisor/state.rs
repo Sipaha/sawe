@@ -48,7 +48,8 @@ pub const AUDITOR_TIMEOUT_SECS: u64 = 5 * 60;
 /// and cutting in after five would be the interrupt this ladder exists to avoid.
 /// Two rungs at this spacing means a forced handoff is at least half an hour
 /// after the first ask, which is affordable precisely because the asking starts
-/// at [`observer_context_threshold`] rather than near the ceiling.
+/// at the auto-compaction threshold ([`crate::model::AutoCompactSetting`]) rather
+/// than near the ceiling.
 pub const COMPACT_ESCALATION_SECS: u64 = 15 * 60;
 
 /// How many times the agent is ASKED to compact itself before the editor stops
@@ -57,7 +58,7 @@ pub const COMPACT_ESCALATION_SECS: u64 = 15 * 60;
 /// and a third ask would just be a slower way of never compacting.
 pub const MAX_COMPACT_REQUESTS: u32 = 2;
 
-/// What a `compact` verdict should actually DO, given how many times this
+/// What the handoff ladder should actually DO, given how many times this
 /// context has already been asked to hand off — see [`compact_guard`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactStep {
@@ -73,7 +74,7 @@ pub enum CompactStep {
     TooSoon,
 }
 
-/// Escalation ladder for `compact` verdicts on ONE context: ask, ask again,
+/// The handoff ladder on ONE context: ask, ask again,
 /// then do it. `requests` is how many asks this context has already had (reset
 /// when the transcript rotates), `since_last_ms` how long ago the last one was.
 ///
@@ -130,6 +131,10 @@ pub fn continue_guard(consecutive_continues: u32) -> ContinueGuard {
 #[serde(rename_all = "snake_case")]
 pub enum VerdictAction {
     Continue = 0,
+    /// Retired: the observer no longer compacts — the editor's auto-compaction
+    /// does (FORK.md #220). Kept so verdict records written before that still
+    /// parse and the per-action counters keep their indices; the MCP verdict
+    /// tool refuses it.
     Compact = 1,
     Done = 2,
     /// Escalate a question to the human operator (work pauses for the user).
@@ -285,132 +290,6 @@ impl SupervisorStatus {
     }
 }
 
-/// Proactive checks never replace the existing idle trigger.
-pub const ACTIVE_REVIEW_INTERVAL_MS: i64 = 60 * 60 * 1000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObserverTrigger {
-    Idle,
-    Context { used: u64, max: u64, threshold: u64 },
-    Hourly,
-}
-
-impl ObserverTrigger {
-    pub fn description(self) -> String {
-        match self {
-            Self::Idle => "Idle/errored session quiet for at least 60 seconds.".into(),
-            Self::Context {
-                used,
-                max,
-                threshold,
-            } => format!(
-                "Context threshold reached while work is running: {used}/{max} tokens; threshold {threshold}%."
-            ),
-            Self::Hourly => "Hourly observation of running work.".into(),
-        }
-    }
-}
-
-/// Fullness at which the editor wakes the observer while work is RUNNING, as a
-/// percentage of the window. Lower for bigger windows, because the absolute
-/// headroom is what a handoff actually needs and a percentage of a 1M window is
-/// a lot of tokens: 40% of 1M is 400k used and 600k left, which is room for the
-/// agent to finish its step, write the handoff, and still have the next context
-/// start clean. A small window cannot afford the same fraction — at 80% of 128k
-/// there are still 25k left, and waking earlier would mean compacting a
-/// conversation that has barely started.
-pub fn observer_context_threshold(max: u64) -> Option<u64> {
-    match max {
-        0 => None,
-        1..=128_000 => Some(80),
-        128_001..=256_000 => Some(75),
-        256_001..=512_000 => Some(65),
-        _ => Some(40),
-    }
-}
-
-/// Transient observation clocks and crossing latch. Unknown usage does not
-/// rearm a consumed crossing; only a known drop below the threshold or a new
-/// transcript epoch does. The hourly deadline follows the previous observer
-/// check (or first observation), but only fires while work is running.
-#[derive(Debug, Clone, Default)]
-pub struct ObserverSchedule {
-    pub epoch: Option<u64>,
-    pub context_latched: bool,
-    pub active_since_ms: Option<i64>,
-    pub last_trigger: Option<ObserverTrigger>,
-}
-
-impl ObserverSchedule {
-    pub fn observe(
-        &mut self,
-        epoch: u64,
-        running: bool,
-        usage: Option<(u64, u64)>,
-        now_ms: i64,
-    ) -> Option<ObserverTrigger> {
-        if self.epoch != Some(epoch) {
-            self.epoch = Some(epoch);
-            self.context_latched = false;
-        }
-        let context = usage.and_then(|(used, max)| {
-            observer_context_threshold(max).map(|threshold| (used, max, threshold))
-        });
-        if context.is_some_and(|(used, max, threshold)| {
-            u128::from(used) * 100 < u128::from(max) * u128::from(threshold)
-        }) {
-            self.context_latched = false;
-        }
-        let since = *self.active_since_ms.get_or_insert(now_ms);
-        if !running {
-            return None;
-        }
-        if !self.context_latched
-            && let Some((used, max, threshold)) = context
-            && u128::from(used) * 100 >= u128::from(max) * u128::from(threshold)
-        {
-            return Some(ObserverTrigger::Context {
-                used,
-                max,
-                threshold,
-            });
-        }
-        (now_ms.saturating_sub(since) >= ACTIVE_REVIEW_INTERVAL_MS)
-            .then_some(ObserverTrigger::Hourly)
-    }
-
-    pub fn fired(&mut self, trigger: ObserverTrigger, now_ms: i64) {
-        if matches!(trigger, ObserverTrigger::Context { .. }) {
-            self.context_latched = true;
-        }
-        self.active_since_ms = Some(now_ms);
-        self.last_trigger = Some(trigger);
-    }
-}
-
-/// Only compaction may act on a review of already-running work. A new turn or
-/// transcript rotation invalidates that snapshot; streamed output does not.
-/// Idle cannot establish which turn ended: a later autonomous turn may already
-/// have completed. Drop that stale review and let the idle observer reassess.
-#[derive(Debug, Clone, Copy)]
-pub struct ActiveReviewSnapshot {
-    pub epoch: u64,
-    pub started_at: std::time::Instant,
-}
-
-impl ActiveReviewSnapshot {
-    pub fn permits(
-        self,
-        action: VerdictAction,
-        epoch: u64,
-        running_started_at: Option<std::time::Instant>,
-    ) -> bool {
-        action == VerdictAction::Compact
-            && self.epoch == epoch
-            && running_started_at == Some(self.started_at)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SupervisorState {
     pub session_id: SolutionSessionId,
@@ -505,8 +384,6 @@ pub struct SupervisorState {
     /// bumping `last_activity_at` past this baseline) the normal idle-nudge
     /// cycle re-engages. `None` on restart by design.
     pub watch_started_ms: Option<i64>,
-    pub observer_schedule: ObserverSchedule,
-    pub active_review: Option<ActiveReviewSnapshot>,
 }
 
 impl SupervisorState {
@@ -527,8 +404,6 @@ impl SupervisorState {
             pending_nudge: None,
             wait_until_ms: None,
             watch_started_ms: None,
-            observer_schedule: ObserverSchedule::default(),
-            active_review: None,
         }
     }
 }
@@ -1000,120 +875,3 @@ pub(crate) fn parse_clock(token: &str) -> Option<(u32, u32)> {
     Some((hour, minute))
 }
 
-#[cfg(test)]
-mod observer_trigger_tests {
-    use super::*;
-
-    #[test]
-    fn context_threshold_boundaries_and_unknown_capacity() {
-        for (max, threshold) in [
-            (128_000, 80),
-            (128_001, 75),
-            (256_000, 75),
-            (256_001, 65),
-            (512_000, 65),
-            (512_001, 40),
-        ] {
-            assert_eq!(observer_context_threshold(max), Some(threshold));
-            let mut schedule = ObserverSchedule::default();
-            let crossing = (max * threshold).div_ceil(100);
-            assert_eq!(
-                schedule.observe(0, true, Some((crossing - 1, max)), 0),
-                None
-            );
-            assert!(matches!(
-                schedule.observe(0, true, Some((crossing, max)), 1),
-                Some(ObserverTrigger::Context { .. })
-            ));
-        }
-        assert_eq!(observer_context_threshold(0), None);
-        assert_eq!(
-            ObserverSchedule::default().observe(0, true, Some((1_000_000, 0)), 0),
-            None
-        );
-        assert_eq!(ObserverSchedule::default().observe(0, true, None, 0), None);
-    }
-
-    #[test]
-    fn threshold_is_consumed_only_on_fire_and_rearms_after_drop_or_epoch() {
-        let mut schedule = ObserverSchedule::default();
-        let first = schedule.observe(1, true, Some((100, 100)), 0).unwrap();
-        assert_eq!(schedule.observe(1, true, Some((100, 100)), 1), Some(first));
-        schedule.fired(first, 1);
-        assert_eq!(schedule.observe(1, true, Some((100, 100)), 2), None);
-        assert_eq!(schedule.observe(1, true, None, 3), None);
-        assert_eq!(schedule.observe(1, true, Some((100, 100)), 4), None);
-        assert_eq!(schedule.observe(1, true, Some((79, 100)), 5), None);
-        assert!(schedule.observe(1, true, Some((80, 100)), 6).is_some());
-        schedule.fired(first, 6);
-        assert!(schedule.observe(2, true, Some((80, 100)), 7).is_some());
-    }
-
-    #[test]
-    fn hourly_checks_follow_last_review_but_only_fire_running() {
-        let mut schedule = ObserverSchedule::default();
-        assert_eq!(schedule.observe(0, false, None, 100), None);
-        assert_eq!(
-            schedule.observe(0, true, None, 100 + ACTIVE_REVIEW_INTERVAL_MS - 1),
-            None
-        );
-        assert_eq!(
-            schedule.observe(0, false, None, 100 + ACTIVE_REVIEW_INTERVAL_MS),
-            None
-        );
-        assert_eq!(
-            schedule.observe(0, true, None, 100 + ACTIVE_REVIEW_INTERVAL_MS),
-            Some(ObserverTrigger::Hourly)
-        );
-        schedule.fired(ObserverTrigger::Hourly, 100 + ACTIVE_REVIEW_INTERVAL_MS);
-        assert_eq!(
-            schedule.observe(0, true, None, 101 + ACTIVE_REVIEW_INTERVAL_MS),
-            None
-        );
-        schedule.fired(ObserverTrigger::Idle, 200 + ACTIVE_REVIEW_INTERVAL_MS);
-        assert_eq!(
-            schedule.observe(0, true, None, 199 + 2 * ACTIVE_REVIEW_INTERVAL_MS),
-            None
-        );
-        assert_eq!(
-            schedule.observe(0, true, None, 200 + 2 * ACTIVE_REVIEW_INTERVAL_MS),
-            Some(ObserverTrigger::Hourly)
-        );
-    }
-
-    #[test]
-    fn active_snapshot_only_allows_compact_without_new_turn_or_rotation() {
-        let started_at = std::time::Instant::now();
-        let snapshot = ActiveReviewSnapshot {
-            epoch: 3,
-            started_at,
-        };
-        assert!(snapshot.permits(VerdictAction::Compact, 3, Some(started_at)));
-        assert!(!snapshot.permits(VerdictAction::Compact, 3, None));
-        assert!(!snapshot.permits(VerdictAction::Compact, 4, Some(started_at)));
-        assert!(!snapshot.permits(
-            VerdictAction::Compact,
-            3,
-            Some(started_at + std::time::Duration::from_secs(1))
-        ));
-        for action in [
-            VerdictAction::Continue,
-            VerdictAction::Ask,
-            VerdictAction::AskAgent,
-            VerdictAction::Wait,
-            VerdictAction::Done,
-        ] {
-            assert!(!snapshot.permits(action, 3, Some(started_at)));
-            assert!(!snapshot.permits(action, 3, None));
-        }
-    }
-
-    #[test]
-    fn capacity_comparison_does_not_overflow() {
-        let mut schedule = ObserverSchedule::default();
-        assert!(matches!(
-            schedule.observe(0, true, Some((u64::MAX, u64::MAX)), 0),
-            Some(ObserverTrigger::Context { threshold: 40, .. })
-        ));
-    }
-}

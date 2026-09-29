@@ -116,7 +116,15 @@ pub(crate) fn render_user_message(
     // (so the agent acts on it), but it is NOT the human's own message — the
     // `spk_observer_nudge` `_meta` marker tags it so we render it as an Observer
     // comment (eye plaque) instead of a plain user bubble.
-    let is_observer = acp_thread::is_observer_nudge_blocks(chunks);
+    // The editor's own messages to the agent (auto-compaction ask, recovery
+    // prompt) get the same plaque under their own name.
+    let plaque = if acp_thread::is_observer_nudge_blocks(chunks) {
+        Some((IconName::Eye, "Observer · to the agent", "copy-observer"))
+    } else if acp_thread::is_editor_recovery_blocks(chunks) {
+        Some((IconName::BoltFilled, "Editor · to the agent", "copy-editor"))
+    } else {
+        None
+    };
     let group_name = SharedString::from(format!("user-msg-{entry_idx}"));
 
     let images: Vec<std::sync::Arc<gpui::Image>> = chunks
@@ -156,7 +164,7 @@ pub(crate) fn render_user_message(
             .into_any_element()
     };
 
-    if is_observer {
+    if let Some((plaque_icon, plaque_label, copy_id)) = plaque {
         // Observer comment: full-width plaque bubble (eye badge + tag over the
         // markdown body), tinted + left-bordered with the accent color — mirrors
         // the System/Observer note render (FORK.md #29) so a supervisor
@@ -178,20 +186,18 @@ pub(crate) fn render_user_message(
                 h_flex()
                     .gap_1()
                     .items_center()
-                    .child(Icon::new(IconName::Eye).size(IconSize::XSmall).color(color))
+                    .child(Icon::new(plaque_icon).size(IconSize::XSmall).color(color))
                     .child(
-                        // Agent-VISIBLE observer nudge (delivered into the thread
-                        // AS a message the agent acts on) — plain eye + solid
-                        // border (above) + "to the agent", distinct from the
-                        // agent-invisible operator-only note (EyeOff, dashed).
-                        Label::new("Observer · to the agent")
-                            .size(LabelSize::XSmall)
-                            .color(color),
+                        // Agent-VISIBLE message (delivered into the thread AS a
+                        // message the agent acts on) — solid border (above) +
+                        // "to the agent", distinct from the agent-invisible
+                        // operator-only note (EyeOff, dashed).
+                        Label::new(plaque_label).size(LabelSize::XSmall).color(color),
                     ),
             )
             .child(div().w_full().min_w_0().child(body))
             .child(render_floating_copy_button(
-                SharedString::from(format!("copy-observer-{entry_idx}")),
+                SharedString::from(format!("{copy_id}-{entry_idx}")),
                 text,
                 group_name.clone(),
             ))
