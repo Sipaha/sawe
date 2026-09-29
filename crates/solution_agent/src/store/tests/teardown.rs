@@ -81,8 +81,9 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
             store.teammate_watchers.set_scan_offset(id, 0);
             store
                 .metrics_emitter
-                .last_emit
+                .inner
                 .lock()
+                .last_emit
                 .insert(id, std::time::Instant::now());
             // A judge whose create has not resolved (judge_id None) — finish_judge
             // must still drop the handle (no child session to close).
@@ -141,7 +142,7 @@ fn close_session_clears_supervisor_and_watcher_maps(cx: &mut TestAppContext) {
                 "auditor_sessions leaked"
             );
             assert!(
-                !store.metrics_emitter.last_emit.lock().contains_key(&id),
+                !store.metrics_emitter.inner.lock().last_emit.contains_key(&id),
                 "metrics_emitter.last_emit leaked"
             );
         });

@@ -77,7 +77,14 @@ overrides it.
     "✓ 10% (custom)", and picking 50% round-tripped.
   - The editor ask rendered as the "editor" plaque on the phone.
 
-## Known, not addressed
+## Fixed afterwards: the phone's context meter lagged
 
-- The phone's context meter in the status strip can lag the real figure: it read 3% while the
-  desktop showed 16%. It reads the session-list cache. This existed before this change.
+The phone's status-strip meter read 3% while the desktop showed 16%. The cause was the desktop's
+`workspace.session_metrics_changed` throttle (`metrics_emitter.rs`). It sent the first update in
+each 2 s window and dropped the rest. The contract said "skipped emits are NOT made up later", so
+the last value of every burst was lost. A burst of file reads followed by a long command (no further
+token updates) left the phone on the burst's first figure.
+
+The throttle is now trailing-edge: an emit inside the window replaces a held payload, and that
+payload is sent when the window closes. Checked live by subscribing to the notifications: after a
+three-read burst the held 322 689 went out as the command started, matching the session.
