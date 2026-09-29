@@ -480,27 +480,6 @@ pub struct SupervisorState {
     /// on restart (a cold-loaded `Held` row is treated as a manual stop — the
     /// conservative default that won't auto-resume supervision).
     pub held_by_done: bool,
-    /// TRANSIENT (not persisted): how many times THIS context has been asked to
-    /// compact itself, and when the last ask went out. Drives [`compact_guard`]
-    /// and is reset the moment the transcript actually rotates — a fresh context
-    /// starts the ladder at zero. Transient on purpose: the ladder describes a
-    /// conversation happening over minutes, and a restart means nobody is
-    /// mid-handoff any more.
-    pub compact_requests: u32,
-    pub last_compact_request_ms: Option<i64>,
-    /// TRANSIENT: when the editor last SENT the compaction request itself (the
-    /// ladder's last rung), as opposed to asking the agent to. Tracked apart
-    /// from the asks because a force can be REFUSED — an unanswered permission
-    /// prompt, no headroom left — and a refusal leaves every other input the
-    /// ladder reads unchanged, so without this the 5-second tick would retry it
-    /// forever, writing a diary note each time. An idle session's first force is
-    /// still immediate: nothing has been forced yet, so there is nothing to back
-    /// off from.
-    pub last_force_ms: Option<i64>,
-    /// TRANSIENT: the judge's "what this handoff must not lose" note from the
-    /// verdict that armed the ladder, kept so the LATER rungs — which the
-    /// editor's own timer drives, with no judge in the loop — carry it too.
-    pub compact_request_note: Option<String>,
     /// TRANSIENT (not persisted): a one-shot `wait` verdict's wake deadline
     /// (epoch-ms). The judge decides ONCE — "the agent is waiting on X, park
     /// until here" — and the mechanism honors that single timeout in FULL: while
@@ -544,10 +523,6 @@ impl SupervisorState {
             trigger_count: 0,
             last_user_input_ms: None,
             judge_superseded: false,
-            compact_requests: 0,
-            last_compact_request_ms: None,
-            last_force_ms: None,
-            compact_request_note: None,
             held_by_done: false,
             pending_nudge: None,
             wait_until_ms: None,

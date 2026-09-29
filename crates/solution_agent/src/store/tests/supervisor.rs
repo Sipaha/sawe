@@ -826,10 +826,6 @@ async fn supervisor_states_loaded_at_persistence_init(cx: &mut gpui::TestAppCont
         trigger_count: 0,
         last_user_input_ms: None,
         judge_superseded: false,
-        compact_requests: 0,
-        last_compact_request_ms: None,
-        last_force_ms: None,
-        compact_request_note: None,
         held_by_done: false,
         pending_nudge: None,
         wait_until_ms: None,
@@ -2915,16 +2911,14 @@ async fn a_compact_verdict_asks_before_it_compacts(cx: &mut gpui::TestAppContext
     // judge would make the ladder's spacing a coincidence.
     let age_last_ask = |cx: &mut gpui::TestAppContext| {
         cx.update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, _| {
-                store
-                    .supervisor_states
-                    .get_mut(&session_id)
-                    .unwrap()
-                    .last_compact_request_ms = Some(
-                    chrono::Utc::now().timestamp_millis()
-                        - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
-                        - 1,
-                );
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.session(session_id).unwrap().update(cx, |session, _| {
+                    session.handoff_ladder.as_mut().unwrap().last_ask_ms = Some(
+                        chrono::Utc::now().timestamp_millis()
+                            - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
+                            - 1,
+                    );
+                });
             });
         });
     };
@@ -3012,7 +3006,7 @@ async fn a_refused_force_backs_off_instead_of_retrying_every_tick(cx: &mut gpui:
     let dir = cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, cx| {
             store.set_supervision_enabled(session_id, true, cx);
-            store.arm_compaction_ladder_for_test(session_id);
+            store.arm_compaction_ladder_for_test(session_id, cx);
             let root = store.solution_root_for(session_id, cx).expect("registered");
             crate::supervisor::supervisor_dir(&root, session_id)
         })
@@ -3061,13 +3055,14 @@ async fn a_refused_force_backs_off_instead_of_retrying_every_tick(cx: &mut gpui:
     // Past the window it may try once more — a refusal that DOES self-resolve
     // (an approval the user finally answered) has to get another chance.
     cx.update(|cx| {
-        SolutionAgentStore::global(cx).update(cx, |store, _| {
-            let state = store.supervisor_states.get_mut(&session_id).unwrap();
-            state.last_force_ms = Some(
-                chrono::Utc::now().timestamp_millis()
-                    - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
-                    - 1,
-            );
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.session(session_id).unwrap().update(cx, |session, _| {
+                session.handoff_ladder.as_mut().unwrap().last_force_ms = Some(
+                    chrono::Utc::now().timestamp_millis()
+                        - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
+                        - 1,
+                );
+            });
         });
     });
     tick(cx);
@@ -3101,18 +3096,16 @@ async fn an_ask_parked_behind_a_typing_user_does_not_spend_a_rung(cx: &mut gpui:
 
     let requests = |cx: &mut gpui::TestAppContext| {
         cx.update(|cx| {
-            SolutionAgentStore::global(cx)
-                .read(cx)
-                .supervisor_state(session_id)
-                .unwrap()
-                .compact_requests
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).unwrap();
+            session.read(cx).handoff_ladder.as_ref().unwrap().asks
         })
     };
 
     cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, cx| {
             store.set_supervision_enabled(session_id, true, cx);
-            store.arm_compaction_ladder_for_test(session_id);
+            store.arm_compaction_ladder_for_test(session_id, cx);
             // The human started typing a second ago.
             store.note_user_input(session_id);
             // Working session with its window elapsed: the ladder would ask now.
@@ -3123,16 +3116,16 @@ async fn an_ask_parked_behind_a_typing_user_does_not_spend_a_rung(cx: &mut gpui:
                     started_at,
                     notified: false,
                 };
+                session.handoff_ladder.as_mut().unwrap().last_ask_ms = Some(
+                    chrono::Utc::now().timestamp_millis()
+                        - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
+                        - 1,
+                );
             });
             let epoch = session.read(cx).epoch;
             let state = store.supervisor_states.get_mut(&session_id).unwrap();
             state.active_review =
                 Some(crate::supervisor::ActiveReviewSnapshot { epoch, started_at });
-            state.last_compact_request_ms = Some(
-                chrono::Utc::now().timestamp_millis()
-                    - (crate::supervisor::COMPACT_ESCALATION_SECS as i64) * 1000
-                    - 1,
-            );
         });
     });
     let before = requests(cx);
@@ -4345,6 +4338,70 @@ async fn proactive_observer_context_honors_pauses_typing_and_backoff(
         assert!(store.supervisor_states[&id].active_review.is_some());
         store.tick_supervisor(cx);
         assert_eq!(store.supervisor_states[&id].trigger_count, 1);
+    });
+}
+
+/// No judge fires while the context is being handed off — whoever started it,
+/// and at every stage: the ladder climbing, the compaction prompt out, the
+/// rotation waiting for the turn's end. The review it would have run waits for
+/// the next context.
+#[gpui::test]
+async fn no_judge_fires_while_the_context_is_being_handed_off(cx: &mut gpui::TestAppContext) {
+    let (store, id, _tmp) = crate::store::test_support::seed_store_with_session(cx).await;
+    store.update(cx, |store, cx| {
+        store.set_supervision_enabled(id, true, cx);
+        store.session(id).unwrap().update(cx, |s, _| {
+            s.state = SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            };
+            s.cached_total_tokens = Some(800_000);
+            s.cached_max_tokens = Some(1_000_000);
+        });
+        let stages: [fn(&mut crate::model::SolutionSession); 4] = [
+            |s| {
+                s.handoff_ladder = Some(crate::model::HandoffLadder {
+                    asker: crate::model::HandoffAsker::User(crate::compact::CompactInitiator::User),
+                    asks: 1,
+                    last_ask_ms: Some(chrono::Utc::now().timestamp_millis()),
+                    last_force_ms: None,
+                    note: None,
+                    claims_user: true,
+                })
+            },
+            |s| {
+                s.handoff_ladder = Some(crate::model::HandoffLadder {
+                    asker: crate::model::HandoffAsker::Observer,
+                    asks: 1,
+                    last_ask_ms: Some(chrono::Utc::now().timestamp_millis()),
+                    last_force_ms: None,
+                    note: None,
+                    claims_user: false,
+                })
+            },
+            |s| {
+                s.begin_compaction_request();
+            },
+            |s| s.pending_rotation = Some("continue".into()),
+        ];
+        for stage in stages {
+            store.session(id).unwrap().update(cx, |s, _| {
+                stage(s);
+            });
+            store.tick_supervisor(cx);
+            assert_eq!(store.supervisor_states[&id].trigger_count, 0);
+            store.session(id).unwrap().update(cx, |s, _| {
+                s.handoff_ladder = None;
+                s.clear_compaction_request();
+                s.pending_rotation = None;
+            });
+        }
+        store.tick_supervisor(cx);
+        assert_eq!(
+            store.supervisor_states[&id].trigger_count,
+            1,
+            "the held review fires once the handoff is over"
+        );
     });
 }
 

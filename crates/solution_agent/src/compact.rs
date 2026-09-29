@@ -38,7 +38,7 @@ pub(crate) struct StartCompactOutcome {
 /// OBSERVER-issued `compact` verdict must NOT wipe it (that path relies on
 /// `user_intent.md` surviving the transcript loss). See
 /// [`crate::supervisor::wipe_supervisor_memory`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactInitiator {
     User,
     Observer,
@@ -270,17 +270,22 @@ pub(crate) fn start_compact_for_session(
     let rendered = render_compact_prompt_inner(session_id, note, initiator, cx)?;
     let from_client = initiator != CompactInitiator::Observer;
     store.update(cx, |store, cx| {
-        let observer_asked = store.observer_requested_compaction(session_id);
+        // No judge rules on a conversation that is being handed off — see
+        // `tick_supervisor`. An observer compaction is the verdict itself.
+        if initiator != CompactInitiator::Observer {
+            store.supersede_judge(session_id, cx);
+        }
         let session = store.session(session_id).expect("session validated above");
         let request = session.update(cx, |session, cx| {
             let request = session.begin_compaction_request();
             // A human `/compact` resets the observer (FORK.md #37) — and every
-            // other way into this function must NOT inherit that authority.
-            // Three things can wrongly claim it, so three conditions:
+            // other way into this function must NOT inherit that authority:
             //   * the observer's own request (`Observer`) never wipes, by #37;
-            //   * a self-compaction the agent performs BECAUSE the observer
-            //     asked would otherwise destroy the memory of the very request
-            //     it is honouring, so the ladder answers "who asked";
+            //   * a request escalated through the handoff ladder was judged
+            //     when it was made — an agent honouring the observer's ask must
+            //     not destroy the memory of the very request it is honouring,
+            //     while one honouring the user's ask is the user's compaction,
+            //     only timed by the agent;
             //   * `Client` is a human's gesture arriving over MCP, where the
             //     caller is unverifiable — an agent can only call a tool from
             //     inside its own turn, so a RUNNING session means the claim is
@@ -288,12 +293,20 @@ pub(crate) fn start_compact_for_session(
             //     compacting a working session from the phone and not getting
             //     the reset (recoverable with `/clear`); the cost the other way
             //     is an agent silently deleting the standing-intent record.
-            let claims_user = match initiator {
-                CompactInitiator::User => true,
-                CompactInitiator::Client => !matches!(session.state, SessionState::Running { .. }),
-                CompactInitiator::Observer | CompactInitiator::Agent => false,
+            // Queuing the prompt ends the ladder: from here the handoff is the
+            // compaction request's to finish, and a ladder left armed would send
+            // the prompt again if this one is not honoured.
+            let ladder = session.handoff_ladder.take();
+            let claims_user = match (initiator, &ladder) {
+                (CompactInitiator::Observer, _) => false,
+                (_, Some(ladder)) => ladder.claims_user,
+                (CompactInitiator::User, None) => true,
+                (CompactInitiator::Client, None) => {
+                    !matches!(session.state, SessionState::Running { .. })
+                }
+                (CompactInitiator::Agent, None) => false,
             };
-            session.compact_reset_observer_memory = claims_user && !observer_asked;
+            session.compact_reset_observer_memory = claims_user;
             cx.notify();
             request
         });
@@ -338,6 +351,59 @@ pub(crate) fn start_compact_for_session(
         queued: true,
         reason: None,
     })
+}
+
+/// A human's "Compact context" — the desktop button or the phone's. On a
+/// session whose turn is running, the compaction prompt would land mid-step, so
+/// the request goes through the same escalation the observer uses: the agent is
+/// asked to finish its step and hand off, asked again, and only then sent the
+/// prompt (see `store::compaction_ladder`). A second request while that is under
+/// way means "now" and sends the prompt at once. An idle session has nothing to
+/// finish and is compacted right away, as before.
+pub(crate) fn request_compact_for_session(
+    session_id: SolutionSessionId,
+    initiator: CompactInitiator,
+    note: Option<&str>,
+    cx: &mut App,
+) -> Result<StartCompactOutcome> {
+    debug_assert!(matches!(
+        initiator,
+        CompactInitiator::User | CompactInitiator::Client
+    ));
+    if let Some(reason) = compact_unavailable_reason(session_id, cx)? {
+        return Ok(StartCompactOutcome {
+            queued: false,
+            reason: Some(reason),
+        });
+    }
+    let store = SolutionAgentStore::global(cx);
+    let request = store.update(cx, |store, cx| {
+        let session = store.session(session_id).expect("session validated above");
+        // Same rule `start_compact_for_session` applies to a direct call: an
+        // unverifiable client claim made while the session runs is not the
+        // user's.
+        let claims_user = initiator == CompactInitiator::User
+            || !matches!(session.read(cx).state, SessionState::Running { .. });
+        store.request_handoff(
+            session_id,
+            crate::model::HandoffAsker::User(initiator),
+            claims_user,
+            note.map(str::to_string),
+            cx,
+        )
+    });
+    if request == crate::store::compaction_ladder::HandoffRequest::Handled {
+        return Ok(StartCompactOutcome {
+            queued: true,
+            reason: None,
+        });
+    }
+    let note = store.read_with(cx, |store, cx| {
+        store
+            .session(session_id)
+            .and_then(|session| session.read(cx).handoff_ladder.as_ref()?.note.clone())
+    });
+    start_compact_for_session(session_id, initiator, note.as_deref(), cx)
 }
 
 /// Render the compact-instruction template for `session_id` and create
@@ -524,7 +590,8 @@ impl SolutionSessionView {
     /// the comment field existed.
     pub(crate) fn start_compact(&self, note: Option<String>, cx: &mut Context<Self>) {
         let session_id = self.session_id();
-        match start_compact_for_session(session_id, CompactInitiator::User, note.as_deref(), cx) {
+        match request_compact_for_session(session_id, CompactInitiator::User, note.as_deref(), cx)
+        {
             Ok(StartCompactOutcome { queued: true, .. }) => {}
             Ok(StartCompactOutcome {
                 queued: false,
@@ -1257,7 +1324,7 @@ mod note_tests {
         cx.update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
                 store.set_supervision_enabled(session_id, true, cx);
-                store.arm_compaction_ladder_for_test(session_id);
+                store.arm_compaction_ladder_for_test(session_id, cx);
             });
             assert!(
                 start_compact_for_session(session_id, CompactInitiator::User, None, cx)
@@ -1277,8 +1344,8 @@ mod note_tests {
         // "user" would let it delete the observer's standing-intent record on
         // its way out.
         cx.update(|cx| {
-            SolutionAgentStore::global(cx).update(cx, |store, _| {
-                store.reset_compaction_ladder(session_id);
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.reset_compaction_ladder(session_id, cx);
             });
             assert!(
                 start_compact_for_session(session_id, CompactInitiator::Agent, None, cx)

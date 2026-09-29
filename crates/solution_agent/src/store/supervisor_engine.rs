@@ -939,10 +939,11 @@ impl SolutionAgentStore {
                 // and only then take the decision away from it. The ladder lives
                 // here rather than in the judge's prompt because the judge wakes
                 // with no memory of having asked.
-                if !self.advance_compaction_ladder(id, note.clone(), cx) {
-                    return;
+                if self.request_handoff(id, crate::model::HandoffAsker::Observer, false, note, cx)
+                    == crate::store::compaction_ladder::HandoffRequest::CompactNow
+                {
+                    self.run_ladder_compaction(id, cx);
                 }
-                self.run_observer_compaction(id, note, cx);
             }
             VerdictAction::Done => {
                 // The supervisor considers the work complete. Don't switch
@@ -1629,6 +1630,13 @@ impl SolutionAgentStore {
         id: SolutionSessionId,
         cx: &mut Context<Self>,
     ) {
+        self.supersede_judge(id, cx);
+    }
+
+    /// Drop the observer's in-flight judge, and any nudge it parked, because
+    /// the conversation it is reading has moved on without it — the user
+    /// answered, or a context handoff started.
+    pub(crate) fn supersede_judge(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
         use crate::supervisor::SupervisorStatus;
         if !self.judge_sessions.contains_key(&id) {
             return;
@@ -2080,11 +2088,12 @@ impl SolutionAgentStore {
             .filter(|(_, st)| st.enabled)
             .map(|(id, _)| *id)
             .collect();
+        // Escalation is on the clock, not on the judge's cadence: a running
+        // agent may not be judged again for an hour, and "ask, then ask again in
+        // fifteen minutes, then do it" cannot wait that long. The user's
+        // requests climb the same ladder, supervised or not.
+        self.tick_compaction_ladders(cx);
         for id in session_ids {
-            // Escalation is on the clock, not on the judge's cadence: a running
-            // agent may not be judged again for an hour, and "ask, then ask
-            // again in fifteen minutes, then do it" cannot wait that long.
-            self.tick_compaction_ladder(id, cx);
             let Some(state) = self.supervisor_states.get(&id) else {
                 continue;
             };
@@ -2182,7 +2191,7 @@ impl SolutionAgentStore {
                 running_started_at,
                 epoch,
                 usage,
-                compact_pending,
+                handing_off,
             ) = {
                 let s = session.read(cx);
                 if s.is_supervisor_ephemeral || s.is_ephemeral {
@@ -2228,7 +2237,7 @@ impl SolutionAgentStore {
                     running_started_at,
                     s.epoch,
                     usage,
-                    s.is_compaction_pending(),
+                    s.is_handing_off(),
                 )
             };
             let proactive_trigger = self.supervisor_states.get_mut(&id).and_then(|state| {
@@ -2245,7 +2254,11 @@ impl SolutionAgentStore {
             // once the work finishes and the agent goes genuinely idle. This is
             // what keeps the judge from firing a stream of `wait` verdicts over
             // a session parked on a long build/test.
-            if (has_live_background_work && running_started_at.is_none()) || compact_pending {
+            // Nor while the context is being handed off, whoever started it:
+            // a judge reading the old transcript would rule on a conversation
+            // about to be replaced, and its nudge would land in the middle of
+            // the handoff. The next context is judged fresh.
+            if (has_live_background_work && running_started_at.is_none()) || handing_off {
                 continue;
             }
             // Treat live human typing as activity: the supervisor's idle clock

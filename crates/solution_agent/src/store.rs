@@ -31,7 +31,7 @@ use crate::pool::SubprocessPool;
 use crate::teammate_watchers::TeammateWatchers;
 
 mod acp_event;
-mod compaction_ladder;
+pub(crate) mod compaction_ladder;
 mod connection_pool;
 mod hydration;
 mod peer;
@@ -4261,7 +4261,7 @@ impl SolutionAgentStore {
         }
         // A fresh context has never been asked to hand off, so the next
         // `compact` verdict starts the ladder at "ask" again.
-        self.reset_compaction_ladder(session_id);
+        self.reset_compaction_ladder(session_id, cx);
         if background_agents_killed {
             cx.emit(SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
                 session_id,
@@ -4534,7 +4534,7 @@ impl SolutionAgentStore {
         // Only wipe observer memory once the replacement exists and
         // the reset can commit successfully.
         self.wipe_supervisor_memory(session_id, cx);
-        self.reset_compaction_ladder(session_id);
+        self.reset_compaction_ladder(session_id, cx);
         // Capture the PRE-clear ACP session id + liveness before the graft
         // overwrites them, so we can reap its orphaned subprocess + release
         // the pool slot it held (skipped for a cold session — it never

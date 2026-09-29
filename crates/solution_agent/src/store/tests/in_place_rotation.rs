@@ -56,7 +56,7 @@ fn add_running_background_agent(session_id: SolutionSessionId, cx: &mut TestAppC
 /// A session whose agent turns hang until the test releases them — so the
 /// thread is genuinely `Generating`, which is what an in-place rotation waits
 /// out (the session's own `SessionState` is not: background activity flips it).
-async fn create_gated_session(
+pub(super) async fn create_gated_session(
     cx: &mut TestAppContext,
 ) -> (
     SolutionSessionId,
@@ -100,7 +100,7 @@ async fn create_gated_session(
     (session_id, thread, gate_tx, tmp)
 }
 
-fn start_turn(session_id: SolutionSessionId, cx: &mut TestAppContext) {
+pub(super) fn start_turn(session_id: SolutionSessionId, cx: &mut TestAppContext) {
     cx.update(|cx| {
         SolutionAgentStore::global(cx).update(cx, |store, cx| {
             store.send_message(session_id, "work".into(), cx).detach();

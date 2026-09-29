@@ -148,6 +148,13 @@ pub(crate) fn render_status_row(
         .map(|error| error.to_string());
     let session_cached_max_tokens = s.cached_max_tokens;
     let compact_pending = s.is_compaction_pending();
+    // Only the user's own request turns the entry into "now"; an observer's
+    // ask is taken over by the user's first click, from the first rung.
+    let handoff_asks = s
+        .handoff_ladder
+        .as_ref()
+        .filter(|ladder| matches!(ladder.asker, crate::model::HandoffAsker::User(_)))
+        .map(|ladder| ladder.asks);
     let compact_permission_pending = crate::compact::has_pending_compact_approval(s, cx);
     let agent_id = s.agent_id.clone();
     // One source of truth for "what do we call this provider" — the same
@@ -485,8 +492,14 @@ pub(crate) fn render_status_row(
         .into()
     } else if pct < COMPACT_BUTTON_MIN_PCT {
         "Conversation is short — compact later".into()
+    } else if let Some(asks) = handoff_asks {
+        format!(
+            "Handoff requested — the agent was asked {asks} of 2 times to wrap up. \
+             Compact again to send the compaction now"
+        )
+        .into()
     } else if is_running {
-        "Request a handoff at the next safe boundary; the current step keeps running".into()
+        "Ask the agent to finish its step and hand off; asked twice, then compacted".into()
     } else if compact_warning {
         "Context is filling up — compact recommended".into()
     } else if is_cold {
@@ -545,7 +558,12 @@ pub(crate) fn render_status_row(
                     };
                     // Starts right away: the plain handoff needs nothing from
                     // the user, so it gets no dialog to confirm.
-                    let compact_entry = ui::ContextMenuEntry::new(with_reason("Compact context"))
+                    let compact_label = if handoff_asks.is_some() {
+                        "Compact context now"
+                    } else {
+                        "Compact context"
+                    };
+                    let compact_entry = ui::ContextMenuEntry::new(with_reason(compact_label))
                         .icon(IconName::Archive)
                         .icon_color(Color::Muted)
                         .disabled(!compact_enabled)

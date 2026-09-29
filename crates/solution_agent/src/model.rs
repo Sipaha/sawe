@@ -385,6 +385,41 @@ pub struct PendingBundle {
     pub blocks: Vec<acp::ContentBlock>,
 }
 
+/// A request that the agent hand its context off, being escalated: ask it to
+/// finish its step and compact itself, ask again, then send the compaction
+/// prompt (see `store::compaction_ladder`). One ladder serves both the
+/// observer's `compact` verdict and the user's Compact on a working session;
+/// only who is asking differs. Counted per CONTEXT: a rotation clears it.
+/// Transient — a restart means nobody is mid-handoff any more.
+#[derive(Clone, Debug)]
+pub(crate) struct HandoffLadder {
+    pub asker: HandoffAsker,
+    /// How many times the agent has been asked so far.
+    pub asks: u32,
+    pub last_ask_ms: Option<i64>,
+    /// When the editor last sent the compaction prompt itself. A force can be
+    /// REFUSED (no headroom left) and a refusal changes nothing else the ladder
+    /// reads, so without this the 5-second tick would retry it forever.
+    pub last_force_ms: Option<i64>,
+    /// What the handoff must not lose — the judge's verdict message or the
+    /// user's "Compact and message…" note. Kept so the later rungs, which the
+    /// editor's clock drives with nobody in the loop, carry it too.
+    pub note: Option<String>,
+    /// Whether the compaction carries the user's authority to reset the
+    /// observer (FORK.md #37). Decided when the request was made: by the time
+    /// it is honoured the caller is the agent or the editor.
+    pub claims_user: bool,
+}
+
+/// Who a handoff request speaks for. The wording, the delivery and where a
+/// refusal is reported differ; the escalation does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandoffAsker {
+    Observer,
+    /// A human's Compact: the desktop button (`User`) or a client's (`Client`).
+    User(crate::compact::CompactInitiator),
+}
+
 /// Live, in-memory representation of one Solution-scoped AI session.
 ///
 /// `acp_thread` is `Option` because a `SolutionSession` may exist briefly
@@ -463,6 +498,7 @@ pub struct SolutionSession {
     /// when the turn ends — `/clear` can only be issued to an idle process.
     /// Dropped if the user stops the turn. Transient, like `pending_compaction`.
     pub(crate) pending_rotation: Option<String>,
+    pub(crate) handoff_ladder: Option<HandoffLadder>,
     pub(crate) compact_reset_observer_memory: bool,
     compact_request_serial: u64,
     /// One-shot signal set by `interrupt_and_flush_pending`: tells the
@@ -794,6 +830,7 @@ impl SolutionSession {
             peer_messages_held: false,
             pending_compaction: None,
             pending_rotation: None,
+            handoff_ladder: None,
             compact_reset_observer_memory: false,
             compact_request_serial: 0,
             flush_after_cancel: false,
@@ -907,6 +944,15 @@ impl SolutionSession {
 
     pub(crate) fn is_compaction_pending(&self) -> bool {
         self.pending_compaction.is_some()
+    }
+
+    /// A context handoff is under way, from the first ask to the rotation: the
+    /// ladder is climbing, the compaction prompt is out, or the rotation waits
+    /// for the turn to end.
+    pub(crate) fn is_handing_off(&self) -> bool {
+        self.handoff_ladder.is_some()
+            || self.pending_compaction.is_some()
+            || self.pending_rotation.is_some()
     }
 
     pub(crate) fn begin_compaction_request(&mut self) -> u64 {

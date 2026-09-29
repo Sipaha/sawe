@@ -354,6 +354,9 @@ impl SolutionAgentStore {
                         agent_client_protocol::schema::v1::StopReason::Cancelled
                     );
                     if cancelled && let Some(session) = self.session(session_id) {
+                        // The user stopped the agent: a handoff they had asked
+                        // for is cut off with the turn, like a queued one.
+                        session.update(cx, |session, _| session.handoff_ladder = None);
                         if session.update(cx, |session, _| session.clear_compaction_request()) {
                             self.mark_queue_changed(session_id, cx);
                             cx.notify();

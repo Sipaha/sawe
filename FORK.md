@@ -4524,7 +4524,9 @@ ends). It reads as an interrupt: the prompt lands in the middle of a step and
 the agent abandons whatever it was holding.
 
 The verdict is now an escalating request, and the ladder lives in the editor
-(`supervisor::compact_guard` + `CompactStep`), not in the judge's prompt:
+(`supervisor::compact_guard` + `CompactStep`, driven by `store::compaction_ladder`),
+not in the judge's prompt. Since #219 the user's Compact on a working session
+climbs the same ladder:
 
 1. **Ask.** The agent gets an observer message naming the exact tool —
    "finish the step you are on, then call `solution_agent.start_compact`" —
@@ -4580,8 +4582,9 @@ Two couplings worth knowing:
   are fired by the tick with no judge in the loop to re-supply it.
 - **An agent that self-compacts does NOT wipe the observer's memory**, whoever
   prompted it. Two separate holes, both closed: one where the observer ASKED and
-  the agent honoured it — the wipe consults the ladder, `is_user &&
-  !observer_asked`, so honouring a request cannot destroy the memory of it — and
+  the agent honoured it — the wipe consults the ladder, whose `claims_user` was
+  decided when the request was made (#219), so honouring a request cannot
+  destroy the memory of it — and
   one where the agent compacts on its own initiative, for which
   `solution_agent.start_compact` grew an `initiator` field (`"user"` default,
   `"agent"`) and `CompactInitiator` two more variants. The MCP tool is reachable
@@ -6102,3 +6105,46 @@ How to apply:
   so set stdio after the conversion.
 - Catalog rows are editable from the add pickers (a pencil, or `secondary-enter`).
 - Finding: `docs/findings/2026-09-28-catalog-clone-hung-on-a-credential-prompt.md`.
+
+### 219. The user's Compact on a working session climbs the observer's ladder
+
+The maintainer, 2026-09-29: *«а можно еще сделать чтобы Compact Context ручной работал для работающей
+сессии как у обсервера с двумя магкими просьбами и одной принудительной командой?»* — and then:
+*«только давай без дублирования кода. Логика "лесенки" должна быть единой для обсервера и для ручного
+запуска»*.
+
+Why: the Compact button (and the phone's) steered the whole compaction prompt into a running turn,
+so it landed mid-step, the same interrupt #183 removed for the observer.
+
+How to apply:
+- There is one ladder per session: `SolutionSession::handoff_ladder` (`model::HandoffLadder`). It is
+  no longer stored in `SupervisorState`. `HandoffAsker::{Observer, User(initiator)}` says whose
+  request it is. It changes only the ask's wording, how the ask is delivered (the observer sends a
+  nudge; the user's ask goes as the user's own message), and where a refused force is reported
+  (the observer's diary, or a system note in the chat).
+- `request_handoff` is the only way in. The observer's `compact` verdict and
+  `compact::request_compact_for_session` both call it. The desktop button and `start_compact` with
+  the `user` initiator use `request_compact_for_session`; the agent's own `"initiator": "agent"`
+  call skips the ladder.
+- `tick_compaction_ladders` (called from `tick_supervisor`) climbs every ladder. It climbs an
+  observer's ladder only while the session is supervised, and a user's always.
+- Rules when requests meet:
+  - A user who asks again means "now": the prompt is sent at once.
+  - A user's request takes over an observer's ladder and starts it from the first rung.
+  - An observer's verdict does not touch a user's ladder.
+  - An idle session is compacted at once, as before.
+  - The session's turn ending without a handoff also triggers the compaction at the next tick.
+- Queuing the compaction prompt consumes the ladder. `claims_user`, the authority to reset the
+  observer (#37), is decided when the ladder is armed. The agent's own later
+  `start_compact(initiator: agent)` inherits it, so a handoff the user asked for is the user's.
+- The user's Stop drops any ladder. Before this change, a stopped session with an observer ladder was
+  compacted on the next tick, because it looked idle.
+- A force waits while a permission prompt is pending, instead of being refused.
+- The maintainer, same day: *«если запустился режим компактной лестницы, то надо исключать запуск
+  обсервера до тех пор пока сжатие не будет произведено (не важно кто триггер лестницы)»*. No judge
+  fires while a handoff is under way (`SolutionSession::is_handing_off`: the ladder is armed, the
+  compaction prompt is out, or the rotation is parked). A judge already running when a user's
+  ladder is armed, or when any non-observer compaction starts, is superseded (`supersede_judge`),
+  and its verdict is dropped. The review it would have run is not lost: the trigger stays armed and
+  fires on the next context.
+

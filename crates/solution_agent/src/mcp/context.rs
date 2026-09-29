@@ -359,11 +359,13 @@ impl McpServerTool for CompactSessionTool {
 // solution_agent.start_compact
 // =====================================================================
 
-/// Kick off the "Compact context" workflow on an idle or errored session — the same
-/// orchestration the desktop's status-row popover "Compact context"
-/// entry runs. Sends the compact-instructions template as a user
-/// message; the agent then writes its handoff files and calls back
-/// into the lower-level `solution_agent.compact_session` to rotate.
+/// Kick off the "Compact context" workflow — the same orchestration the
+/// desktop's status-row popover "Compact context" entry runs. On an idle or
+/// errored session it sends the compact-instructions template as a user
+/// message; on a working one a human's request climbs the handoff ladder
+/// (ask, ask again, then send — see `store::compaction_ladder`). The agent then
+/// writes its handoff files and calls back into the lower-level
+/// `solution_agent.compact_session` to rotate.
 ///
 /// Background sub-agents survive the handoff when the agent can clear its
 /// context in place (claude does). Only for an agent that cannot is the
@@ -412,8 +414,10 @@ impl<'de> Deserialize<'de> for StartCompactParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct StartCompactResult {
-    /// `true` when the compact prompt was enqueued on the agent. A cold
-    /// (sleeping) session is woken first, then the prompt is queued.
+    /// `true` when the request was accepted. On an idle session the compact
+    /// prompt is enqueued (a cold one is woken first); on a working one the
+    /// agent is asked to finish its step and hand off, then asked again, and
+    /// only then sent the prompt — a second request sends it at once.
     /// `false` when a precondition wasn't met (e.g. awaiting approval,
     /// stopping, compaction already pending, background sub-agents running on
     /// an agent that cannot rotate in place, context below 10%, or less than
@@ -457,12 +461,23 @@ impl McpServerTool for StartCompactTool {
         };
 
         let outcome = cx.update(|cx| -> Result<crate::compact::StartCompactOutcome> {
-            crate::compact::start_compact_for_session(
-                session_id,
-                initiator,
-                input.comment.as_deref(),
-                cx,
-            )
+            // A human's request on a running session is escalated (ask, ask
+            // again, then send); the agent's own handoff is sent as is.
+            if initiator == crate::compact::CompactInitiator::Agent {
+                crate::compact::start_compact_for_session(
+                    session_id,
+                    initiator,
+                    input.comment.as_deref(),
+                    cx,
+                )
+            } else {
+                crate::compact::request_compact_for_session(
+                    session_id,
+                    initiator,
+                    input.comment.as_deref(),
+                    cx,
+                )
+            }
         })?;
 
         let text = if outcome.queued {
