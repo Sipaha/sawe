@@ -6253,3 +6253,15 @@ How to apply:
 - Tests: `flip_across_*` in `anchored.rs` (pure placement), and two painted-geometry tests in
   `context_menu.rs` (`CONTEXT_MENU` / `CONTEXT_SUBMENU` debug bounds). The left-side test fails on
   the old code with the exact overlap reported.
+
+### 223. Only the session tabs scroll; the strip's buttons stay put
+
+The maintainer, 2026-09-30, with a squeezed status bar: *«а где кнопка добавления новой сессии?»*
+
+Why: the `…`, `+` and reopen buttons were children of the session strip's `overflow_x_scroll`
+group. The group shrinks whenever the rest of the status bar wants the room (a long
+"Failed to open …" notice was enough), and they scrolled out of view with the tabs.
+
+How to apply: those buttons and the group rule are siblings of the scrolling group, each
+`flex_none`. Guarded by `the_plus_and_reopen_buttons_stay_visible_when_tabs_overflow_the_strip`
+(three tabs in a 420px box; fails on the old layout with the `+` at x=648).

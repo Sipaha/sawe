@@ -1176,15 +1176,15 @@ impl Render for SessionTabStrip {
             .h_full()
             .gap_1()
             .overflow_x_scroll()
-            .children(tabs)
-            .when_some(overflow_popover, |this, popover| this.child(popover))
-            .child(self.render_plus_button())
-            .child(self.render_reopen_button(solution_id, weak_workspace.clone(), cx));
+            .children(tabs);
 
-        // The rule is a sibling of the scrolling group, not its last child:
-        // inside `overflow_x_scroll` it would slide out of view as soon as
-        // enough tabs were open, and a boundary marker that scrolls away is
-        // worse than none. It only exists on this branch — the early return
+        // Only the tabs scroll. The `…`, `+` and reopen buttons, and the rule,
+        // are siblings of the scrolling group, not its children: the group
+        // shrinks whenever the rest of the status bar wants the room (a long
+        // "Failed to open …" notice on the right is enough), and anything
+        // inside it then slides out of view. The maintainer lost the `+` that
+        // way (2026-09-30), and a boundary marker that scrolls away is worse
+        // than none. The rule only exists on this branch — the early return
         // above (no active Solution, so nothing AI-related paints at all)
         // leaves a bare `div`, because a rule with an empty group on one side
         // is chrome rather than structure.
@@ -1192,6 +1192,15 @@ impl Render for SessionTabStrip {
             .h_full()
             .min_w_0()
             .child(group)
+            .when_some(overflow_popover, |this, popover| {
+                this.child(div().flex_none().ml_1().child(popover))
+            })
+            .child(div().flex_none().ml_1().child(self.render_plus_button()))
+            .child(div().flex_none().ml_1().child(self.render_reopen_button(
+                solution_id,
+                weak_workspace.clone(),
+                cx,
+            )))
             .child(render_group_divider())
             .into_any_element()
     }
@@ -1630,6 +1639,91 @@ mod tests {
         // The tempdir backs the Solution's on-disk root for the whole test.
         std::mem::forget(tmp);
         (new_chat_dispatches, workspace, visual)
+    }
+
+    /// Hosts the strip in a box narrower than its tabs, the way the status bar
+    /// squeezes it when the right-hand items want the room.
+    struct NarrowStripHarness {
+        strip: Entity<SessionTabStrip>,
+    }
+
+    const NARROW_STRIP_WIDTH: f32 = 420.;
+
+    impl Render for NarrowStripHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .flex()
+                    .w(px(NARROW_STRIP_WIDTH))
+                    .h(px(40.))
+                    .child(self.strip.clone()),
+            )
+        }
+    }
+
+    // sawe: with the status bar short of room, the `+` and reopen buttons
+    // scrolled out of view together with the tabs (maintainer report,
+    // 2026-09-30: «а где кнопка добавления новой сессии?»). Only the tabs may
+    // scroll; the buttons stay inside the strip's box.
+    #[gpui::test]
+    async fn the_plus_and_reopen_buttons_stay_visible_when_tabs_overflow_the_strip(
+        cx: &mut TestAppContext,
+    ) {
+        let (solution_id, tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            let registry = Arc::new(crate::adapter::AdapterRegistry::new());
+            SolutionAgentStore::init_global(cx, registry);
+        });
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                for ix in 0..3 {
+                    let session = crate::store::tests::insert_cold_session(
+                        SolutionSessionId::new(),
+                        solution_id,
+                        "claude-acp".into(),
+                        None,
+                        Some(project.clone()),
+                        store,
+                        cx,
+                    );
+                    session.update(cx, |session, _| {
+                        session.title = format!("A long session title number {ix}").into();
+                        session.tab_order = Some(ix);
+                    });
+                }
+            });
+        });
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let multi_workspace = multi_workspace
+            .root(cx)
+            .expect("the multi-workspace window's root");
+        let window = cx.add_window(|_window, cx| NarrowStripHarness {
+            strip: cx.new(|cx| SessionTabStrip::new(Some(multi_workspace.downgrade()), cx)),
+        });
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let last_tab = cx
+            .debug_bounds("SESSION-TAB-INACTIVE-2")
+            .or_else(|| cx.debug_bounds("SESSION-TAB-ACTIVE-2"))
+            .expect("the third tab must be laid out");
+        assert!(
+            last_tab.right() > px(NARROW_STRIP_WIDTH),
+            "this test is only meaningful when the tabs overflow the strip ({last_tab:?})"
+        );
+        for icon in ["ICON-Plus", "ICON-HistoryRerun"] {
+            let bounds = cx
+                .debug_bounds(icon)
+                .unwrap_or_else(|| panic!("{icon} must paint"));
+            assert!(
+                bounds.right() <= px(NARROW_STRIP_WIDTH),
+                "{icon} {bounds:?} must stay inside the {NARROW_STRIP_WIDTH}px strip"
+            );
+        }
+        std::mem::forget(tmp);
     }
 
     /// The plus opens provider selection; creation waits for a menu choice.
