@@ -3,9 +3,9 @@ use crate::{
     ListSubHeader, Tooltip, prelude::*, utils::WithRemSize,
 };
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role,
-    Size, Subscription, TaskExt, anchored, canvas, prelude::*, px, relative,
+    Action, Anchor, AnyElement, App, Bounds, BoxShadow, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Role, Size, Subscription, TaskExt, anchored, canvas, hsla, prelude::*, px, relative,
 };
 use menu::{SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious};
 use std::{
@@ -16,6 +16,10 @@ use std::{
 };
 use theme::BufferLineHeight;
 use web_time::Instant;
+
+/// How far an open submenu reaches back over its parent menu's edge, so the
+/// pointer never crosses a gap between the two.
+const SUBMENU_OVERLAP: Pixels = px(2.);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum SubmenuOpenTrigger {
@@ -28,7 +32,6 @@ struct OpenSubmenu {
     entity: Entity<ContextMenu>,
     trigger_bounds: Option<Bounds<Pixels>>,
     offset: Option<Pixels>,
-    flip_left: bool,
     _dismiss_subscription: Subscription,
 }
 
@@ -227,6 +230,10 @@ pub struct ContextMenu {
     item_height: Option<Pixels>,
     main_menu: Option<Entity<ContextMenu>>,
     main_menu_observed_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// This menu's own outer width, which an open submenu flips across when it
+    /// does not fit on the right. Kept apart from `main_menu_observed_bounds`,
+    /// which the open submenu's own bounds overwrite.
+    menu_width: Rc<Cell<Option<Pixels>>>,
     // Docs aide-related fields
     documentation_aside: Option<(usize, DocumentationAside)>,
     aside_trigger_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
@@ -356,6 +363,7 @@ impl ContextMenu {
                     item_height: None,
                     main_menu: None,
                     main_menu_observed_bounds: Rc::new(Cell::new(None)),
+                    menu_width: Rc::new(Cell::new(None)),
                     documentation_aside: None,
                     aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
                     submenu_state: SubmenuState::Closed,
@@ -427,6 +435,7 @@ impl ContextMenu {
                 item_height: None,
                 main_menu: None,
                 main_menu_observed_bounds: Rc::new(Cell::new(None)),
+                menu_width: Rc::new(Cell::new(None)),
                 documentation_aside: None,
                 aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
                 submenu_state: SubmenuState::Closed,
@@ -1288,6 +1297,7 @@ impl ContextMenu {
                 aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
                 main_menu: Some(parent_entity),
                 main_menu_observed_bounds: Rc::new(Cell::new(None)),
+                menu_width: Rc::new(Cell::new(None)),
                 submenu_state: SubmenuState::Closed,
                 hover_target: HoverTarget::MainMenu,
                 submenu_safety_threshold_x: None,
@@ -1335,11 +1345,6 @@ impl ContextMenu {
         let (submenu, dismiss_subscription) =
             Self::create_submenu(builder, cx.entity(), window, cx);
 
-        let flip_left = self
-            .main_menu_observed_bounds
-            .get()
-            .is_some_and(|bounds| bounds.right() + px(200.0) > window.viewport_size().width);
-
         // If we're switching from one submenu item to another, throw away any previously-captured
         // offset so we don't reuse a stale position.
         self.main_menu_observed_bounds.set(None);
@@ -1361,7 +1366,6 @@ impl ContextMenu {
             entity: submenu,
             trigger_bounds,
             offset: None,
-            flip_left,
             _dismiss_subscription: dismiss_subscription,
         });
 
@@ -1728,7 +1732,6 @@ impl ContextMenu {
         ix: usize,
         submenu: Entity<ContextMenu>,
         offset: Pixels,
-        flip_left: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let bounds_cell = self.main_menu_observed_bounds.clone();
@@ -1745,12 +1748,22 @@ impl ContextMenu {
         .top_0()
         .left_0();
 
+        // The side is chosen at layout time from the submenu's real width: to
+        // the right of this menu, or across it to the left when that is what
+        // fits. Guessing the width before layout (it was assumed to be 200px)
+        // sent a wide submenu right, where snapping to the window slid it back
+        // over this menu.
+        let flip_span = self
+            .menu_width
+            .get()
+            .map_or(px(0.), |width| width - SUBMENU_OVERLAP * 2.);
+
         div()
             .id(("submenu-container", ix))
             .absolute()
             .top(offset)
-            .when(flip_left, |this| this.right_full().mr_neg_0p5())
-            .when(!flip_left, |this| this.left_full().ml_neg_0p5())
+            .left_full()
+            .ml(-SUBMENU_OVERLAP)
             .on_hover(cx.listener(|this, hovered, _, _| {
                 if *hovered {
                     this.hover_target = HoverTarget::Submenu;
@@ -1758,11 +1771,8 @@ impl ContextMenu {
             }))
             .child(
                 anchored()
-                    .anchor(if flip_left {
-                        Anchor::TopRight
-                    } else {
-                        Anchor::TopLeft
-                    })
+                    .anchor(Anchor::TopLeft)
+                    .flip_across(flip_span)
                     .snap_to_window_with_margin(px(8.0))
                     .child(
                         div()
@@ -2200,6 +2210,7 @@ impl ContextMenu {
             item_height: None,
             main_menu: None,
             main_menu_observed_bounds: Rc::new(Cell::new(None)),
+            menu_width: Rc::new(Cell::new(None)),
             documentation_aside: None,
             aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
             submenu_state: SubmenuState::Closed,
@@ -2268,12 +2279,7 @@ impl Render for ContextMenu {
                     }
 
                     focus_submenu = Some(open_submenu.entity.read(cx).focus_handle.clone());
-                    Some((
-                        open_submenu.item_index,
-                        open_submenu.entity.clone(),
-                        offset,
-                        open_submenu.flip_left,
-                    ))
+                    Some((open_submenu.item_index, open_submenu.entity.clone(), offset))
                 } else {
                     None
                 }
@@ -2311,17 +2317,54 @@ impl Render for ContextMenu {
             .top_0()
             .left_0();
 
+            // A submenu drawn in its menu's colours, border and shadow reads as
+            // one surface with it where the two meet. A shifted background, a
+            // stronger edge and a deeper shadow set it apart.
+            let is_submenu = self.main_menu.is_some();
+            let submenu_edge = is_submenu.then(|| {
+                let is_light = cx.theme().appearance() == theme::Appearance::Light;
+                let colors = cx.theme().colors();
+                let mut background = colors.elevated_surface_background;
+                background.l = if is_light {
+                    (background.l - 0.03).max(0.)
+                } else {
+                    (background.l + 0.04).min(1.)
+                };
+                (
+                    background,
+                    colors.border,
+                    vec![
+                        BoxShadow::new(
+                            px(0.),
+                            px(4.),
+                            hsla(0., 0., 0., if is_light { 0.18 } else { 0.45 }),
+                        )
+                        .blur_radius(px(14.)),
+                    ],
+                )
+            });
+
             WithRemSize::new(ui_font_size)
                 .occlude()
                 .font_family(ui_font_family.clone())
                 .line_height(line_height)
                 .elevation_2(cx)
+                .when_some(submenu_edge, |this, (background, border, shadow)| {
+                    this.bg(background).border_color(border).shadow(shadow)
+                })
                 .flex()
                 .flex_row()
                 .flex_shrink_0()
                 .child(
                     v_flex()
                         .id("context-menu")
+                        .debug_selector(move || {
+                            if is_submenu {
+                                "CONTEXT_SUBMENU".into()
+                            } else {
+                                "CONTEXT_MENU".into()
+                            }
+                        })
                         .role(Role::Menu)
                         .max_h(vh(0.75, window))
                         .flex_shrink_0()
@@ -2412,6 +2455,18 @@ impl Render for ContextMenu {
             window.focus(focus_handle, cx);
         }
 
+        let menu_width_cell = self.menu_width.clone();
+        let menu_width_measure = move || {
+            canvas(
+                move |bounds, _window, _cx| menu_width_cell.set(Some(bounds.size.width)),
+                |_bounds, _state, _window, _cx| {},
+            )
+            .size_full()
+            .absolute()
+            .top_0()
+            .left_0()
+        };
+
         if is_wide_window {
             let menu_bounds = self.main_menu_observed_bounds.get();
             let trigger_bounds = self
@@ -2430,6 +2485,7 @@ impl Render for ContextMenu {
 
             div()
                 .relative()
+                .child(menu_width_measure())
                 .child(render_menu(cx, window))
                 // Only render the aside once we have trigger bounds to avoid flicker.
                 .when_some(trigger_position, |this, (top, height)| {
@@ -2447,30 +2503,21 @@ impl Render for ContextMenu {
                             .child(render_aside(aside, cx))
                     }))
                 })
-                .when_some(
-                    submenu_container,
-                    |this, (ix, submenu, offset, flip_left)| {
-                        this.child(
-                            self.render_submenu_container(ix, submenu, offset, flip_left, cx),
-                        )
-                    },
-                )
+                .when_some(submenu_container, |this, (ix, submenu, offset)| {
+                    this.child(self.render_submenu_container(ix, submenu, offset, cx))
+                })
         } else {
             v_flex()
                 .w_full()
                 .relative()
                 .gap_1()
                 .justify_end()
+                .child(menu_width_measure())
                 .children(aside.map(|(_, aside)| render_aside(aside, cx)))
                 .child(render_menu(cx, window))
-                .when_some(
-                    submenu_container,
-                    |this, (ix, submenu, offset, flip_left)| {
-                        this.child(
-                            self.render_submenu_container(ix, submenu, offset, flip_left, cx),
-                        )
-                    },
-                )
+                .when_some(submenu_container, |this, (ix, submenu, offset)| {
+                    this.child(self.render_submenu_container(ix, submenu, offset, cx))
+                })
         }
     }
 }
@@ -2669,5 +2716,91 @@ mod tests {
                 "Should wrap around to first selectable entry"
             );
         });
+    }
+
+    /// Paints a menu whose right edge is `right_margin` from the window's right
+    /// edge, opens its submenu, and returns the painted (menu, submenu) bounds.
+    fn painted_menu_and_submenu(
+        cx: &mut TestAppContext,
+        right_margin: Pixels,
+    ) -> (Bounds<Pixels>, Bounds<Pixels>) {
+        struct Host {
+            menu: Entity<ContextMenu>,
+            right_margin: Pixels,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(
+                    div()
+                        .absolute()
+                        .top(px(100.))
+                        .right(self.right_margin)
+                        .child(self.menu.clone()),
+                )
+            }
+        }
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (host, cx) = cx.add_window_view(|window, cx| Host {
+            menu: ContextMenu::build(window, cx, |menu, _, _| {
+                menu.entry("Copy", None, |_, _| {})
+                    .submenu("Branch", |menu, _, _| {
+                        menu.entry(
+                            "Rebase 'feature/ECOSCOM-5482' onto 'origin/bugfix/COREDEV-535'",
+                            None,
+                            |_, _| {},
+                        )
+                    })
+            }),
+            right_margin,
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(700.)));
+        cx.run_until_parked();
+
+        let menu = host.read_with(cx, |host, _| host.menu.clone());
+        menu.update_in(cx, |menu, window, cx| {
+            let Some(ContextMenuItem::Submenu { builder, .. }) = menu.items.get(1) else {
+                panic!("item 1 is the submenu");
+            };
+            let builder = builder.clone();
+            menu.open_submenu(1, builder, SubmenuOpenTrigger::Keyboard, window, cx);
+        });
+        // The submenu's vertical offset is read from bounds measured in the
+        // previous frame, so it takes a couple of frames to appear.
+        for _ in 0..3 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+        (
+            cx.debug_bounds("CONTEXT_MENU")
+                .expect("the menu must paint"),
+            cx.debug_bounds("CONTEXT_SUBMENU")
+                .expect("the submenu must paint"),
+        )
+    }
+
+    // sawe: a submenu too wide for the space right of its menu slid back over
+    // it (maintainer report, 2026-09-30), because its side was picked from a
+    // guessed 200px width. It must open on the far side instead.
+    #[gpui::test]
+    fn a_submenu_that_does_not_fit_on_the_right_opens_on_the_left(cx: &mut TestAppContext) {
+        let (menu, submenu) = painted_menu_and_submenu(cx, px(20.));
+        assert!(
+            submenu.right() <= menu.left() + SUBMENU_OVERLAP + px(1.),
+            "the submenu {submenu:?} must sit left of its menu {menu:?}, not over it"
+        );
+    }
+
+    #[gpui::test]
+    fn a_submenu_that_fits_opens_on_the_right(cx: &mut TestAppContext) {
+        let (menu, submenu) = painted_menu_and_submenu(cx, px(700.));
+        assert!(
+            submenu.left() >= menu.right() - SUBMENU_OVERLAP - px(1.),
+            "the submenu {submenu:?} must sit right of its menu {menu:?}"
+        );
     }
 }

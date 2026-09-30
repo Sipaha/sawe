@@ -129,7 +129,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/workspace/src/active_file_name.rs` | `ActiveFileName::new` now takes the `Workspace` (holds a `WeakEntity<Project>`); the status-bar label prefixes the worktree-relative path with the worktree's root name so it's unambiguous across a Solution's worktrees. (`status_bar.show_active_file` is back to upstream's `false` in `default.json`: on 2026-09-24 the maintainer asked for the path to go — *«убери вот этот путь. Он нам вкладки закрывает»* — because a deep path squeezed the session tabs that share the status bar. The label code stays for anyone who turns it on.) | rebrand / solutions |
 | `crates/editor/src/items.rs` | An editor tab's tooltip is the path from the project root (`language::File::full_path` → `sawe/Procfile.web`), not the `~`-compacted absolute path, which repeated the Solution's location on every tab — the maintainer, 2026-09-24: *«в подсказке показывать путь не от home, а от корня проекта»*. A file outside every visible worktree keeps its absolute path. Guarded by `test_tab_tooltip_shows_path_from_project_root`. | `editor` |
 | `crates/workspace/src/modal_layer.rs` | **Decision #214.** `ModalView::bottom_center()` lets a modal name its window-space bottom-centre; `ModalLayer` then anchors it there instead of at the top. | `workspace` |
-| `crates/ui/src/components/context_menu.rs` | **Decision #214.** `ContextMenu::item_height(px)` — an opt-in fixed row height for entries and submenu rows; entries carry a `context-menu-entry-{ix}` debug selector. | `ui` |
+| `crates/ui/src/components/context_menu.rs` | **Decision #214.** `ContextMenu::item_height(px)` — an opt-in fixed row height for entries and submenu rows; entries carry a `context-menu-entry-{ix}` debug selector. **Decision #222.** A submenu's side is chosen by `anchored().flip_across` from its real width (the 200px guess is gone); a submenu has its own tint, border and shadow; `CONTEXT_MENU` / `CONTEXT_SUBMENU` debug selectors. | `ui` |
+| `crates/gpui/src/elements/anchored.rs` | **Decision #222.** `Anchored::flip_across(width)`: on horizontal overflow, move to the far side of the box the element sits beside instead of snapping over it. | `gpui` |
 | `crates/git_ui/src/conflict_view.rs` | The merge-conflict status-bar indicator and the in-editor conflict block both dispatched agent actions whose only handler early-returns without an `AgentPanel`, which this fork never registers — two silent no-ops, one of which also dismissed itself as if it had worked. Both now open the fork's own conflict resolver (`git_conflict_ui::OpenConflictResolver`) and are relabelled accordingly; the indicator no longer self-dismisses, and neither is gated on `AgentSettings::enabled`, since neither involves the agent any more. | `git_conflict_ui` |
 | `crates/git_ui/src/commit_view.rs` | S-DET commit-view surface (header / parents / refs / contains / affected-files / footer decomposed into `commit_view::*` submodules). **(decision #136, 2026-09-02)** The `single_file: Option<RepoPath>` mode that used to live here is **deleted** — `open_file_diff`, `preview_holds_single_file_diff` and `open_internal` with it — and single-file commit diffs are served by `SoloDiffView`. What remains is the whole-commit view and the `base..head` compare-range view (#87). `open`'s `file_filter` parameter is *not* that mode and stays: it narrows which files the whole-commit diff shows while keeping the metadata chrome. | `git_ui` (S-DET) / `git_graph` |
 | `crates/git_ui/src/commit_blob.rs` | **New (decision #136).** The historic-blob loader extracted out of `CommitView`: `GitBlob` (a `DiskState::Historic` synthetic file), `build_buffer` / `build_buffer_diff`, and `load_commit_file_blob`, which turns one `CommitFile` into a `LoadedBlob { buffer, diff, status, excerpt_ranges, path_key, is_binary }`. Two callers: `CommitView`'s per-file loop and `SoloDiffView::open_commit_file`. Takes `&mut AsyncWindowContext` deliberately — narrowing to `AsyncApp` would trade five recoverable `?` short-circuits for a `.upgrade().expect(..)` panic. | `git_ui` |
@@ -6229,3 +6230,26 @@ How to apply:
   `command_lifecycle` alone. A miss is logged under `claude_native::self_started_turn`.
 - `claude_project_dir_for` moved from `solution_agent` to `claude_native::transcript`. The store
   re-exports it.
+
+### 222. A submenu opens beside its menu, never over it, and looks like a separate surface
+
+The maintainer, 2026-09-30, about the git graph's commit menu: *«вложенные выпадающие списки
+как-то вообще не выделяются и сливаются»* and *«вложенный выпадающий список должен появляться вне
+родительского»*.
+
+Why: `ContextMenu` picked the submenu's side before layout, assuming the submenu was 200px wide. A
+branch submenu ("Rebase 'feature/…' onto 'origin/bugfix/…'") is about 500px. It went right, did not
+fit, and `snap_to_window` slid it back over its parent. Where the two met, identical colours and a
+faint shadow made them read as one menu.
+
+How to apply:
+- The side is decided at layout time, from real sizes: `anchored().flip_across(parent_width)`. On
+  horizontal overflow it tries the far side of the parent. If neither side fits, it takes the side
+  that shows more, and the usual snapping follows. The parent's width comes from its own measure
+  (`ContextMenu::menu_width`). `main_menu_observed_bounds` can't be used for that: the open
+  submenu's bounds overwrite it.
+- A submenu gets a background 0.04 lighter (0.03 darker on light themes), the `border` colour rather
+  than `border_variant`, and a deeper shadow.
+- Tests: `flip_across_*` in `anchored.rs` (pure placement), and two painted-geometry tests in
+  `context_menu.rs` (`CONTEXT_MENU` / `CONTEXT_SUBMENU` debug bounds). The left-side test fails on
+  the old code with the exact overlap reported.

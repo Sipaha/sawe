@@ -20,6 +20,7 @@ pub struct Anchored {
     anchor_position: Option<Point<Pixels>>,
     position_mode: AnchoredPositionMode,
     offset: Option<Point<Pixels>>,
+    flip_across: Option<Pixels>,
 }
 
 /// anchored gives you an element that will avoid overflowing the window bounds.
@@ -32,6 +33,7 @@ pub fn anchored() -> Anchored {
         anchor_position: None,
         position_mode: AnchoredPositionMode::Window,
         offset: None,
+        flip_across: None,
     }
 }
 
@@ -74,6 +76,55 @@ impl Anchored {
     pub fn snap_to_window_with_margin(mut self, edges: impl Into<Edges<Pixels>>) -> Self {
         self.fit_mode = AnchoredFitMode::SnapToWindowWithMargin(edges.into());
         self
+    }
+
+    /// The element sits beside a box `width` wide that ends at the anchor point
+    /// (a submenu beside its parent menu). When it overflows the window
+    /// horizontally, it moves to the far side of that box instead of sliding
+    /// back over it. If neither side fits, the side that shows more of it wins,
+    /// and the fit mode's snapping still applies. Works with any fit mode;
+    /// center anchors are left alone.
+    pub fn flip_across(mut self, width: Pixels) -> Self {
+        self.flip_across = Some(width);
+        self
+    }
+}
+
+/// [`Anchored::flip_across`]'s placement: `desired` beside a `span`-wide box
+/// that ends where `desired` is anchored, flipped to the box's far side when
+/// that fits the window better.
+fn flip_across_span(
+    desired: Bounds<Pixels>,
+    anchor: Anchor,
+    span: Pixels,
+    limits: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let overflows =
+        |bounds: &Bounds<Pixels>| bounds.left() < limits.left() || bounds.right() > limits.right();
+    if !overflows(&desired) {
+        return desired;
+    }
+    let flipped_left = match anchor {
+        Anchor::TopLeft | Anchor::BottomLeft | Anchor::LeftCenter => {
+            desired.left() - span - desired.size.width
+        }
+        Anchor::TopRight | Anchor::BottomRight | Anchor::RightCenter => desired.right() + span,
+        Anchor::TopCenter | Anchor::BottomCenter => return desired,
+    };
+    let flipped = Bounds {
+        origin: point(flipped_left, desired.origin.y),
+        size: desired.size,
+    };
+    if !overflows(&flipped) {
+        return flipped;
+    }
+    let visible_width = |bounds: &Bounds<Pixels>| {
+        (bounds.right().min(limits.right()) - bounds.left().max(limits.left())).max(px(0.))
+    };
+    if visible_width(&flipped) > visible_width(&desired) {
+        flipped
+    } else {
+        desired
     }
 }
 
@@ -177,6 +228,10 @@ impl Element for Anchored {
                     desired = switched;
                 }
             }
+        }
+
+        if let Some(span) = self.flip_across {
+            desired = flip_across_span(desired, self.anchor, span, limits);
         }
 
         let client_inset = window.client_inset.unwrap_or(px(0.));
@@ -375,6 +430,59 @@ mod tests {
 
         assert_eq!(menu_bounds.origin, point(px(100.), px(100.)));
         assert_eq!(menu_bounds.size, size(px(200.), px(300.)));
+    }
+
+    fn bounds(x: f32, width: f32) -> crate::Bounds<Pixels> {
+        crate::Bounds {
+            origin: point(px(x), px(10.)),
+            size: size(px(width), px(100.)),
+        }
+    }
+
+    #[test]
+    fn flip_across_keeps_a_fitting_element_where_it_is() {
+        let limits = bounds(0., 800.);
+        let desired = bounds(400., 300.);
+        assert_eq!(
+            super::flip_across_span(desired, crate::Anchor::TopLeft, px(250.), limits),
+            desired
+        );
+    }
+
+    #[test]
+    fn flip_across_moves_an_overflowing_element_to_the_far_side_of_its_box() {
+        let limits = bounds(0., 800.);
+        // A 300-wide submenu at its parent's right edge (x=600), parent 250 wide
+        // (350..600): it moves to end at the parent's left edge, 50..350, rather
+        // than being snapped back over the parent.
+        let flipped =
+            super::flip_across_span(bounds(600., 300.), crate::Anchor::TopLeft, px(250.), limits);
+        assert_eq!(flipped, bounds(50., 300.));
+        // The far side is tried in the other direction too.
+        let flipped = super::flip_across_span(
+            bounds(-100., 300.),
+            crate::Anchor::TopRight,
+            px(100.),
+            limits,
+        );
+        assert_eq!(flipped, bounds(300., 300.));
+    }
+
+    #[test]
+    fn flip_across_takes_the_side_that_shows_more_when_neither_fits() {
+        let limits = bounds(0., 800.);
+        // Parent spans 100..300; a 600-wide element fits on neither side.
+        // Right of it (300..900) shows 500px, left of it (-500..100) 100px.
+        let desired = bounds(300., 600.);
+        assert_eq!(
+            super::flip_across_span(desired, crate::Anchor::TopLeft, px(200.), limits),
+            desired
+        );
+        // Parent spans 500..700: left of it (-100..500) shows 500px, right 100px.
+        assert_eq!(
+            super::flip_across_span(bounds(700., 600.), crate::Anchor::TopLeft, px(200.), limits),
+            bounds(-100., 600.)
+        );
     }
 
     #[gpui::test]
