@@ -42,11 +42,13 @@
 //! with a vertical rule (`render_group_divider`), so the AI-dialog group reads
 //! as one group rather than as the first few of a dozen unrelated widgets.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use gpui::{
-    Animation, AnimationExt as _, App, Context, ElementId, IntoElement, ParentElement, PromptLevel,
-    Render, SharedString, Styled, Subscription, WeakEntity, Window, div, pulsating_between,
+    Animation, AnimationExt as _, App, Context, ElementId, IntoElement, ParentElement, Pixels,
+    PromptLevel, Render, ScrollHandle, SharedString, Styled, Subscription, WeakEntity, Window,
+    canvas, div, pulsating_between,
 };
 use solutions::{SolutionId, SolutionStore};
 use ui::{ContextMenu, Divider, DividerColor, PopoverMenu, Tooltip, prelude::*, right_click_menu};
@@ -102,6 +104,83 @@ fn split_visible_overflow<T>(entries: &[T]) -> (&[T], &[T]) {
     } else {
         (entries, &[])
     }
+}
+
+/// The strip's natural layout, measured from its invisible full-width copy
+/// (see [`SessionTabStrip::fit`]): what [`fit_tabs`] decides from.
+#[derive(Clone, Debug, PartialEq)]
+struct StripMeasure {
+    /// Each tab's width, left to right.
+    tab_widths: Vec<Pixels>,
+    /// The buttons after the tabs (`…` when it is there, `+`, reopen), from
+    /// the first one's left edge to the last one's right edge.
+    trailing_width: Pixels,
+    /// The width one more icon button adds: the `…` when only the width, and
+    /// not the tab cap, pushes tabs into it.
+    button_width: Pixels,
+    gap: Pixels,
+    /// The room the status bar actually gives the strip.
+    available: Pixels,
+}
+
+/// The narrowest a tab may be squeezed to fill the room left after the tabs
+/// that fit whole: the logo, a few letters of the title and the age still
+/// read at this width. Below it the room stays empty.
+const MIN_SQUEEZED_TAB_WIDTH: Pixels = gpui::px(120.);
+
+/// How the tabs fill the strip: [`TabFit::whole`] leading tabs at their own
+/// width, then, when there is room for it, one more held to `squeezed` so its
+/// title truncates. The rest are behind the `…`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TabFit {
+    whole: usize,
+    squeezed: Option<Pixels>,
+}
+
+impl TabFit {
+    fn shown(self) -> usize {
+        self.whole + usize::from(self.squeezed.is_some())
+    }
+}
+
+/// Fit the tabs, the `…` holding the rest and the trailing buttons into the
+/// room the strip has. A tab never shows cut off at the edge: it either fits
+/// whole, is squeezed so its title truncates, or goes into the `…`. The
+/// squeezed tab uses the room the whole ones leave, which would otherwise be
+/// an empty stretch of status bar up to a tab wide.
+///
+/// `ellipsis_needed` is false when the `…` is already among the trailing
+/// buttons (more than [`MAX_VISIBLE_TABS`] sessions), so its room is already
+/// counted.
+fn fit_tabs(measure: &StripMeasure, ellipsis_needed: bool) -> TabFit {
+    let row_width = |tabs: usize| {
+        let tabs_width: Pixels = measure.tab_widths[..tabs]
+            .iter()
+            .fold(Pixels::ZERO, |sum, width| sum + *width + measure.gap);
+        tabs_width + measure.trailing_width
+    };
+    // A half-pixel of slack: widths are measured from a laid-out frame and
+    // the full row must not flip into the `…` over rounding alone.
+    let slack = gpui::px(0.5);
+    let all = measure.tab_widths.len();
+    if row_width(all) <= measure.available + slack {
+        return TabFit {
+            whole: all,
+            squeezed: None,
+        };
+    }
+    let ellipsis = if ellipsis_needed {
+        measure.button_width + measure.gap
+    } else {
+        Pixels::ZERO
+    };
+    let whole = (0..all)
+        .rev()
+        .find(|&tabs| row_width(tabs) + ellipsis <= measure.available + slack)
+        .unwrap_or(0);
+    let room = measure.available - (row_width(whole) + ellipsis) - measure.gap;
+    let squeezed = (whole < all && room >= MIN_SQUEEZED_TAB_WIDTH).then_some(room);
+    TabFit { whole, squeezed }
 }
 
 /// Decide the next `active_dialog_session` value for a tab click:
@@ -562,6 +641,22 @@ pub struct SessionTabStrip {
     /// on its own, the way the status row's "1m ago" does, even when no store
     /// event fires.
     _age_tick: gpui::Task<()>,
+    /// How the tabs fit the room the status bar leaves the strip. The strip
+    /// lays out an invisible copy of itself at full width — every tab and
+    /// button — and the status bar squeezes that copy to the room there is,
+    /// so it can be measured without the visible row feeding back into it.
+    fit: StripFit,
+}
+
+#[derive(Default)]
+struct StripFit {
+    /// Tracks the invisible copy's children, to read each one's width.
+    measure_scroll: ScrollHandle,
+    /// The last measurement, for the next frame's render.
+    measure: Rc<RefCell<Option<StripMeasure>>>,
+    /// The fit the last render used, so the post-layout check knows whether a
+    /// fresh measurement changes it.
+    shown_fit: Rc<Cell<Option<TabFit>>>,
 }
 
 impl SessionTabStrip {
@@ -603,6 +698,7 @@ impl SessionTabStrip {
             multi_workspace,
             _subscriptions: subscriptions,
             _age_tick: age_tick,
+            fit: StripFit::default(),
         }
     }
 
@@ -740,6 +836,9 @@ impl SessionTabStrip {
         weak_self: WeakEntity<Self>,
         weak_workspace: Option<WeakEntity<Workspace>>,
         tab_height: Pixels,
+        // Held narrower than its content by the strip's fit, so its title
+        // truncates; `None` is the usual cap.
+        max_width: Option<Pixels>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let session_id = candidate.session_id;
@@ -802,7 +901,10 @@ impl SessionTabStrip {
             // (maintainer request, 2026-09-23). The maximum is bumped by the
             // width the provider logo, the separator and the age slot add, so
             // a long title still gets the room it had before they arrived.
-            .max_w(rems_from_px(212_f32))
+            .map(|this| match max_width {
+                Some(width) => this.max_w(width),
+                None => this.max_w(rems_from_px(212_f32)),
+            })
             .relative()
             .rounded_sm()
             .when_some(background, |this, bg| this.bg(bg))
@@ -1027,7 +1129,26 @@ impl Render for SessionTabStrip {
         let store = SolutionAgentStore::global(cx);
         let active_session = store.read(cx).active_dialog_session(solution_id);
         let candidates = self.candidates_for(solution_id, cx);
-        let (visible, overflow) = split_visible_overflow(&candidates);
+        let (capped, cap_overflow) = split_visible_overflow(&candidates);
+        let cap_ellipsis = !cap_overflow.is_empty();
+        // Last frame's measurement decides how many tabs fit; the post-layout
+        // check below asks for another frame if this one's says otherwise.
+        let fitted = self
+            .fit
+            .measure
+            .borrow()
+            .as_ref()
+            .filter(|measure| measure.tab_widths.len() == capped.len())
+            .map_or(
+                TabFit {
+                    whole: capped.len(),
+                    squeezed: None,
+                },
+                |measure| fit_tabs(measure, !cap_ellipsis),
+            );
+        self.fit.shown_fit.set(Some(fitted));
+        let (visible, width_overflow) = capped.split_at(fitted.shown());
+        let overflow: Vec<&TabCandidate> = width_overflow.iter().chain(cap_overflow).collect();
         // Full order across visible AND overflow tabs — `persist_tab_order`
         // NULLs `tab_order` on every session of the solution that is absent
         // from what it's handed, so a drop handler built from `visible`
@@ -1048,9 +1169,29 @@ impl Render for SessionTabStrip {
                 weak_self.clone(),
                 weak_workspace.clone(),
                 tab_height,
+                (ix == fitted.whole).then_some(fitted.squeezed).flatten(),
                 cx,
             )
         });
+        let measured_tabs = capped
+            .iter()
+            .enumerate()
+            .map(|(ix, candidate)| {
+                self.render_tab(
+                    solution_id,
+                    candidate,
+                    active_session == Some(candidate.session_id),
+                    ix,
+                    order.clone(),
+                    weak_self.clone(),
+                    weak_workspace.clone(),
+                    tab_height,
+                    None,
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
 
         let overflow_popover = (!overflow.is_empty()).then(|| {
             // Each overflowing tab still needs everything a visible tab's
@@ -1168,42 +1309,146 @@ impl Render for SessionTabStrip {
                 })
         });
 
-        let group = div()
-            .id("session-tab-strip")
-            .flex()
-            .items_center()
-            .min_w_0()
+        // The invisible full-width copy: every capped tab and every button, laid
+        // out but never painted (a hidden element paints nothing and takes no
+        // input). It is the strip's only in-flow child, so the status bar
+        // squeezes the strip to exactly the room there is, and neither that
+        // room nor the copy depends on how many tabs the visible row shows —
+        // which is what keeps the measure-then-fit loop from oscillating.
+        let measure_button =
+            |id: &'static str, icon: IconName| IconButton::new(id, icon).icon_size(IconSize::Small);
+        let measured_row = h_flex()
+            .id("session-tab-strip-measure")
+            .flex_none()
+            .h_0()
+            .overflow_hidden()
+            .invisible()
+            .gap_1()
+            .track_scroll(&self.fit.measure_scroll)
+            .children(measured_tabs)
+            .when(cap_ellipsis, |this| {
+                this.child(measure_button(
+                    "session-tab-strip-measure-more",
+                    IconName::Ellipsis,
+                ))
+            })
+            .child(measure_button(
+                "session-tab-strip-measure-plus",
+                IconName::Plus,
+            ))
+            .child(measure_button(
+                "session-tab-strip-measure-reopen",
+                IconName::HistoryRerun,
+            ));
+
+        // After layout: measure, and ask for one more frame when the fit this
+        // frame was rendered with is no longer right (a resize, a longer
+        // title). Deferred because a notify raised during a draw is dropped
+        // (see CLAUDE.md).
+        let measure_canvas = {
+            let measure_scroll = self.fit.measure_scroll.clone();
+            let measure_cell = self.fit.measure.clone();
+            let shown_fit = self.fit.shown_fit.clone();
+            let tab_count = capped.len();
+            let trailing_count = usize::from(cap_ellipsis) + 2;
+            let weak_self = weak_self.clone();
+            canvas(
+                move |bounds, _window, cx| {
+                    let Some(measure) = read_strip_measure(
+                        &measure_scroll,
+                        tab_count,
+                        trailing_count,
+                        bounds.size.width,
+                    ) else {
+                        return;
+                    };
+                    let fitted = fit_tabs(&measure, trailing_count == 2);
+                    let previous = measure_cell.replace(Some(measure.clone()));
+                    // Only a changed measurement may ask for a frame. Render
+                    // derives its count from the stored measurement, so the
+                    // two agree; if they ever did not, asking on every frame
+                    // would redraw forever.
+                    if previous.as_ref() != Some(&measure) && shown_fit.get() != Some(fitted) {
+                        shown_fit.set(Some(fitted));
+                        cx.defer(move |cx| {
+                            weak_self.update(cx, |_, cx| cx.notify()).ok();
+                        });
+                    }
+                },
+                |_bounds, _state, _window, _cx| {},
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        };
+
+        // Tabs that do not fit go into the `…` whole: none is ever cut off at
+        // the edge. The buttons follow the last tab shown, so the `+` never
+        // leaves the strip either (maintainer report, 2026-09-30: «а где
+        // кнопка добавления новой сессии?»).
+        let visible_row = h_flex()
+            .absolute()
+            .top_0()
+            .left_0()
             .h_full()
             .gap_1()
-            .overflow_x_scroll()
-            .children(tabs);
+            .children(tabs)
+            .when_some(overflow_popover, |this, popover| this.child(popover))
+            .child(self.render_plus_button())
+            .child(self.render_reopen_button(solution_id, weak_workspace.clone(), cx));
 
-        // Only the tabs scroll. The `…`, `+` and reopen buttons, and the rule,
-        // are siblings of the scrolling group, not its children: the group
-        // shrinks whenever the rest of the status bar wants the room (a long
-        // "Failed to open …" notice on the right is enough), and anything
-        // inside it then slides out of view. The maintainer lost the `+` that
-        // way (2026-09-30), and a boundary marker that scrolls away is worse
-        // than none. The rule only exists on this branch — the early return
-        // above (no active Solution, so nothing AI-related paints at all)
-        // leaves a bare `div`, because a rule with an empty group on one side
-        // is chrome rather than structure.
+        let strip = div()
+            .id("session-tab-strip")
+            .relative()
+            .flex()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .child(measured_row)
+            .child(visible_row)
+            .child(measure_canvas);
+
+        // The rule is a sibling of the strip, not inside it: the strip clips
+        // at the room the status bar gives it, and a boundary marker that
+        // could be clipped away is worse than none. It only exists on this
+        // branch — the early return above (no active Solution, so nothing
+        // AI-related paints at all) leaves a bare `div`, because a rule with
+        // an empty group on one side is chrome rather than structure.
         h_flex()
             .h_full()
             .min_w_0()
-            .child(group)
-            .when_some(overflow_popover, |this, popover| {
-                this.child(div().flex_none().ml_1().child(popover))
-            })
-            .child(div().flex_none().ml_1().child(self.render_plus_button()))
-            .child(div().flex_none().ml_1().child(self.render_reopen_button(
-                solution_id,
-                weak_workspace.clone(),
-                cx,
-            )))
+            .child(strip)
             .child(render_group_divider())
             .into_any_element()
     }
+}
+
+/// Read a [`StripMeasure`] off the invisible copy's laid-out children:
+/// `tab_count` tabs, then `trailing_count` buttons. `None` until the copy has
+/// been laid out with that many children.
+fn read_strip_measure(
+    measure_scroll: &ScrollHandle,
+    tab_count: usize,
+    trailing_count: usize,
+    available: Pixels,
+) -> Option<StripMeasure> {
+    let bounds = (0..tab_count + trailing_count)
+        .map(|ix| measure_scroll.bounds_for_item(ix))
+        .collect::<Option<Vec<_>>>()?;
+    let first_trailing = bounds.get(tab_count)?;
+    let last = bounds.last()?;
+    let gap = match (bounds.first(), bounds.get(1)) {
+        (Some(first), Some(second)) => (second.left() - first.right()).max(Pixels::ZERO),
+        _ => Pixels::ZERO,
+    };
+    Some(StripMeasure {
+        tab_widths: bounds[..tab_count].iter().map(|b| b.size.width).collect(),
+        trailing_width: last.right() - first_trailing.left(),
+        button_width: last.size.width,
+        gap,
+        available,
+    })
 }
 
 impl StatusItemView for SessionTabStrip {
@@ -1282,6 +1527,7 @@ mod tests {
                                 weak_self.clone(),
                                 None,
                                 tab_height,
+                                None,
                                 cx,
                             )
                             .into_any_element()
@@ -1641,41 +1887,37 @@ mod tests {
         (new_chat_dispatches, workspace, visual)
     }
 
-    /// Hosts the strip in a box narrower than its tabs, the way the status bar
+    /// Hosts the strip in a box of a given width, the way the status bar
     /// squeezes it when the right-hand items want the room.
-    struct NarrowStripHarness {
+    struct SizedStripHarness {
         strip: Entity<SessionTabStrip>,
+        width: Pixels,
     }
 
-    const NARROW_STRIP_WIDTH: f32 = 420.;
-
-    impl Render for NarrowStripHarness {
+    impl Render for SizedStripHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(
                 div()
                     .flex()
-                    .w(px(NARROW_STRIP_WIDTH))
+                    .w(self.width)
                     .h(px(40.))
                     .child(self.strip.clone()),
             )
         }
     }
 
-    // sawe: with the status bar short of room, the `+` and reopen buttons
-    // scrolled out of view together with the tabs (maintainer report,
-    // 2026-09-30: «а где кнопка добавления новой сессии?»). Only the tabs may
-    // scroll; the buttons stay inside the strip's box.
-    #[gpui::test]
-    async fn the_plus_and_reopen_buttons_stay_visible_when_tabs_overflow_the_strip(
+    /// Paint the real strip, holding three long-titled tabs, in a box `width`
+    /// wide. Returns the painted tab bounds (left to right) and the visual
+    /// context.
+    async fn paint_three_tabs_in(
+        width: Pixels,
         cx: &mut TestAppContext,
-    ) {
+    ) -> (Vec<gpui::Bounds<Pixels>>, gpui::VisualTestContext) {
         let (solution_id, tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
         cx.update(|cx| {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             let registry = Arc::new(crate::adapter::AdapterRegistry::new());
             SolutionAgentStore::init_global(cx, registry);
-        });
-        cx.update(|cx| {
             SolutionAgentStore::global(cx).update(cx, |store, cx| {
                 for ix in 0..3 {
                     let session = crate::store::tests::insert_cold_session(
@@ -1700,30 +1942,148 @@ mod tests {
         let multi_workspace = multi_workspace
             .root(cx)
             .expect("the multi-workspace window's root");
-        let window = cx.add_window(|_window, cx| NarrowStripHarness {
+        let window = cx.add_window(|_window, cx| SizedStripHarness {
             strip: cx.new(|cx| SessionTabStrip::new(Some(multi_workspace.downgrade()), cx)),
+            width,
         });
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
-        cx.run_until_parked();
+        // The fit is measured after a frame's layout and applied on the next.
+        for _ in 0..3 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+        let tabs = [
+            ("SESSION-TAB-INACTIVE-0", "SESSION-TAB-ACTIVE-0"),
+            ("SESSION-TAB-INACTIVE-1", "SESSION-TAB-ACTIVE-1"),
+            ("SESSION-TAB-INACTIVE-2", "SESSION-TAB-ACTIVE-2"),
+        ]
+        .into_iter()
+        .filter_map(|(inactive, active)| {
+            cx.debug_bounds(inactive)
+                .or_else(|| cx.debug_bounds(active))
+        })
+        .collect();
+        std::mem::forget(tmp);
+        (tabs, cx)
+    }
 
-        let last_tab = cx
-            .debug_bounds("SESSION-TAB-INACTIVE-2")
-            .or_else(|| cx.debug_bounds("SESSION-TAB-ACTIVE-2"))
-            .expect("the third tab must be laid out");
+    // sawe: with the status bar short of room, the `+` scrolled out of view
+    // with the tabs (maintainer report, 2026-09-30: «а где кнопка добавления
+    // новой сессии?»), and the last tab that did show was cut off at the edge.
+    // Tabs that do not fit now go into the `…` whole, and the buttons follow
+    // the last tab shown.
+    #[gpui::test]
+    async fn tabs_that_do_not_fit_go_into_the_ellipsis_and_the_buttons_stay_visible(
+        cx: &mut TestAppContext,
+    ) {
+        let width = px(420.);
+        let (tabs, mut cx) = paint_three_tabs_in(width, cx).await;
+
         assert!(
-            last_tab.right() > px(NARROW_STRIP_WIDTH),
-            "this test is only meaningful when the tabs overflow the strip ({last_tab:?})"
+            !tabs.is_empty() && tabs.len() < 3,
+            "some but not all of the three tabs fit in {width:?}: {tabs:?}"
         );
-        for icon in ["ICON-Plus", "ICON-HistoryRerun"] {
+        let ellipsis = cx
+            .debug_bounds("ICON-Ellipsis")
+            .expect("the tabs that do not fit are behind a `…`");
+        for tab in &tabs {
+            assert!(
+                tab.right() <= ellipsis.left(),
+                "a shown tab {tab:?} must be whole, left of the `…` {ellipsis:?}"
+            );
+        }
+        for icon in ["ICON-Ellipsis", "ICON-Plus", "ICON-HistoryRerun"] {
             let bounds = cx
                 .debug_bounds(icon)
                 .unwrap_or_else(|| panic!("{icon} must paint"));
             assert!(
-                bounds.right() <= px(NARROW_STRIP_WIDTH),
-                "{icon} {bounds:?} must stay inside the {NARROW_STRIP_WIDTH}px strip"
+                bounds.right() <= width,
+                "{icon} {bounds:?} must stay inside the {width:?} strip"
             );
         }
-        std::mem::forget(tmp);
+    }
+
+    #[gpui::test]
+    async fn every_tab_shows_and_no_ellipsis_when_there_is_room(cx: &mut TestAppContext) {
+        let (tabs, mut cx) = paint_three_tabs_in(px(1500.), cx).await;
+        assert_eq!(tabs.len(), 3, "all three tabs fit: {tabs:?}");
+        assert!(cx.debug_bounds("ICON-Ellipsis").is_none());
+        let plus = cx.debug_bounds("ICON-Plus").expect("the `+` paints");
+        assert!(
+            plus.left() >= tabs[2].right(),
+            "the `+` follows the last tab"
+        );
+    }
+
+    fn measure(tab_widths: &[f32], available: f32) -> StripMeasure {
+        StripMeasure {
+            tab_widths: tab_widths.iter().map(|w| px(*w)).collect(),
+            // `+` and reopen: two 22px buttons 4px apart.
+            trailing_width: px(48.),
+            button_width: px(22.),
+            gap: px(4.),
+            available: px(available),
+        }
+    }
+
+    fn whole(tabs: usize) -> TabFit {
+        TabFit {
+            whole: tabs,
+            squeezed: None,
+        }
+    }
+
+    #[test]
+    fn every_tab_fits_when_the_whole_row_does() {
+        // 3 × (100 + 4) + 48 = 360.
+        assert_eq!(
+            fit_tabs(&measure(&[100., 100., 100.], 360.), true),
+            whole(3)
+        );
+    }
+
+    #[test]
+    fn a_tab_that_would_be_cut_off_goes_into_the_ellipsis() {
+        // Two whole tabs, the `…` and the buttons: 2 × 104 + 26 + 48 = 282,
+        // leaving less than a squeezed tab's minimum.
+        assert_eq!(
+            fit_tabs(&measure(&[100., 100., 100.], 282.), true),
+            whole(2)
+        );
+        assert_eq!(
+            fit_tabs(&measure(&[100., 100., 100.], 281.), true),
+            whole(1)
+        );
+        // No room for even one tab: all of them are behind the `…`.
+        assert_eq!(fit_tabs(&measure(&[100., 100., 100.], 60.), true), whole(0));
+    }
+
+    #[test]
+    fn the_room_the_whole_tabs_leave_goes_to_one_squeezed_tab() {
+        // One whole 250px tab: 254 + 26 + 48 = 328. At 460 the second tab
+        // (250 wide, needing 582) does not fit, and 460 - 328 - 4 = 128 is
+        // enough to show it squeezed.
+        assert_eq!(
+            fit_tabs(&measure(&[250., 250., 250.], 460.), true),
+            TabFit {
+                whole: 1,
+                squeezed: Some(px(128.)),
+            }
+        );
+        // 119px of room is below the minimum: it stays empty.
+        assert_eq!(
+            fit_tabs(&measure(&[250., 250., 250.], 451.), true),
+            whole(1)
+        );
+    }
+
+    #[test]
+    fn an_ellipsis_already_there_for_the_tab_cap_is_not_counted_twice() {
+        // The trailing width already includes the cap's `…`, so 2 × 104 + 48.
+        assert_eq!(
+            fit_tabs(&measure(&[100., 100., 100.], 256.), false),
+            whole(2)
+        );
     }
 
     /// The plus opens provider selection; creation waits for a menu choice.

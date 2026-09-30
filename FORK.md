@@ -6254,14 +6254,29 @@ How to apply:
   `context_menu.rs` (`CONTEXT_MENU` / `CONTEXT_SUBMENU` debug bounds). The left-side test fails on
   the old code with the exact overlap reported.
 
-### 223. Only the session tabs scroll; the strip's buttons stay put
+### 223. Session tabs that do not fit go into the `…`; the strip's buttons never leave
 
-The maintainer, 2026-09-30, with a squeezed status bar: *«а где кнопка добавления новой сессии?»*
+The maintainer, 2026-09-30, with a squeezed status bar: *«а где кнопка добавления новой сессии?»*.
+Then, asked whether tabs that do not fit should go into the `…`: *«да»*.
 
-Why: the `…`, `+` and reopen buttons were children of the session strip's `overflow_x_scroll`
-group. The group shrinks whenever the rest of the status bar wants the room (a long
-"Failed to open …" notice was enough), and they scrolled out of view with the tabs.
+Why: the tabs, the `…`, `+` and reopen buttons shared one `overflow_x_scroll` group. The status
+bar shrinks the strip whenever its other items want the room (a long "Failed to open …" notice was
+enough). The buttons then scrolled out of view, and the last tab showed cut off at the edge. The
+`…` only held tabs past `MAX_VISIBLE_TABS`, so nothing said there were more.
 
-How to apply: those buttons and the group rule are siblings of the scrolling group, each
-`flex_none`. Guarded by `the_plus_and_reopen_buttons_stay_visible_when_tabs_overflow_the_strip`
-(three tabs in a 420px box; fails on the old layout with the `+` at x=648).
+How to apply:
+- The strip lays out an invisible copy of itself at full width: every capped tab plus the
+  buttons. That copy is its only in-flow child, so the status bar squeezes the strip to exactly the
+  room there is. The visible row is absolutely positioned over it. The room does not depend on what
+  the visible row shows, so measuring and fitting cannot oscillate.
+- `fit_tabs` decides from that measurement (`StripMeasure`, read through a `ScrollHandle` on the
+  copy). Tabs that fit whole show whole. If the leftover room is at least `MIN_SQUEEZED_TAB_WIDTH`
+  (120px), the next tab shows held to it, so its title truncates. The rest go into the `…` together
+  with the tabs past the cap. The buttons follow the last tab shown.
+- The fit is applied one frame late. A canvas measures after layout and, via `cx.defer`, asks for a
+  new frame only when the measurement changed and gives a different fit. A notify raised during a
+  draw is dropped, and asking on every mismatch would redraw forever if render and check ever
+  disagreed. A mutation test hung on exactly that before the guard.
+- Tests: `fit_tabs` unit tests. `tabs_that_do_not_fit_go_into_the_ellipsis_and_the_buttons_stay_visible`
+  paints the real strip in a 420px box and fails when the fit is disabled.
+  `every_tab_shows_and_no_ellipsis_when_there_is_room` covers the wide case.
