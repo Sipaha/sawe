@@ -1206,3 +1206,54 @@ async fn self_started_turn_prompt_is_announced_from_the_transcript(cx: &mut Test
         "the note must precede the agent's reply to it: {markdown}"
     );
 }
+
+/// The transcript is claude's internal format, so the lookup can stop finding
+/// the entry after a CLI upgrade. The user must still be told the agent started
+/// that turn itself: a generic note, ahead of the reply.
+#[gpui::test]
+async fn self_started_turn_without_a_transcript_entry_gets_the_generic_note(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test(cx).await;
+    let connection = connect_mock(
+        &project,
+        vec![("MOCK_CLAUDE_SELF_STARTED_TURN".into(), "1".into())],
+        cx,
+    )
+    .await;
+    // A cwd with no transcript under it: the lookup finds nothing.
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let task = cx.update(|cx| {
+        Rc::clone(&connection).new_session(project.clone(), PathList::new(&[work_dir.path()]), cx)
+    });
+    let thread = await_thread(task, cx).await;
+    let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+    let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))];
+    let prompt_task =
+        cx.update(|cx| connection.prompt(acp::PromptRequest::new(session_id, prompt), cx));
+    await_prompt(prompt_task, cx, Duration::from_secs(10)).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let markdown = loop {
+        let markdown = thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        if markdown.contains("WAKEUP_REPLY") && markdown.contains("started a turn on its own") {
+            break markdown;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the self-started turn got no note: {markdown}"
+        );
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    };
+    assert!(
+        markdown.find("started a turn on its own") < markdown.find("WAKEUP_REPLY"),
+        "the note must precede the agent's reply: {markdown}"
+    );
+    assert!(
+        markdown.contains("could not be read"),
+        "without an entry there is no prompt to quote: {markdown}"
+    );
+}

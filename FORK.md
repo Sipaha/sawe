@@ -6217,7 +6217,15 @@ How to apply:
   `peer`, `task_notification` or `sdk`. `claude_native::transcript` finds it in the last 1 MiB.
 - The update pump awaits the lookup before it reads the next message, so the note lands above the
   agent's reply (the lookup runs on the background executor). It retries for up to 1 s.
-- Only `scheduled` and `peer` get a note (`SystemNoteLevel::Info`, prompt quoted, capped at 600
-  chars). `task_notification` turns already show as their background task finishing.
+- `scheduled` and `peer` get a note naming the source (`SystemNoteLevel::Info`, prompt quoted,
+  capped at 600 chars). `sdk` and `task_notification` get none. So does a prompt starting with
+  `<task-notification>`: those turns already show as their background task finishing. claude
+  2.1.282 sends them as `system/task_notification`, not `command_lifecycle`, so this only guards
+  against that changing.
+- The transcript format is claude's internal one, so the note must not quietly vanish on a CLI
+  upgrade. Two fallbacks cover that. An entry with an unknown or missing `turnOrigin` gets a generic
+  "started a turn on its own" note with its prompt. No entry at all, or an unresolvable path, gets
+  the note without the prompt. That the agent started the turn itself is certain from
+  `command_lifecycle` alone. A miss is logged under `claude_native::self_started_turn`.
 - `claude_project_dir_for` moved from `solution_agent` to `claude_native::transcript`. The store
   re-exports it.

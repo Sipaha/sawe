@@ -2407,16 +2407,21 @@ async fn announce_self_started_turn(
     command_uuid: String,
     cx: &mut gpui::AsyncApp,
 ) {
-    let Some(path) = shared.work_dirs.first().and_then(|cwd| {
+    let path = shared.work_dirs.first().and_then(|cwd| {
         crate::transcript::session_transcript_path(cwd, &shared.session_id.borrow().0)
-    }) else {
-        return;
-    };
+    });
     let thread = shared.thread.borrow().clone();
     let executor = cx.background_executor().clone();
     let entry = executor
         .clone()
         .spawn(async move {
+            let Some(path) = path else {
+                log::warn!(
+                    target: "claude_native::self_started_turn",
+                    "no transcript path for command {command_uuid}; showing the note without the prompt"
+                );
+                return None;
+            };
             for _ in 0..SELF_STARTED_PROMPT_ATTEMPTS {
                 if let Some(entry) = crate::transcript::find_entry(&path, &command_uuid) {
                     return Some(entry);
@@ -2425,15 +2430,12 @@ async fn announce_self_started_turn(
             }
             log::warn!(
                 target: "claude_native::self_started_turn",
-                "no transcript entry {command_uuid} in {path:?}; the turn's prompt stays unannounced"
+                "no transcript entry {command_uuid} in {path:?}; showing the note without the prompt"
             );
             None
         })
         .await;
-    let Some(note) = entry
-        .as_ref()
-        .and_then(crate::transcript::self_started_turn_note)
-    else {
+    let Some(note) = crate::transcript::self_started_turn_note(entry.as_ref()) else {
         return;
     };
     thread

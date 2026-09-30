@@ -78,21 +78,46 @@ fn find_entry_in(text: &str, uuid: &str) -> Option<Value> {
 /// long; the agent's reply carries the substance anyway.
 const MAX_QUOTED_CHARS: usize = 600;
 
-/// The note to show the user for a turn `claude` started on its own, or `None`
-/// when `entry` is an ordinary prompt. Task notifications are left out on
-/// purpose: they already show as the background task's tool call finishing,
-/// and a note for each would drown the conversation.
-pub fn self_started_turn_note(entry: &Value) -> Option<String> {
-    let heading = match entry.get("turnOrigin").and_then(Value::as_str)? {
-        "scheduled" => {
+/// Shown when the turn's prompt can't be read: the transcript entry is missing,
+/// or the file moved. That the agent started the turn itself is still certain,
+/// because `command_lifecycle` alone says so, and it is the part that matters.
+const UNREADABLE_PROMPT_NOTE: &str = "The agent started a turn on its own, without a message \
+     from you (a scheduled wakeup, a cron job or another session's message). Its prompt could \
+     not be read from the session transcript.";
+
+/// The note to show for a turn `claude` started on its own, given its
+/// transcript entry if one was found, or `None` when no note is due.
+///
+/// The transcript format is claude's internal one, not a contract. So an entry
+/// this code no longer understands (a renamed or missing `turnOrigin`) still
+/// gets a generic note with its prompt. The note must not quietly vanish on a
+/// CLI upgrade and bring the "you repeated the command" confusion back.
+///
+/// Task notifications get no note: they already show as the background task
+/// finishing. claude 2.1.282 does not send `command_lifecycle` for them (they
+/// arrive as `system/task_notification`), so this only guards against that
+/// changing.
+pub fn self_started_turn_note(entry: Option<&Value>) -> Option<String> {
+    let Some(entry) = entry else {
+        return Some(UNREADABLE_PROMPT_NOTE.to_string());
+    };
+    let prompt = entry
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .map(prompt_text)
+        .unwrap_or_default();
+    let prompt = prompt.trim();
+    let heading = match entry.get("turnOrigin").and_then(Value::as_str) {
+        Some("sdk" | "task_notification") => return None,
+        _ if prompt.starts_with("<task-notification>") => return None,
+        Some("scheduled") => {
             "Scheduled wakeup fired. The agent queued this prompt for itself \
              earlier (ScheduleWakeup / CronCreate). It was not sent by you:"
         }
-        "peer" => "Message from another Claude session. It was not sent by you:",
-        _ => return None,
+        Some("peer") => "Message from another Claude session. It was not sent by you:",
+        _ if prompt.is_empty() => return Some(UNREADABLE_PROMPT_NOTE.to_string()),
+        _ => "The agent started a turn on its own. The prompt that started it was not sent by you:",
     };
-    let prompt = prompt_text(entry.get("message")?.get("content")?);
-    let prompt = prompt.trim();
     let quoted: String = prompt.chars().take(MAX_QUOTED_CHARS).collect();
     let ellipsis = if quoted.len() < prompt.len() {
         "…"
@@ -140,7 +165,7 @@ mod tests {
 
     #[test]
     fn scheduled_turn_gets_a_note_quoting_its_prompt() {
-        let note = self_started_turn_note(&parse(SCHEDULED_ENTRY)).expect("scheduled → note");
+        let note = self_started_turn_note(Some(&parse(SCHEDULED_ENTRY))).expect("scheduled → note");
         assert!(note.starts_with("Scheduled wakeup fired."), "{note}");
         assert!(note.ends_with("\n\nWAKEUP-PROBE ping"), "{note}");
     }
@@ -150,26 +175,49 @@ mod tests {
         let entry = parse(
             r#"{"type":"user","turnOrigin":"peer","message":{"role":"user","content":[{"type":"text","text":"Another Claude session sent a message: hi"}]}}"#,
         );
-        let note = self_started_turn_note(&entry).expect("peer → note");
+        let note = self_started_turn_note(Some(&entry)).expect("peer → note");
         assert!(note.starts_with("Message from another Claude session."));
         assert!(note.ends_with("Another Claude session sent a message: hi"));
     }
 
     #[test]
     fn user_sdk_and_task_notification_turns_get_no_note() {
-        for origin in [
-            r#""turnOrigin":"sdk","#,
-            r#""turnOrigin":"task_notification","#,
-            "",
+        for entry in [
+            r#"{"type":"user","turnOrigin":"sdk","message":{"role":"user","content":"x"}}"#,
+            r#"{"type":"user","turnOrigin":"task_notification","message":{"role":"user","content":"x"}}"#,
+            // A task notification whose origin tag was renamed or dropped.
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<task-notification>\n<task-id>b1</task-id>"}]}}"#,
         ] {
-            let entry = parse(&format!(
-                r#"{{"type":"user",{origin}"message":{{"role":"user","content":"x"}}}}"#
-            ));
             assert!(
-                self_started_turn_note(&entry).is_none(),
-                "origin {origin:?}"
+                self_started_turn_note(Some(&parse(entry))).is_none(),
+                "{entry}"
             );
         }
+    }
+
+    #[test]
+    fn an_entry_this_code_does_not_understand_still_gets_a_note() {
+        // `turnOrigin` renamed by a future CLI: the prompt is still shown.
+        let renamed = parse(
+            r#"{"type":"user","origin":"wakeup","message":{"role":"user","content":"review again"}}"#,
+        );
+        let note = self_started_turn_note(Some(&renamed)).expect("unknown origin → note");
+        assert!(
+            note.starts_with("The agent started a turn on its own."),
+            "{note}"
+        );
+        assert!(note.ends_with("\n\nreview again"), "{note}");
+
+        // No readable prompt at all, or no entry: the generic note.
+        let empty = parse(r#"{"type":"user","turnOrigin":"brand_new"}"#);
+        assert_eq!(
+            self_started_turn_note(Some(&empty)).as_deref(),
+            Some(UNREADABLE_PROMPT_NOTE)
+        );
+        assert_eq!(
+            self_started_turn_note(None).as_deref(),
+            Some(UNREADABLE_PROMPT_NOTE)
+        );
     }
 
     #[test]
@@ -179,7 +227,7 @@ mod tests {
             "turnOrigin": "scheduled",
             "message": {"role": "user", "content": long},
         });
-        let note = self_started_turn_note(&entry).expect("note");
+        let note = self_started_turn_note(Some(&entry)).expect("note");
         let quoted = note.rsplit("\n\n").next().expect("quoted part");
         assert_eq!(quoted.chars().count(), MAX_QUOTED_CHARS + 1);
         assert!(quoted.ends_with('…'));
