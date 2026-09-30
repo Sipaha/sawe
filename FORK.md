@@ -6194,3 +6194,26 @@ How to apply:
   "open SPK Editor on your computer". The old banner stays only for an older desktop.
 - Finding: `docs/findings/2026-09-29-auto-compaction-replaces-observer-compact.md`.
 
+
+### 221. A turn claude starts by itself shows the prompt that started it
+
+The maintainer, 2026-09-30, after an agent re-ran a finished review and told them «Вы повторили ту
+же команду»: *«но я не повторял её»*. They then asked for wakeup-started turns to be marked in the
+conversation.
+
+Why: a `ScheduleWakeup` / `CronCreate` firing, or a message from another Claude session, reaches
+stdout only as `command_lifecycle {state:"started", command_uuid}`. The prompt is not replayed, even
+under `--replay-user-messages`. The conversation showed the agent answering a prompt nobody could
+see. In the incident the agent had set itself a 30-minute "fallback heartbeat" wakeup with the
+review command as its prompt and never cancelled it. When it fired, the agent blamed the user.
+
+How to apply:
+- The prompt lives only in claude's transcript (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`), as
+  the user entry whose `uuid` equals `command_uuid`. It is tagged `turnOrigin`: `scheduled`,
+  `peer`, `task_notification` or `sdk`. `claude_native::transcript` finds it in the last 1 MiB.
+- The update pump awaits the lookup before it reads the next message, so the note lands above the
+  agent's reply (the lookup runs on the background executor). It retries for up to 1 s.
+- Only `scheduled` and `peer` get a note (`SystemNoteLevel::Info`, prompt quoted, capped at 600
+  chars). `task_notification` turns already show as their background task finishing.
+- `claude_project_dir_for` moved from `solution_agent` to `claude_native::transcript`. The store
+  re-exports it.

@@ -1736,6 +1736,15 @@ async fn run_update_pump(
             }
         }
 
+        if let OutputMessage::CommandLifecycle(lifecycle) = &message {
+            if lifecycle.state == "started" {
+                // Awaited, not detached: the note has to land before the turn's
+                // own output, which is still queued behind this message.
+                announce_self_started_turn(&shared, lifecycle.command_uuid.clone(), cx).await;
+            }
+            continue;
+        }
+
         if let OutputMessage::Result(result) = &message {
             // Pass the per-turn stream/message-derived `used` so
             // `apply_usage` doesn't overwrite the meter with `result.usage`,
@@ -2379,6 +2388,59 @@ async fn run_update_pump(
                 .ok();
         }
     }
+}
+
+/// How long [`announce_self_started_turn`] waits for the turn's prompt to show
+/// up in the transcript. `claude` writes the entry before it emits the
+/// lifecycle, so the first read normally finds it; the retries only cover a
+/// write that has not reached the disk yet.
+const SELF_STARTED_PROMPT_ATTEMPTS: u32 = 10;
+const SELF_STARTED_PROMPT_RETRY: Duration = Duration::from_millis(100);
+
+/// Show the prompt behind a turn `claude` started on its own (a wakeup or cron
+/// firing, a peer session's message) as a system note. stdout carries only the
+/// `command_lifecycle`, so without the note the user sees the agent act on an
+/// invisible prompt, and the agent tends to attribute it to the user. See
+/// [`crate::transcript`].
+async fn announce_self_started_turn(
+    shared: &SessionShared,
+    command_uuid: String,
+    cx: &mut gpui::AsyncApp,
+) {
+    let Some(path) = shared.work_dirs.first().and_then(|cwd| {
+        crate::transcript::session_transcript_path(cwd, &shared.session_id.borrow().0)
+    }) else {
+        return;
+    };
+    let thread = shared.thread.borrow().clone();
+    let executor = cx.background_executor().clone();
+    let entry = executor
+        .clone()
+        .spawn(async move {
+            for _ in 0..SELF_STARTED_PROMPT_ATTEMPTS {
+                if let Some(entry) = crate::transcript::find_entry(&path, &command_uuid) {
+                    return Some(entry);
+                }
+                executor.timer(SELF_STARTED_PROMPT_RETRY).await;
+            }
+            log::warn!(
+                target: "claude_native::self_started_turn",
+                "no transcript entry {command_uuid} in {path:?}; the turn's prompt stays unannounced"
+            );
+            None
+        })
+        .await;
+    let Some(note) = entry
+        .as_ref()
+        .and_then(crate::transcript::self_started_turn_note)
+    else {
+        return;
+    };
+    thread
+        .update(cx, |thread, cx| {
+            thread.push_system_note(acp_thread::SystemNoteLevel::Info, note, cx);
+        })
+        .ok();
 }
 
 /// Answer a `can_use_tool` control request by policy, without involving the

@@ -9,6 +9,7 @@ mod connection;
 pub mod process;
 pub mod protocol;
 pub mod tool_authorization;
+pub mod transcript;
 mod translate;
 mod watchdog;
 pub mod worktree_hook;

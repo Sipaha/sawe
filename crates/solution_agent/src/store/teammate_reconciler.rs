@@ -15,28 +15,7 @@
 
 use super::*;
 
-/// `~/.claude/projects/<encoded-cwd>/` — the per-project root claude
-/// writes session transcripts and subagent dirs under. `None` when `cwd`
-/// is empty (legacy session) or `home_dir()` can't be resolved.
-pub(crate) fn claude_project_dir_for(cwd: &std::path::Path) -> Option<PathBuf> {
-    if cwd.as_os_str().is_empty() {
-        return None;
-    }
-    let raw = cwd.to_string_lossy();
-    let mut encoded = String::with_capacity(raw.len() + 1);
-    for c in raw.chars() {
-        match c {
-            '/' | '.' => encoded.push('-'),
-            other => encoded.push(other),
-        }
-    }
-    Some(
-        dirs::home_dir()?
-            .join(".claude")
-            .join("projects")
-            .join(encoded),
-    )
-}
+pub(crate) use claude_native::transcript::claude_project_dir_for;
 
 pub(crate) fn background_agent_dir_for(
     cwd: &std::path::Path,

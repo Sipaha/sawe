@@ -20,6 +20,7 @@ pub enum OutputMessage {
     Result(ResultMessage),
     ControlRequest(ControlRequestEnvelope),
     ControlResponse(ControlResponseEnvelope),
+    CommandLifecycle(CommandLifecycle),
     #[serde(other)]
     Unknown,
 }
@@ -49,6 +50,16 @@ pub enum System {
     },
     #[serde(other)]
     Other,
+}
+
+/// `claude` bracketing a turn it started by itself (a scheduled wakeup, a peer
+/// session's message): `state` is `started`, later `completed`. The prompt
+/// behind it is not on stdout; `command_uuid` is the `uuid` of its transcript
+/// entry — see [`crate::transcript`].
+#[derive(Debug, Deserialize)]
+pub struct CommandLifecycle {
+    pub command_uuid: String,
+    pub state: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,6 +452,17 @@ mod tests {
                 assert!(!r.is_error);
                 assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
                 assert_eq!(r.context_window_for_active_model(), Some(1_000_000));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    #[test]
+    fn parses_command_lifecycle() {
+        let v = r#"{"type":"command_lifecycle","command_uuid":"1182c7b1","state":"started","uuid":"f785","session_id":"s"}"#;
+        match OutputMessage::parse(v).unwrap() {
+            OutputMessage::CommandLifecycle(lifecycle) => {
+                assert_eq!(lifecycle.command_uuid, "1182c7b1");
+                assert_eq!(lifecycle.state, "started");
             }
             other => panic!("{other:?}"),
         }

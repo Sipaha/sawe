@@ -1115,3 +1115,94 @@ async fn clear_in_place_refuses_while_a_turn_is_running(cx: &mut TestAppContext)
     assert!(error.to_string().contains("turn is in flight"), "{error:#}");
     assert!(connection.session_process_id_for_test(&id).is_some());
 }
+
+/// A turn claude starts by itself (a `ScheduleWakeup` firing) reaches stdout
+/// only as `command_lifecycle`; its prompt lives in the session transcript. The
+/// pump must surface that prompt as a system note ahead of the agent's reply,
+/// so the user can tell the agent was answering its own wakeup and not them.
+#[gpui::test]
+async fn self_started_turn_prompt_is_announced_from_the_transcript(cx: &mut TestAppContext) {
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    let project = init_test(cx).await;
+    let connection = connect_mock(
+        &project,
+        vec![("MOCK_CLAUDE_SELF_STARTED_TURN".into(), "1".into())],
+        cx,
+    )
+    .await;
+    // A unique cwd gives the session its own `~/.claude/projects/<encoded>` dir,
+    // which the guard removes again.
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let task = cx.update(|cx| {
+        Rc::clone(&connection).new_session(project.clone(), PathList::new(&[work_dir.path()]), cx)
+    });
+    let thread = await_thread(task, cx).await;
+    let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+    let transcript =
+        claude_native::transcript::session_transcript_path(work_dir.path(), &session_id.0)
+            .expect("transcript path");
+    let project_dir = transcript.parent().expect("project dir").to_path_buf();
+    let _cleanup = RemoveOnDrop(project_dir.clone());
+    std::fs::create_dir_all(&project_dir).expect("create project dir");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"hello"},"uuid":"u-hello","turnOrigin":"sdk"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"review-changes again"},"isMeta":true,"uuid":"cmd-self-started","promptSource":"system","turnOrigin":"scheduled"}"#,
+            "\n",
+        ),
+    )
+    .expect("write transcript");
+
+    let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))];
+    let prompt_task =
+        cx.update(|cx| connection.prompt(acp::PromptRequest::new(session_id, prompt), cx));
+    await_prompt(prompt_task, cx, Duration::from_secs(10)).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let markdown = loop {
+        let markdown = thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        if markdown.contains("WAKEUP_REPLY") && markdown.contains("review-changes again") {
+            break markdown;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the self-started turn's prompt was never announced: {markdown}"
+        );
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    };
+    let notes: Vec<String> = thread.read_with(cx, |thread, _| {
+        thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentThreadEntry::SystemNote(note) => Some(note.text.to_string()),
+                _ => None,
+            })
+            .collect()
+    });
+    assert_eq!(
+        notes.len(),
+        1,
+        "exactly one note, for the scheduled turn only: {notes:?}"
+    );
+    assert!(
+        notes[0].starts_with("Scheduled wakeup fired."),
+        "{}",
+        notes[0]
+    );
+    assert!(
+        markdown.find("review-changes again") < markdown.find("WAKEUP_REPLY"),
+        "the note must precede the agent's reply to it: {markdown}"
+    );
+}

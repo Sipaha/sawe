@@ -3158,6 +3158,7 @@ dependencies = [
  "agent_servers",
  "anyhow",
  "chrono",
+ "dirs",
  "editor_mcp",
  "futures 0.3.34",
  "gpui",

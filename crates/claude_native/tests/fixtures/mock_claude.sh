@@ -31,6 +31,14 @@
 #                           on its own (what a background sub-agent's completion
 #                           notification triggers): text `LATE_AFTER_CLEAR` and a
 #                           `result`, with no user message to prompt it.
+#   MOCK_CLAUDE_SELF_STARTED_TURN
+#                         - if set, the first turn's `result` is followed by a
+#                           turn claude starts by itself (a `ScheduleWakeup`
+#                           firing): `command_lifecycle started` naming command
+#                           `cmd-self-started`, text `WAKEUP_REPLY`, a `result`,
+#                           `command_lifecycle completed`. As in the real binary,
+#                           the prompt behind it is not on stdout; the test
+#                           writes it into the session transcript.
 #
 # A user message whose text is exactly `/clear` is answered the way the real
 # binary answers it: `conversation_reset`, an `init` carrying a NEW session id
@@ -169,6 +177,12 @@ while IFS= read -r line; do
           emit '{"type":"result","subtype":"success","is_error":false,"result":"echoed: '"$hook_echo"'","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2},"uuid":"u2","session_id":"mock-session"}'
         else
           emit '{"type":"result","subtype":"success","is_error":false,"result":"Hi","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2},"uuid":"u2","session_id":"mock-session"}'
+        fi
+        if [ -n "${MOCK_CLAUDE_SELF_STARTED_TURN:-}" ]; then
+          emit '{"type":"command_lifecycle","command_uuid":"cmd-self-started","state":"started","uuid":"u-cl1","session_id":"'"$session_id"'"}'
+          emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"WAKEUP_REPLY"}},"uuid":"u-wake","session_id":"'"$session_id"'"}'
+          emit '{"type":"result","subtype":"success","is_error":false,"result":"WAKEUP_REPLY","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1},"uuid":"u-wake-r","session_id":"'"$session_id"'"}'
+          emit '{"type":"command_lifecycle","command_uuid":"cmd-self-started","state":"completed","uuid":"u-cl2","session_id":"'"$session_id"'"}'
         fi
       fi
       ;;
