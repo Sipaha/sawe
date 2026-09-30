@@ -4947,6 +4947,10 @@ boundary**: a link to a large log should not freeze the conversation it was
 clicked from, and a naive byte cut renders the split character as a replacement
 glyph. (The test for that pins a three-byte character on purpose — the cap is
 even, so a two-byte one would land on a boundary by luck and prove nothing.)
+A linked **image** (`png`, `jpg`, `webp`, `gif`, `svg`, `bmp`, `tiff`, `ico`,
+`pnm`, chosen by extension) opens in the window's `Image` mode instead. Until
+2026-09-30 it went down the text path and showed its bytes as mojibake. Images
+are not clipped; one over 64 MiB is refused with a message in the window.
 
 `render_span` carries a weak handle rather than a precomputed list of roots: a
 relative link is resolved against the project **as it stands when clicked**, not

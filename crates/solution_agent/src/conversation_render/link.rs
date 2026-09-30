@@ -13,6 +13,7 @@
 //! a report the agent just wrote does not disturb the editor's tabs.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::{App, SharedString, WeakEntity, Window};
 use workspace::Workspace;
@@ -193,6 +194,25 @@ pub(crate) fn open_link_within_preview(url: &str, roots: &[PathBuf], cx: &mut Ap
 /// `label` is the link as it was written, which is what the user recognises —
 /// `docs/audit.md` rather than the absolute path it resolved to.
 fn preview_content(path: &Path, label: &str) -> crate::preview_window::PreviewContent {
+    if let Some(format) = image_format(path) {
+        match read_image(path) {
+            Ok(bytes) => {
+                return crate::preview_window::PreviewContent::Image(Arc::new(
+                    gpui::Image::from_bytes(format, bytes),
+                ));
+            }
+            Err(err) => {
+                log::warn!("failed to read {} for preview: {err:#}", path.display());
+                return crate::preview_window::PreviewContent::Text {
+                    title: SharedString::from(label.to_string()),
+                    body: SharedString::from(format!(
+                        "Could not show {}:\n\n{err:#}",
+                        path.display()
+                    )),
+                };
+            }
+        }
+    }
     let body = match std::fs::read(path) {
         Ok(bytes) => preview_body(bytes),
         Err(err) => {
@@ -216,6 +236,37 @@ fn preview_content(path: &Path, label: &str) -> crate::preview_window::PreviewCo
             body: SharedString::from(body),
         }
     }
+}
+
+/// An image bigger than this is not decoded. Unlike text it cannot be clipped,
+/// and screenshots the agent links run to a few MB at most.
+const MAX_PREVIEW_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_image(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let size = std::fs::metadata(path)?.len();
+    anyhow::ensure!(
+        size <= MAX_PREVIEW_IMAGE_BYTES,
+        "the image is {size} bytes, over the {MAX_PREVIEW_IMAGE_BYTES}-byte preview limit"
+    );
+    Ok(std::fs::read(path)?)
+}
+
+/// The image format a linked file is shown as, by extension. A screenshot the
+/// agent links used to open as its raw bytes, a screen of mojibake.
+fn image_format(path: &Path) -> Option<gpui::ImageFormat> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => gpui::ImageFormat::Png,
+        "jpg" | "jpeg" => gpui::ImageFormat::Jpeg,
+        "webp" => gpui::ImageFormat::Webp,
+        "gif" => gpui::ImageFormat::Gif,
+        "svg" => gpui::ImageFormat::Svg,
+        "bmp" => gpui::ImageFormat::Bmp,
+        "tif" | "tiff" => gpui::ImageFormat::Tiff,
+        "ico" => gpui::ImageFormat::Ico,
+        "pbm" | "pgm" | "ppm" | "pnm" => gpui::ImageFormat::Pnm,
+        _ => return None,
+    })
 }
 
 /// Extensions the preview renders instead of showing as source.
@@ -364,5 +415,43 @@ mod tests {
             body.len() < MAX_PREVIEW_BYTES + 200,
             "the clipped body should be about the cap, not the whole input"
         );
+    }
+
+    #[test]
+    fn a_linked_image_previews_as_an_image_and_other_files_as_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let png = dir.path().join("shot.PNG");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").expect("write png");
+        let log = dir.path().join("run.log");
+        std::fs::write(&log, "plain text").expect("write log");
+
+        match preview_content(&png, "shot.PNG") {
+            crate::preview_window::PreviewContent::Image(image) => {
+                assert_eq!(image.format(), gpui::ImageFormat::Png)
+            }
+            _ => panic!("a .png link must open as an image"),
+        }
+        assert!(matches!(
+            preview_content(&log, "run.log"),
+            crate::preview_window::PreviewContent::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn image_formats_are_recognised_by_extension() {
+        assert_eq!(
+            image_format(Path::new("a/b.jpg")),
+            Some(gpui::ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            image_format(Path::new("b.JPEG")),
+            Some(gpui::ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            image_format(Path::new("c.webp")),
+            Some(gpui::ImageFormat::Webp)
+        );
+        assert_eq!(image_format(Path::new("d.md")), None);
+        assert_eq!(image_format(Path::new("png")), None);
     }
 }
