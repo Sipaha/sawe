@@ -1076,6 +1076,15 @@ impl SessionTabStrip {
                             }
                         },
                     )
+                    .custom_entry(
+                        |_, _| render_agent_choice(&crate::qwen_adapter::BRAND),
+                        |window, cx| {
+                            if let Ok(action) = cx.build_action("console_panel::NewQwenChat", None)
+                            {
+                                window.dispatch_action(action, cx);
+                            }
+                        },
+                    )
                 }))
             })
     }

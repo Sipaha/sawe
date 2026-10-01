@@ -56,6 +56,7 @@ pub fn agent_brand(agent_id: &str) -> Option<&'static AgentBrand> {
     match agent_id {
         crate::claude_adapter::CLAUDE_ACP_AGENT_ID => Some(&crate::claude_adapter::BRAND),
         crate::codex_adapter::CODEX_AGENT_ID => Some(&crate::codex_adapter::BRAND),
+        crate::qwen_adapter::QWEN_AGENT_ID => Some(&crate::qwen_adapter::BRAND),
         _ => None,
     }
 }

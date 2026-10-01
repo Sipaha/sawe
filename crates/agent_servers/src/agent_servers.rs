@@ -1,5 +1,6 @@
 mod acp;
 mod custom;
+mod qwen;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
@@ -10,6 +11,7 @@ pub use custom::*;
 use fs::Fs;
 use http_client::read_no_proxy_from_env;
 use project::{AgentId, Project, agent_server_store::AgentServerStore};
+pub use qwen::*;
 
 use acp_thread::{AgentConnection, AgentModelId};
 use agent_client_protocol::schema::v1 as acp_schema;

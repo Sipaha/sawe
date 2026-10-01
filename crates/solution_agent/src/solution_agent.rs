@@ -28,6 +28,7 @@ pub mod notifier;
 pub(crate) mod pool;
 pub mod preview_window;
 pub(crate) mod prompt_template;
+pub mod qwen_adapter;
 pub mod rename_session_modal;
 pub mod reopen_session_modal;
 pub mod session_entry;
@@ -75,6 +76,7 @@ pub fn init(cx: &mut App) {
     let mut adapters = adapter::AdapterRegistry::new();
     adapters.register(Arc::new(claude_adapter::ClaudeAcpAdapter));
     adapters.register(Arc::new(codex_adapter::CodexAdapter));
+    adapters.register(Arc::new(qwen_adapter::QwenAdapter));
     let adapters = Arc::new(adapters);
 
     store::SolutionAgentStore::init_global(cx, adapters);
@@ -97,6 +99,17 @@ pub fn init(cx: &mut App) {
             Rc::new(codex_native::CodexAgentServer::new(AgentId(
                 SharedString::from(codex_adapter::CODEX_AGENT_ID),
             ))),
+        );
+        // Qwen Code speaks ACP natively, so unlike the two above it needs no
+        // protocol translation crate — `agent_servers::QwenAgentServer` only
+        // launches the installed `qwen` CLI and hands the process to the
+        // shared ACP connection. See `qwen_adapter` for the mapping onto this
+        // fork's permission and model controls.
+        store.register_agent_server(
+            SharedString::from(qwen_adapter::QWEN_AGENT_ID),
+            Rc::new(agent_servers::QwenAgentServer::new(AgentId(SharedString::from(
+                qwen_adapter::QWEN_AGENT_ID,
+            )))),
         );
     });
 

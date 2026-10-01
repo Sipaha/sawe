@@ -13,6 +13,8 @@ gpui::actions!(
         NewChat,
         /// Creates a new Codex chat and shows it in the Solution band.
         NewCodexChat,
+        /// Creates a new Qwen chat and shows it in the Solution band.
+        NewQwenChat,
         /// Toggles the Solution band's dialog half (`ctrl-shift-a`).
         /// Collapses it if a session is currently showing
         /// (`SolutionAgentStore::set_active_dialog_session(solution_id, None,

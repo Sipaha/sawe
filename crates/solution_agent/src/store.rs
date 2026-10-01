@@ -1664,9 +1664,21 @@ impl SolutionAgentStore {
                         true,
                     );
                 }
+                // An agent that enforces permissions through ACP session modes
+                // (Qwen) cannot be seeded from `acp_meta`: a mode is per
+                // session, so it can only be pushed once the session exists.
+                // No-op — and logged inside — for the native runtimes, which
+                // take `sawePermissionMode` instead.
+                crate::native_controls::set_permission_mode(
+                    acp_thread.read(cx).connection().clone(),
+                    &acp_session_id,
+                    permission_mode,
+                    cx,
+                );
                 let live_models = crate::native_controls::available_models(
                     acp_thread.read(cx).connection().clone(),
                     &acp_session_id,
+                    cx,
                 );
                 if !live_models.is_empty() {
                     store
@@ -1778,7 +1790,8 @@ impl SolutionAgentStore {
     ) -> SessionPermissionMode {
         if !internal
             && (agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID
-                || agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID)
+                || agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID
+                || agent_id.as_ref() == crate::qwen_adapter::QWEN_AGENT_ID)
         {
             // The remembered default is still on disk and unread: a saved
             // `ReadOnly` must not be downgraded into `FullAccess` just because
@@ -2681,7 +2694,7 @@ impl SolutionAgentStore {
         });
         session.update(cx, |s, _| s.desired_model = Some(value.clone()));
         if let Some((conn, acp_sid)) = live {
-            crate::native_controls::set_model(conn.clone(), &acp_sid, Some(value), true);
+            crate::native_controls::set_model(conn.clone(), &acp_sid, Some(value), true, cx);
             if session.read(cx).agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID {
                 let supported = self.session_effort_options(session_id, cx);
                 if session
@@ -2783,18 +2796,22 @@ impl SolutionAgentStore {
                 "Permissions can change only in an idle chat without pending work or approvals"
             ));
         }
-        if s.agent_id.as_ref() != crate::claude_adapter::CLAUDE_ACP_AGENT_ID
-            && s.agent_id.as_ref() != crate::codex_adapter::CODEX_AGENT_ID
-        {
+        let is_native = s.agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID
+            || s.agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID;
+        let is_acp_modes = s.agent_id.as_ref() == crate::qwen_adapter::QWEN_AGENT_ID;
+        if !is_native && !is_acp_modes {
             return Err(anyhow!(
                 "This provider does not support session permissions"
             ));
         }
-        if let Some(thread) = s.acp_thread() {
+        // Only a native runtime has to restart to change policy, so only one
+        // has to prove its close is synchronous — a generic async close could
+        // otherwise race the next resume of the same provider ID. An agent on
+        // ACP session modes (Qwen) switches live and keeps its process.
+        if is_native
+            && let Some(thread) = s.acp_thread()
+        {
             let connection = thread.read(cx).connection().clone();
-            // These native close methods synchronously remove/kill the old
-            // process before returning a ready task. A generic async close
-            // could otherwise race the next resume of the same provider ID.
             if connection
                 .clone()
                 .downcast::<claude_native::ClaudeNativeConnection>()
@@ -2848,6 +2865,27 @@ impl SolutionAgentStore {
             cached_models: s.cached_models.clone(),
             tab_order: s.tab_order,
         };
+        let pair = (s.solution_id, s.agent_id.clone());
+        let live = s.acp_thread().cloned();
+        // An agent that enforces permissions through ACP session modes (Qwen)
+        // switches a live session in place: no process restart, no dropped
+        // thread, no lost transcript. Applied BEFORE anything is persisted — if
+        // the CLI refuses the mode, the stored value must not claim a change
+        // that never reached the agent.
+        let acp_mode_switch = live.as_ref().and_then(|thread| {
+            let thread = thread.read(cx);
+            let connection = thread.connection().clone();
+            crate::native_controls::uses_acp_permission_modes(&connection)
+                .then(|| (connection, thread.session_id().clone()))
+        });
+        let switched_live = acp_mode_switch.is_some();
+        if let Some((connection, acp_sid)) = acp_mode_switch {
+            if !crate::native_controls::set_permission_mode(connection, &acp_sid, mode, cx) {
+                return Err(anyhow!(
+                    "The agent refused this permission mode; the chat keeps its current one"
+                ));
+            }
+        }
         // Commit before acknowledging the UI. Generic asynchronous metadata
         // snapshots never overwrite this column, including older queued saves.
         if let Some(db) = &self.persistence {
@@ -2855,24 +2893,30 @@ impl SolutionAgentStore {
         }
         self.default_permission_mode = mode;
         self.default_permission_mode_touched = true;
-        let pair = (s.solution_id, s.agent_id.clone());
-        let live = s.acp_thread().cloned();
-        if let Some(thread) = live {
-            let (connection, provider_id) = {
-                let t = thread.read(cx);
-                (t.connection().clone(), t.session_id().clone())
-            };
-            connection
-                .close_session(&provider_id, cx)
-                .detach_and_log_err(cx);
-            // Other chats may still share the connection. Resume passes the
-            // new policy to a fresh per-session process on that connection.
-            self.pool_release_session(pair, cx);
+        if !switched_live {
+            if let Some(thread) = live {
+                let (connection, provider_id) = {
+                    let t = thread.read(cx);
+                    (t.connection().clone(), t.session_id().clone())
+                };
+                connection
+                    .close_session(&provider_id, cx)
+                    .detach_and_log_err(cx);
+                // Other chats may still share the connection. Resume passes the
+                // new policy to a fresh per-session process on that connection.
+                self.pool_release_session(pair, cx);
+            }
         }
         session.update(cx, |s, cx| {
             s.permission_mode = mode;
             s.last_activity_at = Utc::now();
-            s.set_acp_thread(None, cx);
+            // A native runtime only picks the new policy up on a fresh
+            // per-session process, so its thread is dropped and the next
+            // message respawns. A live mode switch keeps the thread — that is
+            // the whole point of it.
+            if !switched_live {
+                s.set_acp_thread(None, cx);
+            }
         });
         self.mark_state_changed(id, cx);
         cx.notify();
@@ -2888,7 +2932,7 @@ impl SolutionAgentStore {
         let live = session.read(cx).acp_thread().map(|t| {
             let t = t.read(cx);
             let acp_sid = t.session_id().clone();
-            crate::native_controls::available_models(t.connection().clone(), &acp_sid)
+            crate::native_controls::available_models(t.connection().clone(), &acp_sid, cx)
         });
         // Live-non-empty → update the per-session + global cache and persist.
         // Otherwise (the session is live but its list is still empty — a fresh

@@ -456,6 +456,7 @@ impl SolutionAgentStore {
                         crate::native_controls::available_models(
                             t.connection().clone(),
                             t.session_id(),
+                            cx,
                         )
                     });
                     if let Some(models) = live_models {
