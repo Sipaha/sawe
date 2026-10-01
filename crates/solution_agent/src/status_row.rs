@@ -324,18 +324,27 @@ pub(crate) fn render_status_row(
     // Synchronous read of the agent's current session mode
     // ("default", "plan", …). Claude exposes this via ACP — when
     // the connection doesn't implement modes (e.g. mock test
-    // adapter) we just hide the segment.
-    let mode_text: Option<SharedString> = s.acp_thread().and_then(|thread| {
-        let thread = thread.read(cx);
-        let modes = thread.connection().session_modes(thread.session_id(), cx)?;
-        let current = modes.current_mode();
-        modes
-            .all_modes()
-            .into_iter()
-            .find(|m| m.id == current)
-            .map(|m| SharedString::from(m.name))
-            .or_else(|| Some(SharedString::from(current.0.to_string())))
-    });
+    // adapter) we just hide the segment. Also hidden for an agent
+    // whose permission mode the fork pushes itself through ACP
+    // session modes (Kimi): the permission control beside this
+    // slot already states the mode ("Full access" / "Read only"),
+    // so the raw CLI mode name ("YOLO") would only restate it in
+    // the model segment's place.
+    let mode_text: Option<SharedString> = if crate::native_controls::uses_acp_permission_modes_for_agent(s.agent_id.as_ref()) {
+        None
+    } else {
+        s.acp_thread().and_then(|thread| {
+            let thread = thread.read(cx);
+            let modes = thread.connection().session_modes(thread.session_id(), cx)?;
+            let current = modes.current_mode();
+            modes
+                .all_modes()
+                .into_iter()
+                .find(|m| m.id == current)
+                .map(|m| SharedString::from(m.name))
+                .or_else(|| Some(SharedString::from(current.0.to_string())))
+        })
+    };
     // THE session activity clock — the same `last_activity_at` the stuck-turn
     // watchdog reads, deliberately not a second one derived from the
     // transcript.

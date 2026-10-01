@@ -27,8 +27,10 @@ use crate::{
 /// launcher so the two cannot drift apart.
 pub const KIMI_AGENT_ID: &str = agent_servers::KIMI_CODE_ID;
 
-/// The config option Kimi publishes its model list under.
-pub const MODEL_CONFIG_OPTION_ID: &str = "model";
+/// The config option Kimi publishes its model list under. Re-exported from
+/// the launcher crate so the adapter and the generic ACP connection's
+/// `active_model` cannot drift apart.
+pub const MODEL_CONFIG_OPTION_ID: &str = agent_servers::MODEL_CONFIG_OPTION_ID;
 
 /// Kimi's "analyze only" mode: it cannot modify files or execute commands.
 const MODE_READ_ONLY: &str = "plan";

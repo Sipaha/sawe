@@ -6326,6 +6326,12 @@ How to apply:
   remains Claude; the provider menu exposes Kimi alongside Codex.
 - Kimi's `thinking` config option is deliberately NOT wired to the fork's
   effort control — that control is claude/codex-specific today.
+- `AcpConnection::active_model` reports the current value of the session's
+  `model` config option (by display name) for any ACP session that publishes
+  one, so the status-bar model segment names what the CLI is running; the
+  session-mode text segment is hidden for ACP-mode agents — the permission
+  control beside it already states the mode, and the maintainer reads that
+  slot as "the model's place".
 - `AcpConnection::config_state` diverges from upstream (#58308): upstream drops
   a `session/new` response's legacy `modes` whenever `configOptions` is
   present; the fork keeps both, because the permission control speaks the

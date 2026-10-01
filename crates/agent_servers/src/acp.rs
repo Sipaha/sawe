@@ -2060,6 +2060,42 @@ impl AgentConnection for AcpConnection {
         Some(selector as _)
     }
 
+    fn active_model(&self, session_id: &acp::SessionId) -> Option<SharedString> {
+        // The pinned schema has no per-session model state to read, so the
+        // trait default returns None and the status-bar model segment stayed
+        // empty for ACP-native agents. Agents that publish their model as a
+        // `select` config option (Kimi does, under the id `model`) carry the
+        // current selection in that option — report it by display name so the
+        // segment shows what the CLI is actually running. Deliberately not
+        // gated on an agent id, mirroring `config_option_models`: any ACP
+        // session with a `model` select answers.
+        let sessions = self.sessions.borrow();
+        let session = sessions.get(session_id)?;
+        let config_options = session.config_options.as_ref()?;
+        let options = config_options.config_options.borrow();
+        let option = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == crate::kimi::MODEL_CONFIG_OPTION_ID)?;
+        let acp::SessionConfigKind::Select(select) = &option.kind else {
+            return None;
+        };
+        let current = select.current_value.0.as_ref();
+        let candidates: Vec<&acp::SessionConfigSelectOption> = match &select.options {
+            acp::SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
+            acp::SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .collect(),
+            // `#[non_exhaustive]`.
+            _ => return None,
+        };
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.value.0.as_ref() == current)
+            .map(|candidate| SharedString::from(candidate.name.clone()))
+            .or_else(|| Some(SharedString::from(current.to_string())))
+    }
+
     fn session_config_options(
         &self,
         session_id: &acp::SessionId,

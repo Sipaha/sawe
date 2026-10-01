@@ -48,6 +48,11 @@ pub const KIMI_BINARY: &str = "kimi";
 /// TUI. Note: a positional subcommand, not a `--flag`.
 pub const KIMI_ACP_SUBCOMMAND: &str = "acp";
 
+/// The session config option Kimi publishes its model list under, read by the
+/// generic ACP connection's `active_model` and by
+/// `solution_agent::native_controls`.
+pub const MODEL_CONFIG_OPTION_ID: &str = "model";
+
 pub struct KimiAgentServer {
     agent_id: AgentId,
 }
