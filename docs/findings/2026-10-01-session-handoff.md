@@ -101,6 +101,48 @@ new build:
    publishes one, and the mode segment is hidden for ACP-mode agents (the
    permission control beside it already states the mode).
 
+## Evening round (commits `d6f8cad37e`, `8a9e8857da`)
+
+4. **Mid-turn follow-ups queue and flush on turn end — verified working**
+   for kimi (`solution_agent::queue`: follow-ups queued while Running,
+   delivered as a new turn on `Stopped`; the log shows
+   `flushing N Main block(s)`). True active-turn steering (reading the
+   follow-up while the turn still runs) is codex-native only
+   (`store/steering.rs` downcasts to `CodexConnection`); kimi has queueing,
+   not steering. The maintainer's "подвисшая" session turned out to be the
+   next item, not the queue.
+5. **A dead agent process used to mean a silently stuck session**
+   (`d6f8cad37e`). Live case: kimi session `Running` for minutes with no
+   kimi process in the system and zero log lines. `LoadError::Exited` is
+   now recoverable: Idle + Error system note ("The agent process exited
+   unexpectedly. Your next message will restart it and resume this
+   conversation."), dead-thread detach, pool invalidation by pointer
+   identity; the next send respawns and `session/resume` restores context.
+   Sub-agent did the implementation; 3 new regression tests; isolated E2E
+   with SIGKILL answers after ~6s.
+6. **Quota limits masqueraded as a bare "Authentication required"**
+   (`8a9e8857da`). Kimi's engine log had the full message ("403 You've
+   reached your 5-hour usage limit. Your quota will reset when the current
+   5-hour window ends…") but the ACP layer reports `authRequired` and
+   `AuthRequired`'s Display dropped the captured description.
+   Display now appends it; send failures with AuthRequired also pin the
+   reason into the transcript as an Error-level system note (link clickable).
+   Unverified: whether kimi's wire `message` carries the quota text or a
+   generic one — if generic, the note shows the generic text plus the
+   description is empty; the durable source of truth is
+   `~/.kimi-code/sessions/wd_*/session_*/logs/kimi-code.log`.
+
+## Open follow-ups
+
+- **sawe MCP bridge schema rejected by kimi**: kimi's log shows
+  `mcp server unavailable server=sawe transport=stdio status=failed
+  reason="Invalid input"` (zod validation of tools 65/66 outputSchema
+  `settings` and tools 114/115 inputSchema `args`). Editor-spawned kimi
+  sessions therefore run WITHOUT the sawe MCP tools. Reproduce by
+  inspecting the bridge's tool schemas against kimi's zod expectations.
+- `permission_mode_for` in `kimi_adapter` still has no caller (kept for the
+  future adopt-the-reported-mode path).
+
 ## Follow-ups (optional, not blocking)
 
 - Branch `qwen-code-support`: finish and land, or delete — maintainer's
