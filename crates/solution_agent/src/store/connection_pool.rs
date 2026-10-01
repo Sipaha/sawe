@@ -170,6 +170,27 @@ impl SolutionAgentStore {
         }
     }
 
+    /// Drop the pooled entry for `key` IFF it still hands out `connection`
+    /// (pointer-identity). Called when the agent process behind `connection`
+    /// has exited: a pooled dead connection must never be served again —
+    /// the next `get_or_spawn_connection` has to spawn a fresh process —
+    /// while an entry that already belongs to a NEWER connection (a
+    /// co-tenant session's respawn won the race) must be left untouched.
+    pub(super) fn pool_remove_dead_connection(
+        &mut self,
+        key: &(SolutionId, AgentServerId),
+        connection: &Rc<dyn acp_thread::AgentConnection>,
+    ) {
+        let mut pool = self.pool.lock();
+        let is_the_dead_one = match pool.entry_mut(key).map(|entry| &entry.state) {
+            Some(SpawnState::Ready(existing)) => Rc::ptr_eq(existing, connection),
+            _ => false,
+        };
+        if is_the_dead_one {
+            pool.remove(key);
+        }
+    }
+
     /// Test-only: pretend a session was added against an existing connection.
     #[cfg(any(feature = "test-support", test))]
     pub fn pool_pretend_session_added(

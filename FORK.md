@@ -6343,3 +6343,34 @@ How to apply:
   from `kimi acp` 2.1.1, not read from docs. Re-probe — newline-delimited
   JSON-RPC `initialize` + `session/new` — before trusting memory when adding
   the next ACP-native provider.
+
+### 225. Agent-process death parks the session at Idle with a transcript note; the next send respawns and resumes
+
+Why: the ACP connection watches the child process and, on exit, emits
+`AcpThreadEvent::LoadError(Exited)` to every session on the connection.
+Upstream-treated, that landed as a generic `Errored("agent error")` while the
+session KEPT its dead thread and the pool kept the dead connection — every
+subsequent send hit the corpse and failed the same way, with no recovery short
+of a manual Restart (observed live 2026-10-01: a kimi session answered a big
+turn, its process later died, two sends vanished with zero events and the tab
+eventually read as a phantom `Running` turn over a process that no longer
+existed). A dead process is also exactly the situation the next send can fix
+by itself: drop the dead thread, spawn a fresh process from the pool, and
+`session/resume` the SAME ACP session id (kimi persists its context on disk).
+So the death is surfaced as a recoverable state, not an error.
+
+How to apply:
+- `store/acp_event.rs`'s `LoadError` arm treats `Exited` specially: system
+  note ("The agent process exited unexpectedly. Your next message will restart
+  it and resume this conversation."), then — DEFERRED to the end of the
+  current event flush — `Idle`, `set_acp_thread(None)`, pool slot release, and
+  `pool_remove_dead_connection` (pointer-identity-guarded: never drop an entry
+  a newer connection already replaced).
+- The defer is load-bearing, not cosmetic: the note re-enters the same handler
+  as a nested `NewEntry` whose ingest reads `session.acp_thread()` — detach or
+  unsubscribe synchronously and the delivery mis-reads the note as agent
+  activity (dropped entry + spurious `Idle → Running`).
+- The `send_message_blocks` post-send error arm skips sessions whose thread is
+  detached, so the dying turn's late error cannot clobber the parked state.
+- `claude_native` / `codex_native` never emit `LoadError`; their error and
+  reconnect paths are untouched.

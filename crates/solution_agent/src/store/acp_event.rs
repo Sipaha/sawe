@@ -549,17 +549,110 @@ impl SolutionAgentStore {
                     }
                 }
             }
-            acp_thread::AcpThreadEvent::LoadError(_) => {
-                // A thread load/reconnect failure — distinct from a turn wall, so
-                // no wall-classification here (a stale prior wall in the transcript
-                // must not schedule a spurious resume). Flush + generic error,
-                // same as before.
+            acp_thread::AcpThreadEvent::LoadError(error) => {
+                // No wall-classification here (a stale prior wall in the
+                // transcript must not schedule a spurious resume) — flush any
+                // pending appends, then split by flavor below.
                 self.flush_pending_entry_appends(session_id, cx);
-                self.mutate_state(
-                    session_id,
-                    |state| *state = SessionState::Errored(SharedString::from("agent error")),
-                    cx,
-                );
+                if let acp_thread::LoadError::Exited { status, .. } = error {
+                    // The agent PROCESS behind this connection is gone (crash,
+                    // OOM, external kill). Unlike a turn failure this is
+                    // recoverable by design: the next send cold-wakes the
+                    // session — fresh subprocess + `session/resume` — so park
+                    // the session at Idle with a transcript note instead of
+                    // the generic errored state, and detach the dead thread
+                    // plus drop the pooled connection so that wake actually
+                    // spawns instead of reusing a corpse. Without the detach,
+                    // every subsequent send would hit the dead connection and
+                    // fail with an opaque "agent error" forever.
+                    let Some(thread) = session_entity.read(cx).acp_thread().cloned() else {
+                        // Already cold — a reconnect cold-ize or a rotation
+                        // raced the process-exit event. That machinery owns
+                        // the session's state AND its pool slot now; touching
+                        // either here (a second release, an Idle clobber)
+                        // would corrupt it. The reconnect's own retry drops a
+                        // half-dead pooled connection, so nothing to do.
+                        log::warn!(
+                            target: "solution_agent::store",
+                            "session={session_id} agent process exited ({status}) on an \
+                             already-cold session; leaving the in-flight recovery alone"
+                        );
+                        return;
+                    };
+                    log::warn!(
+                        target: "solution_agent::store",
+                        "session={session_id} agent process exited ({status}); detaching the \
+                         dead thread — the next message will respawn and resume the agent"
+                    );
+                    // The note needs the live thread (`push_system_note`
+                    // no-ops without one), so it lands BEFORE the detach.
+                    // Everything after it is deferred to the end of the
+                    // current event flush: the note re-entered this handler
+                    // as a nested NewEntry event that is still queued, and
+                    // its ingest reads `session.acp_thread()` — detaching or
+                    // unsubscribing now would make that delivery drop the
+                    // entry and mis-read the note as agent activity (a
+                    // spurious Idle → Running flip).
+                    self.push_system_note(
+                        session_id,
+                        acp_thread::SystemNoteLevel::Error,
+                        "The agent process exited unexpectedly. Your next message will \
+                         restart it and resume this conversation.",
+                        cx,
+                    );
+                    let pair = {
+                        let session = session_entity.read(cx);
+                        (session.solution_id, session.agent_id.clone())
+                    };
+                    let dead_connection = thread.read(cx).connection().clone();
+                    let weak_store = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        weak_store
+                            .update(cx, |store, cx| {
+                                // A Running turn is over the moment its
+                                // process dies — park at Idle so neither the
+                                // status row nor the stuck-turn watchdog read
+                                // a phantom in-flight turn.
+                                store.mutate_state(
+                                    session_id,
+                                    |state| *state = SessionState::Idle,
+                                    cx,
+                                );
+                                let killed_background_agents =
+                                    session_entity.update(cx, |session, cx| {
+                                        let killed = session.set_acp_thread(None, cx);
+                                        // The dying turn still holds a pending
+                                        // prompt future that resolves (with an
+                                        // error) shortly; from here on its late
+                                        // Error/StatusChanged events must not
+                                        // reach this handler again.
+                                        session._acp_subscription = None;
+                                        killed
+                                    });
+                                if killed_background_agents {
+                                    cx.emit(
+                                        SolutionAgentStoreEvent::SessionBackgroundAgentsChanged(
+                                            session_id,
+                                        ),
+                                    );
+                                }
+                                // This session's slot on the pair was taken by
+                                // the ACP session that just died; release it
+                                // (mirrors the reconnect cold-ize), then make
+                                // sure the pool never hands the dead
+                                // connection out again.
+                                store.pool_release_session(pair.clone(), cx);
+                                store.pool_remove_dead_connection(&pair, &dead_connection);
+                            })
+                            .ok();
+                    });
+                } else {
+                    self.mutate_state(
+                        session_id,
+                        |state| *state = SessionState::Errored(SharedString::from("agent error")),
+                        cx,
+                    );
+                }
             }
             acp_thread::AcpThreadEvent::ToolAuthorizationRequested(_) => {
                 self.mutate_state(session_id, |state| *state = SessionState::AwaitingInput, cx);

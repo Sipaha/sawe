@@ -410,6 +410,14 @@ impl MockAgentServer {
     pub fn with_resume_support(connect_count: Arc<AtomicUsize>) -> Self {
         Self::configured(connect_count, None, None, None, true)
     }
+
+    /// Swap the gate handed to connections spawned AFTER this call. The pool
+    /// respawns a fresh connection when the previous process dies — a test
+    /// that disconnects the first gate to fail the dead turn's pending prompt
+    /// needs a live gate for the post-respawn prompt.
+    pub fn set_prompt_gate(&self, gate: PromptGate) {
+        *self.prompt_gate.lock() = Some(gate);
+    }
 }
 
 impl agent_servers::AgentServer for MockAgentServer {

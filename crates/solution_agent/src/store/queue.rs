@@ -1143,7 +1143,15 @@ impl SolutionAgentStore {
                     let err_message = SharedString::from(err.to_string());
                     this.update(cx, |store, cx| {
                         if let Some(s) = store.session(session_id) {
-                            let still_same = s.read(cx).acp_session_id == expected_acp_session_id;
+                            // A detached thread means something else — the
+                            // process-exit handler, a reconnect cold-ize, a
+                            // permission-mode switch — already took ownership
+                            // of this session's state; the dead turn's late
+                            // error must not clobber it (e.g. flip the
+                            // process-exit handler's Idle + "next message will
+                            // restart it" back to Errored).
+                            let still_same = s.read(cx).acp_session_id == expected_acp_session_id
+                                && s.read(cx).acp_thread().is_some();
                             if !still_same {
                                 log::debug!(
                                     "send_message_blocks: dropping late error for {session_id} \
