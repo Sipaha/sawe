@@ -1076,6 +1076,15 @@ impl SessionTabStrip {
                             }
                         },
                     )
+                    .custom_entry(
+                        |_, _| render_agent_choice(&crate::kimi_adapter::BRAND),
+                        |window, cx| {
+                            if let Ok(action) = cx.build_action("console_panel::NewKimiChat", None)
+                            {
+                                window.dispatch_action(action, cx);
+                            }
+                        },
+                    )
                 }))
             })
     }

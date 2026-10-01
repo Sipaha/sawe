@@ -90,7 +90,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/acp_thread/src/acp_thread.rs` | (1) `ToolCall::status_started_at: Option<chrono::DateTime<Utc>>` — stamped on the first transition into `InProgress` (both `from_acp` and `update_fields`), preserved across the transition to a terminal status. Lets fork-owned renderers (`solution_agent::conversation_render`, the MCP wire) display a live "ran for Xs" badge without inventing a parallel start-time table. (2) `SPK_CLIENT_SEND_ID_META_KEY` constant + `client_send_id_from_user_message(&UserMessage) -> Option<i64>` helper — read-only scan over a UserMessage's `chunks` for a client-stamped `_meta.spk_client_send_id`. Lets the mobile client round-trip-match its in-flight optimistic bubble to the server-echoed entry by id instead of fragile content-equality on truncated previews. Zero changes to `AcpThread::send` or `UserMessage` struct — the id rides on the existing `acp::ContentBlock._meta` field. | `solution_agent` |
 | `crates/agent_servers/src/acp.rs` | (1) `mcp_servers_for_project` prepends a fork-local `acp::McpServer::Stdio` entry pointing at `<current_exe> --nc <editor_mcp.socket_path>` so spawned ACP subagents see the editor's embedded MCP tools (helper: `sawe_mcp_bridge_server`) — see decision 14. (2) `AcpConnection::new_session_with_meta` impl splices `extra_meta` into `NewSessionRequest::meta`. (3) **(decision #51)** `solution_scope_for_project(project, cx) -> Option<SolutionScope>` — resolves the `(SolutionId, root)` that owns a project's worktrees, so the claude adapter can write/point at that Solution's `claude-settings.json`. | `editor_mcp` / `solution_agent` |
 | `crates/agent_servers/Cargo.toml` | New dep on `editor_mcp` for the socket path. | `editor_mcp` / `solution_agent` |
-| `crates/agent_servers/src/agent_servers.rs` | Re-exports `acp::solution_scope_for_project` alongside `mcp_servers_for_project` (decision #51). | `solution_agent` |
+| `crates/agent_servers/src/agent_servers.rs` | Re-exports `acp::solution_scope_for_project` alongside `mcp_servers_for_project` (decision #51). **(decision #224)** Adds `mod kimi` / `pub use kimi::*` — the built-in `KimiAgentServer` launcher (`kimi acp`); implementation in the new sibling file `crates/agent_servers/src/kimi.rs`. | `solution_agent` |
+| `crates/icons/src/icons.rs` + `assets/icons/ai_kimi.svg` | **First local modification (decision #224).** Adds the `AiKimi` variant; the asset is the official KIMI "K Only" mark (Moonshot brand guide) rescaled into 16×16. The fill is ignored — `ui::Icon` draws the mark as a monochrome mask tinted by the adapter's brand colour. | `solution_agent` (Kimi provider chrome) |
 | `crates/git_ui/src/git_ui.rs`, `crates/git_ui/src/project_diff.rs`, `crates/git_ui/src/branch_picker.rs` | `ProjectDiff` / branch picker follow the **active solution member's** repo (`active_solution` + `SolutionStore::active_member`, subscribed to `ActiveMemberChanged`). Since decision #50 the lookup is `store.active_member(solution.id) -> MemberId` + `solution.member(id)`, not a catalog-slug scan. | `solutions_ui` / `solutions` |
 | `crates/context_server/src/listener.rs` | (1) `broadcast_notification` for fork event push. (2) Per-solution sockets (decision 17): tool handlers became `Rc` (shareable across sockets); `RegisteredTool.wants_solution_id` computed from input schema in `add_tool`; `McpServer.bound_solution_id` + `set_bound_solution`; `split_off_tools` / `export_tools` / `install_tools` to partition the catalog; `handle_call_tool` injects the bound `solution_id` — as a JSON **number** since decision #50, and it **overrides** any id the caller supplied (a per-solution socket can never be talked into acting on another Solution). | `editor_mcp` |
 | `crates/gpui/src/elements/list.rs` | `ListState::measure_last(N)` chunked tail prefetch (plus `MEASURE_LAST_DEFAULT_BATCH` / `LOOKAHEAD` / `EAGER_THRESHOLD` knobs) so virtualized lists can pre-warm their most-recent items on the first layout pass without paying the full-list measurement cost. Used by `solution_agent`'s conversation list to keep scroll-up off long resumed conversations from triggering a height-discovery cascade. | `solution_agent` |
@@ -6280,3 +6281,59 @@ How to apply:
 - Tests: `fit_tabs` unit tests. `tabs_that_do_not_fit_go_into_the_ellipsis_and_the_buttons_stay_visible`
   paints the real strip in a 420px box and fails when the fit is disabled.
   `every_tab_shows_and_no_ellipsis_when_there_is_room` covers the wide case.
+
+### 224. Kimi Code runs as an ACP-native agent behind the existing Solution conversation UI
+
+Kimi Code CLI speaks ACP natively (`kimi acp` — a positional subcommand, not a
+flag), so unlike Claude and Codex it needs no `*_native` translation crate:
+`agent_servers::KimiAgentServer` is only a launcher that resolves the installed
+`kimi` binary from the project shell environment and hands the process to the
+shared ACP connection. Sessions run on the same connection, thread and event
+machinery as any other ACP agent, and auth stays the CLI's own (`kimi login`) —
+the editor injects no token, and deliberately no `NO_BROWSER` either (kimi's
+login is terminal-only).
+
+Why: a translation crate would duplicate the launch surface for a protocol the
+CLI already speaks, and a separate auth path would put a token where the
+maintainer's subscription policy (decision 8) says the CLI's own login state
+belongs.
+
+How to apply:
+- Permissions. Kimi publishes four ACP session modes (`default` / `plan` /
+  `auto` / `yolo`); the fork's binary control maps `ReadOnly → plan` and
+  `FullAccess → yolo` — the honest ends of the range, never the middle two. A
+  mode switch is a live `session/set_mode` on the existing session: no process
+  restart, no dropped thread, unlike the native runtimes whose policy only
+  changes on a fresh per-session process. The switch is attempted BEFORE the
+  permission-mode DB write, and a refused mode is an error — the stored value
+  must never claim a change the CLI did not take.
+- `sawePermissionMode` is native-runtime-only and must not be sent to Kimi: a
+  mode is per-session, so it cannot ride session meta at all. The mode (and the
+  persisted `desired_model`) is pushed after attach on all three paths —
+  fresh create, resume, and the live permission change.
+- Models. The pinned ACP schema dropped `session/new`'s `models` field; Kimi
+  publishes the same list as a `select` config option under the id `model`.
+  `native_controls::config_option_models` reads it for any non-native
+  connection (deliberately not agent-gated); `probe_models` intentionally stays
+  empty for ACP-native agents — the list is captured when the session goes live
+  and persisted on the session row.
+- Kimi advertises both `session/load` and `session/resume`. Always prefer
+  `resume`: `load` replays the whole conversation over the wire, and this fork
+  restores its own transcript from SQLite (the #161 contract).
+- Provider chrome: `KimiAdapter` + `BRAND` (name `Kimi`, vendor `Moonshot AI`,
+  colour `0x1783FF`, the official "K Only" mark as the icon); the system prompt
+  names the provider's own instruction file (`KIMI.md`). The plain chat `+`
+  remains Claude; the provider menu exposes Kimi alongside Codex.
+- Kimi's `thinking` config option is deliberately NOT wired to the fork's
+  effort control — that control is claude/codex-specific today.
+- `AcpConnection::config_state` diverges from upstream (#58308): upstream drops
+  a `session/new` response's legacy `modes` whenever `configOptions` is
+  present; the fork keeps both, because the permission control speaks the
+  legacy `session_modes` surface (`session/set_mode`) and ACP-native agents
+  that populate both (Kimi does — `session/set_mode` is the same switch as its
+  `mode` config option) would otherwise never expose modes at all. Agents that
+  send only `configOptions` behave exactly as before.
+- Ground truth (modes, config-option ids, capability matrix) was probed live
+  from `kimi acp` 2.1.1, not read from docs. Re-probe — newline-delimited
+  JSON-RPC `initialize` + `session/new` — before trusting memory when adding
+  the next ACP-native provider.

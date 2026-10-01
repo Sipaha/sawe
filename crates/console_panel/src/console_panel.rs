@@ -19,11 +19,14 @@ mod terminal_provider;
 use gpui::{Context, Focusable as _, SharedString, Window};
 use solution_agent::SolutionSessionId;
 use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
+use solution_agent::kimi_adapter::KIMI_AGENT_ID;
 use solution_agent::solution_band::SolutionBand;
 use solution_agent::store::SolutionAgentStore;
 use workspace::{UtilityKind, Workspace};
 
-pub use actions::{NewChat, NewCodexChat, NewTerminal, ShowSession, ToggleDialog, ToggleFocus};
+pub use actions::{
+    NewChat, NewCodexChat, NewKimiChat, NewTerminal, ShowSession, ToggleDialog, ToggleFocus,
+};
 pub use panel::{ConsolePanel, ConsoleTab, console_panel_for_workspace};
 pub use terminal_provider::TerminalProvider;
 
@@ -42,6 +45,7 @@ pub fn init(cx: &mut gpui::App) {
         });
         workspace.register_action(handle_new_chat);
         workspace.register_action(handle_new_codex_chat);
+        workspace.register_action(handle_new_kimi_chat);
         workspace.register_action(handle_toggle_focus);
         workspace.register_action(handle_show_session);
         workspace.register_action(handle_toggle_dialog);
@@ -121,6 +125,15 @@ fn handle_new_codex_chat(
     cx: &mut Context<Workspace>,
 ) {
     create_chat(workspace, "codex-native", cx);
+}
+
+fn handle_new_kimi_chat(
+    workspace: &mut Workspace,
+    _: &NewKimiChat,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    create_chat(workspace, KIMI_AGENT_ID, cx);
 }
 
 fn create_chat(workspace: &mut Workspace, agent_id: &'static str, cx: &mut Context<Workspace>) {

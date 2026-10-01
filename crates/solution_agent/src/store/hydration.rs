@@ -638,14 +638,19 @@ impl SolutionAgentStore {
             if !never_started { this.update(cx, |store, cx| {
                 let desired = store.session(meta.id).and_then(|s| s.read(cx).desired_model.clone());
                 let effort = store.session(meta.id).and_then(|s| s.read(cx).desired_effort.clone());
-                crate::native_controls::set_model(connection.clone(), &acp_session_id, desired, false);
+                crate::native_controls::set_model(connection.clone(), &acp_session_id, desired, false, cx);
                 crate::native_controls::set_effort(connection.clone(), &acp_session_id, effort, false);
             })?; }
 
             let resume_meta = this.update(cx, |store, cx| {
                 let mut native_meta = store.build_session_meta(&pair.1, &solution, Some(meta.id), None, cx).unwrap_or_default();
                 let mode = store.session(meta.id).map(|s| s.read(cx).permission_mode).unwrap_or(meta.permission_mode);
-                native_meta.insert("sawePermissionMode".into(), serde_json::json!(mode.as_str()));
+                // `sawePermissionMode` is this fork's own extension and only the
+                // two native runtimes read it. An agent on ACP session modes
+                // gets its mode pushed once the thread is attached, below.
+                if !crate::native_controls::uses_acp_permission_modes_for_agent(pair.1.as_ref()) {
+                    native_meta.insert("sawePermissionMode".into(), serde_json::json!(mode.as_str()));
+                }
                 native_meta
             })?;
             let mut last_err: Option<anyhow::Error> = None;
@@ -663,7 +668,14 @@ impl SolutionAgentStore {
                     .into_owned()]);
                 let acp_thread_task: Task<Result<Entity<acp_thread::AcpThread>>> = cx
                     .update(|cx| {
-                        if connection.supports_resume_session() && !connection.supports_load_session() {
+                        // Prefer `session/resume` whenever the agent offers it.
+                        // `session/load` replays the whole conversation back over
+                        // the wire, and this fork restores its own transcript from
+                        // SQLite — a replay would duplicate every entry (the
+                        // "Resume attaches without replaying server history"
+                        // contract, FORK.md #161). Kimi advertises both; Claude and
+                        // Codex only resume, so this changes nothing for them.
+                        if connection.supports_resume_session() {
                             Ok(connection.clone().resume_session_with_meta(
                                 acp_session_id.clone(), project.clone(), work_dirs.clone(),
                                 title_for_load.clone(), Some(resume_meta.clone()), cx,
@@ -791,6 +803,35 @@ impl SolutionAgentStore {
                     }));
                 }
             };
+            // An agent that keeps its controls in ACP session state (Kimi) has
+            // no spawn-time hook to seed: a mode and a config option both belong
+            // to a session, so neither exists until the attach above succeeded.
+            // Push the persisted pair now. The native runtimes took theirs
+            // through the pre-wake `set_model(…, false)` and `resume_meta`.
+            cx.update(|cx| {
+                let (connection, attached_session_id) = {
+                    let thread = acp_thread.read(cx);
+                    (thread.connection().clone(), thread.session_id().clone())
+                };
+                if !crate::native_controls::uses_acp_permission_modes(&connection) {
+                    return;
+                }
+                if let Some(model) = meta.desired_model.clone() {
+                    crate::native_controls::set_model(
+                        connection.clone(),
+                        &attached_session_id,
+                        Some(model),
+                        true,
+                        cx,
+                    );
+                }
+                crate::native_controls::set_permission_mode(
+                    connection,
+                    &attached_session_id,
+                    meta.permission_mode,
+                    cx,
+                );
+            });
             // Reflect the cwd the agent actually accepted in the rest
             // of the resume — store update + persist below — so a
             // future resume hits this cwd first instead of replaying

@@ -18,6 +18,7 @@ pub(crate) mod conversation_render;
 pub(crate) mod db;
 pub mod event_sources;
 pub(crate) mod expanded_compose;
+pub mod kimi_adapter;
 pub mod mcp;
 pub mod message_generator;
 pub(crate) mod metrics_emitter;
@@ -75,6 +76,7 @@ pub fn init(cx: &mut App) {
     let mut adapters = adapter::AdapterRegistry::new();
     adapters.register(Arc::new(claude_adapter::ClaudeAcpAdapter));
     adapters.register(Arc::new(codex_adapter::CodexAdapter));
+    adapters.register(Arc::new(kimi_adapter::KimiAdapter));
     let adapters = Arc::new(adapters);
 
     store::SolutionAgentStore::init_global(cx, adapters);
@@ -97,6 +99,17 @@ pub fn init(cx: &mut App) {
             Rc::new(codex_native::CodexAgentServer::new(AgentId(
                 SharedString::from(codex_adapter::CODEX_AGENT_ID),
             ))),
+        );
+        // Kimi Code speaks ACP natively, so unlike the two above it needs no
+        // protocol translation crate — `agent_servers::KimiAgentServer` only
+        // launches the installed `kimi` CLI (`kimi acp`) and hands the process
+        // to the shared ACP connection. See `kimi_adapter` for the mapping
+        // onto this fork's permission and model controls.
+        store.register_agent_server(
+            SharedString::from(kimi_adapter::KIMI_AGENT_ID),
+            Rc::new(agent_servers::KimiAgentServer::new(AgentId(SharedString::from(
+                kimi_adapter::KIMI_AGENT_ID,
+            )))),
         );
     });
 

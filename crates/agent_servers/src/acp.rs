@@ -4622,12 +4622,17 @@ fn config_state(
     Option<Rc<RefCell<acp::SessionModeState>>>,
     Option<Rc<RefCell<Vec<acp::SessionConfigOption>>>>,
 ) {
-    if let Some(opts) = config_options {
-        return (None, Some(Rc::new(RefCell::new(opts))));
-    }
-
+    // Upstream's SDK-update (#58308) treated the two as mutually exclusive —
+    // configOptions was the newer unified surface, so a session that sent both
+    // lost its `modes`. This fork's permission control speaks the legacy
+    // `session_modes` surface (`set_mode`), and ACP-native agents that send
+    // both surfaces (Kimi does — verified equivalent on its side:
+    // `session/set_mode` is the same switch as its `mode` config option) would
+    // otherwise never expose modes. Keep both; agents that only send
+    // configOptions behave exactly as before.
     let modes = modes.map(|modes| Rc::new(RefCell::new(modes)));
-    (modes, None)
+    let config_options = config_options.map(|opts| Rc::new(RefCell::new(opts)));
+    (modes, config_options)
 }
 
 struct AcpSessionModes {

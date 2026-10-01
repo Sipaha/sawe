@@ -17,6 +17,7 @@ pub enum IconName {
     AiEdit,
     AiGemini,
     AiGoogle,
+    AiKimi,
     AiLlamaCpp,
     AiLmStudio,
     AiMistral,

@@ -1,5 +1,6 @@
 mod acp;
 mod custom;
+mod kimi;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
@@ -7,6 +8,7 @@ pub mod e2e_tests;
 use client::ProxySettings;
 use collections::{HashMap, HashSet};
 pub use custom::*;
+pub use kimi::*;
 use fs::Fs;
 use http_client::read_no_proxy_from_env;
 use project::{AgentId, Project, agent_server_store::AgentServerStore};
