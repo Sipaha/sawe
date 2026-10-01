@@ -6374,3 +6374,25 @@ How to apply:
   detached, so the dying turn's late error cannot clobber the parked state.
 - `claude_native` / `codex_native` never emit `LoadError`; their error and
   reconnect paths are untouched.
+
+### 226. MCP tool schemas never emit draft-07 boolean `true` subschemas
+
+Why: schemars serializes `serde_json::Value` fields (and other "any" spots)
+as the draft-07 boolean schema `true`. That is valid JSON Schema, but some
+ACP agents validate the whole tool catalog with strict zod schemas that
+reject boolean subschemas inside `properties` — kimi (2.1.1) failed the
+entire `sawe` MCP bridge server at `session/new` with `mcp server
+unavailable … reason="Invalid input"` (paths like
+`tools[65].outputSchema.properties.settings`,
+`tools[115].inputSchema.properties.args`), so editor-spawned kimi sessions
+ran with zero editor tools. Boolean `false` (`additionalProperties: false`)
+is accepted by the same validators and is left alone.
+
+How to apply:
+- `context_server::listener::add_tool` expands every boolean `true` in the
+  generated input/output schemas to the equivalent empty object `{}` via
+  `expand_boolean_any_schemas` before the `Tool` is stored. Apply any new
+  schema-shape normalization there, not at individual tool definitions.
+- Verified end-to-end against `kimi acp` 2.1.1: `mcp.tools_discovered` for
+  server `sawe`, a live `mcp__sawe__solutions_list` call round-tripped
+  through the `sawe --nc` bridge, and the tool result reached the model.

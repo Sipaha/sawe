@@ -75,6 +75,29 @@ type ToolHandler = Rc<
 >;
 type RequestHandler = Box<dyn Fn(RequestId, Option<Box<RawValue>>, &App) -> Task<String>>;
 
+/// Replace draft-07 boolean `true` schemas (meaning "any value") with the
+/// equivalent empty object schema, in place. Kept as a free function so the
+/// transformation is unit-testable without standing up a server.
+fn expand_boolean_any_schemas(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for child in map.values_mut() {
+                expand_boolean_any_schemas(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                expand_boolean_any_schemas(item);
+            }
+        }
+        serde_json::Value::Bool(true) => {
+            *value = serde_json::Value::Object(serde_json::Map::new());
+        }
+        serde_json::Value::Bool(false) | serde_json::Value::Null
+        | serde_json::Value::Number(_) | serde_json::Value::String(_) => {}
+    }
+}
+
 impl McpServer {
     pub fn new(cx: &AsyncApp) -> Task<Result<Self>> {
         let task = cx.background_spawn(async move {
@@ -131,6 +154,22 @@ impl McpServer {
         let mut generator = settings.into_generator();
 
         let input_schema = generator.root_schema_for::<T::Input>();
+        let output_schema = if TypeId::of::<T::Output>() == TypeId::of::<()>() {
+            None
+        } else {
+            Some(generator.root_schema_for::<T::Output>())
+        };
+
+        // draft-07 boolean schemas (`true` = any) are valid JSON Schema, but
+        // some MCP clients reject them inside `properties` — kimi's zod
+        // validation fails the whole server with "Invalid input". Emit the
+        // equivalent empty-object schema instead.
+        let mut input_schema: serde_json::Value = input_schema.into();
+        let mut output_schema: Option<serde_json::Value> = output_schema.map(Into::into);
+        expand_boolean_any_schemas(&mut input_schema);
+        if let Some(schema) = output_schema.as_mut() {
+            expand_boolean_any_schemas(schema);
+        }
 
         let description = input_schema
             .get("description")
@@ -152,12 +191,8 @@ impl McpServer {
                 name: T::NAME.into(),
                 title: None,
                 description,
-                input_schema: input_schema.into(),
-                output_schema: if TypeId::of::<T::Output>() == TypeId::of::<()>() {
-                    None
-                } else {
-                    Some(generator.root_schema_for::<T::Output>().into())
-                },
+                input_schema,
+                output_schema,
                 annotations: Some(tool.annotations()),
             },
             handler: Rc::new({
@@ -729,5 +764,95 @@ mod tests {
         assert!(parsed.get("error").is_none(), "ping error: {parsed}");
 
         drop(server);
+    }
+
+    fn assert_no_boolean_true(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Bool(true) => panic!("boolean `true` schema survived: {value}"),
+            serde_json::Value::Object(map) => {
+                for child in map.values() {
+                    assert_no_boolean_true(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_no_boolean_true(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn expand_boolean_any_schemas_replaces_true_but_keeps_false() {
+        let mut value = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "args": true,
+                "closed": {"type": "object", "additionalProperties": false},
+            },
+            "anyOf": [true, {"type": "string"}],
+        });
+        expand_boolean_any_schemas(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "args": {},
+                    "closed": {"type": "object", "additionalProperties": false},
+                },
+                "anyOf": [{}, {"type": "string"}],
+            })
+        );
+    }
+
+    #[derive(Debug, Clone, ::serde::Deserialize, Serialize, JsonSchema)]
+    /// Probe tool whose free-form fields serialize as draft-07 boolean schemas.
+    struct ProbeInput {
+        args: serde_json::Value,
+    }
+
+    #[derive(Debug, Clone, Serialize, JsonSchema)]
+    struct ProbeOutput {
+        result: serde_json::Value,
+    }
+
+    #[derive(Clone)]
+    struct ProbeTool;
+
+    impl McpServerTool for ProbeTool {
+        type Input = ProbeInput;
+        type Output = ProbeOutput;
+
+        const NAME: &'static str = "probe";
+
+        fn run(
+            &self,
+            _input: Self::Input,
+            _cx: &mut AsyncApp,
+        ) -> impl std::future::Future<Output = Result<ToolResponse<Self::Output>>> {
+            std::future::pending()
+        }
+    }
+
+    #[gpui::test]
+    async fn add_tool_expands_boolean_any_schemas(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let mut server = cx
+            .update(|cx| McpServer::new(&cx.to_async()))
+            .await
+            .expect("server start");
+        server.add_tool(ProbeTool);
+
+        let tools = server.tools.borrow();
+        let tool = tools.get(ProbeTool::NAME).expect("probe registered");
+        assert_no_boolean_true(&tool.tool.input_schema);
+        assert_no_boolean_true(tool.tool.output_schema.as_ref().expect("output schema"));
+        assert_eq!(
+            tool.tool.input_schema.pointer("/properties/args"),
+            Some(&serde_json::json!({})),
+            "free-form input field should be emitted as an empty-object schema"
+        );
     }
 }

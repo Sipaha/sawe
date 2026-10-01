@@ -134,14 +134,24 @@ new build:
 
 ## Open follow-ups
 
-- **sawe MCP bridge schema rejected by kimi**: kimi's log shows
-  `mcp server unavailable server=sawe transport=stdio status=failed
-  reason="Invalid input"` (zod validation of tools 65/66 outputSchema
-  `settings` and tools 114/115 inputSchema `args`). Editor-spawned kimi
-  sessions therefore run WITHOUT the sawe MCP tools. Reproduce by
-  inspecting the bridge's tool schemas against kimi's zod expectations.
 - `permission_mode_for` in `kimi_adapter` still has no caller (kept for the
   future adopt-the-reported-mode path).
+
+## Resolved this session (2026-10-02)
+
+- **sawe MCP bridge schema rejected by kimi — FIXED.** Root cause: schemars
+  emits draft-07 boolean `true` for `serde_json::Value` fields
+  (`workspace.get_effective_settings.settings`,
+  `workspace.dispatch_action.args`, `editor.get_operation.result`, …) and
+  kimi's zod tool-catalog validation rejects boolean subschemas inside
+  `properties`, failing the WHOLE server at `session/new`. Fix:
+  `context_server::listener::add_tool` expands every boolean `true` to `{}`
+  (`expand_boolean_any_schemas`, FORK.md decision #226); `false`
+  (`additionalProperties: false`) is accepted by the same validator and
+  untouched. Verified: `tools/list` on both sockets has zero boolean
+  schemas; live `kimi acp` E2E shows `mcp.tools_discovered` for `sawe`,
+  `toolCount=109`, and a `mcp__sawe__solutions_list` call round-tripping
+  through the `sawe --nc` bridge with the real editor response.
 
 ## Follow-ups (optional, not blocking)
 
