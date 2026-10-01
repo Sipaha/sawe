@@ -91,6 +91,15 @@ new build:
    crates/assets/src/assets.rs` (or `cargo clean -p assets`) before any
    release build that adds asset files. Trap documented here; consider a
    build-script `rerun-if-changed` later.
+3. **"YOLO" sat in the model's slot in the status row** (third commit,
+   `545f17a323`). `AcpConnection` never overrode `active_model` (the pinned
+   schema has no per-session model state), so the model segment showed a
+   "model" placeholder while the session-mode segment showed the raw CLI
+   mode name ("YOLO") — in the slot the maintainer reads as "where the
+   model name goes". `active_model` now reports the `model` config option's
+   current value by display name ("K2.8 Preview") for any ACP session that
+   publishes one, and the mode segment is hidden for ACP-mode agents (the
+   permission control beside it already states the mode).
 
 ## Follow-ups (optional, not blocking)
 
