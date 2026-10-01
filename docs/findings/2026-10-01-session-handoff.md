@@ -69,6 +69,29 @@ table row.
   Codex / Claude / Kimi with correct chrome. Probe solutions/sessions and
   their on-disk dirs were cleaned up.
 
+## Follow-up fixes (same day, second commit)
+
+Two bugs surfaced the moment the maintainer restarted the editor into the
+new build:
+
+1. **Every kimi resume failed** with "Session permissions changed while
+   resuming". `hydration.rs`'s change-during-resume guard compares
+   `resume_meta["sawePermissionMode"]` against the session's current mode —
+   but the meta intentionally carries no such key for an ACP-mode agent, so
+   the comparison was `None != Some(...)` → always true. The guard is now
+   skipped for `uses_acp_permission_modes_for_agent` ids. Verified by a
+   full restart cycle in an isolated home: create → kill editor → relaunch
+   → send; the resumed kimi session answered with the word it was asked to
+   remember before the restart, via `session/resume` (log-clean).
+2. **The Kimi logo rendered nowhere in release builds** (debug was fine).
+   `crates/assets`'s `fs_embed!` snapshots `assets/icons/**` at the *compile
+   time of the assets crate*; the crate didn't recompile for a pure file
+   addition, so the release binary embedded a stale icon set (the one
+   `ai_kimi` string in the binary was just the strum name). Fix: `touch
+   crates/assets/src/assets.rs` (or `cargo clean -p assets`) before any
+   release build that adds asset files. Trap documented here; consider a
+   build-script `rerun-if-changed` later.
+
 ## Follow-ups (optional, not blocking)
 
 - Branch `qwen-code-support`: finish and land, or delete — maintainer's

@@ -1000,7 +1000,13 @@ impl SolutionAgentStore {
 
             let session_id = this.update(cx, |store, cx| {
                 let current_mode = store.session(meta.id).map(|s| s.read(cx).permission_mode).unwrap_or(meta.permission_mode);
-                if resume_meta.get("sawePermissionMode").and_then(serde_json::Value::as_str) != Some(current_mode.as_str()) {
+                // An agent on ACP session modes (Kimi) takes no
+                // `sawePermissionMode` in its resume meta — the mode is pushed
+                // after attach below — so the change-during-resume guard has
+                // nothing to compare and must not fire for it.
+                if !crate::native_controls::uses_acp_permission_modes_for_agent(pair.1.as_ref())
+                    && resume_meta.get("sawePermissionMode").and_then(serde_json::Value::as_str) != Some(current_mode.as_str())
+                {
                     let (connection, provider_id) = {
                         let thread = acp_thread.read(cx);
                         (thread.connection().clone(), thread.session_id().clone())
