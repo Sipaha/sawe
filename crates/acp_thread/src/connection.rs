@@ -544,7 +544,15 @@ impl AuthRequired {
 impl Error for AuthRequired {}
 impl fmt::Display for AuthRequired {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Authentication required")
+        write!(f, "Authentication required")?;
+        // The CLI's own explanation rides along in `description` (e.g. Kimi's
+        // "403 You've reached your 5-hour usage limit. Your quota will reset
+        // when the current 5-hour window ends…"). Without it every auth/quota
+        // failure renders as a bare, unhelpful "Authentication required".
+        if let Some(description) = &self.description {
+            write!(f, ": {description}")?;
+        }
+        Ok(())
     }
 }
 

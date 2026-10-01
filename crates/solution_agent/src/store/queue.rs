@@ -1159,6 +1159,20 @@ impl SolutionAgentStore {
                                 );
                                 return;
                             }
+                            if err.downcast_ref::<acp_thread::AuthRequired>().is_some() {
+                                // Auth failures carry the CLI's own explanation
+                                // in the error (e.g. Kimi's "403 You've reached
+                                // your 5-hour usage limit…" with the reset
+                                // window). The Errored state text alone is a
+                                // transient status-row label — pin the reason
+                                // into the transcript where it survives.
+                                store.push_system_note(
+                                    session_id,
+                                    acp_thread::SystemNoteLevel::Error,
+                                    &err_message,
+                                    cx,
+                                );
+                            }
                             s.update(cx, |s, _| {
                                 s.state = SessionState::Errored(err_message.clone());
                             });
