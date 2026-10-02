@@ -2619,6 +2619,13 @@ impl GitRepository for RealGitRepository {
                     }
 
                     git_binary.run(&["checkout", branch_name]).await?;
+                    if git_binary
+                        .run(&["merge-base", "--is-ancestor", branch_name, &name])
+                        .await
+                        .is_ok()
+                    {
+                        git_binary.run(&["merge", "--ff-only", &name]).await?;
+                    }
                     return anyhow::Ok(());
                 }
 
@@ -6001,6 +6008,77 @@ mod tests {
                 .unwrap(),
             "origin/feature"
         );
+    }
+
+    #[gpui::test]
+    async fn test_change_branch_fast_forwards_existing_local_branch_to_remote(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_remote_directory, clone_directory) =
+            clone_remote_repository_with_main_and_feature(temp_dir.path());
+
+        let repository = RealGitRepository::new(
+            &clone_directory.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let git = repository.git_binary_in_worktree().unwrap();
+        repository
+            .change_branch("origin/feature".to_string())
+            .await
+            .unwrap();
+        git.run(&["checkout", "main"]).await.unwrap();
+
+        let remote_tip = git_command_output(
+            &clone_directory,
+            [
+                "commit-tree",
+                "origin/feature^{tree}",
+                "-p",
+                "origin/feature",
+                "-m",
+                "remote update",
+            ],
+        );
+        git.run(&["update-ref", "refs/remotes/origin/feature", &remote_tip])
+            .await
+            .unwrap();
+        assert_ne!(
+            git.run(&["rev-parse", "feature"]).await.unwrap(),
+            git.run(&["rev-parse", "origin/feature"]).await.unwrap()
+        );
+
+        repository
+            .change_branch("origin/feature".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git.run(&["branch", "--show-current"]).await.unwrap(),
+            "feature"
+        );
+        assert_eq!(
+            git.run(&["rev-parse", "feature"]).await.unwrap(),
+            git.run(&["rev-parse", "origin/feature"]).await.unwrap()
+        );
+
+        fs::write(clone_directory.join("local.txt"), "local").unwrap();
+        git_command(&clone_directory, ["add", "local.txt"]);
+        git_command(&clone_directory, ["commit", "-m", "local update"]);
+        let local_tip = git.run(&["rev-parse", "feature"]).await.unwrap();
+
+        repository
+            .change_branch("origin/feature".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(git.run(&["rev-parse", "feature"]).await.unwrap(), local_tip);
     }
 
     #[gpui::test]

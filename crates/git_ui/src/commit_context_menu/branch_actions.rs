@@ -98,10 +98,10 @@ pub(super) const CHECKOUT_DIVERGENCE_ANSWERS: [&str; 3] =
     ["Rebase onto Remote", "Drop Local Commits", "Cancel"];
 
 /// "Checkout" on a remote-tracking ref. `change_branch` creates (or
-/// re-points) the matching local branch with `--track` and checks that
-/// out, so when the local branch already carries commits the remote
-/// doesn't have, doing it silently would strand them on a branch the
-/// user believes they just synced. IDEA asks first; so do we.
+/// fast-forwards) the matching local branch, sets it to track the remote,
+/// and checks it out, so when the local branch already carries commits
+/// the remote doesn't have, doing it silently would strand them on a branch
+/// the user believes they just synced. IDEA asks first; so do we.
 pub(super) fn run_checkout_remote_branch(
     ctx: CommitContext,
     branch: RemoteBranchRef,
