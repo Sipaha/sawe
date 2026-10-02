@@ -2,13 +2,13 @@
 //! reaches a working session, and when.
 //!
 //! Dropping the compaction prompt into a working session the moment it is
-//! requested lands it mid-step, so the request escalates instead: ask the agent
-//! to hand off itself, ask once more after [`COMPACT_ESCALATION_SECS`], then
-//! send the prompt. The same ladder serves the editor's auto-compaction and the
-//! user's Compact button; only who is asking differs ([`HandoffAsker`]). The
-//! rungs are counted per CONTEXT (reset on rotation) and advanced on the
-//! editor's own clock by `tick_supervisor`: nobody re-clicks a button to move a
-//! ladder along.
+//! requested lands it mid-step, so the request escalates instead: signal that
+//! no new work should start, repeat the signal after [`COMPACT_ESCALATION_SECS`],
+//! then send the prompt. The same ladder serves the editor's auto-compaction
+//! and the user's Compact button; only who is asking differs
+//! ([`HandoffAsker`]). The rungs are counted per CONTEXT (reset on rotation) and
+//! advanced on the editor's own clock by `tick_supervisor`: nobody re-clicks a
+//! button to move a ladder along.
 
 use gpui::{App, Context, TaskExt as _};
 
@@ -177,9 +177,9 @@ impl SolutionAgentStore {
             }
             // The ladder exists to let an agent finish what it is holding. A
             // session holding nothing — no turn running, no background agent or
-            // shell still working for it — has nothing to finish, and "wrap up,
-            // then hand off" addressed to it is a message nobody acts on until
-            // the user types again. It is compacted now instead.
+            // shell still working for it — has no active phase whose next
+            // boundary it can stop at. A signal addressed to it is a message
+            // nobody acts on until the user types again, so compact it now.
             let busy = matches!(s.state, crate::model::SessionState::Running { .. })
                 || self.main_turn_in_flight(id, cx)
                 || s.has_live_background_work(chrono::Utc::now());
@@ -306,11 +306,11 @@ impl SolutionAgentStore {
         });
     }
 
-    /// The text the agent is asked to act on. It names the exact tool, because
-    /// "compact when convenient" with no verb is how an agent acknowledges a
-    /// request and does nothing, and it states that the editor will do it
-    /// anyway — the deadline is real, and hiding it would make the eventual
-    /// forced compaction look arbitrary.
+    /// The early notice sent before the force rung. It deliberately does not
+    /// ask the agent to compact itself: that instruction made the notice
+    /// interrupt the active task by causing the agent to abandon the rest of
+    /// its work and start a handoff. The editor owns the handoff and starts it
+    /// naturally when the turn ends, or forcibly after the notices expire.
     pub(crate) fn compaction_request_message(
         &self,
         id: SolutionSessionId,
@@ -345,20 +345,24 @@ impl SolutionAgentStore {
                     .to_string()
             }
         };
-        let closing = if again {
-            "If it is still open at the next check, the editor will start the handoff for \
-             you, wherever you happen to be."
+        let instruction = if again {
+            "Keep working normally on the phase that was already active when the first notice \
+             arrived. This notice does not change or shorten that phase. At its next natural \
+             boundary — after the active phase and its verification are fully complete — pause \
+             before beginning another phase or independent task. Do not call a compaction tool \
+             because of this notice. The editor will start the handoff when the current turn \
+             ends. If the same phase is still active at the next check, the editor will force \
+             the handoff as the final escalation."
         } else {
-            "If nothing happens, the editor will start it for you."
+            "This is an early signal, not a request to stop the current work. Keep working \
+             normally on the phase already in progress; this notice does not change or shorten \
+             it. At the next natural boundary — after the active phase and its verification are \
+             fully complete — pause before beginning another phase or independent task. Keep \
+             waiting for and integrating work already underway when that belongs to the active \
+             phase. Do not call a compaction tool because of this notice; the editor will start \
+             the handoff when the current turn ends."
         };
-        let mut message = format!(
-            "{opening} Finish the step you are on — do not start new work — then hand off: \
-             call the `solution_agent.start_compact` tool on the `sawe` MCP server with \
-             {{\"session_id\": \"{id}\", \"initiator\": \"agent\"}}. It gives you the standard \
-             handoff instructions to follow. Sub-agents still running keep running across the \
-             handoff and report into the next context, so you need not wait for them. \
-             {closing}"
-        );
+        let mut message = format!("{opening} {instruction}");
         if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             message.push_str(if user {
                 "\n\nThe user's note for this handoff: "

@@ -363,8 +363,8 @@ impl McpServerTool for CompactSessionTool {
 /// desktop's status-row popover "Compact context" entry runs. On an idle or
 /// errored session it sends the compact-instructions template as a user
 /// message; on a working one a human's request climbs the handoff ladder
-/// (ask, ask again, then send — see `store::compaction_ladder`). The agent then
-/// writes its handoff files and calls back into the lower-level
+/// (signal, signal again, then send — see `store::compaction_ladder`). The
+/// agent then writes its handoff files and calls back into the lower-level
 /// `solution_agent.compact_session` to rotate.
 ///
 /// Background sub-agents survive the handoff when the agent can clear its
@@ -416,8 +416,8 @@ impl<'de> Deserialize<'de> for StartCompactParams {
 pub struct StartCompactResult {
     /// `true` when the request was accepted. On an idle session the compact
     /// prompt is enqueued (a cold one is woken first); on a working one the
-    /// agent is asked to finish its step and hand off, then asked again, and
-    /// only then sent the prompt — a second request sends it at once.
+    /// agent is signalled to stop before the next phase, then signalled again,
+    /// and only then sent the prompt — a second request sends it at once.
     /// `false` when a precondition wasn't met (e.g. awaiting approval,
     /// stopping, compaction already pending, background sub-agents running on
     /// an agent that cannot rotate in place, context below 10%, or less than

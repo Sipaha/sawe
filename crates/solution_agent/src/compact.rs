@@ -281,9 +281,9 @@ pub(crate) fn start_compact_for_session(
             // other way into this function must NOT inherit that authority:
             //   * the editor's auto-compaction (`Auto`) never wipes, by #37;
             //   * a request escalated through the handoff ladder was judged
-            //     when it was made — an agent honouring the editor's ask carries
-            //     no authority, while one honouring the user's ask is the user's
-            //     compaction, only timed by the agent;
+            //     when it was made — an agent independently compacting while an
+            //     editor ladder is armed carries no authority, while one doing
+            //     so under the user's ladder is the user's compaction;
             //   * `Client` is a human's gesture arriving over MCP, where the
             //     caller is unverifiable — an agent can only call a tool from
             //     inside its own turn, so a RUNNING session means the claim is
@@ -353,11 +353,11 @@ pub(crate) fn start_compact_for_session(
 
 /// A human's "Compact context" — the desktop button or the phone's. On a
 /// session whose turn is running, the compaction prompt would land mid-step, so
-/// the request goes through the same escalation the observer uses: the agent is
-/// asked to finish its step and hand off, asked again, and only then sent the
-/// prompt (see `store::compaction_ladder`). A second request while that is under
-/// way means "now" and sends the prompt at once. An idle session has nothing to
-/// finish and is compacted right away, as before.
+/// the request goes through the same escalation auto-compaction uses: the agent
+/// is signalled to finish its existing work and start nothing new, signalled
+/// again, and only then sent the prompt (see `store::compaction_ladder`). A second
+/// request while that is under way means "now" and sends the prompt at once. An
+/// idle session has nothing to finish and is compacted right away, as before.
 pub(crate) fn request_compact_for_session(
     session_id: SolutionSessionId,
     initiator: CompactInitiator,

@@ -2,6 +2,12 @@
 
 Date: 2026-09-29. Status: shipped. Decision: FORK.md #220. It retires #166 and changes the asker in #183 and #219.
 
+Amended 2026-10-02: threshold notifications remain in-turn so the agent can
+slow down at the right time, but the first two no longer tell it to call
+`start_compact`. They tell it to finish the already-active phase normally and
+pause before another phase or independent task. The editor starts the handoff
+after the turn ends. The last rung remains the only forced interruption.
+
 ## What the maintainer asked for
 
 - Remove the observer's compaction trigger.
@@ -18,10 +24,10 @@ Date: 2026-09-29. Status: shipped. Decision: FORK.md #220. It retires #166 and c
   default (`solution_session_auto_compact`).
 - When the context crosses the threshold while the agent's turn runs,
   `store::auto_compact::tick_auto_compaction` starts the handoff ladder as `HandoffAsker::Auto`:
-  ask, ask again after 15 min, then send the prompt.
+  signal the next natural boundary, repeat after 15 min, then send the prompt.
   - It fires once per context. A new threshold may fire again.
   - It never fires on an idle session, so nothing is compacted on startup.
-- The ask is marked as the editor's (`spk_editor_recovery` meta). It renders as an
+- The signal is marked as the editor's (`spk_editor_recovery` meta). It renders as an
   "Editor · to the agent" plaque on the desktop and an "editor" plaque on the phone.
 - Desktop control: a bolt next to the eraser. Click toggles; right-click opens the threshold menu:
   the default for the window, the presets 30–80%, and a custom value set over MCP.

@@ -385,16 +385,16 @@ pub struct PendingBundle {
     pub blocks: Vec<acp::ContentBlock>,
 }
 
-/// A request that the agent hand its context off, being escalated: ask it to
-/// finish its step and compact itself, ask again, then send the compaction
-/// prompt (see `store::compaction_ladder`). One ladder serves both the
-/// editor's auto-compaction and the user's Compact on a working session; only
-/// who is asking differs. Counted per CONTEXT: a rotation clears it.
+/// A request that the agent hand its context off, being escalated: signal it to
+/// finish all current work and start nothing new, signal again, then send the
+/// compaction prompt (see `store::compaction_ladder`). One ladder serves both
+/// the editor's auto-compaction and the user's Compact on a working session;
+/// only who is asking differs. Counted per CONTEXT: a rotation clears it.
 /// Transient — a restart means nobody is mid-handoff any more.
 #[derive(Clone, Debug)]
 pub(crate) struct HandoffLadder {
     pub asker: HandoffAsker,
-    /// How many times the agent has been asked so far.
+    /// How many early signals the agent has received so far.
     pub asks: u32,
     pub last_ask_ms: Option<i64>,
     /// When the editor last sent the compaction prompt itself. A force can be
@@ -412,8 +412,9 @@ pub(crate) struct HandoffLadder {
 }
 
 /// A session's auto-compaction: when its context crosses the threshold while
-/// the agent works, the editor asks it to hand off (the handoff ladder). On by
-/// default; `threshold_pct: None` follows the window size
+/// the agent works, the editor signals it to finish current work without
+/// starting more (the handoff ladder). On by default; `threshold_pct: None`
+/// follows the window size
 /// ([`AutoCompactSetting::default_threshold`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AutoCompactSetting {

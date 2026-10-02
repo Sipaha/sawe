@@ -4537,12 +4537,14 @@ The verdict is now an escalating request, and the ladder lives in the editor
 not in the judge's prompt. Since #219 the user's Compact on a working session
 climbs the same ladder:
 
-1. **Ask.** The agent gets an observer message naming the exact tool —
-   "finish the step you are on, then call `solution_agent.start_compact`" —
-   with the context's real fullness, the judge's handoff note if it sent one,
-   and the fact that the editor will do it anyway if nothing happens.
-2. **Ask again**, `COMPACT_ESCALATION_SECS` (15 min) later, saying the first ask
-   went unanswered. A repeat inside that window sends NOTHING.
+1. **Signal.** The agent receives an in-turn notice with the context's real
+   fullness. It keeps working normally on the already-active phase. At the next
+   natural boundary — only after that phase and its verification are complete —
+   it pauses before starting another phase or independent task. The notice
+   explicitly says not to call a compaction tool; the editor owns the handoff.
+2. **Signal again**, `COMPACT_ESCALATION_SECS` (15 min) later. It repeats the
+   same boundary and says the next escalation is forced. A repeat inside that
+   window sends NOTHING.
 3. **Force.** After `MAX_COMPACT_REQUESTS` (2) asks, the editor sends the
    compaction request itself — the old behaviour, unchanged.
 
@@ -4555,15 +4557,14 @@ prompt, no headroom left — and a refusal leaves every other input unchanged;
 unstamped, the tick retried it every five seconds and wrote a diary note each
 time, evicting the observer's real notes from a capped file.
 
-A rung is spent on DELIVERY, not on the attempt: an ask issued while the human
+A rung is spent on DELIVERY, not on the attempt: a signal issued while the human
 is typing is parked (`pending_nudge`) and a genuine user send discards it, so
 counting it would march the ladder toward a forced handoff on the strength of a
 message the agent never saw.
 
 **Only against a session that is actually working.** `Running`, or holding a
 background agent / shell that still vouches for it. An idle session is compacted
-on the spot: "wrap up, then hand off" addressed to a paused session is a message
-nobody acts on until the user types again.
+on the spot: it has no active phase whose next natural boundary it can stop at.
 
 **The clock is the editor's, not the judge's.** `tick_supervisor` advances the
 ladder; a `compact` verdict only arms it. This matters because a judge reviewing
@@ -6145,6 +6146,10 @@ How to apply:
   - A user who asks again means "now": the prompt is sent at once.
   - A user's request takes over an automatic ladder and starts it from the first rung.
   - Auto-compaction does not touch a user's ladder.
+  - The two early rungs are in-turn signals, not handoff commands: the agent
+    finishes its active phase normally, starts no next phase, and never calls
+    compact merely because of the signal. The editor compacts when the turn
+    ends; only the final rung interrupts a still-running turn.
   - An idle session is compacted at once, as before.
   - The session's turn ending without a handoff also triggers the compaction at the next tick.
 - Queuing the compaction prompt consumes the ladder. `claims_user`, the authority to reset the

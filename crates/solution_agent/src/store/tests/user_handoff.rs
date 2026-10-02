@@ -1,6 +1,7 @@
-//! The handoff ladder: ask the agent to hand off, ask again, then send the
-//! compaction prompt — started by the user's "Compact context" on a running
-//! session, or by auto-compaction when the context crosses its threshold.
+//! The handoff ladder: signal the agent to stop at the next natural work
+//! boundary, signal again, then send the compaction prompt — started by the
+//! user's "Compact context" on a running session, or by auto-compaction when
+//! the context crosses its threshold.
 
 use super::in_place_rotation::{create_gated_session, start_turn};
 use crate::compact::{CompactInitiator, request_compact_for_session, start_compact_for_session};
@@ -106,8 +107,8 @@ fn has_compaction_prompt(texts: &[String]) -> bool {
         .any(|text| text.starts_with(crate::compact::COMPACT_PROMPT_HEADING))
 }
 
-/// Ask, ask again after the escalation window, then send the prompt — and the
-/// prompt carries the user's authority, as a direct Compact would.
+/// Signal, signal again after the escalation window, then send the prompt — and
+/// the prompt carries the user's authority, as a direct Compact would.
 #[gpui::test]
 async fn a_running_session_is_asked_twice_then_compacted(cx: &mut TestAppContext) {
     let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
@@ -119,8 +120,14 @@ async fn a_running_session_is_asked_twice_then_compacted(cx: &mut TestAppContext
     assert!(!has_compaction_prompt(&texts), "the first request only asks");
     assert!(
         texts.iter().any(|t| t.starts_with("The user asked for a context handoff")
-            && t.contains("\"initiator\": \"agent\"")),
-        "the ask names the user and the tool to call: {texts:?}"
+            && t.contains("next natural boundary")
+            && t.contains("does not change or shorten")
+            && t.contains("Do not call a compaction tool")),
+        "the signal preserves the active phase and names its natural boundary: {texts:?}"
+    );
+    assert!(
+        texts.iter().all(|t| !t.contains("solution_agent.start_compact")),
+        "an early signal must not tell the agent to interrupt itself: {texts:?}"
     );
     assert_eq!(handoff(session_id, cx).map(|h| h.asks), Some(1));
     deliver_queue(session_id, cx);
@@ -132,8 +139,15 @@ async fn a_running_session_is_asked_twice_then_compacted(cx: &mut TestAppContext
     tick(cx);
     let texts = queued_texts(session_id, cx);
     assert!(
-        texts.iter().any(|t| t.starts_with("The user's context handoff request is still open")),
+        texts.iter().any(|t| t.starts_with("The user's context handoff request is still open")
+            && t.contains("next natural boundary")
+            && t.contains("does not change or shorten")
+            && t.contains("force the handoff as the final escalation")),
         "second ask: {texts:?}"
+    );
+    assert!(
+        texts.iter().all(|t| !t.contains("solution_agent.start_compact")),
+        "the second signal still must not tell the agent to interrupt itself: {texts:?}"
     );
     assert!(!has_compaction_prompt(&texts));
     assert_eq!(handoff(session_id, cx).map(|h| h.asks), Some(2));
@@ -181,8 +195,8 @@ async fn a_second_request_compacts_now(cx: &mut TestAppContext) {
     assert!(handoff(session_id, cx).is_none());
 }
 
-/// The agent honouring the user's request compacts with the user's authority —
-/// it is the user's compaction, only timed by the agent.
+/// If the agent independently starts a handoff while the user's request is
+/// armed, it still inherits the user's authority.
 #[gpui::test]
 async fn the_agents_own_handoff_inherits_the_users_request(cx: &mut TestAppContext) {
     let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
@@ -273,8 +287,9 @@ fn system_notes(session_id: SolutionSessionId, needle: &str, cx: &mut TestAppCon
     })
 }
 
-/// Crossing the threshold while the agent works asks it to hand off, in the
-/// editor's voice and marked as the editor's — once, not every tick.
+/// Crossing the threshold while the agent works signals it to stop before the
+/// next phase, in the editor's voice and marked as the editor's — once, not
+/// every tick.
 #[gpui::test]
 async fn auto_compaction_asks_when_the_context_crosses_the_threshold(cx: &mut TestAppContext) {
     let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
@@ -292,8 +307,15 @@ async fn auto_compaction_asks_when_the_context_crosses_the_threshold(cx: &mut Te
     );
     let texts = queued_texts(session_id, cx);
     assert!(
-        texts.iter().any(|t| t.starts_with("Your context is 41% full.")),
+        texts.iter().any(|t| t.starts_with("Your context is 41% full.")
+            && t.contains("Keep working normally on the phase already in progress")
+            && t.contains("pause before beginning another phase or independent task")
+            && t.contains("Do not call a compaction tool")),
         "the editor's wording: {texts:?}"
+    );
+    assert!(
+        texts.iter().all(|t| !t.contains("solution_agent.start_compact")),
+        "the threshold is a signal inside the turn, not a self-interrupt command: {texts:?}"
     );
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);

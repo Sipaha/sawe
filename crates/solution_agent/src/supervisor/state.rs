@@ -52,30 +52,33 @@ pub const AUDITOR_TIMEOUT_SECS: u64 = 5 * 60;
 /// than near the ceiling.
 pub const COMPACT_ESCALATION_SECS: u64 = 15 * 60;
 
-/// How many times the agent is ASKED to compact itself before the editor stops
-/// asking and runs the compaction. Two: the first ask can land mid-step and be
-/// forgotten by the end of a long turn, a second one cannot plausibly be missed,
-/// and a third ask would just be a slower way of never compacting.
+/// How many times the agent is NOTIFIED not to start new work before the editor
+/// interrupts and runs the compaction. Two: the first signal can land mid-step
+/// and be forgotten by the end of a long turn, a second one cannot plausibly be
+/// missed, and a third notice would just be a slower way of never compacting.
 pub const MAX_COMPACT_REQUESTS: u32 = 2;
 
 /// What the handoff ladder should actually DO, given how many times this
-/// context has already been asked to hand off — see [`compact_guard`].
+/// context has already been signalled to stop before its next phase — see
+/// [`compact_guard`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactStep {
-    /// Ask the agent to finish its step and start the handoff itself.
+    /// Signal that the agent should finish its current work and start nothing
+    /// new.
     Ask,
-    /// It was asked and did not; ask once more, plainly.
+    /// The first signal did not end the turn; repeat it plainly.
     AskAgain,
-    /// Asking has not worked: the editor sends the compaction request itself.
+    /// The signals have not worked: the editor sends the compaction request
+    /// itself.
     Force,
     /// The last ask is younger than [`COMPACT_ESCALATION_SECS`] — the agent is
-    /// plausibly still finishing the step it was asked to finish. Say nothing
+    /// plausibly still completing the active phase. Say nothing
     /// rather than repeating the same sentence into a running turn.
     TooSoon,
 }
 
-/// The handoff ladder on ONE context: ask, ask again,
-/// then do it. `requests` is how many asks this context has already had (reset
+/// The handoff ladder on ONE context: signal, signal again,
+/// then do it. `requests` is how many signals this context has already had (reset
 /// when the transcript rotates), `since_last_ms` how long ago the last one was.
 ///
 /// Pure so the ladder can be tested without a session: the whole point of it
@@ -874,4 +877,3 @@ pub(crate) fn parse_clock(token: &str) -> Option<(u32, u32)> {
     }
     Some((hour, minute))
 }
-

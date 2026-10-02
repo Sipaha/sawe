@@ -2,6 +2,14 @@
 
 Date: 2026-09-29. Status: shipped. Decision: FORK.md #219, which amends #183.
 
+Amended 2026-10-02: the two early rungs still arrive inside the active turn, but
+they are boundary signals rather than commands to start a handoff. The agent
+continues the already-active phase normally, including its verification and any
+work already underway, then pauses before a new phase or independent task. It
+is explicitly told not to call a compaction tool because of the signal. The
+editor compacts when the turn ends; only the final rung interrupts a phase that
+has continued through both escalation windows.
+
 ## What was wrong
 
 "Compact context" on a session whose turn was running sent the whole compaction prompt at once. On
@@ -16,14 +24,14 @@ agent therefore stopped mid-step to write its handoff. The observer had not work
   there from `SupervisorState`. The escalation logic (`store/compaction_ladder.rs`: `request_handoff`,
   `climb_compaction_ladder`, `tick_compaction_ladders`, `run_ladder_compaction`) is shared. The two
   kinds of asker differ only in:
-  - the ask's wording;
-  - how the ask is delivered: the observer sends a nudge, and the user's ask goes as the user's own
-    message;
-  - where a refused force is reported: the observer's diary, or a system note in the chat.
+  - the signal's wording;
+  - how the signal is delivered: auto-compaction sends an editor notice, and
+    the user's signal goes as the user's own message;
+  - where a refused force is reported: a system note in the chat.
 - The desktop button and the phone's `start_compact` go through
   `compact::request_compact_for_session`:
   - an idle session is compacted at once;
-  - a working session gets the first ask;
+  - a working session gets the first boundary signal;
   - a second request while the ladder runs sends the prompt now. While a user ladder is armed, the
     menu entry reads "Compact context now".
 - The agent's own `start_compact(initiator: "agent")` bypasses the ladder. It consumes the ladder
@@ -59,7 +67,7 @@ diary.
 - `store/tests/supervisor.rs::no_judge_fires_while_the_context_is_being_handed_off` and
   `user_handoff.rs::the_users_request_supersedes_an_in_flight_judge` cover the observer standing down.
 - `store/tests/user_handoff.rs` has 8 ladder tests:
-  - ask, ask again, force;
+  - signal, signal again, force;
   - a turn ending without a handoff;
   - a second request forcing at once;
   - the agent's own handoff inheriting the user's claim;

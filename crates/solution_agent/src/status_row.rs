@@ -503,12 +503,14 @@ pub(crate) fn render_status_row(
         "Conversation is short — compact later".into()
     } else if let Some(asks) = handoff_asks {
         format!(
-            "Handoff requested — the agent was asked {asks} of 2 times to wrap up. \
+            "Handoff requested — the agent was signalled {asks} of 2 times to stop before its \
+             next phase. \
              Compact again to send the compaction now"
         )
         .into()
     } else if is_running {
-        "Ask the agent to finish its step and hand off; asked twice, then compacted".into()
+        "Notify the agent to pause before its next phase; two notices, then compaction"
+            .into()
     } else if compact_warning {
         "Context is filling up — compact recommended".into()
     } else if is_cold {
@@ -1258,8 +1260,8 @@ fn render_auto_compact_button(
     let threshold = setting.effective_threshold(max);
     let tooltip: SharedString = if setting.enabled {
         format!(
-            "Auto-compaction on: at {threshold}% of the context the agent is asked to hand off. \
-             Click to turn off, right-click for the threshold"
+            "Auto-compaction on: at {threshold}% of the context the agent is notified to pause \
+             before its next phase. Click to turn off, right-click for the threshold"
         )
         .into()
     } else {
