@@ -524,6 +524,10 @@ impl ConfigOptions {
 pub struct AcpSession {
     thread: WeakEntity<AcpThread>,
     suppress_abort_err: bool,
+    // Kimi ignores session _meta; forward editor instructions in the prompt
+    // transport without adding them to the local user-message transcript.
+    prompt_context: Option<String>,
+    close_on_release: bool,
     session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
     config_options: Option<ConfigOptions>,
     _release_subscription: Subscription,
@@ -1207,7 +1211,7 @@ impl AcpConnection {
                         _ => None,
                     }
                 };
-                if removed.is_none() || !supports_close {
+                if !removed.is_some_and(|session| session.close_on_release) || !supports_close {
                     return;
                 }
                 cx.foreground_executor()
@@ -1226,11 +1230,22 @@ impl AcpConnection {
             AcpSession {
                 thread: thread.downgrade(),
                 suppress_abort_err: false,
+                prompt_context: None,
+                close_on_release: true,
                 session_modes,
                 config_options,
                 _release_subscription: release_subscription,
             },
         );
+    }
+
+    /// An idle Solution session is detaching only to reapply its policy on
+    /// resume. Keep the provider session alive; an asynchronous release close
+    /// could otherwise race the next resume. Pool shutdown still reaps it.
+    pub fn prepare_session_for_resume(&self, session_id: &acp::SessionId) {
+        if let Some(session) = self.sessions.borrow_mut().get_mut(session_id) {
+            session.close_on_release = false;
+        }
     }
 
     fn agent_supports_session_close(&self) -> bool {
@@ -1637,6 +1652,14 @@ fn meta_terminal_auth_task(
     ))
 }
 
+fn kimi_prompt_context(agent_id: &AgentId, meta: Option<&acp::Meta>) -> Option<String> {
+    if agent_id.0.as_ref() != crate::kimi::KIMI_CODE_ID {
+        return None;
+    }
+    meta?.get("systemPrompt")?.get("append")?.as_str()
+        .filter(|prompt| !prompt.trim().is_empty()).map(str::to_owned)
+}
+
 impl AgentConnection for AcpConnection {
     fn agent_id(&self) -> AgentId {
         self.id.clone()
@@ -1671,6 +1694,7 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
+        let prompt_context = kimi_prompt_context(&self.id, extra_meta.as_ref());
         let mcp_servers = mcp_servers_for_project(&project, cx);
 
         cx.spawn(async move |cx| {
@@ -1758,12 +1782,15 @@ impl AgentConnection for AcpConnection {
 
             cx.update(|cx| {
                 self.register_session(
-                    response.session_id,
+                    response.session_id.clone(),
                     &thread,
                     modes,
                     config_options.map(ConfigOptions::new),
                     cx,
-                )
+                );
+                if let Some(session) = self.sessions.borrow_mut().get_mut(&response.session_id) {
+                    session.prompt_context = prompt_context;
+                }
             });
 
             Ok(thread)
@@ -1872,6 +1899,26 @@ impl AgentConnection for AcpConnection {
         )
     }
 
+    fn resume_session_with_meta(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        meta: Option<acp::Meta>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        let prompt_context = kimi_prompt_context(&self.id, meta.as_ref());
+        let task = self.clone().resume_session(session_id.clone(), project, work_dirs, title, cx);
+        cx.spawn(async move |_| {
+            let thread = task.await?;
+            if let Some(session) = self.sessions.borrow_mut().get_mut(&session_id) {
+                session.prompt_context = prompt_context;
+            }
+            Ok(thread)
+        })
+    }
+
     fn auth_methods(&self) -> &[acp::AuthMethod] {
         &self.auth_methods
     }
@@ -1943,9 +1990,18 @@ impl AgentConnection for AcpConnection {
 
     fn prompt(
         &self,
-        params: acp::PromptRequest,
+        mut params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
+        if let Some(context) = self.sessions.borrow().get(&params.session_id)
+            .and_then(|session| session.prompt_context.as_deref())
+        {
+            // Kimi inspects ONLY the first block for built-in/skill slash
+            // commands. Keep it intact. Ordinary turns consume every block.
+            params.prompt.push(acp::ContentBlock::Text(acp::TextContent::new(
+                format!("<sawe_editor_context>\n{context}\n</sawe_editor_context>"),
+            )));
+        }
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
@@ -2321,6 +2377,7 @@ pub mod test_support {
         pub authenticate_count: Arc<AtomicUsize>,
         pub logout_count: Arc<AtomicUsize>,
         pub keep_agent_alive: Task<anyhow::Result<()>>,
+        pub prompts: Arc<Mutex<Vec<acp::PromptRequest>>>,
     }
 
     struct FakeAcpAgentConnection {
@@ -2510,6 +2567,7 @@ pub mod test_support {
     ) -> Result<FakeAcpConnectionHarness> {
         let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
 
+        let prompts = Arc::new(Mutex::new(Vec::new()));
         let authenticate_count = Arc::new(AtomicUsize::new(0));
         let logout_count = Arc::new(AtomicUsize::new(0));
         let sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>> =
@@ -2585,13 +2643,21 @@ pub mod test_support {
             .on_receive_request(
                 {
                     let fail_next_prompt = fail_next_prompt.clone();
-                    async move |_req: acp::PromptRequest, responder, _cx| {
+                    let prompts = prompts.clone();
+                    async move |req: acp::PromptRequest, responder, _cx| {
+                        prompts.lock().unwrap().push(req);
                         if fail_next_prompt.swap(false, Ordering::SeqCst) {
                             responder.respond_with_error(acp::ErrorCode::InternalError.into())
                         } else {
                             responder.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
                         }
                     }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: acp::ResumeSessionRequest, responder, _cx| {
+                    responder.respond(acp::ResumeSessionResponse::new())
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -2703,6 +2769,7 @@ pub mod test_support {
             authenticate_count,
             logout_count,
             keep_agent_alive,
+            prompts,
         })
     }
 
@@ -2800,6 +2867,83 @@ mod tests {
     use super::*;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _};
     use settings::Settings as _;
+
+    fn context_meta(text: &str) -> acp::Meta {
+        acp::Meta::from_iter([("systemPrompt".into(), serde_json::json!({"append": text}))])
+    }
+
+    #[gpui::test]
+    async fn kimi_context_reaches_wire_on_create_and_resume_without_changing_first_block(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "project": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        {
+            let connection = Rc::get_mut(&mut harness.connection).unwrap();
+            connection.id = AgentId::new(crate::kimi::KIMI_CODE_ID);
+            connection.agent_capabilities.session_capabilities.resume = Some(acp::SessionResumeCapabilities::new());
+        }
+        let connection = harness.connection.clone();
+        let dirs = PathList::new(&[std::path::PathBuf::from("/project")]);
+        let thread = cx.update(|cx| connection.clone().new_session_with_meta(
+            project.clone(), dirs.clone(), Some(context_meta("Stay inside /solution. Session first.")), cx,
+        )).await.unwrap();
+        let sid = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let original = vec![acp::ContentBlock::Text(acp::TextContent::new("/status"))];
+        cx.update(|cx| connection.prompt(acp::PromptRequest::new(sid.clone(), original.clone()), cx)).await.unwrap();
+        {
+            let wire = harness.prompts.lock().unwrap();
+            assert_eq!(serde_json::to_value(&wire[0].prompt[0]).unwrap(), serde_json::to_value(&original[0]).unwrap());
+            assert_eq!(wire[0].prompt.len(), 2);
+            let acp::ContentBlock::Text(context) = &wire[0].prompt[1] else { panic!("context must be text") };
+            assert!(context.text.contains("Session first."));
+        }
+        assert_eq!(original.len(), 1, "the caller's local transcript input is untouched");
+        connection.prepare_session_for_resume(&sid);
+        drop(thread);
+        cx.run_until_parked();
+        assert_eq!(harness.close_session_count.load(Ordering::SeqCst), 0,
+            "policy detach must not race an automatic close against resume");
+        let resumed = cx.update(|cx| connection.clone().resume_session_with_meta(
+            sid.clone(), project, dirs, None,
+            Some(context_meta("Stay inside /solution. Session resumed.")), cx,
+        )).await.unwrap();
+        for _ in 0..2 {
+            cx.update(|cx| connection.prompt(acp::PromptRequest::new(sid.clone(), original.clone()), cx)).await.unwrap();
+        }
+        {
+            let wire = harness.prompts.lock().unwrap();
+            for prompt in &wire[1..] {
+                let acp::ContentBlock::Text(context) = &prompt.prompt[1] else { panic!("context must be text") };
+                assert!(context.text.contains("Session resumed."));
+                assert!(!context.text.contains("Session first."));
+            }
+        }
+        drop(resumed);
+        cx.run_until_parked();
+        assert_eq!(harness.close_session_count.load(Ordering::SeqCst), 1,
+            "a normal release after resume must still close the provider session");
+    }
+
+    #[gpui::test]
+    async fn unrelated_acp_agent_does_not_inject_prompt_context(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "project": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        let harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        let connection = harness.connection.clone();
+        let thread = cx.update(|cx| connection.clone().new_session_with_meta(
+            project, PathList::new(&[std::path::PathBuf::from("/project")]),
+            Some(context_meta("do not inject")), cx,
+        )).await.unwrap();
+        let sid = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let original = vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))];
+        cx.update(|cx| connection.prompt(acp::PromptRequest::new(sid, original.clone()), cx)).await.unwrap();
+        let wire = harness.prompts.lock().unwrap();
+        assert_eq!(serde_json::to_value(&wire[0].prompt).unwrap(), serde_json::to_value(&original).unwrap());
+    }
 
     fn init_feature_flags_test(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

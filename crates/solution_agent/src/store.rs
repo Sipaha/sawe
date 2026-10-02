@@ -2884,7 +2884,12 @@ impl SolutionAgentStore {
         self.default_permission_mode = mode;
         self.default_permission_mode_touched = true;
         if let Some(thread) = live {
-            if !acp_modes {
+            if acp_modes {
+                let thread = thread.read(cx);
+                if let Some(connection) = thread.connection().clone().downcast::<agent_servers::AcpConnection>() {
+                    connection.prepare_session_for_resume(thread.session_id());
+                }
+            } else {
                 let (connection, provider_id) = {
                     let t = thread.read(cx);
                     (t.connection().clone(), t.session_id().clone())
