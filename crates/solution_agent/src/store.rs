@@ -1646,6 +1646,21 @@ impl SolutionAgentStore {
                 }
             };
 
+            let controls = cx.update(|cx| {
+                let (connection, provider_id) = {
+                    let thread = acp_thread.read(cx);
+                    (thread.connection().clone(), thread.session_id().clone())
+                };
+                crate::native_controls::apply_acp_controls(
+                    connection, &provider_id,
+                    permission_mode, model.clone(), cx,
+                )
+            });
+            if let Err(error) = controls.await {
+                this.update(cx, |store, cx| store.pool_release_session(pair.clone(), cx)).ok();
+                return Err(error);
+            }
+
             // 4. Register the session and emit `SessionCreated`.
             let session_id = this.update(cx, |store, cx| {
                 let acp_session_id = acp_thread.read(cx).session_id().clone();
@@ -1664,17 +1679,6 @@ impl SolutionAgentStore {
                         true,
                     );
                 }
-                // An agent that enforces permissions through ACP session modes
-                // (Kimi) cannot be seeded from `acp_meta`: a mode is per
-                // session, so it can only be pushed once the session exists.
-                // No-op — and logged inside — for the native runtimes, which
-                // take `sawePermissionMode` instead.
-                crate::native_controls::set_permission_mode(
-                    acp_thread.read(cx).connection().clone(),
-                    &acp_session_id,
-                    permission_mode,
-                    cx,
-                );
                 let live_models = crate::native_controls::available_models(
                     acp_thread.read(cx).connection().clone(),
                     &acp_session_id,
@@ -2867,25 +2871,11 @@ impl SolutionAgentStore {
         };
         let pair = (s.solution_id, s.agent_id.clone());
         let live = s.acp_thread().cloned();
-        // An agent that enforces permissions through ACP session modes (Kimi)
-        // switches a live session in place: no process restart, no dropped
-        // thread, no lost transcript. Applied BEFORE anything is persisted — if
-        // the CLI refuses the mode, the stored value must not claim a change
-        // that never reached the agent.
-        let acp_mode_switch = live.as_ref().and_then(|thread| {
-            let thread = thread.read(cx);
-            let connection = thread.connection().clone();
-            crate::native_controls::uses_acp_permission_modes(&connection)
-                .then(|| (connection, thread.session_id().clone()))
-        });
-        let switched_live = acp_mode_switch.is_some();
-        if let Some((connection, acp_sid)) = acp_mode_switch {
-            if !crate::native_controls::set_permission_mode(connection, &acp_sid, mode, cx) {
-                return Err(anyhow!(
-                    "The agent refused this permission mode; the chat keeps its current one"
-                ));
-            }
-        }
+        // Kimi also changes policy through a cold attach. The old code
+        // detached a mode RPC and persisted success before its response, so
+        // rejected changes silently disagreed with the running agent. Resume
+        // now awaits the selected policy before accepting any prompt.
+        let acp_modes = crate::native_controls::uses_acp_permission_modes_for_agent(s.agent_id.as_ref());
         // Commit before acknowledging the UI. Generic asynchronous metadata
         // snapshots never overwrite this column, including older queued saves.
         if let Some(db) = &self.persistence {
@@ -2893,30 +2883,23 @@ impl SolutionAgentStore {
         }
         self.default_permission_mode = mode;
         self.default_permission_mode_touched = true;
-        if !switched_live {
-            if let Some(thread) = live {
+        if let Some(thread) = live {
+            if !acp_modes {
                 let (connection, provider_id) = {
                     let t = thread.read(cx);
                     (t.connection().clone(), t.session_id().clone())
                 };
-                connection
-                    .close_session(&provider_id, cx)
-                    .detach_and_log_err(cx);
-                // Other chats may still share the connection. Resume passes the
-                // new policy to a fresh per-session process on that connection.
-                self.pool_release_session(pair, cx);
+                connection.close_session(&provider_id, cx).detach_and_log_err(cx);
             }
+            // ACP resume replaces the client registration for the same idle
+            // provider session. Do not race an asynchronous close against it.
+            self.pool_release_session(pair, cx);
         }
         session.update(cx, |s, cx| {
             s.permission_mode = mode;
             s.last_activity_at = Utc::now();
-            // A native runtime only picks the new policy up on a fresh
-            // per-session process, so its thread is dropped and the next
-            // message respawns. A live mode switch keeps the thread — that is
-            // the whole point of it.
-            if !switched_live {
-                s.set_acp_thread(None, cx);
-            }
+            s.set_acp_thread(None, cx);
+            s._acp_subscription = None;
         });
         self.mark_state_changed(id, cx);
         cx.notify();
@@ -4206,6 +4189,25 @@ impl SolutionAgentStore {
             });
             let new_thread = new_thread_task.await?;
 
+            let controls = this.update(cx, |store, cx| {
+                let session = store.session(session_id).ok_or_else(|| anyhow!("Session not found"))?;
+                let (mode, model) = {
+                    let session = session.read(cx);
+                    (session.permission_mode, session.desired_model.clone())
+                };
+                let (connection, provider_id) = {
+                    let thread = new_thread.read(cx);
+                    (thread.connection().clone(), thread.session_id().clone())
+                };
+                Ok::<_, anyhow::Error>(crate::native_controls::apply_acp_controls(
+                    connection, &provider_id, mode, model, cx,
+                ))
+            })??;
+            if let Err(error) = controls.await {
+                this.update(cx, |store, cx| store.pool_release_session(pair.clone(), cx)).ok();
+                return Err(error);
+            }
+
             // A steer can be accepted before its receipt is observed. Do not
             // migrate that reserved queue into the replacement context and
             // accidentally deliver it again. The native transport bounds its
@@ -4546,6 +4548,25 @@ impl SolutionAgentStore {
                     .new_session_with_meta(project.clone(), work_dirs, acp_meta, cx)
             });
             let new_thread = new_thread_task.await?;
+
+            let controls = this.update(cx, |store, cx| {
+                let session = store.session(session_id).ok_or_else(|| anyhow!("Session not found"))?;
+                let (mode, model) = {
+                    let session = session.read(cx);
+                    (session.permission_mode, session.desired_model.clone())
+                };
+                let (connection, provider_id) = {
+                    let thread = new_thread.read(cx);
+                    (thread.connection().clone(), thread.session_id().clone())
+                };
+                Ok::<_, anyhow::Error>(crate::native_controls::apply_acp_controls(
+                    connection, &provider_id, mode, model, cx,
+                ))
+            })??;
+            if let Err(error) = controls.await {
+                this.update(cx, |store, cx| store.pool_release_session(pair.clone(), cx)).ok();
+                return Err(error);
+            }
 
             this.update(cx, |store, cx| {
                 // Creating a replacement can await authentication or process startup.
@@ -6398,6 +6419,36 @@ mod subagent_view_tests {
 #[cfg(test)]
 mod permission_tests {
     use super::*;
+    #[gpui::test]
+    async fn kimi_permission_change_detaches_before_the_next_prompt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use acp_thread::AgentConnection as _;
+        let (store, id, _tmp) = test_support::seed_store_with_session(cx).await;
+        let connection = Rc::new(crate::test_support::MockConnection::configured(None, None, true));
+        let thread_task = cx.update(|cx| {
+            let solution = solutions::SolutionStore::global(cx).read(cx).solutions()[0].clone();
+            let project = SolutionAgentStore::make_headless_project_for_solution(&solution, cx).unwrap();
+            connection.clone().new_session(project, util::path_list::PathList::default(), cx)
+        });
+        let thread = thread_task.await.unwrap();
+        let provider_id = cx.update(|cx| thread.read(cx).session_id().clone());
+        store.update(cx, |store, cx| {
+            let session = store.session(id).unwrap();
+            session.update(cx, |session, cx| {
+                session.agent_id = crate::kimi_adapter::KIMI_AGENT_ID.into();
+                session.acp_session_id = provider_id.clone();
+                session.set_acp_thread(Some(thread), cx);
+            });
+            store.set_session_permission_mode(id, SessionPermissionMode::ReadOnly, cx).unwrap();
+            let session = session.read(cx);
+            assert!(session.acp_thread().is_none(), "the next send must await resume controls");
+            assert_eq!(session.acp_session_id, provider_id, "preserve provider history for resume");
+            assert_eq!(session.permission_mode, SessionPermissionMode::ReadOnly);
+            assert!(connection.live_sessions().contains(&provider_id), "no async close may race resume");
+        });
+    }
+
     #[gpui::test]
     async fn permission_selection_requires_idle_and_survives_context_metadata(
         cx: &mut gpui::TestAppContext,

@@ -35,8 +35,11 @@ pub const MODEL_CONFIG_OPTION_ID: &str = agent_servers::MODEL_CONFIG_OPTION_ID;
 /// Kimi's "analyze only" mode: it cannot modify files or execute commands.
 const MODE_READ_ONLY: &str = "plan";
 
-/// Kimi's "approve every tool" mode.
-const MODE_FULL_ACCESS: &str = "yolo";
+/// The installed CLI's engine calls `auto` "Never Ask". Its ACP descriptions
+/// are stale: `yolo` still requests approval for dangerous commands and
+/// sensitive files. Neither mode is a filesystem sandbox; the Solution
+/// boundary remains part of the injected instructions.
+const MODE_FULL_ACCESS: &str = "auto";
 
 /// Kimi's chrome in the "new session" picker, on its session tabs and in the
 /// status row. See [`AgentBrand`] for why the model list carries no version
@@ -117,7 +120,7 @@ mod tests {
         );
         assert_eq!(
             mode_for(SessionPermissionMode::FullAccess).0.as_ref(),
-            "yolo",
+            "auto",
             "full access must map to the mode that approves every tool"
         );
     }
@@ -135,13 +138,13 @@ mod tests {
         }
     }
 
-    /// `default` and `auto` are real Kimi modes that the fork's binary control
+    /// `default` and `yolo` are real Kimi modes that the fork's binary control
     /// cannot express. Reporting one of them as "full access" would tell the
     /// user their chat can edit files when it may still stop to ask, so the
     /// adoption path has to see `None` and leave the stored mode alone.
     #[test]
     fn modes_the_fork_cannot_express_are_not_guessed_at() {
-        for mode in ["default", "auto", "", "YOLO", "Plan"] {
+        for mode in ["default", "yolo", "", "YOLO", "Plan"] {
             assert_eq!(
                 permission_mode_for(&acp::SessionModeId::new(mode)),
                 None,

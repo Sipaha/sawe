@@ -803,35 +803,22 @@ impl SolutionAgentStore {
                     }));
                 }
             };
-            // An agent that keeps its controls in ACP session state (Kimi) has
-            // no spawn-time hook to seed: a mode and a config option both belong
-            // to a session, so neither exists until the attach above succeeded.
-            // Push the persisted pair now. The native runtimes took theirs
-            // through the pre-wake `set_model(…, false)` and `resume_meta`.
-            cx.update(|cx| {
-                let (connection, attached_session_id) = {
+            // These settings belong to the provider session, and must be
+            // acknowledged before the resumed thread can accept a prompt.
+            let controls = cx.update(|cx| {
+                let (connection, provider_id) = {
                     let thread = acp_thread.read(cx);
                     (thread.connection().clone(), thread.session_id().clone())
                 };
-                if !crate::native_controls::uses_acp_permission_modes(&connection) {
-                    return;
-                }
-                if let Some(model) = meta.desired_model.clone() {
-                    crate::native_controls::set_model(
-                        connection.clone(),
-                        &attached_session_id,
-                        Some(model),
-                        true,
-                        cx,
-                    );
-                }
-                crate::native_controls::set_permission_mode(
-                    connection,
-                    &attached_session_id,
-                    meta.permission_mode,
-                    cx,
-                );
+                crate::native_controls::apply_acp_controls(
+                    connection, &provider_id,
+                    meta.permission_mode, meta.desired_model.clone(), cx,
+                )
             });
+            if let Err(error) = controls.await {
+                this.update(cx, |store, cx| store.pool_release_session(pair.clone(), cx)).ok();
+                return Err(error);
+            }
             // Reflect the cwd the agent actually accepted in the rest
             // of the resume — store update + persist below — so a
             // future resume hits this cwd first instead of replaying
@@ -1000,12 +987,12 @@ impl SolutionAgentStore {
 
             let session_id = this.update(cx, |store, cx| {
                 let current_mode = store.session(meta.id).map(|s| s.read(cx).permission_mode).unwrap_or(meta.permission_mode);
-                // An agent on ACP session modes (Kimi) takes no
-                // `sawePermissionMode` in its resume meta — the mode is pushed
-                // after attach below — so the change-during-resume guard has
-                // nothing to compare and must not fire for it.
-                if !crate::native_controls::uses_acp_permission_modes_for_agent(pair.1.as_ref())
-                    && resume_meta.get("sawePermissionMode").and_then(serde_json::Value::as_str) != Some(current_mode.as_str())
+                let applied_mode = if crate::native_controls::uses_acp_permission_modes_for_agent(pair.1.as_ref()) {
+                    Some(meta.permission_mode.as_str())
+                } else {
+                    resume_meta.get("sawePermissionMode").and_then(serde_json::Value::as_str)
+                };
+                if applied_mode != Some(current_mode.as_str())
                 {
                     let (connection, provider_id) = {
                         let thread = acp_thread.read(cx);

@@ -7,7 +7,7 @@ use std::{path::PathBuf, rc::Rc};
 use acp_thread::{AgentConnection, NativeAgentModelInfo};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use gpui::{App, AsyncApp, Task, TaskExt as _};
 use util::ResultExt as _;
 
@@ -84,7 +84,10 @@ pub(crate) fn available_models(
         .downcast::<claude_native::ClaudeNativeConnection>()
     {
         native.available_models(session)
-    } else if let Some(native) = connection.clone().downcast::<codex_native::CodexConnection>() {
+    } else if let Some(native) = connection
+        .clone()
+        .downcast::<codex_native::CodexConnection>()
+    {
         native
             .available_models(session)
             .into_iter()
@@ -132,7 +135,10 @@ pub(crate) fn set_model(
         if apply && let Some(value) = value {
             native.select_model(session, value);
         }
-    } else if let Some(native) = connection.clone().downcast::<codex_native::CodexConnection>() {
+    } else if let Some(native) = connection
+        .clone()
+        .downcast::<codex_native::CodexConnection>()
+    {
         native.set_desired_model(session, value.clone());
         if apply && let Some(value) = value {
             native.select_model(session, value).log_err();
@@ -215,45 +221,49 @@ pub(crate) fn codex_efforts(
         .unwrap_or_default()
 }
 
-/// Push the fork's binary permission mode onto an agent that enforces it
-/// through ACP session modes, i.e. Kimi. Returns `false` when this agent has
-/// no ACP modes to set, so the caller knows the mode was not applied and can
-/// leave its own persisted value alone rather than claiming a change that did
-/// not reach the CLI.
-///
-/// The two native runtimes enforce permissions through the `sawePermissionMode`
-/// session meta instead and are rejected by the id check below — they do not
-/// implement `session_modes`, so the check is belt and braces, but the
-/// dispatch belongs here where every other runtime branch lives.
-pub(crate) fn set_permission_mode(
+/// Apply session-owned controls before exposing an ACP session to prompts.
+/// A rejected mode/model fails the attach, rather than leaving the UI and the
+/// running agent on different settings. Native runtimes use spawn metadata.
+pub(crate) fn apply_acp_controls(
     connection: Rc<dyn AgentConnection>,
     session: &acp::SessionId,
     mode: SessionPermissionMode,
+    model: Option<String>,
     cx: &mut App,
-) -> bool {
+) -> Task<Result<()>> {
     if !uses_acp_permission_modes(&connection) {
-        return false;
+        return Task::ready(Ok(()));
     }
     let Some(modes) = connection.session_modes(session, cx) else {
-        log::warn!(
-            "kimi session {} advertises no ACP modes; permission mode not applied",
-            session.0
-        );
-        return false;
+        return Task::ready(Err(anyhow!(
+            "The agent publishes no session permission modes"
+        )));
     };
     let mode_id = kimi_adapter::mode_for(mode);
-    // Check before setting: a mode the CLI never advertised would be rejected
-    // anyway, and failing here keeps the session on the mode it actually runs
-    // in instead of letting the UI read "full access" over a chat that is
-    // still stopping to ask.
     if !modes.all_modes().iter().any(|m| m.id == mode_id) {
-        log::warn!(
-            "kimi does not offer session mode `{mode_id:?}`; permission mode not applied"
-        );
-        return false;
+        return Task::ready(Err(anyhow!(
+            "The agent does not support permission mode {mode_id:?}"
+        )));
     }
-    modes.set_mode(mode_id, cx).detach_and_log_err(cx);
-    true
+    let config = connection.session_config_options(session, cx);
+    if model.is_some() && config.is_none() {
+        return Task::ready(Err(anyhow!("The agent publishes no model configuration")));
+    }
+    let mode_task = modes.set_mode(mode_id, cx);
+    cx.spawn(async move |cx| {
+        mode_task.await?;
+        if let (Some(model), Some(config)) = (model, config) {
+            cx.update(|cx| {
+                config.set_config_option(
+                    acp::SessionConfigId::new(kimi_adapter::MODEL_CONFIG_OPTION_ID),
+                    acp::SessionConfigOptionValue::value_id(acp::SessionConfigValueId::new(model)),
+                    cx,
+                )
+            })
+            .await?;
+        }
+        Ok(())
+    })
 }
 
 /// Whether `connection` enforces the fork's permission modes through ACP
@@ -267,4 +277,189 @@ pub(crate) fn uses_acp_permission_modes(connection: &Rc<dyn AgentConnection>) ->
 /// built for one.
 pub(crate) fn uses_acp_permission_modes_for_agent(agent_id: &str) -> bool {
     agent_id == kimi_adapter::KIMI_AGENT_ID
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acp_thread::{AgentSessionConfigOptions, AgentSessionModes};
+    use std::cell::RefCell;
+
+    struct Controls {
+        mode_reply: async_channel::Receiver<bool>,
+        model_reply: async_channel::Receiver<bool>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl AgentSessionModes for Controls {
+        fn current_mode(&self) -> acp::SessionModeId {
+            acp::SessionModeId::new("default")
+        }
+        fn all_modes(&self) -> Vec<acp::SessionMode> {
+            vec![
+                acp::SessionMode::new("auto", "Auto"),
+                acp::SessionMode::new("plan", "Plan"),
+            ]
+        }
+        fn set_mode(&self, mode: acp::SessionModeId, cx: &mut App) -> Task<Result<()>> {
+            self.calls.borrow_mut().push(format!("mode:{}", mode.0));
+            let reply = self.mode_reply.clone();
+            cx.spawn(async move |_| {
+                anyhow::ensure!(reply.recv().await?, "mode refused");
+                Ok(())
+            })
+        }
+    }
+    impl AgentSessionConfigOptions for Controls {
+        fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+            vec![]
+        }
+        fn set_config_option(
+            &self,
+            _: acp::SessionConfigId,
+            _: acp::SessionConfigOptionValue,
+            cx: &mut App,
+        ) -> Task<Result<Vec<acp::SessionConfigOption>>> {
+            self.calls.borrow_mut().push("model".into());
+            let reply = self.model_reply.clone();
+            cx.spawn(async move |_| {
+                anyhow::ensure!(reply.recv().await?, "model refused");
+                Ok(vec![])
+            })
+        }
+    }
+    struct Connection(Rc<Controls>);
+    impl AgentConnection for Connection {
+        fn agent_id(&self) -> project::AgentId {
+            project::AgentId::new(kimi_adapter::KIMI_AGENT_ID)
+        }
+        fn telemetry_id(&self) -> gpui::SharedString {
+            "test".into()
+        }
+        fn new_session(
+            self: Rc<Self>,
+            _: gpui::Entity<project::Project>,
+            _: util::path_list::PathList,
+            _: &mut App,
+        ) -> Task<Result<gpui::Entity<acp_thread::AcpThread>>> {
+            unimplemented!()
+        }
+        fn auth_methods(&self) -> &[acp::AuthMethod] {
+            &[]
+        }
+        fn authenticate(&self, _: acp::AuthMethodId, _: &mut App) -> Task<Result<()>> {
+            unimplemented!()
+        }
+        fn prompt(&self, _: acp::PromptRequest, _: &mut App) -> Task<Result<acp::PromptResponse>> {
+            unimplemented!()
+        }
+        fn cancel(&self, _: &acp::SessionId, _: &mut App) {
+            unimplemented!()
+        }
+        fn session_modes(&self, _: &acp::SessionId, _: &App) -> Option<Rc<dyn AgentSessionModes>> {
+            Some(self.0.clone())
+        }
+        fn session_config_options(
+            &self,
+            _: &acp::SessionId,
+            _: &App,
+        ) -> Option<Rc<dyn AgentSessionConfigOptions>> {
+            Some(self.0.clone())
+        }
+        fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+            self
+        }
+    }
+
+    fn fixture() -> (
+        Rc<Controls>,
+        async_channel::Sender<bool>,
+        async_channel::Sender<bool>,
+    ) {
+        let (mode_tx, mode_reply) = async_channel::bounded(1);
+        let (model_tx, model_reply) = async_channel::bounded(1);
+        (
+            Rc::new(Controls {
+                mode_reply,
+                model_reply,
+                calls: RefCell::new(vec![]),
+            }),
+            mode_tx,
+            model_tx,
+        )
+    }
+
+    #[gpui::test]
+    async fn attach_waits_for_permission_then_model_acknowledgement(cx: &mut gpui::TestAppContext) {
+        let (controls, mode_tx, model_tx) = fixture();
+        let (done_tx, done_rx) = async_channel::bounded(1);
+        let apply = cx.update(|cx| {
+            apply_acp_controls(
+                Rc::new(Connection(controls.clone())),
+                &acp::SessionId::new("session"),
+                SessionPermissionMode::FullAccess,
+                Some("chosen".into()),
+                cx,
+            )
+        });
+        cx.spawn(async move |_| {
+            done_tx.send(apply.await).await.unwrap();
+        })
+        .detach();
+        cx.executor().run_until_parked();
+        assert_eq!(&*controls.calls.borrow(), &["mode:auto"]);
+        assert!(done_rx.try_recv().is_err());
+        mode_tx.send(true).await.unwrap();
+        cx.executor().run_until_parked();
+        assert_eq!(&*controls.calls.borrow(), &["mode:auto", "model"]);
+        assert!(done_rx.try_recv().is_err());
+        model_tx.send(true).await.unwrap();
+        done_rx.recv().await.unwrap().unwrap();
+    }
+
+    #[gpui::test]
+    async fn rejected_permission_blocks_model_application(cx: &mut gpui::TestAppContext) {
+        let (controls, mode_tx, _model_tx) = fixture();
+        let apply = cx.update(|cx| {
+            apply_acp_controls(
+                Rc::new(Connection(controls.clone())),
+                &acp::SessionId::new("session"),
+                SessionPermissionMode::ReadOnly,
+                Some("chosen".into()),
+                cx,
+            )
+        });
+        mode_tx.send(false).await.unwrap();
+        assert!(
+            apply
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("mode refused")
+        );
+        assert_eq!(&*controls.calls.borrow(), &["mode:plan"]);
+    }
+
+    #[gpui::test]
+    async fn rejected_model_fails_the_attach(cx: &mut gpui::TestAppContext) {
+        let (controls, mode_tx, model_tx) = fixture();
+        let apply = cx.update(|cx| {
+            apply_acp_controls(
+                Rc::new(Connection(controls)),
+                &acp::SessionId::new("session"),
+                SessionPermissionMode::FullAccess,
+                Some("chosen".into()),
+                cx,
+            )
+        });
+        mode_tx.send(true).await.unwrap();
+        model_tx.send(false).await.unwrap();
+        assert!(
+            apply
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("model refused")
+        );
+    }
 }
