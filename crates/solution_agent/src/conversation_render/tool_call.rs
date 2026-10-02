@@ -400,21 +400,67 @@ pub(crate) fn tool_call_content_summary(
     truncate_tool_summary(&raw)
 }
 
+/// A top-level CommonMark fence. Shorter/different markers inside a block
+/// are content; backtick info strings cannot contain backticks.
+#[derive(Clone, Copy)]
+struct CodeFence {
+    marker: char,
+    width: usize,
+}
+
+impl CodeFence {
+    fn parse(line: &str) -> Option<(Self, &str)> {
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() > 3 {
+            return None;
+        }
+        let marker = trimmed.chars().next()?;
+        if !matches!(marker, '`' | '~') {
+            return None;
+        }
+        let width = trimmed.chars().take_while(|ch| *ch == marker).count();
+        (width >= 3).then(|| (Self { marker, width }, &trimmed[width..]))
+    }
+
+    fn opening(line: &str) -> Option<Self> {
+        let (fence, suffix) = Self::parse(line)?;
+        (fence.marker != '`' || !suffix.contains('`')).then_some(fence)
+    }
+
+    fn closes(self, line: &str) -> bool {
+        Self::parse(line).is_some_and(|(fence, suffix)| {
+            fence.marker == self.marker
+                && fence.width >= self.width
+                && suffix.trim_matches([' ', '\t']).is_empty()
+        })
+    }
+}
+
+fn is_single_fenced_block(text: &str) -> bool {
+    let is_blank = |line: &str| line.trim_matches([' ', '\t']).is_empty();
+    let mut lines = text.lines().skip_while(|line| is_blank(line));
+    let Some(fence) = lines.next().and_then(CodeFence::opening) else {
+        return false;
+    };
+    for line in lines.by_ref() {
+        if fence.closes(line) {
+            return lines.all(is_blank);
+        }
+    }
+    false
+}
+
 /// Wrap plain-text tool output in a collision-free fence so CommonMark
 /// preserves newlines instead of joining them as soft breaks. No-op for
-/// empty strings and for text that already opens with a code fence (the
-/// agent occasionally returns pre-fenced markdown for table-like tools).
+/// empty strings and one complete pre-fenced code block. A leading fence
+/// followed by prose is raw output too: leaving it alone leaks that prose
+/// into Markdown headings, links, and other formatting.
 fn fence_plain_text(text: &str) -> String {
     let trimmed = text.trim_end();
     if trimmed.is_empty() {
         return text.to_string();
     }
-    let already_fenced = trimmed
-        .lines()
-        .next()
-        .map(|line| line.trim_start().starts_with("```"))
-        .unwrap_or(false);
-    if already_fenced {
+    if is_single_fenced_block(text) {
         return text.to_string();
     }
     MarkdownCodeBlock {
@@ -440,35 +486,18 @@ pub(crate) fn truncate_tool_summary(text: &str) -> String {
     }
     // Nested/shorter fences are literal code, not toggles. Only a matching
     // marker at least as long as the opener, with no info string, closes it.
-    let mut open_fence: Option<(char, usize)> = None;
+    let mut open_fence: Option<CodeFence> = None;
     for line in &head {
-        let trimmed = line.trim_start_matches(' ');
-        if line.len() - trimmed.len() > 3 {
-            continue;
-        }
-        let Some(marker @ ('`' | '~')) = trimmed.chars().next() else {
-            continue;
-        };
-        let width = trimmed.chars().take_while(|ch| *ch == marker).count();
-        let suffix = &trimmed[width..];
         match open_fence {
-            Some((opening_marker, opening_width))
-                if marker == opening_marker
-                    && width >= opening_width
-                    && suffix.trim().is_empty() =>
-            {
-                open_fence = None;
-            }
-            None if width >= 3 && (marker != '`' || !suffix.contains('`')) => {
-                open_fence = Some((marker, width));
-            }
+            Some(fence) if fence.closes(line) => open_fence = None,
+            None => open_fence = CodeFence::opening(line),
             _ => {}
         }
     }
     let mut out = head.join("\n");
-    if let Some((marker, width)) = open_fence {
+    if let Some(fence) = open_fence {
         out.push('\n');
-        out.extend(std::iter::repeat_n(marker, width));
+        out.extend(std::iter::repeat_n(fence.marker, fence.width));
     }
     out.push_str(&format!("\n\n_… (+{remaining} more lines)_"));
     out
@@ -685,6 +714,32 @@ mod fence_tests {
                 &output,
                 false,
             );
+        }
+    }
+
+    #[test]
+    fn leading_fence_does_not_allow_trailing_prose_to_escape() {
+        for output in [
+            "```sh\necho hello\n```\n# Builds a temp file\n",
+            "\n  ~~~sh\necho hello\n  ~~~~~\n# Builds a temp file\n",
+            "```sh\necho hello\n```\n```\nsecond block\n```\n",
+            "```sh`invalid\n# Builds a temp file\n```\n",
+            "    ```sh\n# Builds a temp file\n    ```\n",
+            "```sh\n# An unclosed block\n",
+        ] {
+            assert_single_code_preview(&fence_plain_text(output), output, false);
+        }
+    }
+
+    #[test]
+    fn complete_prefenced_block_is_preserved() {
+        for source in [
+            "```sh\necho hello\n```",
+            "\n \t\n   ```sh\necho hello\n   ````` \t\n\n",
+            "~~~sh\necho hello\n~~~~~",
+            "````sh\n```\n# Still code\n`````",
+        ] {
+            assert_eq!(fence_plain_text(source), source);
         }
     }
 
