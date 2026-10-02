@@ -1125,6 +1125,9 @@ impl SolutionAgentStore {
         // an error a second later because the previous turn finally
         // resolved.
         let expected_acp_session_id = session_entity.read(cx).acp_session_id.clone();
+        // Resume intentionally preserves the provider ID, but installs a new
+        // thread. Only the original thread may settle this send's state.
+        let expected_thread_id = acp_thread.entity_id();
 
         // EVERYTHING past this point is CONSUMED. `AcpThread::send_inner` pushes
         // the `UserMessage` entry onto the thread BEFORE it calls
@@ -1151,7 +1154,7 @@ impl SolutionAgentStore {
                             // process-exit handler's Idle + "next message will
                             // restart it" back to Errored).
                             let still_same = s.read(cx).acp_session_id == expected_acp_session_id
-                                && s.read(cx).acp_thread().is_some();
+                                && s.read(cx).acp_thread().is_some_and(|thread| thread.entity_id() == expected_thread_id);
                             if !still_same {
                                 log::debug!(
                                     "send_message_blocks: dropping late error for {session_id} \
@@ -1194,7 +1197,9 @@ impl SolutionAgentStore {
                         let Some(s) = store.session(session_id) else {
                             return;
                         };
-                        if s.read(cx).acp_session_id != expected_acp_session_id {
+                        if s.read(cx).acp_session_id != expected_acp_session_id
+                            || !s.read(cx).acp_thread().is_some_and(|thread| thread.entity_id() == expected_thread_id)
+                        {
                             return;
                         }
                         // Recovery for a LOST `AcpThreadEvent::Stopped`: the turn

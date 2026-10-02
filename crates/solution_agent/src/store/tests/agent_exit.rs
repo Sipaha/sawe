@@ -50,7 +50,11 @@ fn emit_process_exit(thread: &Entity<acp_thread::AcpThread>, cx: &mut gpui::App)
 fn session_snapshot(
     cx: &mut TestAppContext,
     session_id: crate::model::SolutionSessionId,
-) -> (SessionState, bool, Option<(crate::session_entry::SystemEntryLevel, String)>) {
+) -> (
+    SessionState,
+    bool,
+    Option<(crate::session_entry::SystemEntryLevel, String)>,
+) {
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.update(cx, |store, cx| {
@@ -161,6 +165,17 @@ async fn process_exit_parks_idle_with_note_and_clears_pool(cx: &mut TestAppConte
 
 #[gpui::test]
 async fn next_send_after_process_exit_respawns_and_resumes(cx: &mut TestAppContext) {
+    check_process_exit_recovery(cx, false).await;
+}
+
+#[gpui::test]
+async fn old_send_error_cannot_clobber_resumed_thread_with_same_provider_id(
+    cx: &mut TestAppContext,
+) {
+    check_process_exit_recovery(cx, true).await;
+}
+
+async fn check_process_exit_recovery(cx: &mut TestAppContext, late_error_after_resume: bool) {
     let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
     let agent_id = SharedString::from("mock-agent");
 
@@ -215,7 +230,9 @@ async fn next_send_after_process_exit_respawns_and_resumes(cx: &mut TestAppConte
     // A turn is in flight when the process dies.
     let first_send = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store.update(cx, |store, cx| store.send_message(session_id, "one".into(), cx))
+        store.update(cx, |store, cx| {
+            store.send_message(session_id, "one".into(), cx)
+        })
     });
     cx.executor().run_until_parked();
     {
@@ -238,18 +255,23 @@ async fn next_send_after_process_exit_respawns_and_resumes(cx: &mut TestAppConte
         assert!(note.is_some(), "the transcript must explain the death");
     }
 
-    // The dead turn's pending prompt future now resolves with an error; that
-    // late error must NOT clobber the parked Idle state.
-    gate_tx.close();
-    cx.executor().run_until_parked();
-    {
-        let (state, cold, _) = session_snapshot(cx, session_id);
-        assert!(
-            matches!(state, SessionState::Idle),
-            "the dying turn's late error must not flip the session back to Errored, \
-             state: {state:?}"
-        );
-        assert!(cold, "no thread must have been grafted back by the late error");
+    if !late_error_after_resume {
+        // The dead turn's pending prompt future now resolves with an error; that
+        // late error must NOT clobber the parked Idle state.
+        gate_tx.close();
+        cx.executor().run_until_parked();
+        {
+            let (state, cold, _) = session_snapshot(cx, session_id);
+            assert!(
+                matches!(state, SessionState::Idle),
+                "the dying turn's late error must not flip the session back to Errored, \
+                 state: {state:?}"
+            );
+            assert!(
+                cold,
+                "no thread must have been grafted back by the late error"
+            );
+        }
     }
 
     // The next send transparently cold-wakes: fresh subprocess (second
@@ -258,7 +280,9 @@ async fn next_send_after_process_exit_respawns_and_resumes(cx: &mut TestAppConte
     server.set_prompt_gate(PromptGate(gate2_rx));
     let second_send = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store.update(cx, |store, cx| store.send_message(session_id, "two".into(), cx))
+        store.update(cx, |store, cx| {
+            store.send_message(session_id, "two".into(), cx)
+        })
     });
     cx.executor().run_until_parked();
     {
@@ -290,13 +314,39 @@ async fn next_send_after_process_exit_respawns_and_resumes(cx: &mut TestAppConte
         );
     }
 
+    if late_error_after_resume {
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(session_id).unwrap();
+            let session = session.read(cx);
+            assert_eq!(session.acp_session_id, original_acp_session_id);
+            assert_ne!(
+                session.acp_thread().unwrap().entity_id(),
+                first_thread.entity_id()
+            );
+        });
+        // Resolve the dead prompt only AFTER recovery has attached a different
+        // thread under the same provider ID and started another live turn.
+        gate_tx.close();
+        cx.executor().run_until_parked();
+        let (state, cold, _) = session_snapshot(cx, session_id);
+        assert!(
+            matches!(state, SessionState::Running { .. }),
+            "a late error from the dead thread must not overwrite the new turn: {state:?}"
+        );
+        assert!(!cold);
+    }
+
     gate2_tx.send(()).await.expect("release second prompt");
     second_send.await.expect("second send completes");
     cx.executor().run_until_parked();
 
     {
         let (state, cold, _) = session_snapshot(cx, session_id);
-        assert!(matches!(state, SessionState::Idle), "turn completed: {state:?}");
+        assert!(
+            matches!(state, SessionState::Idle),
+            "turn completed: {state:?}"
+        );
         assert!(!cold);
     }
     // The second user message is a transcript entry (the send went through
@@ -314,7 +364,10 @@ async fn next_send_after_process_exit_respawns_and_resumes(cx: &mut TestAppConte
             })
         })
     });
-    assert!(sent_two, "the post-recovery message must land in the transcript");
+    assert!(
+        sent_two,
+        "the post-recovery message must land in the transcript"
+    );
 
     // The abandoned first turn never left a phantom user bubble unanswered:
     // message "one" sits in the transcript too (pushed optimistically at send
@@ -402,4 +455,3 @@ async fn process_exit_on_already_cold_session_is_a_noop(cx: &mut TestAppContext)
         });
     });
 }
-
