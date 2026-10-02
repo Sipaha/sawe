@@ -79,6 +79,7 @@ zed_actions.workspace = true
 ashpd.workspace = true
 
 [dev-dependencies]
+pulldown-cmark.workspace = true
 acp_thread = { workspace = true, features = ["test-support"] }
 action_log.workspace = true
 agent_servers = { workspace = true, features = ["test-support"] }

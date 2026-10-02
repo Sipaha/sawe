@@ -3,6 +3,7 @@
 //! Relocated verbatim from `conversation_render.rs` (Tier-1 god-object split).
 
 use super::*;
+use util::markdown::MarkdownCodeBlock;
 
 /// The single most informative string value in a tool call's `raw_input`,
 /// VERBATIM — newlines and full length intact. Prefers a well-known argument
@@ -382,9 +383,8 @@ pub(crate) fn tool_call_content_summary(
         // not Terminal). claude-acp ships those as `ContentBlock::Text`
         // with single `\n`s between rows, which CommonMark renders as
         // soft breaks — i.e. all the rows get joined into one paragraph
-        // and the user loses the line structure. Wrap in a 4-backtick
-        // fence (same trick `terminal_output_markdown` and
-        // `raw_output_fallback_markdown` use) so the markdown widget
+        // and the user loses the line structure. Wrap in a fence longer
+        // than any backtick run in the output so the markdown widget
         // paints it monospaced + line-preserving.
         ToolCallContent::ContentBlock(block) => fence_plain_text(&content_block_text(block, cx)),
         ToolCallContent::Diff(diff) => diff_summary_markdown(diff, cx),
@@ -400,7 +400,7 @@ pub(crate) fn tool_call_content_summary(
     truncate_tool_summary(&raw)
 }
 
-/// Wrap plain-text tool output in a 4-backtick fence so CommonMark
+/// Wrap plain-text tool output in a collision-free fence so CommonMark
 /// preserves newlines instead of joining them as soft breaks. No-op for
 /// empty strings and for text that already opens with a code fence (the
 /// agent occasionally returns pre-fenced markdown for table-like tools).
@@ -417,7 +417,11 @@ fn fence_plain_text(text: &str) -> String {
     if already_fenced {
         return text.to_string();
     }
-    format!("````\n{trimmed}\n````")
+    MarkdownCodeBlock {
+        tag: "",
+        text: trimmed,
+    }
+    .to_string()
 }
 
 /// Trims tool-call output for the inline chat view — long Read / Bash /
@@ -434,28 +438,37 @@ pub(crate) fn truncate_tool_summary(text: &str) -> String {
     if remaining == 0 {
         return text.to_string();
     }
-    // Preserve the closing fence if the truncated output started one,
-    // otherwise the markdown widget would parse the rest of the message
-    // as a runaway code block.
-    let opens_fence = head
-        .iter()
-        .filter(|line| line.starts_with("```") || line.starts_with("````"))
-        .count()
-        % 2
-        == 1;
-    let mut out = head.join("\n");
-    if opens_fence {
-        // Match whichever fence width opened (prefer 4 to be safe).
-        let fence = if head
-            .iter()
-            .any(|line| line.trim_start().starts_with("````"))
-        {
-            "````"
-        } else {
-            "```"
+    // Nested/shorter fences are literal code, not toggles. Only a matching
+    // marker at least as long as the opener, with no info string, closes it.
+    let mut open_fence: Option<(char, usize)> = None;
+    for line in &head {
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() > 3 {
+            continue;
+        }
+        let Some(marker @ ('`' | '~')) = trimmed.chars().next() else {
+            continue;
         };
+        let width = trimmed.chars().take_while(|ch| *ch == marker).count();
+        let suffix = &trimmed[width..];
+        match open_fence {
+            Some((opening_marker, opening_width))
+                if marker == opening_marker
+                    && width >= opening_width
+                    && suffix.trim().is_empty() =>
+            {
+                open_fence = None;
+            }
+            None if width >= 3 && (marker != '`' || !suffix.contains('`')) => {
+                open_fence = Some((marker, width));
+            }
+            _ => {}
+        }
+    }
+    let mut out = head.join("\n");
+    if let Some((marker, width)) = open_fence {
         out.push('\n');
-        out.push_str(fence);
+        out.extend(std::iter::repeat_n(marker, width));
     }
     out.push_str(&format!("\n\n_… (+{remaining} more lines)_"));
     out
@@ -475,10 +488,13 @@ pub(crate) fn raw_output_fallback_markdown(raw: Option<&serde_json::Value>) -> O
             if trimmed.is_empty() {
                 return None;
             }
-            // 4-backtick fence so embedded triple-backticks in the
-            // captured stdout don't break the markdown widget. Same
-            // trick `terminal_output_markdown` uses.
-            Some(format!("````\n{trimmed}\n````"))
+            Some(
+                MarkdownCodeBlock {
+                    tag: "",
+                    text: trimmed,
+                }
+                .to_string(),
+            )
         }
         serde_json::Value::Bool(b) => Some(b.to_string()),
         serde_json::Value::Number(n) => Some(n.to_string()),
@@ -487,7 +503,13 @@ pub(crate) fn raw_output_fallback_markdown(raw: Option<&serde_json::Value>) -> O
             if pretty.trim().is_empty() || pretty.trim() == "{}" || pretty.trim() == "[]" {
                 return None;
             }
-            Some(format!("```json\n{pretty}\n```"))
+            Some(
+                MarkdownCodeBlock {
+                    tag: "json",
+                    text: &pretty,
+                }
+                .to_string(),
+            )
         }
     }
 }
@@ -510,7 +532,13 @@ pub(crate) fn diff_summary_markdown(diff: &Entity<acp_thread::Diff>, cx: &App) -
     }
     let added = body.lines().filter(|l| l.starts_with('+')).count();
     let removed = body.lines().filter(|l| l.starts_with('-')).count();
-    format!("**Edited** `{path}` · +{added} / −{removed}\n```diff\n{body}\n```")
+    format!(
+        "**Edited** `{path}` · +{added} / −{removed}\n{}",
+        MarkdownCodeBlock {
+            tag: "diff",
+            text: &body
+        }
+    )
 }
 
 /// Render `Terminal` tool-call content as fenced code in markdown so the
@@ -544,15 +572,11 @@ pub(crate) fn terminal_output_markdown(
     if trimmed.is_empty() {
         return "_(no output yet)_".to_string();
     }
-    // 4-backtick fence so an embedded ```…``` in the captured output (e.g.
-    // an agent that ran `cat README.md`) does not close our fence early.
-    let mut out = String::with_capacity(trimmed.len() + 16);
-    out.push_str("````\n");
-    out.push_str(trimmed);
-    if !trimmed.ends_with('\n') {
-        out.push('\n');
+    let mut out = MarkdownCodeBlock {
+        tag: "",
+        text: trimmed,
     }
-    out.push_str("````");
+    .to_string();
     if was_truncated {
         out.push_str("\n_(output truncated)_");
     }
@@ -608,4 +632,87 @@ pub(crate) fn render_plan(
 
 pub(crate) fn content_block_text(block: &ContentBlock, cx: &App) -> String {
     block.to_markdown(cx).to_string()
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    fn assert_single_code_preview(markdown: &str, expected_code: &str, truncated: bool) {
+        let mut code = String::new();
+        let mut outside = String::new();
+        let mut in_code = false;
+        let mut blocks = 0;
+        for event in Parser::new(markdown) {
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => {
+                    blocks += 1;
+                    in_code = true;
+                }
+                Event::End(TagEnd::CodeBlock) => in_code = false,
+                Event::Start(Tag::Heading { .. }) => panic!("output became a heading"),
+                Event::Text(text) if in_code => code.push_str(&text),
+                Event::Text(text) => outside.push_str(&text),
+                _ => {}
+            }
+        }
+        assert_eq!(blocks, 1, "{markdown}");
+        assert_eq!(code, expected_code, "{markdown}");
+        if truncated {
+            assert!(
+                outside.starts_with("… (+"),
+                "hint must be outside code: {markdown}"
+            );
+        } else {
+            assert!(outside.is_empty(), "output escaped code: {markdown}");
+        }
+    }
+
+    #[test]
+    fn nested_fences_in_shell_output_preserve_makefile_comments() {
+        // A shell command can print another session's already-fenced transcript
+        // followed by Makefile comments. Four fixed backticks were insufficient.
+        for width in [3, 4, 5, 12] {
+            let inner = "`".repeat(width);
+            let output = format!(
+                "session entries:\n{inner}\ninner output\n{inner}\n# Builds a temp file\n## Keeps the old inode\n"
+            );
+            assert_single_code_preview(&fence_plain_text(&output), &output, false);
+            let raw = serde_json::Value::String(output.clone());
+            assert_single_code_preview(
+                &raw_output_fallback_markdown(Some(&raw)).unwrap(),
+                &output,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_closes_outer_fence_and_keeps_hint_outside_code() {
+        for width in [3, 4, 5, 12] {
+            let inner = "`".repeat(width);
+            let output = format!(
+                "session entries:\n{inner}\n# Literal heading\n{}",
+                "line\n".repeat(30)
+            );
+            let fenced = fence_plain_text(&output);
+            let expected = output.lines().take(14).collect::<Vec<_>>().join("\n") + "\n";
+            assert_single_code_preview(&truncate_tool_summary(&fenced), &expected, true);
+        }
+    }
+
+    #[test]
+    fn truncation_ignores_short_fences_and_closing_fences_with_info_strings() {
+        for marker in ['`', '~'] {
+            let fence = marker.to_string().repeat(6);
+            let text = format!(
+                "{fence}text\n{}\n{fence}still code\n{}",
+                marker.to_string().repeat(3),
+                "# Literal heading\n".repeat(30)
+            );
+            let expected = text.lines().skip(1).take(14).collect::<Vec<_>>().join("\n") + "\n";
+            assert_single_code_preview(&truncate_tool_summary(&text), &expected, true);
+        }
+    }
 }
