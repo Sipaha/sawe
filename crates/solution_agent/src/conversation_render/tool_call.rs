@@ -14,6 +14,9 @@ use super::*;
 /// squeezes the same value onto one line for the header row — the two must
 /// agree on WHICH value they are talking about, hence one picker.
 pub(crate) fn tool_call_arg_value(raw_input: &serde_json::Value) -> Option<&str> {
+    if let Some(value) = raw_input.as_str() {
+        return (!value.is_empty()).then_some(value);
+    }
     const PREFERRED_KEYS: &[&str] = &[
         "command",
         "file_path",
@@ -35,6 +38,26 @@ pub(crate) fn tool_call_arg_value(raw_input: &serde_json::Value) -> Option<&str>
             obj.values()
                 .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
         })
+}
+
+/// ACP permits approval details in content without rawInput. Keep both:
+/// an approval may also carry a diff or context absent from the shell command.
+pub(crate) fn approval_details(
+    raw_input: Option<&serde_json::Value>,
+    content_md: &[String],
+) -> Option<String> {
+    let mut sections = Vec::new();
+    if let Some(input) = raw_input.filter(|input| !input.is_null()) {
+        let input = match input.as_str() {
+            Some(text) => text.to_owned(),
+            None => serde_json::to_string_pretty(input).ok()?,
+        };
+        if !input.is_empty() {
+            sections.push(input);
+        }
+    }
+    sections.extend(content_md.iter().filter(|text| !text.is_empty()).cloned());
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
 /// One-line preview of [`tool_call_arg_value`] for the tool header's sub-row.
@@ -119,14 +142,20 @@ pub(crate) fn render_tool_call(
     // multi-megabyte string. The cap is far above anything a person reads in a
     // modal and far below a per-frame memcpy that matters.
     const MAX_MODAL_LEN: usize = 64 * 1024;
-    let arg_full = raw_input.and_then(tool_call_arg_value).map(|full| {
-        match full.char_indices().nth(MAX_MODAL_LEN) {
-            Some((cut, _)) => SharedString::from(format!(
-                "{}\n\n[…truncated by the editor at {MAX_MODAL_LEN} characters]",
-                &full[..cut]
-            )),
-            None => SharedString::new(full),
-        }
+    let approval_full = matches!(status, ToolStatus::WaitingForConfirmation)
+        .then(|| approval_details(raw_input, content_md))
+        .flatten()
+        .map(SharedString::from);
+    let arg_full = approval_full.clone().or_else(|| {
+        raw_input.and_then(tool_call_arg_value).map(|full| {
+            match full.char_indices().nth(MAX_MODAL_LEN) {
+                Some((cut, _)) => SharedString::from(format!(
+                    "{}\n\n[…truncated by the editor at {MAX_MODAL_LEN} characters]",
+                    &full[..cut]
+                )),
+                None => SharedString::new(full),
+            }
+        })
     });
     let arg_modal_title =
         SharedString::from(crate::session_entry::single_line_tool_label(label_text));
@@ -215,6 +244,24 @@ pub(crate) fn render_tool_call(
                         .truncate(),
                 ),
             )
+        })
+        .when_some(approval_full, |this, full| {
+            this.child(
+                h_flex().child(
+                    Button::new(("approval-details", entry_idx), "View full request")
+                        .style(ButtonStyle::Outlined)
+                        .on_click(move |_, window, cx| {
+                            crate::preview_window::open_preview(
+                                crate::preview_window::PreviewContent::Text {
+                                    title: "Approval details".into(),
+                                    body: full.clone(),
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                ),
+            )
         });
 
     let mut span_idx = 1;
@@ -272,9 +319,9 @@ pub(crate) fn render_tool_call(
             let mut row = h_flex().gap_2().mt_2().flex_wrap();
             for (button_idx, button) in buttons.into_iter().enumerate() {
                 let style = if button.is_allow() {
-                    ButtonStyle::Filled
+                    ButtonStyle::Tinted(ui::TintColor::Accent)
                 } else {
-                    ButtonStyle::Subtle
+                    ButtonStyle::Outlined
                 };
                 let label_color = Color::Default;
                 let thread = thread.clone();

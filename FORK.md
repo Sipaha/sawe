@@ -6299,18 +6299,22 @@ maintainer's subscription policy (decision 8) says the CLI's own login state
 belongs.
 
 How to apply:
-- Permissions. Kimi publishes four ACP session modes (`default` / `plan` /
-  `auto` / `yolo`); the fork's binary control maps `ReadOnly → plan` and
-  `FullAccess → yolo` — the honest ends of the range, never the middle two. A
-  mode switch is a live `session/set_mode` on the existing session: no process
-  restart, no dropped thread, unlike the native runtimes whose policy only
-  changes on a fresh per-session process. The switch is attempted BEFORE the
-  permission-mode DB write, and a refused mode is an error — the stored value
-  must never claim a change the CLI did not take.
-- `sawePermissionMode` is native-runtime-only and must not be sent to Kimi: a
-  mode is per-session, so it cannot ride session meta at all. The mode (and the
-  persisted `desired_model`) is pushed after attach on all three paths —
-  fresh create, resume, and the live permission change.
+- Permissions. `ReadOnly → plan`, `FullAccess → auto`. In installed Kimi Code
+  2.1.1, ACP's description of `yolo` as "auto-approve everything" is stale:
+  `yolo` still asks for risky commands; `auto` is the CLI's "Never Ask" mode.
+  This also lets the CLI decide questions automatically. Neither mode is a
+  filesystem sandbox; Solution boundaries are instructions to the model.
+- Permission and desired-model RPCs are awaited before create, resume, clear
+  or compact exposes a thread to prompts. Refusal fails the attach visibly.
+  Changing the policy in an idle chat stores the desired policy and detaches
+  the thread; the next send resumes the same provider context and applies the
+  policy before starting work. No detached RPC can silently change live policy.
+- `sawePermissionMode` is native-runtime-only. Kimi ignores `_meta.systemPrompt`
+  as well: the ACP connection carries editor instructions in the outgoing
+  prompt, without adding them to the local user-message transcript. Refresh
+  them on every normal turn so provider-side compaction cannot erase scope
+  or the stable Sawe session identity. For skill slash commands, include the
+  context in the first block's arguments: Kimi discards later blocks there.
 - Models. The pinned ACP schema dropped `session/new`'s `models` field; Kimi
   publishes the same list as a `select` config option under the id `model`.
   `native_controls::config_option_models` reads it for any non-native

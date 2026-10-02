@@ -40,6 +40,46 @@ fn tool_call_arg_preview_prefers_command_for_bash() {
 }
 
 #[test]
+fn approval_details_preserves_content_only_commands_without_truncation() {
+    let command = format!(
+        "Requesting approval to Running: cat <<'EOF'\n{}\nEOF",
+        "x".repeat(70_000)
+    );
+    assert_eq!(
+        approval_details(None, std::slice::from_ref(&command)),
+        Some(command.clone())
+    );
+    assert_eq!(
+        approval_details(Some(&serde_json::Value::Null), std::slice::from_ref(&command)),
+        Some(command)
+    );
+    assert!(approval_details(None, &[]).is_none());
+}
+
+#[test]
+fn approval_details_includes_all_arguments_and_explanation() {
+    let input =
+        serde_json::json!({"command": "chmod +x .agents/check.sh", "cwd": "/solution/member"});
+    let details = approval_details(Some(&input), &["Permission requested by Bash".into()]).unwrap();
+    assert!(details.contains("chmod +x .agents/check.sh"));
+    assert!(details.contains("/solution/member"));
+    assert!(details.ends_with("Permission requested by Bash"));
+}
+
+#[test]
+fn string_raw_input_is_inspectable() {
+    let input = serde_json::json!("echo first\necho second");
+    assert_eq!(
+        tool_call_arg_preview(&input).as_deref(),
+        Some("echo first↵echo second")
+    );
+    assert_eq!(
+        approval_details(Some(&input), &[]).as_deref(),
+        Some("echo first\necho second")
+    );
+}
+
+#[test]
 fn tool_call_arg_preview_prefers_file_path_for_read() {
     let input = serde_json::json!({ "file_path": "/etc/hosts", "offset": 0 });
     assert_eq!(

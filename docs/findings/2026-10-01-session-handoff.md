@@ -1,5 +1,10 @@
 # Session handoff — Kimi Code support shipped
 
+> Correction (2026-10-02): ACP mode descriptions were stale, and Kimi ignores
+> `_meta.systemPrompt`. Current contracts and fixes are in
+> [the Kimi review](2026-10-02-kimi-review.md) and FORK.md #224.
+
+
 **Status:** DONE. Kimi Code runs as a Solution-chat provider on `main`
 (committed + pushed). The pause snapshot this file started as (2026-10-01
 morning, work half-landed) is fully resolved; what remains is optional

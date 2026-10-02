@@ -2811,7 +2811,7 @@ impl SolutionAgentStore {
         // Only a native runtime has to restart to change policy, so only one
         // has to prove its close is synchronous — a generic async close could
         // otherwise race the next resume of the same provider ID. An agent on
-        // ACP session modes (Kimi) switches live and keeps its process.
+        // ACP session modes (Kimi) retains its provider session across detach.
         if is_native
             && let Some(thread) = s.acp_thread()
         {

@@ -2886,6 +2886,7 @@ mod tests {
     async fn kimi_context_reaches_wire_on_create_and_resume_without_changing_first_block(
         cx: &mut gpui::TestAppContext,
     ) {
+        init_feature_flags_test(cx);
         let fs = fs::FakeFs::new(cx.executor());
         fs.insert_tree("/", serde_json::json!({ "project": {} })).await;
         let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
@@ -2912,8 +2913,9 @@ mod tests {
         }
         assert_eq!(original.len(), 1, "the caller's local transcript input is untouched");
         connection.prepare_session_for_resume(&sid);
-        drop(thread);
+        cx.update(|_| drop(thread));
         cx.run_until_parked();
+        assert!(!connection.sessions.borrow().contains_key(&sid));
         assert_eq!(harness.close_session_count.load(Ordering::SeqCst), 0,
             "policy detach must not race an automatic close against resume");
         let resumed = cx.update(|cx| connection.clone().resume_session_with_meta(
@@ -2931,7 +2933,7 @@ mod tests {
                 assert!(!context.text.contains("Session first."));
             }
         }
-        drop(resumed);
+        cx.update(|_| drop(resumed));
         cx.run_until_parked();
         assert_eq!(harness.close_session_count.load(Ordering::SeqCst), 1,
             "a normal release after resume must still close the provider session");
@@ -2939,6 +2941,7 @@ mod tests {
 
     #[gpui::test]
     async fn kimi_skill_first_turn_receives_context_in_slash_arguments(cx: &mut gpui::TestAppContext) {
+        init_feature_flags_test(cx);
         let fs = fs::FakeFs::new(cx.executor());
         fs.insert_tree("/", serde_json::json!({ "project": {} })).await;
         let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
@@ -2972,6 +2975,7 @@ mod tests {
 
     #[gpui::test]
     async fn unrelated_acp_agent_does_not_inject_prompt_context(cx: &mut gpui::TestAppContext) {
+        init_feature_flags_test(cx);
         let fs = fs::FakeFs::new(cx.executor());
         fs.insert_tree("/", serde_json::json!({ "project": {} })).await;
         let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
@@ -3350,7 +3354,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn connection_routes_terminal_auth_without_acp_beta(cx: &mut gpui::TestAppContext) {
+    async fn connection_routes_terminal_auth_with_fork_acp_beta_policy(cx: &mut gpui::TestAppContext) {
         init_feature_flags_test(cx);
 
         let fs = fs::FakeFs::new(cx.executor());
@@ -3387,10 +3391,11 @@ mod tests {
                     },
                     cx,
                 );
-                assert!(!cx.has_flag::<AcpBetaFeatureFlag>());
+                // Sawe forces ACP beta on even when settings request off.
+                assert!(cx.has_flag::<AcpBetaFeatureFlag>());
                 harness.connection.terminal_auth_task(&method_id, cx)
             })
-            .expect("first-class terminal auth should be routed without ACP beta");
+            .expect("first-class terminal auth should be routed with the fork ACP policy");
         terminal_task
             .await
             .expect_err("first-class routing should resolve the test agent's external command");

@@ -6,8 +6,8 @@
 //! is the two places where Kimi's own vocabulary is wider than the fork's:
 //!
 //! - **Permissions.** Kimi publishes four ACP session modes; the fork's UI
-//!   offers two ([`crate::model::SessionPermissionMode`]). The ends of the
-//!   range are the honest mapping — see [`mode_for`].
+//!   offers two ([`crate::model::SessionPermissionMode`]); see [`mode_for`]
+//!   for the mapping verified against the installed engine.
 //! - **Models.** The pinned ACP schema no longer parses `session/new`'s
 //!   `models` field, but Kimi also publishes the same list as a `select`
 //!   config option, which the schema does parse. [`MODEL_CONFIG_OPTION_ID`]
@@ -32,7 +32,7 @@ pub const KIMI_AGENT_ID: &str = agent_servers::KIMI_CODE_ID;
 /// `active_model` cannot drift apart.
 pub const MODEL_CONFIG_OPTION_ID: &str = agent_servers::MODEL_CONFIG_OPTION_ID;
 
-/// Kimi's "analyze only" mode: it cannot modify files or execute commands.
+/// Kimi's planning mode.
 const MODE_READ_ONLY: &str = "plan";
 
 /// The installed CLI's engine calls `auto` "Never Ask". Its ACP descriptions
@@ -112,7 +112,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_permission_modes_map_onto_the_ends_of_kimis_range() {
+    fn permission_modes_match_the_installed_engine_policy() {
         assert_eq!(
             mode_for(SessionPermissionMode::ReadOnly).0.as_ref(),
             "plan",
