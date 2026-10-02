@@ -139,6 +139,8 @@ Short, dated, single-fact notes from sessions: "ran a benchmark and got X",
 
 | Date | Status | Topic |
 |---|---|---|
+| 2026-10-02 | fixed | [Nested tool-output fences](findings/2026-10-02-tool-output-fences.md) |
+| 2026-10-02 | installed | [Codex browser setup](findings/2026-10-02-codex-browser-setup.md) |
 | 2026-10-02 | fixed | [Kimi review: approvals and session lifecycle](findings/2026-10-02-kimi-review.md) |
 | 2026-10-01 | shipped | [Kimi integration handoff](findings/2026-10-01-session-handoff.md). Permission and instruction-delivery claims corrected by the October 2 review above. |
 | 2026-09-29 | shipped | [`findings/2026-09-29-auto-compaction-replaces-observer-compact.md`](findings/2026-09-29-auto-compaction-replaces-observer-compact.md) — **the observer no longer compacts; the editor does.** Per-session auto-compaction (bolt next to the eraser; right-click for the threshold; on by default) starts the handoff ladder when the context crosses the threshold while the agent works. The `compact` verdict and the observer's reviews of running work are gone. The phone gets the same toggle and can answer approvals in place (`pending_approvals`). Gotcha fixed on the way: a claude process's first turn did not know its window, so the window is now seeded from the `init` model (`…[1m]`). |

@@ -18187,6 +18187,7 @@ dependencies = [
  "parking_lot",
  "paths",
  "project",
+ "pulldown-cmark 0.13.4",
  "rand 0.9.4",
  "regex",
  "schemars 1.0.4",
