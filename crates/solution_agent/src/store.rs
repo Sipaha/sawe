@@ -6423,15 +6423,10 @@ mod permission_tests {
     async fn kimi_permission_change_detaches_before_the_next_prompt(
         cx: &mut gpui::TestAppContext,
     ) {
-        use acp_thread::AgentConnection as _;
-        let (store, id, _tmp) = test_support::seed_store_with_session(cx).await;
-        let connection = Rc::new(crate::test_support::MockConnection::configured(None, None, true));
-        let thread_task = cx.update(|cx| {
-            let solution = solutions::SolutionStore::global(cx).read(cx).solutions()[0].clone();
-            let project = SolutionAgentStore::make_headless_project_for_solution(&solution, cx).unwrap();
-            connection.clone().new_session(project, util::path_list::PathList::default(), cx)
-        });
-        let thread = thread_task.await.unwrap();
+        let (id, thread, _tmp) = tests::create_session_with_thread(cx).await;
+        let store = cx.update(|cx| SolutionAgentStore::global(cx));
+        let connection = cx.update(|cx| thread.read(cx).connection().clone()
+            .downcast::<crate::test_support::MockConnection>().unwrap());
         let provider_id = cx.update(|cx| thread.read(cx).session_id().clone());
         store.update(cx, |store, cx| {
             let session = store.session(id).unwrap();
