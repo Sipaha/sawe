@@ -1996,11 +1996,21 @@ impl AgentConnection for AcpConnection {
         if let Some(context) = self.sessions.borrow().get(&params.session_id)
             .and_then(|session| session.prompt_context.as_deref())
         {
-            // Kimi inspects ONLY the first block for built-in/skill slash
-            // commands. Keep it intact. Ordinary turns consume every block.
-            params.prompt.push(acp::ContentBlock::Text(acp::TextContent::new(
-                format!("<sawe_editor_context>\n{context}\n</sawe_editor_context>"),
-            )));
+            let context = format!("<sawe_editor_context>\n{context}\n</sawe_editor_context>");
+            // Skill activation consumes only the first text block's arguments,
+            // discarding all remaining blocks. Add context to those arguments
+            // while preserving the slash command token. Kimi's parser splits
+            // on ASCII SPACE (a newline alone changes the command's name).
+            // Built-ins keep their command token too; compact accepts custom
+            // instructions and the informational commands ignore arguments.
+            if let Some(acp::ContentBlock::Text(first)) = params.prompt.first_mut()
+                && first.text.starts_with('/')
+            {
+                first.text.push_str(" \n");
+                first.text.push_str(&context);
+            } else {
+                params.prompt.push(acp::ContentBlock::Text(acp::TextContent::new(context)));
+            }
         }
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
@@ -2891,7 +2901,7 @@ mod tests {
             project.clone(), dirs.clone(), Some(context_meta("Stay inside /solution. Session first.")), cx,
         )).await.unwrap();
         let sid = thread.read_with(cx, |thread, _| thread.session_id().clone());
-        let original = vec![acp::ContentBlock::Text(acp::TextContent::new("/status"))];
+        let original = vec![acp::ContentBlock::Text(acp::TextContent::new("Explain this project"))];
         cx.update(|cx| connection.prompt(acp::PromptRequest::new(sid.clone(), original.clone()), cx)).await.unwrap();
         {
             let wire = harness.prompts.lock().unwrap();
@@ -2928,6 +2938,39 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn kimi_skill_first_turn_receives_context_in_slash_arguments(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "project": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        Rc::get_mut(&mut harness.connection).unwrap().id = AgentId::new(crate::kimi::KIMI_CODE_ID);
+        let connection = harness.connection.clone();
+        let thread = cx.update(|cx| connection.clone().new_session_with_meta(
+            project, PathList::new(&[std::path::PathBuf::from("/project")]),
+            Some(context_meta("Stay inside /solution.")), cx,
+        )).await.unwrap();
+        let sid = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        for original in ["/skill", "/skill existing arguments", "/status"] {
+            let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(original))];
+            cx.update(|cx| connection.prompt(acp::PromptRequest::new(sid.clone(), blocks.clone()), cx)).await.unwrap();
+            let wire = harness.prompts.lock().unwrap();
+            let sent = &wire.last().unwrap().prompt;
+            assert_eq!(sent.len(), 1, "skill activation discards all later blocks");
+            let acp::ContentBlock::Text(first) = &sent[0] else { panic!("expected text") };
+            // Match the installed CLI's literal-space command/args split.
+            let (command, args) = first.text[1..].trim().split_once(' ').unwrap();
+            assert_eq!(command, original[1..].split(' ').next().unwrap());
+            assert!(first.text.starts_with(original));
+            assert!(args.contains("Stay inside /solution."));
+            if original.contains("existing arguments") {
+                assert!(args.starts_with("existing arguments"));
+            }
+            let acp::ContentBlock::Text(local) = &blocks[0] else { unreachable!() };
+            assert_eq!(local.text, original, "local transcript remains unchanged");
+        }
+    }
+
+    #[gpui::test]
     async fn unrelated_acp_agent_does_not_inject_prompt_context(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
         fs.insert_tree("/", serde_json::json!({ "project": {} })).await;
@@ -2939,10 +2982,12 @@ mod tests {
             Some(context_meta("do not inject")), cx,
         )).await.unwrap();
         let sid = thread.read_with(cx, |thread, _| thread.session_id().clone());
-        let original = vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))];
-        cx.update(|cx| connection.prompt(acp::PromptRequest::new(sid, original.clone()), cx)).await.unwrap();
-        let wire = harness.prompts.lock().unwrap();
-        assert_eq!(serde_json::to_value(&wire[0].prompt).unwrap(), serde_json::to_value(&original).unwrap());
+        for original in ["hello", "/skill", "/skill existing arguments", "/status"] {
+            let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(original))];
+            cx.update(|cx| connection.prompt(acp::PromptRequest::new(sid.clone(), blocks.clone()), cx)).await.unwrap();
+            let wire = harness.prompts.lock().unwrap();
+            assert_eq!(serde_json::to_value(&wire.last().unwrap().prompt).unwrap(), serde_json::to_value(&blocks).unwrap());
+        }
     }
 
     fn init_feature_flags_test(cx: &mut gpui::TestAppContext) {
