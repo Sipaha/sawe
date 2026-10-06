@@ -245,8 +245,10 @@ For each section:
 - NO `unwrap()` / `expect()` in production code. In `#[cfg(test)]` / `tests/` — fine.
 - NO `let _ = fallible_call()?` — handle errors (`?` to propagate, `.log_err()`
   to swallow visibly, `match` for custom logic).
-- NO release builds. Always `cargo build --bin sawe` (debug), `cargo test`
-  (debug). `cargo build --release` / `script/bundle-*` is for the maintainer.
+- Agent-only verification uses `cargo build --bin sawe` and `cargo test`
+  (debug). Before handing off source changes for use in the user's editor,
+  build `cargo build --release --bin sawe`; `./run.sh` launches
+  `target/release/sawe`. `script/bundle-*` remains for the maintainer.
 - NO changes to locked rebrand identifiers (CLAUDE.md § "Locked rebrand
   identifiers") without explicit user approval.
 - NO re-enabling disabled subsystems (auto_update, telemetry, collab, Zeta,
@@ -542,10 +544,11 @@ modifications" decision 2. Once a file is listed in FORK.md "Notable
 upstream file modifications", this rule relaxes (we already paid the
 cherry-pick cost on that file). See ADR-0001.
 
-❌ **Release builds for verification.** `cargo build --release` is 3–9 min, the
-maintainer does release builds at finalize / bundle time. Agent verification is
-debug-only. If a check genuinely requires release behaviour (optimizer-only
-bug), pause and ask the user.
+❌ **Release builds just for agent-only verification.** Use debug builds for
+tests and isolated MCP/UI probes. After verification, user hand-off requires
+`cargo build --release --bin sawe`, matching `./run.sh` and
+`target/release/sawe`. `release-fast` does not update the launcher binary.
+An explicitly requested check of release-specific behaviour also uses release.
 
 ❌ **Piping a long cargo command to `tail` / `grep` and trusting the exit
 code.** `cargo build … | tail` reports `tail`'s exit (always 0) — a failed

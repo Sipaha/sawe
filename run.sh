@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the release-fast `sawe` editor so it logs to its own file.
+# Launch the release `sawe` editor so it logs to its own file.
 #
 # sawe logs to stdout ONLY when stdout is a TTY (main.rs: `stdout_is_a_pty()`).
 # Launched bare from a terminal, every log line goes to the console and nothing
@@ -14,12 +14,12 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$DIR/target/release-fast/sawe"
+BIN="$DIR/target/release/sawe"
 EDITOR_LOG="$HOME/.spk/sawe/logs/sawe.log"
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: binary not found at $BIN" >&2
-    echo "build it first: cargo build --bin sawe --profile release-fast" >&2
+    echo "build it first: cargo build --release --bin sawe" >&2
     exit 1
 fi
 
