@@ -45,7 +45,7 @@ impl EditorClaudeSettings {
     }
 
     pub fn temp_dir(&self) -> PathBuf {
-        solution_temp_dir(&self.agents_dir)
+        solution_temp_dir(self.agents_dir.parent().unwrap_or(&self.agents_dir))
     }
 
     pub fn to_json(&self) -> Value {
@@ -111,10 +111,10 @@ impl EditorClaudeSettings {
     }
 }
 
-/// `<solution_root>/.agents/tmp` — where agents keep scratch files, so cleaning
+/// `<solution_root>/.tmp` — where agents keep scratch files, so cleaning
 /// them up stays inside the Solution and needs no approval.
-pub fn solution_temp_dir(agents_dir: &Path) -> PathBuf {
-    agents_dir.join("tmp")
+pub fn solution_temp_dir(solution_root: &Path) -> PathBuf {
+    solution_root.join(".tmp")
 }
 
 /// The temp-dir rule, worded once for both the session's system prompt and the
@@ -282,10 +282,10 @@ mod tests {
             command.starts_with("'/opt/my apps/sawe' --subagent-start-hook --temp-dir "),
             "got: {command}"
         );
-        assert!(command.ends_with(".agents/tmp'"), "got: {command}");
+        assert!(command.ends_with("/sol/.tmp'"), "got: {command}");
 
         let output: serde_json::Value = serde_json::from_str(&subagent_start_hook_output(
-            Path::new("/sol/.agents/tmp"),
+            Path::new("/sol/.tmp"),
         ))
         .expect("hook output is JSON");
         assert_eq!(output["hookSpecificOutput"]["hookEventName"], "SubagentStart");
@@ -293,7 +293,7 @@ mod tests {
             .as_str()
             .expect("additionalContext");
         assert!(context.contains("never use /tmp"), "got: {context}");
-        assert!(context.contains("under /sol/.agents/tmp/"), "got: {context}");
+        assert!(context.contains("under /sol/.tmp/"), "got: {context}");
     }
 
     #[test]

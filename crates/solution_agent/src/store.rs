@@ -183,18 +183,17 @@ const RESTART_CONTINUATION_PROMPT: &str = "The editor restarted your process at 
      state. Check any interrupted operation before repeating it; its effects may already have landed. \
      Keep the user's language, constraints, and outstanding approval requirements.";
 
-/// Continuation sent after [`SolutionAgentStore::reconnect_agent`] when the
-/// wedge happened on an UNANSWERED user message — the transcript tail is a human
-/// message with no assistant reply after it (the agent hung *before* it started
-/// answering). The generic "carry on where you left off" prompt is actively
-/// WRONG here: there was no work in progress to resume, and telling a fresh
-/// subprocess to "continue" makes it treat the replayed user message as
-/// already-handled history and skip it — the reported "my message never reached
-/// you" bug. So point it explicitly at the user's message instead.
-const RECONNECT_UNANSWERED_USER_PROMPT: &str = "The editor restarted your process before you answered \
-     the latest human message above. The conversation has been restored. Read and address that \
-     message now; do not treat it as already handled. Check any interrupted operation before \
-     repeating it, and keep the user's language, constraints, and approval requirements.";
+/// Recovery of human input captured in the editor's transcript tail. A steer
+/// receipt proves acceptance, but the provider may not persist its buffered
+/// input before a hard restart. Supply the input itself, not "the message above"
+/// in provider history (which may end at an older, already-answered question).
+const RECONNECT_UNANSWERED_USER_PROMPT: &str = "The editor restarted your process while these latest \
+     human messages were pending a response. They are reproduced below because accepted follow-ups \
+     may be missing from your restored runtime history. Reconcile them with completed work and \
+     address the outstanding requests in order; do not return to an older question instead. \
+     Acceptance does not prove that you answered them. Check any interrupted operation before \
+     repeating it, and keep the user's language, constraints, and approval requirements.\n\n\
+     Latest human messages captured by the editor:\n\n";
 
 /// Continuation sent when a scheduled usage-limit resume comes due (see the
 /// one-shot resume branch in `tick_supervisor`). The wall cut the agent off
@@ -226,34 +225,44 @@ fn classify_done_reasoning(reasoning: &str) -> (bool, &str) {
     }
 }
 
-/// True when the transcript tail is an UNANSWERED human message: scanning from
-/// the end past editor-injected `System` notes, the first real entry is a
-/// `UserMessage` that is NOT a supervisor observer-nudge. This is the "agent
-/// hung before it answered the user" shape — distinct from a mid-work wedge
-/// (tail is an assistant/tool entry), which the generic continuation handles.
-/// An observer nudge tail is excluded: it's the supervisor's own voice, not the
-/// human's, and the generic "carry on" is right for it.
-fn tail_is_unanswered_user_message(
+/// Capture consecutive human messages at the Main transcript tail, including
+/// attachments and legacy markdown-only entries. Stop at an assistant/tool or
+/// non-human message; ignore System notes and teammate entries. Preserve order.
+fn reconnect_unanswered_user_blocks(
     entries: &[std::sync::Arc<crate::session_entry::SessionEntry>],
-) -> bool {
+) -> Vec<acp::ContentBlock> {
     use crate::session_entry::SessionEntryKind;
-    entries
+    let tail = entries
         .iter()
         .rev()
-        .find(|e| !matches!(e.kind, SessionEntryKind::System { .. }))
-        .is_some_and(|e| {
-            matches!(
-                &e.kind,
-                SessionEntryKind::UserMessage { chunks, .. }
-                    // Exclude editor-injected non-human messages: an observer nudge
-                    // AND a prior reconnect-recovery prompt (else a SECOND
-                    // consecutive hang points the recovery at the editor's own
-                    // "your process hung" message).
-                    if !acp_thread::is_observer_nudge_blocks(chunks)
-                        && !acp_thread::is_editor_recovery_blocks(chunks)
-                        && !is_peer_only_blocks(chunks)
-            )
+        .filter(|e| e.subagent_id.is_none() && !matches!(e.kind, SessionEntryKind::System { .. }))
+        .take_while(|e| {
+            matches!(&e.kind, SessionEntryKind::UserMessage { chunks, .. }
+                if !acp_thread::is_observer_nudge_blocks(chunks)
+                    && !acp_thread::is_editor_recovery_blocks(chunks)
+                    && !is_peer_only_blocks(chunks))
         })
+        .collect::<Vec<_>>();
+    let mut blocks = Vec::new();
+    for entry in tail.into_iter().rev() {
+        let SessionEntryKind::UserMessage {
+            chunks, content_md, ..
+        } = &entry.kind
+        else {
+            unreachable!();
+        };
+        if !blocks.is_empty() {
+            blocks.push(acp::ContentBlock::Text(acp::TextContent::new("\n\n")));
+        }
+        if chunks.is_empty() {
+            blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
+                content_md.clone(),
+            )));
+        } else {
+            blocks.extend(chunks.clone());
+        }
+    }
+    blocks
 }
 
 /// Human-readable reason a reconnect resume attempt did not succeed, folding the
@@ -3383,12 +3392,10 @@ impl SolutionAgentStore {
         // reconnect of an already-idle session was_running == false → no
         // spurious nudge.
         let was_running = matches!(session.read(cx).state, SessionState::Running { .. });
-        // Also capture — BEFORE cold-ize drops the live thread — whether the
-        // wedge happened on an unanswered human message (transcript tail is a
-        // non-nudge `UserMessage`). If so the continuation must point the fresh
-        // subprocess AT that message rather than tell it to "carry on", or the
-        // message is silently dropped (see `RECONNECT_UNANSWERED_USER_PROMPT`).
-        let tail_unanswered_user = tail_is_unanswered_user_message(&session.read(cx).entries);
+        // Capture the actual human input BEFORE dropping the live thread.
+        // Accepted steering input can exist only in the editor's projection
+        // while the provider still buffers it; --resume alone won't restore it.
+        let unanswered_user_blocks = reconnect_unanswered_user_blocks(&session.read(cx).entries);
         let project = match session.read(cx).project.clone() {
             Some(project) => project,
             None => {
@@ -3596,7 +3603,7 @@ impl SolutionAgentStore {
                     resumed,
                     reason,
                     was_running,
-                    tail_unanswered_user,
+                    unanswered_user_blocks,
                     cx,
                 );
             })
@@ -3612,10 +3619,9 @@ impl SolutionAgentStore {
     /// already-idle session (e.g. a manual MCP reconnect) gets no spurious
     /// nudge. The prompt is normally a "carry on" instruction, deliberately NOT
     /// a replay of the interrupted turn (replaying could re-run tool calls whose
-    /// side effects already landed) — EXCEPT when `tail_unanswered_user` says the
-    /// wedge happened on an unanswered human message, where it instead points the
-    /// agent AT that message (`RECONNECT_UNANSWERED_USER_PROMPT`) so it isn't
-    /// dropped as already-handled history. `from_user: false`: editor-originated,
+    /// side effects already landed). Human messages pending a response are
+    /// included explicitly because provider history may not contain them.
+    /// `from_user: false`: editor-originated,
     /// so it must not reset the supervisor's continue counter / resume a
     /// `WaitingUser` hold.
     pub(crate) fn maybe_send_reconnect_continuation(
@@ -3623,32 +3629,117 @@ impl SolutionAgentStore {
         session_id: SolutionSessionId,
         reason: RespawnReason,
         was_running: bool,
-        tail_unanswered_user: bool,
+        unanswered_user_blocks: Vec<acp::ContentBlock>,
         cx: &mut Context<Self>,
     ) {
         if !was_running {
             return;
         }
-        // When the wedge happened on an unanswered human message, drive the
-        // fresh subprocess AT that message — a generic "carry on" would make it
-        // treat the replayed message as already-handled and drop it.
-        let prompt = if tail_unanswered_user {
+        // Queued messages have not reached the provider at all. Deliver them
+        // first instead of starting a recovery turn on stale runtime history.
+        // An outstanding steering receipt still owns its reserved bundles.
+        if self.active_steers.contains_key(&session_id) {
+            // The receipt handler records accepted input on the new thread.
+            // Wait for it before choosing recovery input, otherwise that input
+            // is removed from the queue after our snapshot and never recovered.
+            let Some(expected_context) = self.session(session_id).map(|session| {
+                let s = session.read(cx);
+                (
+                    s.epoch,
+                    s.acp_session_id.clone(),
+                    s.acp_thread().map(|t| t.entity_id()),
+                )
+            }) else {
+                return;
+            };
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let waiting = this
+                        .update(cx, |store, cx| {
+                            let session = store.session(session_id)?;
+                            let s = session.read(cx);
+                            if (
+                                s.epoch,
+                                s.acp_session_id.clone(),
+                                s.acp_thread().map(|t| t.entity_id()),
+                            ) != expected_context
+                            {
+                                return None;
+                            }
+                            Some(store.active_steers.contains_key(&session_id))
+                        })
+                        .ok()
+                        .flatten();
+                    let Some(waiting) = waiting else {
+                        return;
+                    };
+                    if !waiting {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(100))
+                        .await;
+                }
+                this.update(cx, |store, cx| {
+                    let Some(session) = store.session(session_id) else {
+                        return;
+                    };
+                    // Appending a receipt's optimistic user entry also marks
+                    // the store Running. Only the thread's actual turn status
+                    // distinguishes that bookkeeping from a newly-started turn.
+                    if !matches!(session.read(cx).state, SessionState::Idle | SessionState::Running { .. })
+                        || session.read(cx).acp_thread().is_none_or(|thread| {
+                            thread.read(cx).status() != acp_thread::ThreadStatus::Idle
+                        })
+                    {
+                        return;
+                    }
+                    let captured = reconnect_unanswered_user_blocks(&session.read(cx).entries);
+                    if captured.is_empty() {
+                        return;
+                    }
+                    session.update(cx, |s, _| s.state = SessionState::Idle);
+                    store.maybe_send_reconnect_continuation(
+                        session_id,
+                        reason,
+                        was_running,
+                        captured,
+                        cx,
+                    );
+                })
+                .log_err();
+            })
+            .detach();
+            return;
+        }
+        if self
+            .session(session_id)
+            .is_some_and(|s| !s.read(cx).pending_messages.is_empty())
+        {
+            self.flush_stopped_queue(session_id, false, cx);
+            return;
+        }
+        // Recovery must be self-contained: never ask the provider to guess which
+        // "message above" the editor saw before killing its process.
+        let prompt = if !unanswered_user_blocks.is_empty() {
             RECONNECT_UNANSWERED_USER_PROMPT
         } else {
             reason.continuation_prompt()
         };
+        let mut blocks = vec![agent_client_protocol::schema::v1::ContentBlock::Text(
+            // Stamp the editor-recovery `_meta` marker (invisible to the
+            // agent's text) so consumers that reason about "the user's goal"
+            // exclude it: the supervisor must not distill "your process hung"
+            // into `user_intent.md`, and `reconnect_unanswered_user_blocks`
+            // must not mistake THIS prompt for an unanswered human message on
+            // a second consecutive hang.
+            agent_client_protocol::schema::v1::TextContent::new(prompt.to_string())
+                .meta(Some(acp_thread::meta_with_editor_recovery())),
+        )];
+        blocks.extend(unanswered_user_blocks);
         self.send_message_blocks_targeted(
             session_id,
-            vec![agent_client_protocol::schema::v1::ContentBlock::Text(
-                // Stamp the editor-recovery `_meta` marker (invisible to the
-                // agent's text) so consumers that reason about "the user's goal"
-                // exclude it: the supervisor must not distill "your process hung"
-                // into `user_intent.md`, and `tail_is_unanswered_user_message`
-                // must not mistake THIS prompt for an unanswered human message on
-                // a second consecutive hang.
-                agent_client_protocol::schema::v1::TextContent::new(prompt.to_string())
-                    .meta(Some(acp_thread::meta_with_editor_recovery())),
-            )],
+            blocks,
             crate::model::QueueTarget::Main,
             false,
             cx,

@@ -9,6 +9,9 @@
 
 ## Entry points
 
+- Latest recovery fix:
+  [Reconnect loses accepted input](findings/2026-10-06-reconnect-loses-accepted-input.md).
+
 - **Starting a new session?** → read `CLAUDE.md` + this file.
 - **About to dispatch a sub-agent or plan a feature?** → [`workflow/supervisor-mode.md`](workflow/supervisor-mode.md).
 - **Not sure where to write something?** → [`workflow/doc-discipline.md`](workflow/doc-discipline.md).

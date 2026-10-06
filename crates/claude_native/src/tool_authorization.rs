@@ -518,9 +518,9 @@ mod tests {
     fn a_substituted_rm_target_read_from_a_file_inside_is_allowed() {
         let root = tempfile::tempdir().expect("root");
         let roots = vec![root.path().to_path_buf()];
-        let doomed = root.path().join(".agents/tmp/tmp.Ru3jifhqK7");
+        let doomed = root.path().join(".tmp/tmp.Ru3jifhqK7");
         std::fs::create_dir_all(&doomed).expect("doomed");
-        let pointer = root.path().join(".agents/tmp/appdir.txt");
+        let pointer = root.path().join(".tmp/appdir.txt");
         let write = |content: &str| std::fs::write(&pointer, content).expect("pointer");
         let decide_for = |cmd: String| {
             decide(&bash(&cmd), Some(SUBSTITUTION_REASON), &roots, SessionPolicy::FullAccess)

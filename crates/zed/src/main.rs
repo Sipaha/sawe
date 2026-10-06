@@ -2674,7 +2674,7 @@ struct Args {
     subagent_start_hook: bool,
 
     /// The Solution temp directory named by `--subagent-start-hook` —
-    /// `<solution_root>/.agents/tmp`.
+    /// `<solution_root>/.tmp`.
     #[arg(long, hide = true, value_name = "DIR")]
     temp_dir: Option<PathBuf>,
 

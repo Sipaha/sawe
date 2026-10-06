@@ -22,8 +22,16 @@ use gpui::{
     Styled, Window, WindowHandle, div, px,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use settings::Settings;
+use theme_settings::ThemeSettings;
 use ui::prelude::*;
+use ui::utils::WithRemSize;
 use ui::{CopyButton, IconButton, IconName, Label, LabelSize, Tooltip};
+
+/// A floating report is a compact companion to the conversation, not the
+/// full-width Markdown editor. Keep its type scale one step below the regular
+/// preview while still following `markdown_preview.font_size` and zoom.
+const DOCUMENT_FONT_SCALE: f32 = 0.875;
 
 /// What the preview window is showing. One window, two kinds of content —
 /// keeping them in one view is what lets a click on an image retarget a window
@@ -307,6 +315,9 @@ impl Render for PreviewWindow {
                     // markdown-preview font settings), not the chat's — this
                     // window is showing a file, not a message.
                     let style = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
+                    let preview_font_size = ThemeSettings::get_global(cx)
+                        .markdown_preview_font_size(cx)
+                        * DOCUMENT_FONT_SCALE;
                     let roots: Vec<std::path::PathBuf> = base_dir.iter().cloned().collect();
                     div()
                         .id("preview-markdown")
@@ -315,19 +326,26 @@ impl Render for PreviewWindow {
                         .p_3()
                         .overflow_y_scroll()
                         .child(
-                            MarkdownElement::new(markdown.clone(), style).on_url_click(
-                                move |url, _window, cx| {
-                                    // A relative link in a document points at
-                                    // its neighbours, so the document's own
-                                    // directory is the root it resolves
-                                    // against; anything else falls through to
-                                    // the browser.
-                                    crate::conversation_render::link::open_link_within_preview(
-                                        url.as_ref(),
-                                        &roots,
-                                        cx,
-                                    );
-                                },
+                            // Preview typography is rem-based. The regular
+                            // MarkdownPreviewView supplies this same local rem
+                            // root; this compact window uses a smaller root,
+                            // but without one it silently inherits the larger
+                            // UI size and ignores markdown_preview.font_size.
+                            WithRemSize::new(preview_font_size).child(
+                                MarkdownElement::new(markdown.clone(), style).on_url_click(
+                                    move |url, _window, cx| {
+                                        // A relative link in a document points at
+                                        // its neighbours, so the document's own
+                                        // directory is the root it resolves
+                                        // against; anything else falls through to
+                                        // the browser.
+                                        crate::conversation_render::link::open_link_within_preview(
+                                            url.as_ref(),
+                                            &roots,
+                                            cx,
+                                        );
+                                    },
+                                ),
                             ),
                         )
                         .into_any_element()
@@ -352,7 +370,7 @@ impl Render for PreviewWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
 
     fn an_image() -> Arc<gpui::Image> {
         // Never rendered by these tests, so the bytes do not have to decode —
@@ -500,6 +518,72 @@ mod tests {
                 assert!(preview.editor.is_some());
             })
             .expect("the window is still open");
+    }
+
+    /// Preview styles express their entire type scale in `rem`. The regular
+    /// MarkdownPreviewView installs a local rem root, but this standalone
+    /// window once omitted it and therefore rendered at the UI font size no
+    /// matter what `markdown_preview.font_size` said.
+    #[gpui::test]
+    async fn standalone_markdown_preview_respects_preview_font_size(cx: &mut TestAppContext) {
+        let (_solution_id, _tmp, project) =
+            crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.markdown_preview.get_or_insert_default().font_size = Some(10.0.into());
+                });
+            });
+        });
+        cx.run_until_parked();
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |_, window, cx| {
+            open_preview(
+                PreviewContent::Markdown {
+                    title: "TYPE-SCALE.md".into(),
+                    source: "paragraph one\n\nparagraph two\n\nparagraph three".into(),
+                    base_dir: None,
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let handle = cx
+            .update(|_, cx| cx.global::<OpenPreview>().0)
+            .expect("the document opened a preview");
+        let mut preview_cx = VisualTestContext::from_window(handle.into(), cx);
+        let small_height = preview_cx
+            .debug_bounds("inner")
+            .expect("the markdown root was drawn")
+            .size
+            .height;
+
+        preview_cx.update(|_, cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.markdown_preview.get_or_insert_default().font_size = Some(20.0.into());
+                });
+            });
+        });
+        preview_cx.run_until_parked();
+        preview_cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let large_height = preview_cx
+            .debug_bounds("inner")
+            .expect("the markdown root was redrawn")
+            .size
+            .height;
+
+        assert!(
+            large_height > small_height * 1.5,
+            "the preview setting must scale this window: {small_height:?} -> {large_height:?}"
+        );
     }
 
     /// A link inside a rendered document is clicked from INSIDE the preview

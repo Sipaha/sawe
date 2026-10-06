@@ -6585,7 +6585,7 @@ async fn reconnect_continues_a_wedged_running_session(cx: &mut TestAppContext) {
                 session_id,
                 RespawnReason::Watchdog,
                 /* was_running */ true,
-                /* tail_unanswered_user */ false,
+                Vec::new(),
                 cx,
             )
         });
@@ -6618,7 +6618,7 @@ async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
                 session_id,
                 RespawnReason::Watchdog,
                 /* was_running */ false,
-                /* tail_unanswered_user */ false,
+                Vec::new(),
                 cx,
             )
         });
@@ -6707,7 +6707,9 @@ async fn reconnect_on_unanswered_user_message_points_at_it(cx: &mut TestAppConte
                 session_id,
                 RespawnReason::Watchdog,
                 /* was_running */ true,
-                /* tail_unanswered_user */ true,
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "Release ecos-model 2.39.*",
+                ))],
                 cx,
             )
         });
@@ -6717,22 +6719,19 @@ async fn reconnect_on_unanswered_user_message_points_at_it(cx: &mut TestAppConte
     let (has_unanswered_prompt, has_generic) = cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
         store.read_with(cx, |store, cx| {
-            let unanswered = last_user_text_contains(
-                store,
-                session_id,
-                "before you answered the latest human message above",
-                cx,
-            ) && last_user_text_contains(
-                store,
-                session_id,
-                "Read and address that message now; do not treat it as already handled",
-                cx,
-            ) && last_user_text_contains(
-                store,
-                session_id,
-                "Check any interrupted operation before repeating it",
-                cx,
-            );
+            let unanswered =
+                last_user_text_contains(
+                    store,
+                    session_id,
+                    "Latest human messages captured by the editor:",
+                    cx,
+                ) && last_user_text_contains(store, session_id, "Release ecos-model 2.39.*", cx)
+                    && last_user_text_contains(
+                        store,
+                        session_id,
+                        "Check any interrupted operation before repeating it",
+                        cx,
+                    );
             let generic = thread_has_continuation(store, session_id, cx);
             (unanswered, generic)
         })
@@ -6810,7 +6809,9 @@ fn tail_unanswered_user_detection() {
         chunks: vec![AssistantChunk::Message("ok".into())],
     };
 
-    use crate::store::tail_is_unanswered_user_message as tail;
+    let tail = |entries: &[std::sync::Arc<SessionEntry>]| {
+        !crate::store::reconnect_unanswered_user_blocks(entries).is_empty()
+    };
     assert!(
         !tail(&[]),
         "empty transcript is not an unanswered-user tail"
@@ -6837,6 +6838,221 @@ fn tail_unanswered_user_detection() {
         !tail(&[ent(plain_user()), ent(nudge_user())]),
         "a nudge after the human message means the tail is not a bare unanswered human message",
     );
+}
+
+#[test]
+fn reconnect_captures_new_task_and_followup_without_replaying_answered_question() {
+    use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+    let entry = |kind| {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: None,
+            kind,
+        })
+    };
+    let user = |text: &str, chunks| {
+        entry(SessionEntryKind::UserMessage {
+            id: None,
+            content_md: text.into(),
+            chunks,
+        })
+    };
+    let image = acp::ContentBlock::Image(acp::ImageContent::new("cGl4ZWxz", "image/png"));
+    let entries = vec![
+        user("Does LDAP block?", vec![]),
+        entry(SessionEntryKind::AssistantMessage {
+            chunks: vec![AssistantChunk::Message("LDAP question answered".into())],
+        }),
+        user("Release ecos-model 2.39.*", vec![]),
+        user(
+            "Raise records too",
+            vec![
+                acp::ContentBlock::Text(acp::TextContent::new("Raise records too")),
+                image.clone(),
+            ],
+        ),
+    ];
+    let blocks = reconnect_unanswered_user_blocks(&entries);
+    let text = blocks
+        .iter()
+        .filter_map(|b| match b {
+            acp::ContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(text, "Release ecos-model 2.39.*\n\nRaise records too");
+    assert!(blocks.contains(&image));
+    assert!(reconnect_unanswered_user_blocks(&entries[..2]).is_empty());
+}
+
+#[gpui::test]
+async fn reconnect_delivers_queued_human_input_before_any_recovery_nudge(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.session(session_id).unwrap().update(cx, |s, _| {
+                s.pending_messages.push_back(crate::model::PendingBundle {
+                    id: uuid::Uuid::new_v4(),
+                    origin: crate::model::MessageOrigin::User,
+                    target: crate::model::QueueTarget::Main,
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new("NEW TASK"))],
+                });
+            });
+            store.maybe_send_reconnect_continuation(
+                session_id,
+                RespawnReason::Watchdog,
+                true,
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "OLD QUESTION",
+                ))],
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            assert!(last_user_text_contains(store, session_id, "NEW TASK", cx));
+            assert!(!last_user_text_contains(
+                store,
+                session_id,
+                "OLD QUESTION",
+                cx
+            ));
+            assert!(!last_user_text_contains(
+                store,
+                session_id,
+                RECONNECT_UNANSWERED_USER_PROMPT,
+                cx
+            ));
+            assert!(
+                store
+                    .session(session_id)
+                    .unwrap()
+                    .read(cx)
+                    .pending_messages
+                    .is_empty()
+            );
+        });
+    });
+}
+
+#[gpui::test]
+async fn reconnect_waits_for_receipt_and_recaptures_accepted_input(cx: &mut TestAppContext) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reserve_steer_for_test(session_id, std::collections::HashSet::new());
+            store.maybe_send_reconnect_continuation(
+                session_id,
+                RespawnReason::Watchdog,
+                true,
+                Vec::new(),
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.push_user_message_entry(
+                None,
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "ACCEPTED DURING RECONNECT",
+                ))],
+                cx,
+            );
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.active_steers.remove(&session_id);
+            // The optimistic entry marks the store Running even though no
+            // provider turn exists. Recovery must inspect the thread itself.
+            assert!(matches!(store.session(session_id).unwrap().read(cx).state,
+                SessionState::Running { .. }));
+            assert!(!last_user_text_contains(
+                store,
+                session_id,
+                RECONNECT_UNANSWERED_USER_PROMPT,
+                cx
+            ));
+        });
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(101));
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            assert!(last_user_text_contains(
+                store,
+                session_id,
+                RECONNECT_UNANSWERED_USER_PROMPT,
+                cx
+            ));
+            let thread = store
+                .session(session_id)
+                .unwrap()
+                .read(cx)
+                .acp_thread()
+                .unwrap()
+                .clone();
+            let recovery = thread
+                .read(cx)
+                .entries()
+                .iter()
+                .filter_map(|e| match e {
+                    acp_thread::AgentThreadEntry::UserMessage(m)
+                        if acp_thread::is_editor_recovery_blocks(&m.chunks) =>
+                    {
+                        Some(m)
+                    }
+                    _ => None,
+                })
+                .last()
+                .unwrap();
+            assert!(recovery.chunks.iter().any(
+                |b| matches!(b, acp::ContentBlock::Text(t) if t.text == "ACCEPTED DURING RECONNECT")
+            ));
+        });
+    });
+}
+
+#[gpui::test]
+async fn reconnect_receipt_wait_cannot_restore_input_after_clear(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.reserve_steer_for_test(session_id, std::collections::HashSet::new());
+            store.maybe_send_reconnect_continuation(session_id, RespawnReason::Watchdog,
+                true, vec![acp::ContentBlock::Text(acp::TextContent::new("ERASED INPUT"))], cx);
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.active_steers.remove(&session_id);
+            store.session(session_id).unwrap().update(cx, |s, _| { s.bump_epoch(); });
+        });
+    });
+    cx.executor().advance_clock(std::time::Duration::from_millis(101));
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            assert!(!last_user_text_contains(store, session_id, "ERASED INPUT", cx));
+            assert!(!thread_has_continuation(store, session_id, cx));
+        });
+    });
 }
 
 /// Regression (ghost console tabs): internal one-shot AI helpers

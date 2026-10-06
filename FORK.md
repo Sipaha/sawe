@@ -703,13 +703,13 @@ Related prompt change (`supervisor_judge_instructions.md`): the judge instructio
 
 How to apply: any status the supervisor treats as "parked until the human acts" must also consider whether the AGENT itself can end the park (a self-clocked task it's awaiting) and re-arm on that. When one status value is overloaded across two intents that need different behavior, disambiguate with an explicit flag set at every entry point and read only under the status guard — don't branch on the shared status alone. Guard: `store::tests::self_resume_rearms_parked_supervisor`.
 
-### 45. The stuck-session reconnect must re-surface an unanswered user message, not "carry on"
+### 45. Reconnect must carry the editor's pending human input
 
-What: `SolutionAgentStore::maybe_send_reconnect_continuation` now picks its continuation prompt by the transcript tail. When the hang happened on an UNANSWERED human message (`tail_is_unanswered_user_message` — scanning `session.entries` from the end past `System` notes, the first real entry is a non-observer-nudge `UserMessage`), it sends `RECONNECT_UNANSWERED_USER_PROMPT` ("you hung before answering the user's last message — re-read it and do it now, don't treat it as already handled") instead of the generic `RECONNECT_CONTINUATION_PROMPT` ("carry on where you left off"). `reconnect_agent` captures the flag from `session.read(cx).entries` before the cold-ize.
+What: `respawn_agent` captures the consecutive human messages at the Main transcript tail before detaching the thread. `maybe_send_reconnect_continuation` includes their actual content blocks (and attachments) in an editor-marked recovery message, asking the agent to reconcile completed work and address outstanding requests in order. Assistant/tool or non-human messages end the capture; System notes and teammate entries are ignored. Queued input is delivered before a generic recovery nudge. In-flight steering receipts settle before recovery recaptures their accepted input; a changed context or an already-started turn cancels that deferred recovery.
 
-Why: a user message was silently dropped. Proven from a live transcript: the user sent a message; the `claude` subprocess hung processing it for `STUCK_TURN_SECS` (5 min); `tick_stuck_sessions` fired `reconnect_agent`, which respawned the subprocess and injected the generic "carry on" continuation. The fresh subprocess, told to continue prior work, treated the replayed user message as already-handled history and never acted on it — the message was visible in the conversation but never answered. The generic continuation is correct for a MID-WORK wedge (the agent was doing its own thing and should resume), but actively wrong when the tail is a bare human message the agent never started answering: "carry on where you left off" points at the wrong place.
+Why: the original fix referred to “the latest human message above”, assuming provider resume history matched the editor. On 2026-10-06, Codex accepted two follow-ups visible in Sawe but did not persist them before watchdog reconnect; its restored history ended at an older LDAP question that had already received a response. That recovery prompt made it repeat the old answer and ignore the new hotfix task. A steering receipt proves acceptance, not durable history or completion. Evidence and current contract: [reconnect loses accepted input](docs/findings/2026-10-06-reconnect-loses-accepted-input.md).
 
-How to apply: any recovery path that re-drives a respawned agent with a synthetic prompt must condition that prompt on WHERE the interruption happened. A generic "continue" is safe only when there was in-progress agent work to continue; if the interruption sits on an unhandled human request, the recovery prompt must name that request or the fresh agent will mistake it for context. Observer nudges are excluded from the "unanswered human" detection deliberately — a nudge is the supervisor's own voice and self-heals (the supervisor re-fires on the next idle tick), unlike a human message which has no automatic retry. Guards: `store::tests::{tail_unanswered_user_detection, reconnect_on_unanswered_user_message_points_at_it}`. Coverage boundary (unchanged): the mock backend can't drive a real `reconnect_agent` resume, so the flag CAPTURE at the call site is exercised only via the pure helper + the direct `maybe_send_reconnect_continuation` test, not end-to-end.
+How to apply: recovery must be self-contained when provider history can lag behind accepted editor input. Preserve the requests and their order; do not blindly repeat their side effects or label old answered history as unhandled. Guards include `tail_unanswered_user_detection`, `reconnect_on_unanswered_user_message_points_at_it`, `reconnect_captures_new_task_and_followup_without_replaying_answered_question`, `reconnect_delivers_queued_human_input_before_any_recovery_nudge`, and `reconnect_waits_for_receipt_and_recaptures_accepted_input`.
 
 ### 46. Supervisor verdict tools are authenticated by a per-briefing nonce, and applying a verdict is the idempotency key
 
@@ -5175,7 +5175,14 @@ just wrote and linked — that is showing the reader the markup they asked to be
 spared: `#`, backticks and pipe tables instead of headings, code and a table.
 `PreviewContent::Markdown` renders it with `MarkdownElement` under
 `MarkdownFont::Preview` (the markdown-preview font settings — this window is
-showing a file, not a chat message).
+showing a file, not a chat message). Its element is hosted under
+`WithRemSize(markdown_preview_font_size * 0.875)`: the window follows the
+preview setting and zoom while keeping its companion-window typography one
+step more compact than the full editor preview. Preview typography expresses
+the body and heading sizes in `rem`; if the standalone window omits that local
+root, it falls back to the window UI size and silently ignores
+`markdown_preview.font_size`, making the document look oversized whenever
+those sizes differ.
 
 Routing is by EXTENSION (`.md` / `.markdown`), not by sniffing the bytes: prose
 with a stray `#` in it is indistinguishable from markdown, and a wrong guess on
@@ -5976,7 +5983,7 @@ producing token changes must opt out the same way — `editor_tests::init_test` 
 left `'app'` alone — and left `version:    2` too, because it shares a hunk with the requoted line —
 and `ctrl-s` wrote the file byte for byte.
 
-### 213. Agents keep scratch files in `<solution_root>/.agents/tmp`, and sub-agents hear it from a hook
+### 213. Agents keep scratch files in `<solution_root>/.tmp`, and sub-agents hear it from a hook
 
 The maintainer, 2026-09-24, after a sub-agent's `rm -rf "$(cat /tmp/…)"` stopped a whole turn on an
 "Approval needed — target outside the Solution" prompt: *«Наверное не норм, что агенты общий tmp
@@ -5987,7 +5994,7 @@ the parent: *«общий промпт то не надо наверное вс�
 
 What: `claude_native::claude_settings::temp_dir_rule` words the rule once — never a system temp
 directory; every scratch file, log, screenshot, pid file and throwaway profile goes under
-`<solution_root>/.agents/tmp/` (`mktemp -d -p` it), which is inside the Solution, so cleaning up
+`<solution_root>/.tmp/` (`mktemp -d -p` it), which is inside the Solution, so cleaning up
 needs no approval. `solution_system_prompt` (Claude and Codex sessions, fresh and resumed) appends
 it. Built-in Claude sub-agents never see the appended system prompt, so the editor-owned claude
 settings layer adds a `SubagentStart` hook, `sawe --subagent-start-hook --temp-dir <dir>`, which
@@ -5997,6 +6004,12 @@ like `--worktree-hook` (~40 ms). `EditorClaudeSettings::write_to` creates the di
 Why a hook and not the prompt: asking the parent to copy the rule into every delegation spends
 its context on boilerplate and still depends on the model remembering. Why not `TMPDIR`: it moves
 claude's own task-output directory too and still misses the literal `/tmp/...` paths agents type.
+
+Follow-up, 2026-10-05: the maintainer renamed the scratch root from `.agents/tmp` to the
+Solution-level `.tmp`, so its system-owned, disposable purpose is visible immediately and it no
+longer looks like durable agent state. `.agents` remains the home of worktrees, auto memory and
+session archives; existing `.agents/tmp` contents are legacy and are not moved while live probe
+sockets may still refer to them.
 
 Verified against claude 2.1.281: a `claude -p` whose `general-purpose` sub-agent was asked to quote
 any temp-file instruction returned the rule verbatim with the hook and `NONE` without it. Guarded
