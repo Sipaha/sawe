@@ -193,6 +193,18 @@ impl SolutionAgentStore {
                             format!("Agent follow-up delivery could not be confirmed: {error}. It was not resent automatically; verify the conversation before retrying."), cx);
                     }
                 }
+                // Explicit rejection guarantees this input was not delivered.
+                // If both runtime and client thread are idle, Running is stale;
+                // start the queued input now instead of waiting for a watchdog.
+                let rejected_idle = retry && session.read(cx).acp_thread().is_some_and(|thread| {
+                    crate::native_controls::codex_turn_active(thread, cx) == Some(false)
+                        && thread.read(cx).status() == acp_thread::ThreadStatus::Idle
+                });
+                if rejected_idle && matches!(session.read(cx).state, SessionState::Running { .. }) {
+                    store.recover_lost_stopped_queue(session_id, cx);
+                    cx.notify();
+                    return;
+                }
                 if matches!(session.read(cx).state, SessionState::Idle) {
                     let has_queued_compact = session.read(cx).pending_messages.iter().any(|bundle| crate::compact::is_compaction_blocks(&bundle.blocks));
                     if !has_queued_compact { session.update(cx, |s, _| {s.clear_compaction_request();}); }

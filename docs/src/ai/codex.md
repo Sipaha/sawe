@@ -46,6 +46,13 @@ the current turn and sends the queued message. **Stop** cancels the current
 turn. Closing and reopening a chat resumes its Codex thread and keeps the
 locally saved conversation.
 
+Codex may start a turn on its own, for example to continue an active Goal.
+Sawe shows a system note for that start and tracks it as a busy turn until it
+finishes. Follow-ups can steer that turn, and **Stop** can interrupt it.
+When a follow-up is explicitly rejected because no turn is active, Sawe starts
+it as a fresh turn once the runtime and client thread are both idle. Accepted
+or unconfirmed deliveries are not automatically resent.
+
 ## Troubleshooting and current limits
 
 Startup errors appear as editor notifications. If Codex is missing, check

@@ -22,23 +22,41 @@ impl SolutionAgentStore {
             return;
         };
         match event {
+            acp_thread::AcpThreadEvent::ExternalTurnStarted => {
+                session_entity.update(cx, |s, _| {
+                    if !matches!(s.state, SessionState::Stopping { .. }) {
+                        // A distinct anchor also prevents the old prompt future's
+                        // lost-Stopped safety net from settling this newer turn.
+                        s.state = SessionState::Running {
+                            started_at: std::time::Instant::now(), notified: false,
+                        };
+                        s.last_turn_duration = None;
+                    }
+                    s.last_activity_at = Utc::now();
+                });
+                self.rearm_supervisor_on_self_activity(session_id, cx);
+                self.mark_state_changed(session_id, cx);
+                self.try_steer_pending(session_id, cx);
+                cx.notify();
+            }
             acp_thread::AcpThreadEvent::NewEntry => {
-                // An editor-injected `SystemNote` is not agent activity — it
+                // A SystemNote or a late Codex receipt is not agent activity — it
                 // must NOT flip an Idle session to Running (that would make the
                 // stuck-session watchdog and the status row think a turn is in
                 // flight) nor reset the silence clock. Still convert + persist +
                 // delta-sync it below so it shows in the conversation.
-                let is_system_note = session_entity
+                let is_passive_entry = session_entity
                     .read(cx)
                     .acp_thread()
                     .map(|t| {
-                        matches!(
-                            t.read(cx).entries().last(),
-                            Some(acp_thread::AgentThreadEntry::SystemNote(_))
-                        )
+                        let thread = t.read(cx);
+                        matches!(thread.entries().last(), Some(acp_thread::AgentThreadEntry::SystemNote(_)))
+                            || (matches!(thread.entries().last(), Some(acp_thread::AgentThreadEntry::UserMessage(_)))
+                                && thread.status() == acp_thread::ThreadStatus::Idle
+                                && crate::native_controls::codex_turn_active(t, cx) == Some(false))
                     })
                     .unwrap_or(false);
-                if !is_system_note {
+                if !is_passive_entry {
                     self.mutate_state(
                         session_id,
                         |state| {
@@ -184,6 +202,14 @@ impl SolutionAgentStore {
                 }
             }
             acp_thread::AcpThreadEvent::Stopped(stop_reason) => {
+                // The original prompt can settle after Codex has already
+                // started an autonomous continuation. Its Stop must not idle
+                // the newer turn or dispatch queued input over it.
+                if session_entity.read(cx).acp_thread().is_some_and(|thread| {
+                    crate::native_controls::codex_turn_active(thread, cx) == Some(true)
+                }) {
+                    return;
+                }
                 // Not every `Stopped` proves a round trip to the model
                 // actually completed. `StopReason` is `#[non_exhaustive]`
                 // upstream, so this match needs a wildcard arm even though
@@ -495,6 +521,11 @@ impl SolutionAgentStore {
                 self.persist_session_row(session_id, cx);
             }
             acp_thread::AcpThreadEvent::Error => {
+                if session_entity.read(cx).acp_thread().is_some_and(|thread| {
+                    crate::native_controls::codex_turn_active(thread, cx) == Some(true)
+                }) {
+                    return;
+                }
                 // Symmetric with the `Stopped` arm: flush any pending end-of-turn
                 // entry-append throttle synchronously so the final entry's
                 // `SessionMessageAppended` (+ `agent_session_dirty`) rides out on

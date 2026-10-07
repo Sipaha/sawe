@@ -6840,6 +6840,36 @@ fn tail_unanswered_user_detection() {
     );
 }
 
+#[gpui::test]
+async fn external_provider_turn_gets_its_own_anchor_and_returns_to_idle(cx: &mut TestAppContext) {
+    let (id, thread, _tmp) = create_session_with_thread(cx).await;
+    let old_started = std::time::Instant::now() - std::time::Duration::from_secs(30);
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.session(id).unwrap().update(cx, |s, _| {
+                s.state = SessionState::Running { started_at: old_started, notified: false };
+            });
+        });
+        thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::ExternalTurnStarted));
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(id).unwrap();
+        assert!(matches!(session.read(cx).state, SessionState::Running { started_at, .. } if started_at > old_started));
+        thread.update(cx, |thread, cx| {
+            thread.flush_end_of_turn_tail(cx);
+            cx.emit(acp_thread::AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(matches!(store.read(cx).session(id).unwrap().read(cx).state, SessionState::Idle));
+    });
+}
+
 #[test]
 fn reconnect_captures_new_task_and_followup_without_replaying_answered_question() {
     use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};

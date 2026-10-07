@@ -948,6 +948,9 @@ impl SolutionAgentStore {
         // Queue follow-ups, then let the native steering/hook path claim them.
         // A completed turn still awaits receipts before starting queued work.
         let already_running = matches!(session_entity.read(cx).state, SessionState::Running { .. })
+            || session_entity.read(cx).acp_thread().is_some_and(|thread| {
+                crate::native_controls::codex_turn_active(thread, cx) == Some(true)
+            })
             || self.active_steers.contains_key(&session_id);
         if already_running {
             // A parent parked on its own background agents fires no hooks, so

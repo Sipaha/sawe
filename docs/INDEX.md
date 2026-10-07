@@ -9,6 +9,9 @@
 
 ## Entry points
 
+- Codex automatic-turn fix:
+  [Autonomous turn lifecycle](findings/2026-10-07-codex-autonomous-turn-lifecycle.md).
+
 - Latest recovery fix:
   [Reconnect loses accepted input](findings/2026-10-06-reconnect-loses-accepted-input.md).
 

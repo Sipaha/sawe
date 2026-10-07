@@ -2597,6 +2597,9 @@ impl From<&AcpThread> for ActionLogTelemetry {
 #[derive(Debug)]
 pub enum AcpThreadEvent {
     StatusChanged,
+    /// The provider started a turn without a client prompt (for example a goal
+    /// continuation). No client-owned `run_turn` future drives its lifecycle.
+    ExternalTurnStarted,
     PromptUpdated,
     NewEntry,
     TitleUpdated,
@@ -2738,6 +2741,7 @@ impl AcpThread {
                 | AcpThreadEvent::ElicitationRequested(_)
                 | AcpThreadEvent::ElicitationResponded(_) => this.update_idle_sleep_prevention(cx),
                 AcpThreadEvent::PromptUpdated
+                | AcpThreadEvent::ExternalTurnStarted
                 | AcpThreadEvent::NewEntry
                 | AcpThreadEvent::TitleUpdated
                 | AcpThreadEvent::TokenUsageUpdated

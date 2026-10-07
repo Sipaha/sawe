@@ -13,6 +13,14 @@ use util::ResultExt as _;
 
 use crate::{kimi_adapter, model::SessionPermissionMode};
 
+/// Codex can run provider-owned turns without AcpThread's client turn future.
+/// None means another backend; its existing lifecycle rules remain unchanged.
+pub(crate) fn codex_turn_active(thread: &gpui::Entity<acp_thread::AcpThread>, cx: &App) -> Option<bool> {
+    let thread = thread.read(cx);
+    let native = thread.connection().clone().downcast::<codex_native::CodexConnection>()?;
+    Some(native.has_active_turn(thread.session_id()))
+}
+
 fn model_info(model: codex_native::CodexModelInfo) -> NativeAgentModelInfo {
     NativeAgentModelInfo {
         value: model.value,

@@ -73,6 +73,7 @@ struct Session {
     process: Rc<Process>,
     state: Rc<RefCell<TurnState>>,
     models: Vec<CodexModelInfo>,
+    thread: gpui::WeakEntity<AcpThread>,
     _pump: Task<()>,
 }
 impl Drop for Session {
@@ -93,6 +94,36 @@ struct TurnState {
     active_model: Option<String>,
 }
 impl TurnState {
+    fn has_active_turn(&self) -> bool {
+        !self.disconnected && (self.sender.is_some() || self.turn_id.is_some())
+    }
+
+    fn started(&mut self, id: String) -> bool {
+        let autonomous = self.sender.is_none() && self.turn_id.as_ref() != Some(&id);
+        if autonomous {
+            self.generation += 1;
+            self.cancel_requested = false;
+        }
+        self.turn_id = Some(id);
+        autonomous
+    }
+
+    /// Client-owned completion resolves prompt(); autonomous completion needs
+    /// an explicit thread event. A late completion cannot finish a newer turn.
+    fn completed(&mut self, id: &str, result: Result<acp::PromptResponse>) -> Option<Result<acp::PromptResponse>> {
+        if self.turn_id.as_deref() != Some(id) {
+            return None;
+        }
+        if self.sender.is_some() {
+            self.finish(result);
+            None
+        } else {
+            self.turn_id = None;
+            self.cancel_requested = false;
+            Some(result)
+        }
+    }
+
     fn finish(&mut self, result: Result<acp::PromptResponse>) {
         self.turn_id = None;
         self.cancel_requested = false;
@@ -110,6 +141,10 @@ pub struct CodexConnection {
     desired_efforts: RefCell<HashMap<acp::SessionId, String>>,
 }
 impl CodexConnection {
+    /// Includes provider-owned turns, which have no client prompt sender.
+    pub fn has_active_turn(&self, id: &acp::SessionId) -> bool {
+        self.sessions.borrow().get(id).is_some_and(|session| session.state.borrow().has_active_turn())
+    }
     /// Add input to the currently active turn. Acceptance is not completion:
     /// the original prompt future remains owned by turn/completed.
     pub fn steer(
@@ -138,7 +173,7 @@ impl CodexConnection {
                 let unavailable = {
                     let state = state.borrow();
                     state.generation != generation
-                        || state.sender.is_none()
+                        || !state.has_active_turn()
                         || state.cancel_requested
                         || state.disconnected
                 };
@@ -276,15 +311,43 @@ impl CodexConnection {
                     if method == "sawe/disconnected" { break; }
                     let params = &message["params"];
                     if !belongs_to_thread(params, &pump_id) {continue;}
-                    if method == "turn/started" { pump_state.borrow_mut().turn_id = params["turn"]["id"].as_str().map(str::to_owned); }
+                    if method == "turn/completed" && pump_state.borrow().turn_id.as_deref() != params["turn"]["id"].as_str() {
+                        continue;
+                    }
+                    if method == "turn/started" {
+                        if let Some(id) = params["turn"]["id"].as_str() {
+                            let autonomous = pump_state.borrow_mut().started(id.to_owned());
+                            if autonomous {
+                                weak_thread.update(cx, |thread, cx| {
+                                    thread.flush_end_of_turn_tail(cx);
+                                    thread.push_system_note(acp_thread::SystemNoteLevel::Info,
+                                        "Codex started a turn on its own (for example a goal continuation).", cx);
+                                    cx.emit(acp_thread::AcpThreadEvent::ExternalTurnStarted);
+                                }).log_err();
+                            }
+                        }
+                    }
                     for update in translator.translate(method, params) { weak_thread.update(cx, |thread, cx| thread.handle_session_update(update, cx).log_err()).log_err(); }
-                    if method == "turn/completed" { let result = translate::turn_result(&params["turn"]); pump_state.borrow_mut().finish(result); translator = translate::Translator::default(); }
+                    if method == "turn/completed" {
+                        if let Some(id) = params["turn"]["id"].as_str() {
+                            let orphan = pump_state.borrow_mut().completed(id, translate::turn_result(&params["turn"]));
+                            if let Some(result) = orphan {
+                                weak_thread.update(cx, |thread, cx| finish_external_turn(thread, result, cx)).log_err();
+                            }
+                        }
+                        translator = translate::Translator::default();
+                    }
                 }
                 if let Some(process) = weak_process.upgrade() { process.kill(); }
-                pump_state.borrow_mut().disconnected = true;
-                pump_state.borrow_mut().finish(Err(anyhow!("Codex process disconnected. Reopen this chat to reconnect.")));
+            let orphaned = pump_state.borrow().sender.is_none() && pump_state.borrow().turn_id.is_some();
+            pump_state.borrow_mut().disconnected = true;
+            pump_state.borrow_mut().finish(Err(anyhow!("Codex process disconnected. Reopen this chat to reconnect.")));
+            if orphaned {
+                weak_thread.update(cx, |thread, cx| finish_external_turn(thread,
+                    Err(anyhow!("Codex process disconnected. Reopen this chat to reconnect.")), cx)).log_err();
+            }
             });
-            self.sessions.borrow_mut().insert(id, Session {process, state, models: available_models, _pump: pump});
+            self.sessions.borrow_mut().insert(id, Session {process, state, models: available_models, thread: thread.downgrade(), _pump: pump});
             Ok(thread)
         })
     }
@@ -393,12 +456,13 @@ impl AgentConnection for CodexConnection {
             Ok(input) => input,
             Err(error) => return Task::ready(Err(error)),
         };
-        if session.state.borrow().sender.is_some() {
+        if session.state.borrow().has_active_turn() {
             return Task::ready(Err(anyhow!("Codex is already responding in this chat")));
         }
         let (sender, receiver) = oneshot::channel();
         session.state.borrow_mut().sender = Some(sender);
         session.state.borrow_mut().generation += 1;
+        let generation = session.state.borrow().generation;
         let process = session.process.clone();
         let state = session.state.clone();
         let model = self
@@ -420,8 +484,12 @@ impl AgentConnection for CodexConnection {
         cx.spawn(async move |_| {
             let response = process.request("turn/start",json!({"threadId":params.session_id.0,"input":input,"model":model,"effort":effort})).await;
             match response {
-                Ok(response) => {let mut state = state.borrow_mut(); if state.sender.is_some() {state.turn_id = response["turn"]["id"].as_str().map(str::to_owned); state.active_model = model.or(state.active_model.take());}}
-                Err(error) => {process.kill(); state.borrow_mut().disconnected = true; state.borrow_mut().finish(Err(error));}
+                Ok(response) => {let mut state = state.borrow_mut(); if state.generation == generation && state.sender.is_some() {state.turn_id = response["turn"]["id"].as_str().map(str::to_owned); state.active_model = model.or(state.active_model.take());}}
+                Err(error) => {
+                    if state.borrow().generation == generation && state.borrow().sender.is_some() {
+                        process.kill(); state.borrow_mut().disconnected = true; state.borrow_mut().finish(Err(error));
+                    }
+                }
             }
             receiver.await.context("Codex session closed during response")?
         })
@@ -431,13 +499,14 @@ impl AgentConnection for CodexConnection {
         let Some(session) = sessions.get(id) else {
             return;
         };
-        if session.state.borrow().sender.is_none() || session.state.borrow().cancel_requested {
+        if !session.state.borrow().has_active_turn() || session.state.borrow().cancel_requested {
             return;
         }
         session.state.borrow_mut().cancel_requested = true;
         let generation = session.state.borrow().generation;
         let state = session.state.clone();
         let process = session.process.clone();
+        let weak_thread = session.thread.clone();
         let id = id.clone();
         cx.spawn(async move |cx| {
             // A stop can arrive before turn/start responds; wait briefly for its id.
@@ -445,7 +514,7 @@ impl AgentConnection for CodexConnection {
                 if state.borrow().generation != generation {
                     return;
                 }
-                if state.borrow().turn_id.is_some() || state.borrow().sender.is_none() {
+                if state.borrow().turn_id.is_some() || !state.borrow().has_active_turn() {
                     break;
                 }
                 cx.background_executor()
@@ -467,9 +536,15 @@ impl AgentConnection for CodexConnection {
                 .await;
             if state.borrow().generation == generation && state.borrow().cancel_requested {
                 process.kill();
+                let orphaned = state.borrow().sender.is_none();
+                state.borrow_mut().disconnected = true;
                 state
                     .borrow_mut()
                     .finish(Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)));
+                if orphaned {
+                    weak_thread.update(cx, |thread, cx| finish_external_turn(thread,
+                        Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)), cx)).log_err();
+                }
             }
         })
         .detach();
@@ -478,6 +553,17 @@ impl AgentConnection for CodexConnection {
         self
     }
 }
+fn finish_external_turn(thread: &mut AcpThread, result: Result<acp::PromptResponse>, cx: &mut gpui::Context<AcpThread>) {
+    thread.flush_end_of_turn_tail(cx);
+    match result {
+        Ok(response) => cx.emit(acp_thread::AcpThreadEvent::Stopped(response.stop_reason)),
+        Err(error) => {
+            thread.push_system_note(acp_thread::SystemNoteLevel::Error, error.to_string(), cx);
+            cx.emit(acp_thread::AcpThreadEvent::Error);
+        }
+    }
+}
+
 async fn models(process: &Process) -> Result<Vec<CodexModelInfo>> {
     let mut cursor = Value::Null;
     let mut models = Vec::new();
@@ -679,6 +765,43 @@ fn belongs_to_thread(params: &Value, id: &acp::SessionId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_completion_then_autonomous_goal_has_independent_lifecycle() {
+        smol::block_on(async {
+            let (sender, receiver) = oneshot::channel();
+            let mut state = TurnState { sender: Some(sender), generation: 1, ..Default::default() };
+            assert!(!state.started("client".into()));
+            assert!(state.completed("client", Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))).is_none());
+            assert_eq!(receiver.await.unwrap().unwrap().stop_reason, acp::StopReason::EndTurn);
+            assert!(!state.has_active_turn());
+            assert!(state.started("goal".into()));
+            assert!(state.has_active_turn(), "a goal is active without a client sender");
+            assert_eq!(state.generation, 2);
+            assert!(!state.started("goal".into()), "duplicate start is not a new goal");
+            assert_eq!(state.generation, 2);
+            assert!(state.completed("client", Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))).is_none());
+            assert!(state.has_active_turn(), "late client completion cannot finish the goal");
+            let response = state.completed("goal", Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))).unwrap().unwrap();
+            assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+            assert!(!state.has_active_turn());
+            assert!(state.completed("goal", Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))).is_none(), "duplicate completion emits no extra stop");
+        });
+    }
+
+    #[test]
+    fn autonomous_failure_and_interruption_are_terminal_not_silent() {
+        let mut state = TurnState::default();
+        state.started("failure".into());
+        let error = state.completed("failure", Err(anyhow!("provider unavailable"))).unwrap().unwrap_err();
+        assert!(error.to_string().contains("provider unavailable"));
+        assert!(!state.has_active_turn());
+        state.started("cancel".into());
+        state.cancel_requested = true;
+        let result = state.completed("cancel", Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))).unwrap().unwrap();
+        assert_eq!(result.stop_reason, acp::StopReason::Cancelled);
+        assert!(!state.cancel_requested);
+        assert!(!state.has_active_turn());
+    }
     #[test]
     fn forwards_stdio_and_http_mcp_configuration() {
         let config = session_config(&[
