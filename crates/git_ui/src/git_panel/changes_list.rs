@@ -17,7 +17,8 @@
 //!   - **The row renderers.** `render_list_header`, `render_status_entry` and
 //!     `render_directory_entry`, plus the row primitives only they use
 //!     (`row_background_colors`, the chevron pair, `entry_label`,
-//!     `list_item_height`, `path_formatted`).
+//!     `list_item_height`). File content is rendered by `ChangedFileContent`,
+//!     shared with the Push dialog.
 //!
 //! `GitPanel` is a single large struct, so these stay inherent methods in a
 //! second `impl GitPanel` block — the partial-class idiom this fork already
@@ -26,7 +27,6 @@
 //! `visible_indices`, `section_counts`) remain declared on `GitPanel`.
 
 use super::*;
-use gpui::FontWeight;
 
 /// Left padding of a section header row (`Changes` / `Untracked` /
 /// `Conflicts`). Headers are the outermost level, so they get the bare row
@@ -646,62 +646,15 @@ impl GitPanel {
         cx: &Context<Self>,
     ) -> AnyElement {
         let settings = GitPanelSettings::get_global(cx);
-        let tree_view = settings.tree_view;
         let path_style = self.project.read(cx).path_style(cx);
-        let git_path_style = ProjectSettings::get_global(cx).git.path_style;
         let display_name = entry.display_name(path_style);
 
         let selected = self.selected_entry == Some(ix);
         // Not the same thing as `selected`: the cursor is where the keyboard
         // is, this is what the centre pane is showing. One row can be both.
         let open_in_pane = self.is_open_working_diff(repo.id, &entry.repo_path);
-        let status_style = settings.status_style;
         let status = entry.status;
-        let file_icon = if settings.file_icons {
-            FileIcons::get_icon(entry.repo_path.as_std_path(), cx)
-        } else {
-            None
-        };
-
-        let has_conflict = status.is_conflicted();
-        // Sticky for the whole merge, unlike `has_conflict`: a file that has
-        // been marked resolved keeps its row under `Conflicts` with a tick, and
-        // that tick's tooltip has to keep speaking resolution vocabulary.
         let had_conflict = repo.had_conflict_on_last_merge_head_change(&entry.repo_path);
-        let is_modified = status.is_modified();
-        let is_deleted = status.is_deleted();
-        let is_created = status.is_created();
-
-        let label_color = if status_style == StatusStyle::LabelColor {
-            if has_conflict {
-                Color::VersionControlConflict
-            } else if is_created {
-                Color::VersionControlUntracked
-            } else if is_modified {
-                Color::VersionControlModified
-            } else if is_deleted {
-                // We don't want a bunch of red labels in the list
-                Color::Disabled
-            } else {
-                Color::VersionControlAdded
-            }
-        } else if is_created {
-            // IDEA tints unversioned files in its Commit tool window; keep that
-            // cue even when the panel is in "status icon" mode, where every
-            // other row is plain. `is_created` is exactly the predicate behind
-            // the "Untracked" section header, so it gets the dedicated
-            // untracked tint; `version_control_added` would collide with the
-            // green this panel already spends on "added to the index".
-            Color::VersionControlUntracked
-        } else {
-            Color::Default
-        };
-
-        let path_color = if status.is_deleted() {
-            Color::Disabled
-        } else {
-            Color::Muted
-        };
 
         let id: ElementId = ElementId::Name(format!("entry_{}_{}", display_name, ix).into());
         let checkbox_wrapper_id: ElementId =
@@ -723,51 +676,15 @@ impl GitPanel {
 
         let (base_bg, hover_bg, active_bg) = row_background_colors(selected, open_in_pane, cx);
 
-        let name_row = h_flex()
-            .min_w_0()
-            .flex_1()
-            .gap_1()
-            .when(settings.file_icons, |this| {
-                this.child(
-                    file_icon
-                        .map(|file_icon| {
-                            Icon::from_path(file_icon)
-                                .size(IconSize::Small)
-                                .color(Color::Muted)
-                        })
-                        .unwrap_or_else(|| {
-                            Icon::new(IconName::File)
-                                .size(IconSize::Small)
-                                .color(Color::Muted)
-                        }),
-                )
-            })
-            .when(status_style != StatusStyle::LabelColor, |el| {
-                el.child(git_status_icon(status))
-            })
-            .map(|this| {
-                if tree_view {
-                    this.child(
-                        self.entry_label(display_name, label_color)
-                            .when(open_in_pane, |label| label.weight(FontWeight::BOLD))
-                            .when(status.is_deleted(), Label::strikethrough)
-                            .truncate(),
-                    )
-                } else {
-                    this.child(self.path_formatted(
-                        entry.parent_dir(path_style),
-                        path_color,
-                        display_name,
-                        label_color,
-                        path_style,
-                        git_path_style,
-                        status.is_deleted(),
-                        open_in_pane,
-                    ))
-                }
-            });
-
-        let id_for_diff_stat = id.clone();
+        let name_row = crate::changed_file_content::ChangedFileContent {
+            id: format!("diff-stat-{id}").into(),
+            path: entry.repo_path.clone(),
+            status,
+            path_style,
+            tree_view: settings.tree_view,
+            bold: open_in_pane,
+            stat: entry.diff_stat,
+        };
 
         h_flex()
             .id(id)
@@ -852,16 +769,6 @@ impl GitPanel {
                     ),
             )
             .child(name_row)
-            .when(GitPanelSettings::get_global(cx).diff_stats, |el| {
-                el.when_some(entry.diff_stat, move |this, stat| {
-                    let id = format!("diff-stat-{}", id_for_diff_stat);
-                    this.child(ui::DiffStat::new(
-                        id,
-                        stat.added as usize,
-                        stat.deleted as usize,
-                    ))
-                })
-            })
             .on_click({
                 cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.selected_entry = Some(ix);
@@ -1014,48 +921,6 @@ impl GitPanel {
                 })
             })
             .into_any_element()
-    }
-
-    fn path_formatted(
-        &self,
-        directory: Option<String>,
-        path_color: Color,
-        file_name: String,
-        label_color: Color,
-        path_style: PathStyle,
-        git_path_style: GitPathStyle,
-        strikethrough: bool,
-        bold_file_name: bool,
-    ) -> Div {
-        let file_name_first = git_path_style == GitPathStyle::FileNameFirst;
-        let file_path_first = git_path_style == GitPathStyle::FilePathFirst;
-
-        let file_name = format!("{} ", file_name);
-
-        h_flex()
-            .min_w_0()
-            .overflow_hidden()
-            .when(file_path_first, |this| this.flex_row_reverse())
-            .child(
-                div().flex_none().child(
-                    self.entry_label(file_name, label_color)
-                        .when(bold_file_name, |label| label.weight(FontWeight::BOLD))
-                        .when(strikethrough, Label::strikethrough),
-                ),
-            )
-            .when_some(directory, |this, dir| {
-                let path_name = if file_name_first {
-                    dir
-                } else {
-                    format!("{dir}{}", path_style.primary_separator())
-                };
-
-                this.child(
-                    self.entry_label(path_name, path_color)
-                        .truncate_start()
-                        .when(strikethrough, Label::strikethrough),
-                )
-            })
     }
 }
 

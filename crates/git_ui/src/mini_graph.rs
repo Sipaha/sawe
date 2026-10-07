@@ -40,6 +40,7 @@ impl MiniCommit {
 pub struct MiniGraph {
     commits: Vec<MiniCommit>,
     selected: Option<usize>,
+    dialog_style: bool,
 }
 
 impl MiniGraph {
@@ -47,11 +48,19 @@ impl MiniGraph {
         Self {
             commits,
             selected: None,
+            dialog_style: false,
         }
     }
 
     pub fn with_selected(mut self, selected: Option<usize>) -> Self {
         self.selected = selected;
+        self
+    }
+
+    /// Rows with a shared 0.75rem inset and an accent on the selection,
+    /// for the push dialog's edge-to-edge commit pane.
+    pub fn with_dialog_style(mut self) -> Self {
+        self.dialog_style = true;
         self
     }
 
@@ -78,6 +87,7 @@ impl MiniGraph {
         let row_count = self.commits.len();
         let commits = self.commits;
         let selected = self.selected;
+        let dialog_style = self.dialog_style;
         let scroll_handle = UniformListScrollHandle::new();
 
         if row_count == 0 {
@@ -104,7 +114,14 @@ impl MiniGraph {
                     };
                     let is_selected = selected == Some(ix);
                     let on_select = on_select.clone();
-                    elements.push(render_row(ix, commit, is_selected, on_select, cx));
+                    elements.push(render_row(
+                        ix,
+                        commit,
+                        is_selected,
+                        dialog_style,
+                        on_select,
+                        cx,
+                    ));
                 }
                 elements
             },
@@ -120,6 +137,7 @@ fn render_row(
     ix: usize,
     commit: &MiniCommit,
     is_selected: bool,
+    dialog_style: bool,
     on_select: Rc<dyn Fn(usize, &mut App)>,
     cx: &mut App,
 ) -> AnyElement {
@@ -127,7 +145,10 @@ fn render_row(
     let short: SharedString = commit.short_sha().into();
     let date: SharedString = format_relative(commit.committer_date_unix).into();
     let bg = if is_selected {
-        cx.theme().colors().element_selected
+        cx.theme()
+            .colors()
+            .element_selected
+            .opacity(if dialog_style { 0.75 } else { 1.0 })
     } else {
         gpui::transparent_black()
     };
@@ -136,6 +157,21 @@ fn render_row(
         .id(SharedString::from(format!("mini-graph-row-{ix}")))
         .px_2()
         .py_1()
+        .when(dialog_style, |row| {
+            row.relative().px_3().py_1().rounded_r_md().child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(gpui::px(2.))
+                    .bg(if is_selected {
+                        cx.theme().colors().text_accent
+                    } else {
+                        gpui::transparent_black()
+                    }),
+            )
+        })
         .gap_2()
         .bg(bg)
         .hover(|s| s.bg(cx.theme().colors().element_hover))

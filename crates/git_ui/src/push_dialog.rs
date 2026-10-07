@@ -14,10 +14,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use crate::changed_file_content::ChangedFileContent;
+use crate::solo_diff_view::{DiffOpen, SoloDiffView};
 use anyhow::{Context as _, Result, anyhow};
 use editor::Editor;
 use git::push_rejection::PushRejection;
+use git::repository::RepoPath;
 use git::repository::{Remote, RemoteCommandOutput};
+use git::status::{DiffStat, FileStatus, StatusCode, TrackedStatus};
 use gpui::{
     AppContext, ClickEvent, ClipboardItem, DismissEvent, Entity, EventEmitter, FocusHandle,
     Focusable, InteractiveElement, ParentElement, Render, SharedString, Styled, Task, WeakEntity,
@@ -32,6 +36,7 @@ use ui::{
 };
 use util::ResultExt as _;
 use util::command::new_command;
+use util::paths::PathStyle;
 use workspace::{ModalView, Workspace};
 
 mod force_confirm;
@@ -155,8 +160,7 @@ impl PushFailure {
 struct DiffFileSummary {
     path: String,
     status: String,
-    additions: u32,
-    deletions: u32,
+    stat: Option<DiffStat>,
 }
 
 impl EventEmitter<DismissEvent> for PushDialog {}
@@ -308,12 +312,21 @@ impl PushDialog {
         };
         let work_dir = self.work_dir.clone();
         cx.spawn(async move |this, cx| {
+            let selected_sha = commit.sha;
+            let query_sha = selected_sha.clone();
             let files = cx
-                .background_spawn(async move { commit_file_summary(&work_dir, &commit.sha).await })
+                .background_spawn(async move { commit_file_summary(&work_dir, &query_sha).await })
                 .await
                 .log_err()
                 .unwrap_or_default();
             this.update(cx, |this, cx| {
+                let current_sha = this
+                    .selected_commit
+                    .and_then(|ix| this.preview.ahead.get(ix))
+                    .map(|commit| commit.sha.as_str());
+                if current_sha != Some(selected_sha.as_str()) {
+                    return;
+                }
                 this.selected_files = files;
                 cx.notify();
             })
@@ -846,8 +859,17 @@ impl Render for PushDialog {
             .on_action(cx.listener(Self::cancel))
             .track_focus(&self.focus_handle)
             .elevation_3(cx)
-            .border_color(cx.theme().colors().text_muted.opacity(0.65))
-            .w(rems(64.)
+            .border_color(cx.theme().colors().text.opacity(0.22))
+            .rounded_xl()
+            .shadow(vec![
+                gpui::BoxShadow::new(
+                    gpui::px(0.),
+                    gpui::px(14.),
+                    gpui::hsla(0.62, 0.28, 0.06, 0.32),
+                )
+                .blur_radius(gpui::px(40.)),
+            ])
+            .w(rems(46.)
                 .to_pixels(window.rem_size())
                 .min(window.viewport_size().width - gpui::px(32.)))
             .max_h(window.viewport_size().height - gpui::px(112.))
@@ -855,7 +877,7 @@ impl Render for PushDialog {
             .child(header)
             .child(body)
             .when_some(status, |this, status| {
-                this.child(div().px_4().pb_3().flex_shrink_0().child(status))
+                this.child(div().px_3().py_3().flex_shrink_0().child(status))
             })
             .child(footer)
             .into_any_element()
@@ -869,13 +891,13 @@ impl PushDialog {
         } else {
             self.remote.clone()
         };
-        let border = cx.theme().colors().text_muted.opacity(0.45);
+        let border = cx.theme().colors().text_muted.opacity(0.22);
         v_flex()
             .w_full()
             .flex_shrink_0()
-            .px_4()
-            .py_3()
-            .gap_3()
+            .px_3()
+            .py_2()
+            .gap_2()
             .border_b_1()
             .border_color(border)
             .child(
@@ -894,7 +916,7 @@ impl PushDialog {
             .child(
                 h_flex()
                     .w_full()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         Label::new("From")
                             .size(LabelSize::Small)
@@ -915,14 +937,15 @@ impl PushDialog {
                     .child(Label::new("To").size(LabelSize::Small).color(Color::Muted))
                     .child(
                         h_flex()
-                            .flex_1()
+                            .w(rems(16.))
+                            .flex_shrink(1.)
                             .min_w_0()
                             .gap_2()
                             .px_2()
                             .py_1()
                             .rounded_md()
                             .border_1()
-                            .border_color(border)
+                            .border_color(cx.theme().colors().text_muted.opacity(0.35))
                             .bg(cx.theme().colors().editor_background)
                             .child(
                                 Label::new(remote)
@@ -952,7 +975,7 @@ impl PushDialog {
                     .p_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(cx.theme().colors().text_muted.opacity(0.45))
+                    .border_color(cx.theme().colors().text_muted.opacity(0.22))
                     .gap_2()
                     .child(
                         Icon::new(IconName::ArrowCircle)
@@ -1096,7 +1119,7 @@ impl PushDialog {
 
         let mini = if commits.is_empty() {
             div()
-                .py_4()
+                .py_2()
                 .child(
                     // Pushing is not gated on having commits ahead: with `tags`
                     // on, `git push --tags` still has work to do. Saying
@@ -1116,6 +1139,7 @@ impl PushDialog {
         } else {
             let entity = cx.weak_entity();
             MiniGraph::new(commits)
+                .with_dialog_style()
                 .with_selected(selected)
                 .render(
                     move |ix, cx| {
@@ -1135,9 +1159,6 @@ impl PushDialog {
                 .w_full()
                 .gap_0p5()
                 .pb_2()
-                .mb_1()
-                .border_b_1()
-                .border_color(cx.theme().colors().text_muted.opacity(0.45))
                 .child(
                     Label::new(commit.subject.clone())
                         .size(LabelSize::Small)
@@ -1150,32 +1171,56 @@ impl PushDialog {
                 )
                 .into_any_element();
             let mut rows: Vec<gpui::AnyElement> = vec![header];
-            for file in &self.selected_files {
+            for (file_ix, file) in self.selected_files.iter().enumerate() {
+                let Ok(path) = RepoPath::new(&file.path) else {
+                    continue;
+                };
+                let status_code = match file.status.chars().next() {
+                    Some('A') => StatusCode::Added,
+                    Some('D') => StatusCode::Deleted,
+                    Some('R') => StatusCode::Renamed,
+                    Some('C') => StatusCode::Copied,
+                    Some('T') => StatusCode::TypeChanged,
+                    _ => StatusCode::Modified,
+                };
+                let sha: SharedString = commit.sha.clone().into();
+                let repository = self.repository.clone();
+                let workspace = self.workspace.clone();
+                let entity = cx.weak_entity();
                 rows.push(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(cx.theme().colors().text_muted.opacity(0.25))
-                        .child(
-                            Label::new(file.status.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            div().flex_1().min_w_0().child(
-                                Label::new(file.path.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Default)
-                                    .truncate(),
-                            ),
-                        )
-                        .child(
-                            Label::new(format!("+{} −{}", file.additions, file.deletions))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
+                    ui::ButtonLike::new(("push-file", file_ix))
+                        .height(rems(1.75).into())
+                        .child(ChangedFileContent {
+                            id: ("push-file-stat", file_ix).into(),
+                            path: path.clone(),
+                            status: FileStatus::Tracked(TrackedStatus {
+                                index_status: status_code,
+                                worktree_status: StatusCode::Unmodified,
+                            }),
+                            path_style: PathStyle::local(),
+                            tree_view: false,
+                            bold: false,
+                            stat: file.stat,
+                        })
+                        .tooltip(Tooltip::text(file.path.clone()))
+                        .on_click(move |event: &ClickEvent, window, cx| {
+                            let mode = if event.click_count() >= 2 {
+                                entity.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+                                DiffOpen::Summon { focus: true }
+                            } else {
+                                DiffOpen::Retarget
+                            };
+                            SoloDiffView::open_commit_file(
+                                sha.clone(),
+                                repository.clone(),
+                                path.clone(),
+                                workspace.clone(),
+                                mode,
+                                window,
+                                cx,
+                            )
+                            .detach_and_log_err(cx);
+                        })
                         .into_any_element(),
                 );
             }
@@ -1211,13 +1256,13 @@ impl PushDialog {
                     .flex_shrink_0()
                     .flex_wrap()
                     .border_t_1()
-                    .border_color(cx.theme().colors().text_muted.opacity(0.45))
+                    .border_color(cx.theme().colors().text_muted.opacity(0.22))
                     .child(
-                        Button::new("push-dialog-squash", "Squash with Previous")
+                        Button::new("push-dialog-squash", "Squash")
+                            .tooltip(Tooltip::text("Squash with the previous commit"))
                             .label_size(LabelSize::Small)
-                            .style(ButtonStyle::OutlinedCustom(
-                                cx.theme().colors().text_muted.opacity(0.45),
-                            ))
+                            .color(Color::Muted)
+                            .style(ButtonStyle::Subtle)
                             .on_click(move |_event: &ClickEvent, window, cx| {
                                 if let Some(this) = entity_for_squash.upgrade() {
                                     this.update(cx, |this, cx| {
@@ -1229,9 +1274,8 @@ impl PushDialog {
                     .child(
                         Button::new("push-dialog-reword", "Reword")
                             .label_size(LabelSize::Small)
-                            .style(ButtonStyle::OutlinedCustom(
-                                cx.theme().colors().text_muted.opacity(0.45),
-                            ))
+                            .color(Color::Muted)
+                            .style(ButtonStyle::Subtle)
                             .on_click(move |_event: &ClickEvent, window, cx| {
                                 if let Some(this) = entity_for_reword.upgrade() {
                                     this.update(cx, |this, cx| this.run_reword(ix, window, cx));
@@ -1241,9 +1285,8 @@ impl PushDialog {
                     .child(
                         Button::new("push-dialog-drop", "Drop")
                             .label_size(LabelSize::Small)
-                            .style(ButtonStyle::OutlinedCustom(
-                                cx.theme().colors().text_muted.opacity(0.45),
-                            ))
+                            .color(Color::Muted)
+                            .style(ButtonStyle::Subtle)
                             .on_click(move |_event: &ClickEvent, window, cx| {
                                 if let Some(this) = entity_for_drop.upgrade() {
                                     this.update(cx, |this, cx| this.run_drop(ix, window, cx));
@@ -1264,17 +1307,21 @@ impl PushDialog {
             }
         );
 
-        let border = cx.theme().colors().text_muted.opacity(0.45);
+        let border = cx.theme().colors().text_muted.opacity(0.22);
+        // Show short previews at their natural height; cap long lists so the
+        // commit list and file pane scroll rather than growing the modal.
+        let commit_height =
+            2.75 * total.clamp(1, 5) as f32 + if selected.is_some() { 4.5 } else { 2. };
+        let file_height = if selected.is_some() {
+            5. + 1.75 * self.selected_files.len().min(7) as f32
+        } else {
+            3.75
+        };
         h_flex()
-            .mx_4()
-            .my_3()
-            .h(rems(22.))
+            .w_full()
+            .h(rems(commit_height.max(file_height).min(20.)))
             .min_h_0()
-            .border_1()
-            .border_color(border)
-            .rounded_md()
             .overflow_hidden()
-            .bg(cx.theme().colors().editor_background)
             .child(
                 v_flex()
                     .w(gpui::relative(0.46))
@@ -1283,30 +1330,26 @@ impl PushDialog {
                     .flex_shrink_0()
                     .border_r_1()
                     .border_color(border)
+                    .bg(cx.theme().colors().editor_background)
                     .child(
                         h_flex()
-                            .h_10()
+                            .h_8()
                             .px_3()
                             .gap_2()
                             .flex_shrink_0()
-                            .border_b_1()
-                            .border_color(border)
-                            .bg(cx.theme().colors().elevated_surface_background)
-                            .child(Label::new("Commits to push").size(LabelSize::Small))
+                            .child(
+                                Label::new("Commits to push")
+                                    .weight(gpui::FontWeight::SEMIBOLD)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
                             .child(
                                 Label::new(summary_label)
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .px_1()
-                            .overflow_hidden()
-                            .child(mini),
-                    )
+                    .child(div().flex_1().min_h_0().overflow_hidden().child(mini))
                     .when_some(context_menu_row, |this, row| this.child(row)),
             )
             .child(
@@ -1316,14 +1359,12 @@ impl PushDialog {
                     .h_full()
                     .min_h_0()
                     .child(
-                        h_flex()
-                            .h_10()
-                            .px_3()
-                            .flex_shrink_0()
-                            .border_b_1()
-                            .border_color(border)
-                            .bg(cx.theme().colors().elevated_surface_background)
-                            .child(Label::new("Changed files").size(LabelSize::Small)),
+                        h_flex().h_8().px_3().flex_shrink_0().child(
+                            Label::new("Changed files")
+                                .weight(gpui::FontWeight::SEMIBOLD)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
                     )
                     .child(
                         v_flex()
@@ -1332,7 +1373,6 @@ impl PushDialog {
                             .min_h_0()
                             .px_3()
                             .py_1()
-                            .gap_1()
                             .overflow_y_scroll()
                             .children(detail),
                     ),
@@ -1380,7 +1420,7 @@ impl PushDialog {
         };
 
         let options = h_flex()
-            .gap_3()
+            .gap_2()
             .child(force_lease_box)
             .child(
                 Checkbox::new("push-dialog-tags", tags_state)
@@ -1396,11 +1436,11 @@ impl PushDialog {
         let mut footer = v_flex()
             .w_full()
             .flex_shrink_0()
-            .px_4()
-            .py_3()
-            .gap_3()
+            .px_3()
+            .py_2()
+            .gap_2()
             .border_t_1()
-            .border_color(cx.theme().colors().text_muted.opacity(0.45));
+            .border_color(cx.theme().colors().text_muted.opacity(0.22));
         if self.preview.divergence() {
             let pull_rebase_state = if self.pull_rebase_first {
                 ToggleState::Selected
@@ -1433,7 +1473,7 @@ impl PushDialog {
         footer.child(
             h_flex()
                 .w_full()
-                .gap_3()
+                .gap_2()
                 .justify_between()
                 .child(options)
                 .child(
@@ -1442,9 +1482,7 @@ impl PushDialog {
                         .child(
                             Button::new("push-dialog-cancel", "Cancel")
                                 .size(ButtonSize::Medium)
-                                .style(ButtonStyle::OutlinedCustom(
-                                    cx.theme().colors().text_muted.opacity(0.45),
-                                ))
+                                .style(ButtonStyle::Subtle)
                                 .on_click(
                                     cx.listener(|_this, _, _window, cx| cx.emit(DismissEvent)),
                                 ),
@@ -1559,7 +1597,7 @@ impl Render for RewordPromptModal {
                     .child(Icon::new(IconName::Pencil).size(IconSize::XSmall))
                     .child(Headline::new(format!("Reword ({short})")).size(HeadlineSize::XSmall)),
             )
-            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+            .child(div().px_3().pb_2().w_full().child(self.editor.clone()))
     }
 }
 
@@ -1739,39 +1777,61 @@ async fn list_commits_in_range(
 }
 
 async fn commit_file_summary(work_dir: &Path, sha: &str) -> Result<Vec<DiffFileSummary>> {
-    let numstat = run_git(work_dir, &["show", "--numstat", "--format=", sha]).await?;
-    let namestatus = run_git(work_dir, &["show", "--name-status", "--format=", sha]).await?;
-    let mut files = Vec::new();
-    let mut status_map = std::collections::HashMap::new();
-    for line in namestatus.lines() {
-        let mut cols = line.splitn(2, '\t');
-        let status = cols.next().unwrap_or("").to_string();
-        let path = cols.next().unwrap_or("").to_string();
-        if path.is_empty() {
+    let numstat = run_git(work_dir, &["show", "--numstat", "-z", "--format=", sha]).await?;
+    let statuses = run_git(work_dir, &["show", "--name-status", "-z", "--format=", sha]).await?;
+    Ok(parse_commit_file_summary(&numstat, &statuses))
+}
+
+fn parse_commit_file_summary(numstat: &str, statuses: &str) -> Vec<DiffFileSummary> {
+    let mut stats = std::collections::HashMap::new();
+    let mut records = numstat.split('\0');
+    while let Some(record) = records.next() {
+        let mut fields = record.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             continue;
-        }
-        status_map.insert(path, status);
+        };
+        let path = if path.is_empty() {
+            let _old_path = records.next();
+            let Some(new_path) = records.next() else {
+                break;
+            };
+            new_path
+        } else {
+            path
+        };
+        let stat = added
+            .parse::<u32>()
+            .ok()
+            .zip(deleted.parse::<u32>().ok())
+            .map(|(added, deleted)| DiffStat { added, deleted });
+        stats.insert(path, stat);
     }
-    for line in numstat.lines() {
-        let mut cols = line.splitn(3, '\t');
-        let additions: u32 = cols.next().unwrap_or("0").parse().unwrap_or(0);
-        let deletions: u32 = cols.next().unwrap_or("0").parse().unwrap_or(0);
-        let path = cols.next().unwrap_or("").to_string();
-        if path.is_empty() {
+    let mut files = Vec::new();
+    let mut records = statuses.split('\0');
+    while let Some(status) = records.next() {
+        if status.is_empty() {
             continue;
         }
-        let status = status_map
-            .get(&path)
-            .cloned()
-            .unwrap_or_else(|| "M".to_string());
+        let Some(path) = records.next() else {
+            break;
+        };
+        let path = if status.starts_with('R') || status.starts_with('C') {
+            let Some(new_path) = records.next() else {
+                break;
+            };
+            new_path
+        } else {
+            path
+        };
         files.push(DiffFileSummary {
-            path,
-            status,
-            additions,
-            deletions,
+            path: path.to_owned(),
+            status: status.to_owned(),
+            stat: stats.get(path).copied().flatten(),
         });
     }
-    Ok(files)
+    files
 }
 
 /// Returns the list of remote refs that contain `sha` ("origin/main",
@@ -1972,6 +2032,41 @@ async fn run_git_void(work_dir: &Path, args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_summary_handles_renames_and_binary_files() {
+        let files = super::parse_commit_file_summary(
+            "2\t1\t\0old.txt\0new.txt\0-\t-\timage.png\0",
+            "R090\0old.txt\0new.txt\0A\0image.png\0",
+        );
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "new.txt");
+        assert_eq!(files[0].status, "R090");
+        assert_eq!(
+            files[0].stat,
+            Some(git::status::DiffStat {
+                added: 2,
+                deleted: 1
+            })
+        );
+        assert_eq!(files[1].path, "image.png");
+        assert_eq!(files[1].stat, None);
+    }
+
+    #[test]
+    fn file_summary_preserves_tabs_and_newlines_in_paths() {
+        let files =
+            super::parse_commit_file_summary("1\t0\tdir/a\tb\nc.txt\0", "A\0dir/a\tb\nc.txt\0");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "dir/a\tb\nc.txt");
+        assert_eq!(
+            files[0].stat,
+            Some(git::status::DiffStat {
+                added: 1,
+                deleted: 0
+            })
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
 

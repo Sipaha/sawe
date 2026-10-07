@@ -1057,6 +1057,21 @@ How to apply:
 - "Force push with lease" re-enters `confirm_push` with `ForceMode::WithLease` rather than calling `run_force_with_lease` directly, so the S-SOL-PRT branch-protection check at the press boundary still runs. Only `--force-with-lease` is ever offered as a remediation — see #74, which removed the bare `--force` from the tree entirely.
 - Keymap: `ctrl-shift-k` is `git::Push` in the `Workspace` block of `assets/keymaps/default-linux.json` (IDEA parity). It displaced `editor::DeleteLine`, which moved to IDEA's `ctrl-y`; `editor::Redo` keeps `ctrl-shift-z` and the `redo` key. macOS/Windows defaults were left alone.
 
+Push preview layout (2026-10-07): use edge-to-edge panes rather than an inset,
+rounded table inside the modal. Headers, commit rows, file details, and actions
+share a 0.75rem content inset. Backgrounds and restrained separators establish
+hierarchy; a selected-row accent identifies the current commit. The perimeter
+has a soft outline and shadow. Short previews fit their commit/file counts;
+long lists scroll within a bounded height. `MiniGraph::with_dialog_style` opts into the
+aligned rows; other mini-graph consumers retain their existing layout. Clicking
+outside keeps this stateful dialog open; Cancel and Escape remain explicit exits.
+File content is shared with Changes through `ChangedFileContent`: file icons,
+status colors/icons, filename/path ordering, and `DiffStat` follow the panel's
+settings. Push rows activate a historical diff for the selected commit. Preview
+file paths are parsed as NUL-separated git records so renames, binary files,
+and whitespace in paths keep their identity. Late file-list loads are ignored
+when the selected commit has changed.
+
 ### 69. The commit menu's branch submenu is a transcription of IDEA's, and it lists remote-tracking refs
 
 Why: S-CTM's "Branches at This Commit" section originally filtered remote-tracking refs out — the comment in `git_ui::commit_context_menu` argued that acting on them from a commit row would be surprising — and gave local branches a three-entry submenu (Checkout / Merge / Delete). Both were wrong against the reference: the tip of `origin/master` on a repo where nothing is merged locally carries *only* remote decorations, so the whole section vanished exactly when the row's ref chips most needed explaining; and IDEA's own `Branch '<name>'` submenu is ~14 rows deep. The submenu is now a row-for-row transcription of IDEA's (same entries, order, separators and `'name'` interpolation), and remote refs are listed beside local ones with `IconName::Screen`, the icon the branch picker already uses for remote entries.
