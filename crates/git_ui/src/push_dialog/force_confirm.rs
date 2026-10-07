@@ -189,7 +189,11 @@ impl PushDialog {
     /// [`FORCE_PUSH_CONFIRM_DELAY_SECS`] so a reflex click aimed at
     /// "Push" cannot land on it. When the push is refused there is no
     /// confirm button at all, dead or otherwise.
-    pub(super) fn render_force_push_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_force_push_confirm(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(confirm) = self.force_confirm.as_ref() else {
             return div().into_any_element();
         };
@@ -269,7 +273,10 @@ impl PushDialog {
             .on_action(cx.listener(Self::cancel))
             .track_focus(&self.focus_handle)
             .elevation_3(cx)
-            .w(rems(64.))
+            .border_color(cx.theme().colors().text_muted.opacity(0.65))
+            .w(rems(64.)
+                .to_pixels(window.rem_size())
+                .min(window.viewport_size().width - gpui::px(32.)))
             .max_h(rems(40.))
             .p_3()
             .gap_2()

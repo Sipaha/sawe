@@ -134,6 +134,16 @@ To view File History:
 
 Fetch, push, or pull from your Git repository in Zed via the buttons available on the Git Panel or via the Command Palette by looking at the respective actions: {#action git::Fetch}, {#action git::Push}, and {#action git::Pull}.
 
+### Push preview {#push-preview}
+
+In Sawe, {#action git::Push} opens a review dialog before sending changes.
+Check the source branch and destination at the top. Select a commit in
+**Commits to push** to review its **Changed files**. Commit editing actions stay
+below the commit list; push options and the **Push** button are in the footer.
+
+Clicking outside the dialog keeps it open. Use **Cancel** or {#kb menu::Cancel} to close it.
+If a force-push confirmation is open, the same key returns to the preview first.
+
 ### Push Configuration
 
 Zed respects Git's push configuration. When pushing, Zed checks the following in order:

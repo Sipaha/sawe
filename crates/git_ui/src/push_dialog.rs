@@ -26,9 +26,9 @@ use gpui::{
 use menu::Cancel;
 use project::git_store::Repository;
 use ui::{
-    App, Button, ButtonStyle, Checkbox, Clickable, Color, Context, Headline, HeadlineSize, Icon,
-    IconName, IconSize, IntoElement, Label, LabelCommon, LabelSize, TintColor, ToggleState,
-    Tooltip, h_flex, prelude::*, rems, v_flex,
+    App, Button, ButtonSize, ButtonStyle, Checkbox, Clickable, Color, Context, Headline,
+    HeadlineSize, Icon, IconName, IconSize, IntoElement, Label, LabelCommon, LabelSize, TintColor,
+    ToggleState, Tooltip, h_flex, prelude::*, rems, v_flex,
 };
 use util::ResultExt as _;
 use util::command::new_command;
@@ -160,7 +160,19 @@ struct DiffFileSummary {
 }
 
 impl EventEmitter<DismissEvent> for PushDialog {}
-impl ModalView for PushDialog {}
+impl ModalView for PushDialog {
+    fn dismiss_on_overlay_click(&self) -> bool {
+        false
+    }
+
+    fn fade_out_background(&self) -> bool {
+        true
+    }
+
+    fn debug_kind(&self) -> &'static str {
+        "PushDialog"
+    }
+}
 impl Focusable for PushDialog {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -818,14 +830,14 @@ struct PushInvocation {
 }
 
 impl Render for PushDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The confirmation takes the dialog over rather than layering on
         // top of it: while it is up, none of the toggles or commit rows
         // behind it may be reachable.
         if self.force_confirm.is_some() {
-            return self.render_force_push_confirm(cx);
+            return self.render_force_push_confirm(window, cx);
         }
-        let header = self.render_header().into_any_element();
+        let header = self.render_header(cx).into_any_element();
         let body = self.render_body(cx).into_any_element();
         let status = self.render_status(cx);
         let footer = self.render_footer(cx).into_any_element();
@@ -834,53 +846,98 @@ impl Render for PushDialog {
             .on_action(cx.listener(Self::cancel))
             .track_focus(&self.focus_handle)
             .elevation_3(cx)
-            .w(rems(64.))
-            .max_h(rems(40.))
-            .p_3()
-            .gap_2()
+            .border_color(cx.theme().colors().text_muted.opacity(0.65))
+            .w(rems(64.)
+                .to_pixels(window.rem_size())
+                .min(window.viewport_size().width - gpui::px(32.)))
+            .max_h(window.viewport_size().height - gpui::px(112.))
+            .overflow_hidden()
             .child(header)
             .child(body)
-            .when_some(status, |this, status| this.child(status))
+            .when_some(status, |this, status| {
+                this.child(div().px_4().pb_3().flex_shrink_0().child(status))
+            })
             .child(footer)
             .into_any_element()
     }
 }
 
 impl PushDialog {
-    fn render_header(&self) -> impl IntoElement {
-        let branch = self.branch.clone();
+    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
         let remote = if self.remote.is_empty() {
             SharedString::from("(no remote)")
         } else {
             self.remote.clone()
         };
-        let create_hint = if self.preview.will_create_remote_branch {
-            Some(
-                Label::new("Will create new remote branch")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Accent),
-            )
-        } else {
-            None
-        };
-        h_flex()
-            .gap_2()
-            .child(Icon::new(IconName::ArrowUp).size(IconSize::Small))
-            .child(Headline::new("Push").size(HeadlineSize::Small))
-            .child(Label::new(branch).size(LabelSize::Small))
-            .child(Label::new("→").size(LabelSize::Small).color(Color::Muted))
+        let border = cx.theme().colors().text_muted.opacity(0.45);
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_4()
+            .py_3()
+            .gap_3()
+            .border_b_1()
+            .border_color(border)
             .child(
-                Label::new(remote)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(IconName::ArrowUp).size(IconSize::Small))
+                    .child(Headline::new("Push").size(HeadlineSize::Small))
+                    .when(self.preview.will_create_remote_branch, |row| {
+                        row.child(
+                            Label::new("Will create new remote branch")
+                                .size(LabelSize::Small)
+                                .color(Color::Accent),
+                        )
+                    }),
             )
-            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
             .child(
-                div()
-                    .min_w(rems(16.))
-                    .child(self.remote_branch_editor.clone()),
+                h_flex()
+                    .w_full()
+                    .gap_3()
+                    .child(
+                        Label::new("From")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div().max_w(rems(20.)).min_w_0().child(
+                            Label::new(self.branch.clone())
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        ),
+                    )
+                    .child(
+                        Icon::new(IconName::ArrowRight)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new("To").size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .bg(cx.theme().colors().editor_background)
+                            .child(
+                                Label::new(remote)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(self.remote_branch_editor.clone()),
+                            ),
+                    ),
             )
-            .when_some(create_hint, |this, hint| this.child(hint))
     }
 
     /// Renders the outcome of the last push / remediation. Git's own text
@@ -891,6 +948,11 @@ impl PushDialog {
         if let Some(remediation) = self.remediation.clone() {
             return Some(
                 h_flex()
+                    .w_full()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().text_muted.opacity(0.45))
                     .gap_2()
                     .child(
                         Icon::new(IconName::ArrowCircle)
@@ -909,6 +971,12 @@ impl PushDialog {
         if let Some(notice) = self.notice.clone() {
             return Some(
                 h_flex()
+                    .w_full()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().status().success_border)
+                    .bg(cx.theme().status().success_background)
                     .gap_2()
                     .child(
                         Icon::new(IconName::Check)
@@ -1063,8 +1131,13 @@ impl PushDialog {
         let detail: Vec<gpui::AnyElement> = if let Some(ix) = selected
             && let Some(commit) = self.preview.ahead.get(ix)
         {
-            let header = h_flex()
-                .gap_2()
+            let header = v_flex()
+                .w_full()
+                .gap_0p5()
+                .pb_2()
+                .mb_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().text_muted.opacity(0.45))
                 .child(
                     Label::new(commit.subject.clone())
                         .size(LabelSize::Small)
@@ -1080,17 +1153,23 @@ impl PushDialog {
             for file in &self.selected_files {
                 rows.push(
                     h_flex()
+                        .w_full()
                         .gap_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().text_muted.opacity(0.25))
                         .child(
                             Label::new(file.status.clone())
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         )
                         .child(
-                            Label::new(file.path.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Default)
-                                .truncate(),
+                            div().flex_1().min_w_0().child(
+                                Label::new(file.path.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Default)
+                                    .truncate(),
+                            ),
                         )
                         .child(
                             Label::new(format!("+{} −{}", file.additions, file.deletions))
@@ -1125,69 +1204,139 @@ impl PushDialog {
             let entity_for_drop = entity;
             Some(
                 h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_2()
                     .gap_1()
+                    .flex_shrink_0()
+                    .flex_wrap()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().text_muted.opacity(0.45))
                     .child(
-                        Button::new("push-dialog-squash", "Squash with Previous").on_click(
-                            move |_event: &ClickEvent, window, cx| {
+                        Button::new("push-dialog-squash", "Squash with Previous")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::OutlinedCustom(
+                                cx.theme().colors().text_muted.opacity(0.45),
+                            ))
+                            .on_click(move |_event: &ClickEvent, window, cx| {
                                 if let Some(this) = entity_for_squash.upgrade() {
                                     this.update(cx, |this, cx| {
                                         this.run_squash_with_previous(ix, window, cx)
                                     });
                                 }
-                            },
-                        ),
+                            }),
                     )
-                    .child(Button::new("push-dialog-reword", "Reword").on_click(
-                        move |_event: &ClickEvent, window, cx| {
-                            if let Some(this) = entity_for_reword.upgrade() {
-                                this.update(cx, |this, cx| this.run_reword(ix, window, cx));
-                            }
-                        },
-                    ))
-                    .child(Button::new("push-dialog-drop", "Drop").on_click(
-                        move |_event: &ClickEvent, window, cx| {
-                            if let Some(this) = entity_for_drop.upgrade() {
-                                this.update(cx, |this, cx| this.run_drop(ix, window, cx));
-                            }
-                        },
-                    )),
+                    .child(
+                        Button::new("push-dialog-reword", "Reword")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::OutlinedCustom(
+                                cx.theme().colors().text_muted.opacity(0.45),
+                            ))
+                            .on_click(move |_event: &ClickEvent, window, cx| {
+                                if let Some(this) = entity_for_reword.upgrade() {
+                                    this.update(cx, |this, cx| this.run_reword(ix, window, cx));
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("push-dialog-drop", "Drop")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::OutlinedCustom(
+                                cx.theme().colors().text_muted.opacity(0.45),
+                            ))
+                            .on_click(move |_event: &ClickEvent, window, cx| {
+                                if let Some(this) = entity_for_drop.upgrade() {
+                                    this.update(cx, |this, cx| this.run_drop(ix, window, cx));
+                                }
+                            }),
+                    ),
             )
         } else {
             None
         };
 
         let summary_label = format!(
-            "{total} commit(s) ahead{}",
+            "{total} ahead{}",
             if self.preview.divergence() {
-                format!(", remote {} ahead", self.preview.behind.len())
+                format!(", {} behind", self.preview.behind.len())
             } else {
                 String::new()
             }
         );
 
-        v_flex()
-            .gap_2()
+        let border = cx.theme().colors().text_muted.opacity(0.45);
+        h_flex()
+            .mx_4()
+            .my_3()
+            .h(rems(22.))
+            .min_h_0()
+            .border_1()
+            .border_color(border)
+            .rounded_md()
+            .overflow_hidden()
+            .bg(cx.theme().colors().editor_background)
             .child(
-                Label::new(summary_label)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                v_flex()
+                    .w(gpui::relative(0.46))
+                    .h_full()
+                    .min_h_0()
+                    .flex_shrink_0()
+                    .border_r_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .h_10()
+                            .px_3()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .border_b_1()
+                            .border_color(border)
+                            .bg(cx.theme().colors().elevated_surface_background)
+                            .child(Label::new("Commits to push").size(LabelSize::Small))
+                            .child(
+                                Label::new(summary_label)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .px_1()
+                            .overflow_hidden()
+                            .child(mini),
+                    )
+                    .when_some(context_menu_row, |this, row| this.child(row)),
             )
             .child(
-                h_flex()
-                    .gap_3()
-                    .h(rems(20.))
-                    .child(div().w(rems(28.)).h_full().overflow_hidden().child(mini))
-                    .child(div().w_px().h_full().bg(cx.theme().colors().border_variant))
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .min_h_0()
+                    .child(
+                        h_flex()
+                            .h_10()
+                            .px_3()
+                            .flex_shrink_0()
+                            .border_b_1()
+                            .border_color(border)
+                            .bg(cx.theme().colors().elevated_surface_background)
+                            .child(Label::new("Changed files").size(LabelSize::Small)),
+                    )
                     .child(
                         v_flex()
+                            .id("push-dialog-files")
                             .flex_1()
-                            .h_full()
+                            .min_h_0()
+                            .px_3()
+                            .py_1()
                             .gap_1()
-                            .overflow_hidden()
+                            .overflow_y_scroll()
                             .children(detail),
                     ),
             )
-            .when_some(context_menu_row, |this, row| this.child(row))
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1230,21 +1379,28 @@ impl PushDialog {
             ))),
         };
 
-        let mut footer = v_flex().gap_2().child(
-            h_flex()
-                .gap_3()
-                .child(force_lease_box)
-                .child(
-                    Checkbox::new("push-dialog-tags", tags_state)
-                        .label("tags")
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_tags(cx))),
-                )
-                .child(
-                    Checkbox::new("push-dialog-no-verify", no_verify_state)
-                        .label("no-verify")
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_no_verify(cx))),
-                ),
-        );
+        let options = h_flex()
+            .gap_3()
+            .child(force_lease_box)
+            .child(
+                Checkbox::new("push-dialog-tags", tags_state)
+                    .label("tags")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_tags(cx))),
+            )
+            .child(
+                Checkbox::new("push-dialog-no-verify", no_verify_state)
+                    .label("no-verify")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_no_verify(cx))),
+            );
+
+        let mut footer = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_4()
+            .py_3()
+            .gap_3()
+            .border_t_1()
+            .border_color(cx.theme().colors().text_muted.opacity(0.45));
         if self.preview.divergence() {
             let pull_rebase_state = if self.pull_rebase_first {
                 ToggleState::Selected
@@ -1274,24 +1430,40 @@ impl PushDialog {
         // do nothing (`confirm_push` bails), but the button must not
         // look live either — and it is not "Pushing…" yet.
         let push_disabled = pushing || self.force_confirm.is_some();
-        footer = footer.child(
+        footer.child(
             h_flex()
-                .gap_2()
-                .justify_end()
+                .w_full()
+                .gap_3()
+                .justify_between()
+                .child(options)
                 .child(
-                    Button::new("push-dialog-cancel", "Cancel")
-                        .on_click(cx.listener(|_this, _, _window, cx| cx.emit(DismissEvent))),
-                )
-                .child(
-                    Button::new(
-                        "push-dialog-push",
-                        if pushing { "Pushing…" } else { "Push" },
-                    )
-                    .disabled(push_disabled)
-                    .on_click(cx.listener(|this, _, window, cx| this.confirm_push(window, cx))),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("push-dialog-cancel", "Cancel")
+                                .size(ButtonSize::Medium)
+                                .style(ButtonStyle::OutlinedCustom(
+                                    cx.theme().colors().text_muted.opacity(0.45),
+                                ))
+                                .on_click(
+                                    cx.listener(|_this, _, _window, cx| cx.emit(DismissEvent)),
+                                ),
+                        )
+                        .child(
+                            Button::new(
+                                "push-dialog-push",
+                                if pushing { "Pushing…" } else { "Push" },
+                            )
+                            .size(ButtonSize::Medium)
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .start_icon(Icon::new(IconName::ArrowUp))
+                            .disabled(push_disabled)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.confirm_push(window, cx)),
+                            ),
+                        ),
                 ),
-        );
-        footer
+        )
     }
 }
 
