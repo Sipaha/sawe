@@ -70,3 +70,21 @@ are separate from the runtime integration.
 
 See [Codex app-server documentation](https://learn.chatgpt.com/docs/app-server)
 for the underlying protocol.
+
+## Temporary overload and account limits
+
+Codex handles its own nonterminal retries. If it finally stops with a temporary
+model overload, Sawe makes up to three additional attempts after roughly 10,
+20 and 40 seconds. A conversation note shows the attempt and delay. The chat
+stays active while waiting, and Stop cancels the pending attempt immediately.
+
+Recovery continues the same conversation and selected model. It asks Codex to
+check completed steps before continuing remaining work; it does not resend your
+original message or automatically switch models.
+
+Account token/quota limits, billing errors and authentication failures do not
+get these additional attempts. The error stays visible for you to address or
+wait for the account quota to reset.
+
+A failed turn does not mark the current work phase complete for automatic
+context handoff. The editor keeps the early notice separate from completion.

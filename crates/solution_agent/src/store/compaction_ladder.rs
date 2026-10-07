@@ -41,6 +41,7 @@ impl SolutionAgentStore {
             session.update(cx, |session, _| {
                 session.handoff_ladder = Some(HandoffLadder {
                     asker: HandoffAsker::Auto,
+                    end_turn_observed: false,
                     asks: 1,
                     last_ask_ms: Some(chrono::Utc::now().timestamp_millis()),
                     last_force_ms: None,
@@ -113,6 +114,7 @@ impl SolutionAgentStore {
                 session.update(cx, |s, cx| {
                     s.handoff_ladder = Some(HandoffLadder {
                         asker,
+                        end_turn_observed: false,
                         asks: 0,
                         last_ask_ms: None,
                         last_force_ms: None,
@@ -175,14 +177,16 @@ impl SolutionAgentStore {
             if s.is_compaction_pending() || crate::compact::has_pending_compact_approval(s, cx) {
                 return false;
             }
-            // The ladder exists to let an agent finish what it is holding. A
-            // session holding nothing — no turn running, no background agent or
-            // shell still working for it — has no active phase whose next
-            // boundary it can stop at. A signal addressed to it is a message
-            // nobody acts on until the user types again, so compact it now.
+            // A user can compact an idle session immediately. An automatic
+            // request must distinguish successful completion from a provider
+            // failure that merely releases the prompt future (often to Idle).
+            let main_active = self.main_turn_in_flight(id, cx);
             let busy = matches!(s.state, crate::model::SessionState::Running { .. })
-                || self.main_turn_in_flight(id, cx)
+                || main_active
                 || s.has_live_background_work(chrono::Utc::now());
+            if !main_active && ladder.asker == HandoffAsker::Auto && !ladder.end_turn_observed {
+                return false;
+            }
             (ladder, busy)
         };
         // Checked before the not-busy short-circuit, which would otherwise skip

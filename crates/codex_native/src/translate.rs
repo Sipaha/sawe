@@ -20,6 +20,13 @@ pub fn turn_result(turn: &Value) -> Result<acp::PromptResponse> {
         )),
     }
 }
+/// Only a terminal overload is eligible for an application-level continuation.
+/// Nonterminal `error` notifications belong to Codex's own retry loop.
+pub fn is_capacity_failure(turn: &Value) -> bool {
+    turn["status"].as_str() == Some("failed")
+        && matches!(turn["error"]["codexErrorInfo"].as_str(), Some("serverOverloaded" | "server_overloaded"))
+}
+
 #[derive(Default)]
 pub struct Translator {
     text: HashMap<String, String>,

@@ -819,6 +819,14 @@ impl SolutionAgentStore {
             ))));
         }
 
+        if target == QueueTarget::Main {
+            session_entity.update(cx, |s, _| {
+                if let Some(ladder) = s.handoff_ladder.as_mut() {
+                    ladder.end_turn_observed = false;
+                }
+            });
+        }
+
         // This copy of the session was restored WITHOUT its transcript (a read
         // of the rows / `epoch` / blob failed, or the blob would not decode), so
         // its empty `entries` is not a fact about the conversation. Letting the

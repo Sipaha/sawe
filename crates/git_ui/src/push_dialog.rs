@@ -223,6 +223,12 @@ impl PushDialog {
                 editor.set_placeholder_text("remote/branch", window, cx);
                 editor
             });
+            cx.subscribe(&editor, |_, _, event: &editor::EditorEvent, cx| {
+                if matches!(event, editor::EditorEvent::BufferEdited) {
+                    cx.notify();
+                }
+            })
+            .detach();
             let mut dialog = PushDialog {
                 workspace: workspace_handle,
                 repository: repo,
@@ -850,7 +856,7 @@ impl Render for PushDialog {
         if self.force_confirm.is_some() {
             return self.render_force_push_confirm(window, cx);
         }
-        let header = self.render_header(cx).into_any_element();
+        let header = self.render_header(window, cx).into_any_element();
         let body = self.render_body(cx).into_any_element();
         let status = self.render_status(cx);
         let footer = self.render_footer(cx).into_any_element();
@@ -885,82 +891,78 @@ impl Render for PushDialog {
 }
 
 impl PushDialog {
-    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let remote = if self.remote.is_empty() {
             SharedString::from("(no remote)")
         } else {
             self.remote.clone()
         };
-        let border = cx.theme().colors().text_muted.opacity(0.22);
-        v_flex()
+        let branch_text: SharedString = self.remote_branch_editor.read(cx).text(cx).into();
+        let font_size = ui::TextSize::Default.rems(cx).to_pixels(window.rem_size());
+        let run = gpui::TextRun {
+            len: branch_text.len(),
+            font: theme::theme_settings(cx).ui_font(cx).clone(),
+            color: cx.theme().colors().text,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let branch_width = (window
+            .text_system()
+            .shape_line(branch_text, font_size, &[run], None)
+            .width
+            + rems(0.5).to_pixels(window.rem_size())
+            + gpui::px(2.))
+        .clamp(
+            rems(3.).to_pixels(window.rem_size()),
+            rems(12.).to_pixels(window.rem_size()),
+        );
+        let focus = self.remote_branch_editor.focus_handle(cx);
+        h_flex()
             .w_full()
+            .min_w_0()
             .flex_shrink_0()
             .px_3()
             .py_2()
             .gap_2()
             .border_b_1()
-            .border_color(border)
+            .border_color(cx.theme().colors().text_muted.opacity(0.22))
+            .child(Icon::new(IconName::ArrowUp).size(IconSize::Small))
+            .child(Headline::new("Push").size(HeadlineSize::Small))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(Icon::new(IconName::ArrowUp).size(IconSize::Small))
-                    .child(Headline::new("Push").size(HeadlineSize::Small))
-                    .when(self.preview.will_create_remote_branch, |row| {
-                        row.child(
-                            Label::new("Will create new remote branch")
-                                .size(LabelSize::Small)
-                                .color(Color::Accent),
-                        )
-                    }),
+                div()
+                    .max_w(rems(12.))
+                    .min_w_0()
+                    .child(Label::new(self.branch.clone()).truncate()),
             )
             .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(
-                        Label::new("From")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        div().max_w(rems(20.)).min_w_0().child(
-                            Label::new(self.branch.clone())
-                                .size(LabelSize::Small)
-                                .truncate(),
-                        ),
-                    )
-                    .child(
-                        Icon::new(IconName::ArrowRight)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new("To").size(LabelSize::Small).color(Color::Muted))
-                    .child(
-                        h_flex()
-                            .w(rems(16.))
-                            .flex_shrink(1.)
-                            .min_w_0()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(cx.theme().colors().text_muted.opacity(0.35))
-                            .bg(cx.theme().colors().editor_background)
-                            .child(
-                                Label::new(remote)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(self.remote_branch_editor.clone()),
-                            ),
-                    ),
+                Icon::new(IconName::ArrowRight)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
             )
+            .child(Label::new(remote))
+            .child(Label::new("/").color(Color::Muted))
+            .child(
+                div()
+                    .id("push-dialog-destination")
+                    .track_focus(&focus)
+                    .w(branch_width)
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .px_1()
+                    .border_b_1()
+                    .border_color(gpui::transparent_black())
+                    .focus(|style| style.border_color(cx.theme().colors().text_accent))
+                    .hover(|style| style.border_color(cx.theme().colors().text_muted.opacity(0.35)))
+                    .child(self.remote_branch_editor.clone()),
+            )
+            .when(self.preview.will_create_remote_branch, |header| {
+                header.child(
+                    Label::new("Will create new remote branch")
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+            })
     }
 
     /// Renders the outcome of the last push / remediation. Git's own text
@@ -1119,6 +1121,7 @@ impl PushDialog {
 
         let mini = if commits.is_empty() {
             div()
+                .px_3()
                 .py_2()
                 .child(
                     // Pushing is not gated on having commits ahead: with `tags`
@@ -1308,7 +1311,7 @@ impl PushDialog {
         );
 
         let border = cx.theme().colors().text_muted.opacity(0.22);
-        // Show short previews at their natural height; cap long lists so the
+        // Keep a usable review area even for an empty preview; cap long lists so the
         // commit list and file pane scroll rather than growing the modal.
         let commit_height =
             2.75 * total.clamp(1, 5) as f32 + if selected.is_some() { 4.5 } else { 2. };
@@ -1319,7 +1322,7 @@ impl PushDialog {
         };
         h_flex()
             .w_full()
-            .h(rems(commit_height.max(file_height).min(20.)))
+            .h(rems(commit_height.max(file_height).clamp(16., 20.)))
             .min_h_0()
             .overflow_hidden()
             .child(

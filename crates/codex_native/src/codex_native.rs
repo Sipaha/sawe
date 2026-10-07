@@ -75,6 +75,7 @@ struct Session {
     models: Vec<CodexModelInfo>,
     thread: gpui::WeakEntity<AcpThread>,
     _pump: Task<()>,
+    _capacity_retry: Rc<RefCell<Option<Task<()>>>>,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -92,18 +93,30 @@ struct TurnState {
     disconnected: bool,
     generation: u64,
     active_model: Option<String>,
+    active_effort: Option<String>,
+    retry_model: Option<String>,
+    capacity_retry_count: usize,
+    capacity_retry_waiting: bool,
+    capacity_retry_starting: bool,
+    capacity_retry_started: bool,
 }
 impl TurnState {
     fn has_active_turn(&self) -> bool {
-        !self.disconnected && (self.sender.is_some() || self.turn_id.is_some())
+        !self.disconnected && (self.sender.is_some() || self.turn_id.is_some()
+            || self.capacity_retry_waiting || self.capacity_retry_starting)
     }
 
     fn started(&mut self, id: String) -> bool {
-        let autonomous = self.sender.is_none() && self.turn_id.as_ref() != Some(&id);
+        let autonomous = self.sender.is_none() && self.turn_id.as_ref() != Some(&id)
+            && !self.capacity_retry_starting;
         if autonomous {
             self.generation += 1;
             self.cancel_requested = false;
+            self.capacity_retry_count = 0;
         }
+        self.capacity_retry_waiting = false;
+        self.capacity_retry_starting = false;
+        self.capacity_retry_started = self.capacity_retry_count > 0;
         self.turn_id = Some(id);
         autonomous
     }
@@ -120,11 +133,38 @@ impl TurnState {
         } else {
             self.turn_id = None;
             self.cancel_requested = false;
+            self.capacity_retry_count = 0;
+            self.capacity_retry_waiting = false;
+            self.capacity_retry_starting = false;
             Some(result)
         }
     }
 
+    fn capacity_retry_delay(&mut self, turn: &Value) -> Option<Duration> {
+        let Some(id) = turn["id"].as_str() else { return None; };
+        if self.turn_id.as_deref() != Some(id)
+            || self.cancel_requested || !translate::is_capacity_failure(turn) {
+            return None;
+        }
+        let seconds = [10, 20, 40].get(self.capacity_retry_count).copied()?;
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        self.turn_id.hash(&mut hash);
+        self.capacity_retry_count.hash(&mut hash);
+        let jitter = Duration::from_millis(hash.finish() % 1000);
+        self.capacity_retry_count += 1;
+        self.capacity_retry_started = false;
+        self.turn_id = None;
+        self.capacity_retry_waiting = true;
+        self.capacity_retry_starting = false;
+        Some(Duration::from_secs(seconds) + jitter)
+    }
+
     fn finish(&mut self, result: Result<acp::PromptResponse>) {
+        self.capacity_retry_waiting = false;
+        self.capacity_retry_starting = false;
+        self.capacity_retry_count = 0;
+        self.capacity_retry_started = false;
         self.turn_id = None;
         self.cancel_requested = false;
         if let Some(sender) = self.sender.take()
@@ -300,6 +340,8 @@ impl CodexConnection {
             let state = Rc::new(RefCell::new(TurnState {active_model, ..Default::default()}));
             let pump_state = state.clone(); let weak_thread = thread.downgrade(); let weak_process = Rc::downgrade(&process);
             let pump_id = id.clone();
+            let capacity_retry = Rc::new(RefCell::new(None));
+            let pump_capacity_retry = capacity_retry.clone();
             let pump = cx.spawn(async move |cx| {
                 let mut translator = translate::Translator::default();
                 while let Some(message) = incoming.next().await {
@@ -316,12 +358,17 @@ impl CodexConnection {
                     }
                     if method == "turn/started" {
                         if let Some(id) = params["turn"]["id"].as_str() {
+                            let recovering = {
+                                let state = pump_state.borrow();
+                                state.capacity_retry_count > 0 && !state.capacity_retry_started
+                            };
                             let autonomous = pump_state.borrow_mut().started(id.to_owned());
-                            if autonomous {
+                            if autonomous || recovering {
                                 weak_thread.update(cx, |thread, cx| {
                                     thread.flush_end_of_turn_tail(cx);
                                     thread.push_system_note(acp_thread::SystemNoteLevel::Info,
-                                        "Codex started a turn on its own (for example a goal continuation).", cx);
+                                        if recovering { "Codex resumed after temporary overload." }
+                                        else { "Codex started a turn on its own (for example a goal continuation)." }, cx);
                                     cx.emit(acp_thread::AcpThreadEvent::ExternalTurnStarted);
                                 }).log_err();
                             }
@@ -329,6 +376,28 @@ impl CodexConnection {
                     }
                     for update in translator.translate(method, params) { weak_thread.update(cx, |thread, cx| thread.handle_session_update(update, cx).log_err()).log_err(); }
                     if method == "turn/completed" {
+                        let delay = pump_state.borrow_mut().capacity_retry_delay(&params["turn"]);
+                        if let Some(delay) = delay {
+                            let (attempt, generation) = {
+                                let state = pump_state.borrow();
+                                (state.capacity_retry_count, state.generation)
+                            };
+                            weak_thread.update(cx, |thread, cx| {
+                                thread.flush_end_of_turn_tail(cx);
+                                thread.push_system_note(acp_thread::SystemNoteLevel::Info,
+                                    format!("Codex is temporarily overloaded. Retrying in {}s ({attempt}/3).", delay.as_secs()), cx);
+                            }).log_err();
+                            let task_state = pump_state.clone();
+                            let task_process = weak_process.clone();
+                            let task_thread = weak_thread.clone();
+                            let task_id = pump_id.clone();
+                            *pump_capacity_retry.borrow_mut() = Some(cx.spawn(async move |cx| {
+                                retry_after_capacity(task_state, task_process, task_thread,
+                                    task_id, generation, delay, cx).await;
+                            }));
+                            translator = translate::Translator::default();
+                            continue;
+                        }
                         if let Some(id) = params["turn"]["id"].as_str() {
                             let orphan = pump_state.borrow_mut().completed(id, translate::turn_result(&params["turn"]));
                             if let Some(result) = orphan {
@@ -347,7 +416,7 @@ impl CodexConnection {
                     Err(anyhow!("Codex process disconnected. Reopen this chat to reconnect.")), cx)).log_err();
             }
             });
-            self.sessions.borrow_mut().insert(id, Session {process, state, models: available_models, thread: thread.downgrade(), _pump: pump});
+            self.sessions.borrow_mut().insert(id, Session {process, state, models: available_models, thread: thread.downgrade(), _pump: pump, _capacity_retry: capacity_retry});
             Ok(thread)
         })
     }
@@ -481,10 +550,20 @@ impl AgentConnection for CodexConnection {
                         && candidate.supported_efforts.contains(effort)
                 })
             });
+        state.borrow_mut().active_effort = effort.clone();
+        state.borrow_mut().retry_model = model.clone();
         cx.spawn(async move |_| {
             let response = process.request("turn/start",json!({"threadId":params.session_id.0,"input":input,"model":model,"effort":effort})).await;
             match response {
-                Ok(response) => {let mut state = state.borrow_mut(); if state.generation == generation && state.sender.is_some() {state.turn_id = response["turn"]["id"].as_str().map(str::to_owned); state.active_model = model.or(state.active_model.take());}}
+                Ok(response) => {
+                    let mut state = state.borrow_mut();
+                    if state.generation == generation && state.sender.is_some() {
+                        if state.turn_id.is_none() && !state.capacity_retry_waiting && !state.capacity_retry_starting {
+                            state.turn_id = response["turn"]["id"].as_str().map(str::to_owned);
+                        }
+                        state.active_model = model.or(state.active_model.take());
+                    }
+                }
                 Err(error) => {
                     if state.borrow().generation == generation && state.borrow().sender.is_some() {
                         process.kill(); state.borrow_mut().disconnected = true; state.borrow_mut().finish(Err(error));
@@ -500,6 +579,16 @@ impl AgentConnection for CodexConnection {
             return;
         };
         if !session.state.borrow().has_active_turn() || session.state.borrow().cancel_requested {
+            return;
+        }
+        if session.state.borrow().capacity_retry_waiting {
+            let orphaned = session.state.borrow().sender.is_none();
+            session.state.borrow_mut().finish(Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)));
+            session._capacity_retry.borrow_mut().take();
+            if orphaned {
+                session.thread.update(cx, |thread, cx| finish_external_turn(thread,
+                    Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)), cx)).log_err();
+            }
             return;
         }
         session.state.borrow_mut().cancel_requested = true;
@@ -553,6 +642,48 @@ impl AgentConnection for CodexConnection {
         self
     }
 }
+const CAPACITY_CONTINUATION: &str = "Sawe runtime recovery notice, not a human request or new authorization. The previous turn stopped because the selected model was temporarily overloaded. Continue the same unfinished authorized work in this conversation. First reconcile completed steps and tool results; do not repeat actions that already succeeded. If the work is complete or needs human input, report that instead of starting new work.";
+
+async fn retry_after_capacity(
+    state: Rc<RefCell<TurnState>>, process: std::rc::Weak<Process>,
+    thread: gpui::WeakEntity<AcpThread>, id: acp::SessionId,
+    generation: u64, delay: Duration, cx: &mut AsyncApp,
+) {
+    cx.background_executor().timer(delay).await;
+    let params = {
+        let mut state = state.borrow_mut();
+        if state.generation != generation || state.disconnected || state.cancel_requested
+            || !state.capacity_retry_waiting { return; }
+        state.capacity_retry_waiting = false;
+        state.capacity_retry_starting = true;
+        json!({"threadId":id.0,"model":state.retry_model.as_ref().or(state.active_model.as_ref()),"effort":state.active_effort,
+            "input":[{"type":"text","text":CAPACITY_CONTINUATION,"text_elements":[]}]})
+    };
+    let Some(process) = process.upgrade() else { return; };
+    let result = process.request("turn/start", params).await.and_then(|response| {
+        response["turn"]["id"].as_str().map(str::to_owned)
+            .context("Codex retry did not return a turn id")
+    });
+    let mut state = state.borrow_mut();
+    if state.generation != generation || !state.capacity_retry_starting { return; }
+    match result {
+        Ok(turn_id) => {
+            state.turn_id = Some(turn_id);
+            state.capacity_retry_starting = false;
+        }
+        Err(error) => {
+            let orphaned = state.sender.is_none();
+            let message = error.to_string();
+            state.finish(Err(error));
+            drop(state);
+            if orphaned {
+                thread.update(cx, |thread, cx| finish_external_turn(thread,
+                    Err(anyhow!(message)), cx)).log_err();
+            }
+        }
+    }
+}
+
 fn finish_external_turn(thread: &mut AcpThread, result: Result<acp::PromptResponse>, cx: &mut gpui::Context<AcpThread>) {
     thread.flush_end_of_turn_tail(cx);
     match result {
@@ -765,6 +896,74 @@ fn belongs_to_thread(params: &Value, id: &acp::SessionId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn overloaded_turn(id: &str) -> Value {
+        json!({"id":id,"status":"failed","error":{"message":"Selected model is at capacity.","codexErrorInfo":"serverOverloaded"}})
+    }
+
+    #[test]
+    fn capacity_recovery_keeps_one_client_completion_and_is_bounded() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut state = TurnState { sender: Some(sender), generation: 7, ..Default::default() };
+        for (attempt, seconds) in [10, 20, 40].into_iter().enumerate() {
+            let id = format!("retry-{attempt}");
+            state.capacity_retry_starting = attempt > 0;
+            assert!(!state.started(id.clone()));
+            assert_eq!(state.generation, 7);
+            let delay = state.capacity_retry_delay(&overloaded_turn(&id)).expect("retry");
+            assert!(delay >= Duration::from_secs(seconds) && delay < Duration::from_secs(seconds + 1));
+            assert!(state.has_active_turn());
+            assert!(state.turn_id.is_none());
+            assert!(receiver.try_recv().unwrap().is_none(), "no early failure delivered");
+        }
+        state.capacity_retry_starting = true;
+        state.started("exhausted".into());
+        assert!(state.capacity_retry_delay(&overloaded_turn("exhausted")).is_none());
+        assert!(state.completed("exhausted", Err(anyhow!("capacity exhausted"))).is_none());
+        assert!(!state.has_active_turn());
+        assert!(receiver.try_recv().unwrap().unwrap().is_err());
+    }
+
+    #[test]
+    fn capacity_wait_can_be_cancelled_without_disconnect_or_replay() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut state = TurnState { sender: Some(sender), ..Default::default() };
+        state.started("client".into());
+        assert!(state.capacity_retry_delay(&overloaded_turn("client")).is_some());
+        state.finish(Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)));
+        assert_eq!(receiver.try_recv().unwrap().unwrap().unwrap().stop_reason, acp::StopReason::Cancelled);
+        assert!(!state.has_active_turn());
+        assert!(!state.disconnected);
+        assert!(!state.capacity_retry_waiting);
+    }
+
+    #[test]
+    fn autonomous_capacity_retry_preserves_generation_and_final_event() {
+        let mut state = TurnState::default();
+        assert!(state.started("goal".into()));
+        let generation = state.generation;
+        assert!(state.capacity_retry_delay(&overloaded_turn("goal")).is_some());
+        state.capacity_retry_waiting = false;
+        state.capacity_retry_starting = true;
+        assert!(!state.started("goal-retry".into()));
+        assert_eq!(state.generation, generation);
+        assert!(state.completed("goal-retry", Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))).unwrap().is_ok());
+        assert!(!state.has_active_turn());
+    }
+
+    #[test]
+    fn only_terminal_overload_is_retried() {
+        assert!(translate::is_capacity_failure(&overloaded_turn("t")));
+        for code in ["usageLimitExceeded", "unauthorized", "contextWindowExceeded", "other"] {
+            assert!(!translate::is_capacity_failure(&json!({"status":"failed","error":{"codexErrorInfo":code}})));
+        }
+        assert!(!translate::is_capacity_failure(&json!({"status":"inProgress","error":{"codexErrorInfo":"serverOverloaded"},"willRetry":true})));
+        let mut state = TurnState::default();
+        state.started("current".into());
+        assert!(state.capacity_retry_delay(&overloaded_turn("old")).is_none());
+        state.cancel_requested = true;
+        assert!(state.capacity_retry_delay(&overloaded_turn("current")).is_none());
+    }
+
     #[test]
     fn client_completion_then_autonomous_goal_has_independent_lifecycle() {
         smol::block_on(async {

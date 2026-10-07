@@ -24,6 +24,9 @@ impl SolutionAgentStore {
         match event {
             acp_thread::AcpThreadEvent::ExternalTurnStarted => {
                 session_entity.update(cx, |s, _| {
+                    if let Some(ladder) = s.handoff_ladder.as_mut() {
+                        ladder.end_turn_observed = false;
+                    }
                     if !matches!(s.state, SessionState::Stopping { .. }) {
                         // A distinct anchor also prevents the old prompt future's
                         // lost-Stopped safety net from settling this newer turn.
@@ -210,6 +213,11 @@ impl SolutionAgentStore {
                 }) {
                     return;
                 }
+                session_entity.update(cx, |s, _| {
+                    if let Some(ladder) = s.handoff_ladder.as_mut() {
+                        ladder.end_turn_observed = matches!(stop_reason, acp::StopReason::EndTurn);
+                    }
+                });
                 // Not every `Stopped` proves a round trip to the model
                 // actually completed. `StopReason` is `#[non_exhaustive]`
                 // upstream, so this match needs a wildcard arm even though
@@ -526,6 +534,11 @@ impl SolutionAgentStore {
                 }) {
                     return;
                 }
+                session_entity.update(cx, |s, _| {
+                    if let Some(ladder) = s.handoff_ladder.as_mut() {
+                        ladder.end_turn_observed = false;
+                    }
+                });
                 // Symmetric with the `Stopped` arm: flush any pending end-of-turn
                 // entry-append throttle synchronously so the final entry's
                 // `SessionMessageAppended` (+ `agent_session_dirty`) rides out on
@@ -581,6 +594,11 @@ impl SolutionAgentStore {
                 }
             }
             acp_thread::AcpThreadEvent::LoadError(error) => {
+                session_entity.update(cx, |s, _| {
+                    if let Some(ladder) = s.handoff_ladder.as_mut() {
+                        ladder.end_turn_observed = false;
+                    }
+                });
                 // No wall-classification here (a stale prior wall in the
                 // transcript must not schedule a spurious resume) — flush any
                 // pending appends, then split by flavor below.

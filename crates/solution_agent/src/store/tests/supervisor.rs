@@ -3742,6 +3742,7 @@ async fn no_judge_fires_while_the_context_is_being_handed_off(cx: &mut gpui::Tes
         });
         let ladder = |asker| crate::model::HandoffLadder {
             asker,
+            end_turn_observed: false,
             asks: 1,
             last_ask_ms: Some(chrono::Utc::now().timestamp_millis()),
             last_force_ms: Some(chrono::Utc::now().timestamp_millis()),

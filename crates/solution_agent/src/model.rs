@@ -394,6 +394,9 @@ pub struct PendingBundle {
 #[derive(Clone, Debug)]
 pub(crate) struct HandoffLadder {
     pub asker: HandoffAsker,
+    /// An idle automatic handoff requires a successful main-turn EndTurn.
+    /// A failed/aborted transport is not the user's natural work boundary.
+    pub end_turn_observed: bool,
     /// How many early signals the agent has received so far.
     pub asks: u32,
     pub last_ask_ms: Option<i64>,

@@ -9,6 +9,8 @@
 
 ## Entry points
 
+- Codex overload recovery and handoff guard:
+  [Overload and premature handoff](findings/2026-10-08-codex-overload-and-handoff.md).
 - Codex automatic-turn fix:
   [Autonomous turn lifecycle](findings/2026-10-07-codex-autonomous-turn-lifecycle.md).
 

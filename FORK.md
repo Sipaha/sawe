@@ -1061,8 +1061,9 @@ Push preview layout (2026-10-07): use edge-to-edge panes rather than an inset,
 rounded table inside the modal. Headers, commit rows, file details, and actions
 share a 0.75rem content inset. Backgrounds and restrained separators establish
 hierarchy; a selected-row accent identifies the current commit. The perimeter
-has a soft outline and shadow. Short previews fit their commit/file counts;
-long lists scroll within a bounded height. `MiniGraph::with_dialog_style` opts into the
+has a soft outline and shadow. The branch route sits inline with Push in the header, with a text-like editable
+destination and an underline on focus. Preview height has a 16rem floor even
+when empty; long lists scroll within a bounded height. `MiniGraph::with_dialog_style` opts into the
 aligned rows; other mini-graph consumers retain their existing layout. Clicking
 outside keeps this stateful dialog open; Cancel and Escape remain explicit exits.
 File content is shared with Changes through `ChangedFileContent`: file icons,
@@ -6434,3 +6435,19 @@ How to apply:
 - Verified end-to-end against `kimi acp` 2.1.1: `mcp.tools_discovered` for
   server `sawe`, a live `mcp__sawe__solutions_list` call round-tripped
   through the `sawe --nc` bridge, and the tool result reached the model.
+
+### Codex overload recovery and automatic handoff boundary (2026-10-08)
+
+A main-turn failure is not the natural phase boundary promised by the 40%
+notice. Automatic idle handoff requires an observed main EndTurn; new main
+input and failures invalidate that proof. A failed main turn stays parked even
+when background activity labels the session Running. Explicit user requests
+and the two 15-minute escalation windows are preserved.
+
+Codex-native recovery acts only on a terminal serverOverloaded turn, after the
+runtime's own retries. It preserves the original client completion (or the
+autonomous lifecycle) across three bounded, jittered delays and continues the
+same thread/model with a runtime notice instead of resending accepted input.
+Stop cancels waiting immediately. Account token/quota limits and other error
+codes are excluded. Evidence and protocol references:
+[overload and handoff](docs/findings/2026-10-08-codex-overload-and-handoff.md).

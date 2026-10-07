@@ -331,6 +331,91 @@ async fn auto_compaction_asks_when_the_context_crosses_the_threshold(cx: &mut Te
     assert_eq!(handoff(session_id, cx).map(|l| l.asks), Some(1), "one ask per rung");
 }
 
+/// A provider failure releases the prompt future, but does not finish the
+/// user's work. The 40% warning must not become an immediate handoff at 41%.
+#[gpui::test]
+async fn auto_compaction_does_not_force_after_a_failed_turn(cx: &mut TestAppContext) {
+    let (session_id, thread, gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    assert_eq!(handoff(session_id, cx).map(|l| l.asks), Some(1));
+    deliver_queue(session_id, cx);
+    drop(gate);
+    cx.executor().run_until_parked();
+
+    for _ in 0..3 { tick(cx); }
+    assert!(!compaction_state(session_id, cx).0,
+        "a failed provider turn is not the natural work boundary");
+    assert!(!has_compaction_prompt(&queued_texts(session_id, cx)));
+    assert_eq!(handoff(session_id, cx).map(|l| l.asks), Some(1));
+    // Background/side-channel activity can label the session Running even
+    // though the failed main turn is gone. It must not start another prompt.
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        session.update(cx, |s, _| { s.state.resume_on_activity(); });
+    });
+    age_last_ask(session_id, cx);
+    tick(cx);
+    assert_eq!(handoff(session_id, cx).unwrap().asks, 1);
+    assert!(!compaction_state(session_id, cx).0);
+}
+
+#[gpui::test]
+async fn automatic_handoff_follows_a_successful_end_turn(cx: &mut TestAppContext) {
+    let (session_id, thread, gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    gate.send(()).await.unwrap();
+    cx.executor().run_until_parked();
+    assert!(handoff(session_id, cx).unwrap().end_turn_observed);
+    tick(cx);
+    assert!(compaction_state(session_id, cx).0);
+}
+
+#[gpui::test]
+async fn a_new_failed_turn_cannot_reuse_an_old_successful_boundary(cx: &mut TestAppContext) {
+    let (session_id, thread, gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    gate.send(()).await.unwrap();
+    cx.executor().run_until_parked();
+    assert!(handoff(session_id, cx).unwrap().end_turn_observed);
+    start_turn(session_id, cx);
+    assert!(!handoff(session_id, cx).unwrap().end_turn_observed);
+    drop(gate);
+    cx.executor().run_until_parked();
+    age_last_ask(session_id, cx);
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0);
+    assert_eq!(handoff(session_id, cx).unwrap().asks, 1);
+}
+
+#[gpui::test]
+async fn automatic_forced_handoff_still_obeys_both_escalation_windows(cx: &mut TestAppContext) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    tick(cx);
+    assert_eq!(handoff(session_id, cx).unwrap().asks, 1);
+    age_last_ask(session_id, cx);
+    tick(cx);
+    assert_eq!(handoff(session_id, cx).unwrap().asks, 2);
+    deliver_queue(session_id, cx);
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0);
+    age_last_ask(session_id, cx);
+    tick(cx);
+    assert!(compaction_state(session_id, cx).0);
+}
+
 /// Once per context: a user who stops the handoff is not asked again in the
 /// same context.
 #[gpui::test]
