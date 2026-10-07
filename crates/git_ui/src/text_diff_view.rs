@@ -1,4 +1,4 @@
-//! TextDiffView currently provides a UI for displaying differences between the clipboard and selected text.
+//! Displays differences between the clipboard and a file or selected text.
 
 use anyhow::Result;
 use buffer_diff::BufferDiff;
@@ -49,10 +49,16 @@ impl TextDiffView {
         cx: &mut App,
     ) -> Option<Task<Result<Entity<Self>>>> {
         let source_editor = diff_data.editor.clone();
+        let full_buffer = diff_data.full_buffer;
 
         let selection_data = source_editor.update(cx, |editor, cx| {
             let multibuffer = editor.buffer();
             let multibuffer_snapshot = multibuffer.read(cx).snapshot(cx);
+            if full_buffer {
+                let source_buffer = multibuffer.read(cx).as_singleton()?;
+                let max_point = source_buffer.read(cx).snapshot().max_point();
+                return Some((source_buffer, Point::new(0, 0)..max_point));
+            }
             let first_selection = editor.selections.newest_anchor();
 
             let (source_buffer, buffer_range) = multibuffer_snapshot
@@ -81,31 +87,36 @@ impl TextDiffView {
             return None;
         };
 
-        source_editor.update(cx, |source_editor, cx| {
-            let multibuffer = source_editor.buffer();
-            let mb_range = {
-                let mb = multibuffer.read(cx);
-                let start_anchor =
-                    mb.buffer_point_to_anchor(&source_buffer, expanded_selection_range.start, cx);
-                let end_anchor =
-                    mb.buffer_point_to_anchor(&source_buffer, expanded_selection_range.end, cx);
-                start_anchor.zip(end_anchor).map(|(s, e)| {
-                    let snapshot = mb.snapshot(cx);
-                    s.to_point(&snapshot)..e.to_point(&snapshot)
-                })
-            };
+        if !full_buffer {
+            source_editor.update(cx, |source_editor, cx| {
+                let multibuffer = source_editor.buffer();
+                let mb_range = {
+                    let mb = multibuffer.read(cx);
+                    let start_anchor = mb.buffer_point_to_anchor(
+                        &source_buffer,
+                        expanded_selection_range.start,
+                        cx,
+                    );
+                    let end_anchor =
+                        mb.buffer_point_to_anchor(&source_buffer, expanded_selection_range.end, cx);
+                    start_anchor.zip(end_anchor).map(|(s, e)| {
+                        let snapshot = mb.snapshot(cx);
+                        s.to_point(&snapshot)..e.to_point(&snapshot)
+                    })
+                };
 
-            if let Some(range) = mb_range {
-                source_editor.change_selections(Default::default(), window, cx, |s| {
-                    s.select_ranges(vec![range]);
-                });
-            }
-        });
+                if let Some(range) = mb_range {
+                    source_editor.change_selections(Default::default(), window, cx, |s| {
+                        s.select_ranges(vec![range]);
+                    });
+                }
+            });
+        }
 
         let source_buffer_snapshot = source_buffer.read(cx).snapshot();
         let mut clipboard_text = diff_data.clipboard_text.clone();
 
-        if !clipboard_text.ends_with("\n") {
+        if !full_buffer && !clipboard_text.ends_with("\n") {
             clipboard_text.push_str("\n");
         }
 
@@ -138,6 +149,7 @@ impl TextDiffView {
                         source_editor,
                         source_buffer,
                         expanded_selection_range,
+                        full_buffer,
                         diff_buffer,
                         project,
                         workspace_entity,
@@ -163,6 +175,7 @@ impl TextDiffView {
         source_editor: Entity<Editor>,
         source_buffer: Entity<Buffer>,
         source_range: Range<Point>,
+        full_buffer: bool,
         diff_buffer: Entity<BufferDiff>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
@@ -204,7 +217,9 @@ impl TextDiffView {
 
         let editor = source_editor.read(cx);
         let title = editor.buffer().read(cx).title(cx).to_string();
-        let selection_location_text = selection_location_text(editor, cx);
+        let selection_location_text = (!full_buffer)
+            .then(|| selection_location_text(editor, cx))
+            .flatten();
         let selection_location_title = selection_location_text
             .as_ref()
             .map(|text| format!("{} @ {}", title, text))
@@ -736,6 +751,7 @@ mod tests {
             .update_in(cx, |workspace, window, cx| {
                 TextDiffView::open(
                     &DiffClipboardWithSelectionData {
+                        full_buffer: false,
                         clipboard_text: "REPLACED".to_string(),
                         editor,
                     },
@@ -825,6 +841,7 @@ mod tests {
             .update_in(cx, |workspace, window, cx| {
                 TextDiffView::open(
                     &DiffClipboardWithSelectionData {
+                        full_buffer: false,
                         clipboard_text: "REPLACED".to_string(),
                         editor,
                     },
@@ -849,6 +866,70 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn test_compare_with_clipboard_ignores_selection(cx: &mut TestAppContext) {
+        base_test_with_scope(
+            path!("/test"),
+            path!("/test/text.txt"),
+            "old header\nshared\nold footer\n",
+            "new header\n«sharedˇ»\nnew footer\n",
+            "- old header\n+ ˇnew header\n  shared\n- old footer\n+ new footer\n",
+            "Clipboard ↔ text.txt",
+            &format!("Clipboard ↔ {}", path!("test/text.txt")),
+            true,
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn test_compare_with_clipboard_preserves_missing_final_newline(cx: &mut TestAppContext) {
+        base_test_with_scope(
+            path!("/test"),
+            path!("/test/text.txt"),
+            "same",
+            "s«amˇ»e",
+            "ˇsame",
+            "Clipboard ↔ text.txt",
+            &format!("Clipboard ↔ {}", path!("test/text.txt")),
+            true,
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn test_compare_with_empty_clipboard(cx: &mut TestAppContext) {
+        base_test_with_scope(
+            path!("/test"),
+            path!("/test/text.txt"),
+            "",
+            "«someˇ» text",
+            "+ ˇsome text",
+            "Clipboard ↔ text.txt",
+            &format!("Clipboard ↔ {}", path!("test/text.txt")),
+            true,
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn test_compare_with_clipboard_empty_file(cx: &mut TestAppContext) {
+        base_test_with_scope(
+            path!("/test"),
+            path!("/test/text.txt"),
+            "clipboard",
+            "ˇ",
+            "- clipboard\n  ˇ",
+            "Clipboard ↔ text.txt",
+            &format!("Clipboard ↔ {}", path!("test/text.txt")),
+            true,
+            cx,
+        )
+        .await;
+    }
+
     async fn base_test(
         project_root: &str,
         file_path: &str,
@@ -857,6 +938,31 @@ mod tests {
         expected_diff: &str,
         expected_tab_title: &str,
         expected_tab_tooltip: &str,
+        cx: &mut TestAppContext,
+    ) {
+        base_test_with_scope(
+            project_root,
+            file_path,
+            clipboard_text,
+            editor_text,
+            expected_diff,
+            expected_tab_title,
+            expected_tab_tooltip,
+            false,
+            cx,
+        )
+        .await;
+    }
+
+    async fn base_test_with_scope(
+        project_root: &str,
+        file_path: &str,
+        clipboard_text: &str,
+        editor_text: &str,
+        expected_diff: &str,
+        expected_tab_title: &str,
+        expected_tab_tooltip: &str,
+        full_buffer: bool,
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -902,12 +1008,18 @@ mod tests {
             editor
         });
 
+        let original_selections = editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .all::<MultiBufferOffset>(&editor.display_snapshot(cx))
+        });
         let diff_view = workspace
             .update_in(cx, |workspace, window, cx| {
                 TextDiffView::open(
                     &DiffClipboardWithSelectionData {
+                        full_buffer,
                         clipboard_text: clipboard_text.to_string(),
-                        editor,
+                        editor: editor.clone(),
                     },
                     workspace,
                     window,
@@ -919,6 +1031,16 @@ mod tests {
             .unwrap();
 
         cx.executor().run_until_parked();
+        if full_buffer {
+            editor.update(cx, |editor, cx| {
+                assert_eq!(
+                    editor
+                        .selections
+                        .all::<MultiBufferOffset>(&editor.display_snapshot(cx)),
+                    original_selections
+                );
+            });
+        }
 
         assert_state_with_diff(
             &diff_view.read_with(cx, |diff_view, cx| {

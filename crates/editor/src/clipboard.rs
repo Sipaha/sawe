@@ -548,6 +548,26 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_clipboard_diff(false, window, cx);
+    }
+
+    pub(super) fn compare_with_clipboard(
+        &mut self,
+        _: &CompareWithClipboard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.buffer.read(cx).as_singleton().is_some() {
+            self.open_clipboard_diff(true, window, cx);
+        }
+    }
+
+    fn open_clipboard_diff(
+        &mut self,
+        full_buffer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let selections = self
             .selections
             .all::<MultiBufferOffset>(&self.display_snapshot(cx));
@@ -571,6 +591,7 @@ impl Editor {
 
         window.dispatch_action(
             Box::new(DiffClipboardWithSelectionData {
+                full_buffer,
                 clipboard_text,
                 editor: cx.entity(),
             }),

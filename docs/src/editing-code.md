@@ -30,6 +30,17 @@ For example, you might:
 - Use multiple cursors to make additional edits across all locations
 - Get immediate diagnostic feedback if something breaks
 
+## Compare With Clipboard {#compare-with-clipboard}
+
+Copy text, then right-click inside an open file and choose **Compare With
+Clipboard**. The diff tab compares the entire current file, including unsaved
+changes, with the clipboard text. Your cursor and selection stay in place.
+The command is also available as {#action editor::CompareWithClipboard}.
+
+The menu item is disabled when the clipboard has no text or the editor displays
+multiple file excerpts. To compare a selection instead, use
+{#action editor::DiffClipboardWithSelection}.
+
 ## Related Features
 
 - [AI Features](./ai/overview.md) — Agentic editing, inline code transformations, and AI code completions

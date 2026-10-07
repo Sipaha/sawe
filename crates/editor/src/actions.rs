@@ -318,6 +318,7 @@ pub struct SpawnNearestTask {
 #[derive(Clone, PartialEq, Action)]
 #[action(no_json, no_register)]
 pub struct DiffClipboardWithSelectionData {
+    pub full_buffer: bool,
     pub clipboard_text: String,
     pub editor: Entity<Editor>,
 }
@@ -515,6 +516,8 @@ actions!(
         DeleteToEndOfLine,
         /// Diffs the text stored in the clipboard against the current selection.
         DiffClipboardWithSelection,
+        /// Compares the entire current buffer with text from the clipboard.
+        CompareWithClipboard,
         /// Displays names of all active cursors.
         DisplayCursorNames,
         /// Duplicates the current line below.

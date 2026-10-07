@@ -1,8 +1,8 @@
 use crate::{
-    Copy, CopyAndTrim, CopyPermalinkToLine, Cut, DisplayPoint, DisplaySnapshot, Editor,
-    EvaluateSelectedText, FindAllReferences, GoToDeclaration, GoToDefinition, GoToImplementation,
-    GoToTypeDefinition, Paste, Rename, RevealInFileManager, RunToCursor, SelectMode,
-    SelectionEffects, SelectionExt, ToDisplayPoint, ToggleCodeActions,
+    CompareWithClipboard, Copy, CopyAndTrim, CopyPermalinkToLine, Cut, DisplayPoint,
+    DisplaySnapshot, Editor, EvaluateSelectedText, FindAllReferences, GoToDeclaration,
+    GoToDefinition, GoToImplementation, GoToTypeDefinition, Paste, Rename, RevealInFileManager,
+    RunToCursor, SelectMode, SelectionEffects, SelectionExt, ToDisplayPoint, ToggleCodeActions,
     actions::{Format, FormatSelections},
     selections_collection::SelectionsCollection,
 };
@@ -217,6 +217,13 @@ pub fn deploy_context_menu(
                         .is_some()
                 });
 
+        let can_compare_clipboard = editor.buffer.read(cx).as_singleton().is_some()
+            && cx.read_from_clipboard().is_some_and(|item| {
+                item.entries()
+                    .iter()
+                    .any(|entry| matches!(entry, gpui::ClipboardEntry::String(_)))
+            });
+
         let evaluate_selection = window.is_action_available(&EvaluateSelectedText, cx);
         let run_to_cursor = window.is_action_available(&RunToCursor, cx);
         let format_selections = window.is_action_available(&FormatSelections, cx);
@@ -299,6 +306,11 @@ pub fn deploy_context_menu(
                 .action("Copy", Box::new(Copy))
                 .action("Copy and Trim", Box::new(CopyAndTrim))
                 .action("Paste", Box::new(Paste))
+                .action_disabled_when(
+                    !can_compare_clipboard,
+                    "Compare With Clipboard",
+                    Box::new(CompareWithClipboard),
+                )
                 .separator()
                 .action_disabled_when(
                     !has_reveal_target,

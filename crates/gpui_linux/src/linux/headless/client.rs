@@ -83,6 +83,8 @@ pub struct HeadlessClientState {
     windows: Vec<TrackedWindow>,
     /// Cached display so multiple `displays()` calls return the same `Rc`.
     display: Rc<dyn PlatformDisplay>,
+    /// Private to this headless instance; never touches the desktop clipboard.
+    clipboard: Option<gpui::ClipboardItem>,
 }
 
 #[derive(Clone)]
@@ -145,6 +147,7 @@ impl HeadlessClient {
             common,
             windows: Vec::new(),
             display,
+            clipboard: None,
         })))
     }
 
@@ -321,14 +324,16 @@ impl LinuxClient for HeadlessClient {
 
     fn write_to_primary(&self, _item: gpui::ClipboardItem) {}
 
-    fn write_to_clipboard(&self, _item: gpui::ClipboardItem) {}
+    fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
+        self.0.borrow_mut().clipboard = Some(item);
+    }
 
     fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
         None
     }
 
     fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
-        None
+        self.0.borrow().clipboard.clone()
     }
 
     fn run(&self) {
@@ -388,6 +393,28 @@ mod tests {
 
     fn handle(id: u64) -> AnyWindowHandle {
         WindowHandle::<TestRoot>::new(WindowId::from(id)).into()
+    }
+
+    #[test]
+    fn clipboard_is_retained_and_isolated_between_clients() {
+        let client = HeadlessClient::new();
+        let other = HeadlessClient::new();
+        assert!(client.read_from_clipboard().is_none());
+        client.write_to_clipboard(gpui::ClipboardItem::new_string_with_json_metadata(
+            "copied".into(),
+            vec![1, 2],
+        ));
+        for _ in 0..2 {
+            let item = client.read_from_clipboard().unwrap();
+            assert_eq!(item.text().as_deref(), Some("copied"));
+            assert_eq!(item.metadata().map(String::as_str), Some("[1,2]"));
+        }
+        assert!(other.read_from_clipboard().is_none());
+        client.write_to_clipboard(gpui::ClipboardItem::new_string("replacement".into()));
+        assert_eq!(
+            client.read_from_clipboard().unwrap().text().as_deref(),
+            Some("replacement")
+        );
     }
 
     /// A window gpui has dropped must stop being tracked. Before this was
