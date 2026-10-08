@@ -114,8 +114,9 @@ replaying the obsolete compact request; its resulting chat was screenshot-checke
 
 ## Automatic handoff thresholds
 
-The configured auto-compaction threshold is an early notice. Sawe repeats that
-notice after 15 minutes and can hand off after a successful main turn ends.
+The configured auto-compaction threshold is an early notice. While work stays
+active below 80%, Sawe repeats the reminder every 30 minutes, without a limit
+on the number of reminders. It can hand off after a successful main turn ends.
 While the turn is still active, automatic forced handoff requires at least
 80% context usage. Time since the notice cannot force a handoff below 80%.
 At 80%, the editor can request handoff without waiting for another timer.

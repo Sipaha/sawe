@@ -6,7 +6,7 @@
 //! no new work should start, repeat the signal after [`COMPACT_ESCALATION_SECS`],
 //! then send the prompt for a manual request. Automatic requests can force an
 //! active turn only at 80% context usage; below that, elapsed time only permits
-//! a repeated notice. Both paths can hand off at a successful turn boundary.
+//! a notice every thirty minutes. Both paths can hand off at a successful turn boundary.
 //! The same ladder serves auto-compaction and the user's Compact button
 //! ([`HandoffAsker`]). The rungs are counted per CONTEXT (reset on rotation) and
 //! advanced on the editor's own clock by `tick_supervisor`: nobody re-clicks a
@@ -18,6 +18,10 @@ use crate::compact::CompactInitiator;
 use crate::model::{HandoffAsker, HandoffLadder, SolutionSessionId};
 use crate::store::SolutionAgentStore;
 use crate::supervisor::{COMPACT_ESCALATION_SECS, CompactStep};
+
+/// Automatic notices repeat while work continues; they never consume a
+/// finite escalation budget or force a handoff because time elapsed.
+const AUTO_COMPACT_REMINDER_SECS: i64 = 30 * 60;
 
 /// What the caller of [`SolutionAgentStore::request_handoff`] still has to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,19 +213,22 @@ impl SolutionAgentStore {
         }
         let step = if !busy || auto_force_due {
             CompactStep::Force
+        } else if ladder.asker == HandoffAsker::Auto {
+            if ladder.asks == 0 {
+                CompactStep::Ask
+            } else if ladder.last_ask_ms.is_none_or(|at| {
+                now.saturating_sub(at) >= AUTO_COMPACT_REMINDER_SECS * 1000
+            }) {
+                CompactStep::AskAgain
+            } else {
+                CompactStep::TooSoon
+            }
         } else {
             crate::supervisor::compact_guard(
                 ladder.asks,
                 ladder.last_ask_ms.map(|at| now.saturating_sub(at)),
             )
         };
-        if step == CompactStep::Force
-            && busy
-            && ladder.asker == HandoffAsker::Auto
-            && !auto_force_due
-        {
-            return false;
-        }
         match step {
             CompactStep::TooSoon => false,
             CompactStep::Force => {
@@ -390,7 +397,8 @@ impl SolutionAgentStore {
              before beginning another phase or independent task. Do not call a compaction tool \
              because of this notice. The editor will start the handoff when the current turn \
              ends. While work remains active, automatic forced handoff requires at least 80% \
-             context usage; elapsed time alone will not force it."
+             context usage; elapsed time alone will not force it. Until then, the editor may \
+             repeat this reminder every thirty minutes."
         } else {
             instruction
         };

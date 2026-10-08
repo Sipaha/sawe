@@ -6443,7 +6443,7 @@ notice. Automatic idle handoff requires an observed main EndTurn; new main
 input and failures invalidate that proof. A failed main turn stays parked even
 when background activity labels the session Running. Explicit user requests
 and manual compaction keeps its two 15-minute escalation windows. Automatic
-requests repeat the early notice after 15 minutes, but cannot force an active
+requests repeat the early notice every 30 minutes while work continues, but cannot force an active
 turn below 80% context usage, regardless of elapsed time. At 80%, the hard
 threshold permits handoff without waiting for the timer. Delivered compact
 prompts are recognized after stripping queue timestamps and render as a chip.

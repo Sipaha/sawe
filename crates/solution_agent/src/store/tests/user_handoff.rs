@@ -410,6 +410,9 @@ async fn automatic_force_waits_for_eighty_percent_after_notices(cx: &mut TestApp
     assert_eq!(handoff(session_id, cx).unwrap().asks, 1);
     age_last_ask(session_id, cx);
     tick(cx);
+    assert_eq!(handoff(session_id, cx).unwrap().asks, 1, "no reminder at fifteen minutes");
+    age_last_ask(session_id, cx);
+    tick(cx);
     assert_eq!(handoff(session_id, cx).unwrap().asks, 2);
     assert!(queued_texts(session_id, cx).iter().any(|t| t.contains("at least 80%")
         && t.contains("elapsed time alone will not force it")));
@@ -437,6 +440,32 @@ async fn automatic_force_at_eighty_percent_does_not_wait_for_timer(cx: &mut Test
     set_usage(&thread, 800_000, cx);
     tick(cx);
     assert!(compaction_state(session_id, cx).0);
+}
+
+#[gpui::test]
+async fn automatic_reminders_repeat_every_thirty_minutes_without_forcing(cx: &mut TestAppContext) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 454_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    // The old fifteen-minute escalation must no longer send even a reminder.
+    age_last_ask(session_id, cx);
+    tick(cx);
+    assert!(queued_texts(session_id, cx).is_empty());
+    assert_eq!(handoff(session_id, cx).unwrap().asks, 1);
+    for expected in 2..=4 {
+        age_last_ask(session_id, cx);
+        tick(cx);
+        assert_eq!(handoff(session_id, cx).unwrap().asks, expected);
+        assert!(queued_texts(session_id, cx).iter().any(|t| t.contains("earlier handoff request is still open")));
+        assert!(!compaction_state(session_id, cx).0);
+        deliver_queue(session_id, cx);
+        tick(cx);
+        assert!(queued_texts(session_id, cx).is_empty(), "no reminder flood between intervals");
+        // From here each interval needs the full thirty minutes.
+        age_last_ask(session_id, cx);
+    }
 }
 
 /// Once per context: a user who stops the handoff is not asked again in the

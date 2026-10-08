@@ -20,7 +20,8 @@ manual escalation windows retain their behavior. After the later 15:11 incident
 in session `9bfre59i`, automatic timer-only force was removed: active turns now
 require at least 80% context usage for forced handoff. The first notice at 14:41
 and repeat at 14:56 had previously forced at 15:11 with only 45.4% used. The user
-explicitly chose the 80% hard threshold. A timestamp (`[15:11:02]`) before the
+explicitly chose the 80% hard threshold, then asked for reminders every 30
+minutes below it, for as long as work continues. A timestamp (`[15:11:02]`) before the
 delivered prompt's heading also bypassed the chip detector; the detector now
 strips queue metadata before matching.
 
@@ -61,3 +62,11 @@ kept an active turn at 45.4% with only an early notice, then moved to exactly
 80% and delivered one compact prompt on that same turn without waiting for a
 timer. The real rendered transcript showed a compact clickable chip rather
 than the full request. Evidence is in the Solution `.tmp/compact-timestamp`.
+
+The later 30-minute reminder regression also failed before its change. The
+final suite passed 1013 tests with one ignored, including repeated reminders
+without timer-based force, no reminder at 15 minutes, 79.9999% versus 80%,
+failed-turn exclusion at 80%, and unchanged manual escalation. Native threshold
+and chip verification was repeated on the final source. The earlier release
+build was stopped when the user added the reminder policy; the final release
+is built from the follow-up commit containing that decision.
