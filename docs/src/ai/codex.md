@@ -111,3 +111,18 @@ human input around a compact request, visible pre-send failure, and stale
 recovery errors after a context change. A native headless mock verified a new
 process resuming the same thread and starting exactly one recovery turn without
 replaying the obsolete compact request; its resulting chat was screenshot-checked.
+
+## Automatic handoff thresholds
+
+The configured auto-compaction threshold is an early notice. Sawe repeats that
+notice after 15 minutes and can hand off after a successful main turn ends.
+While the turn is still active, automatic forced handoff requires at least
+80% context usage. Time since the notice cannot force a handoff below 80%.
+At 80%, the editor can request handoff without waiting for another timer.
+A failed provider turn remains a failure, even above 80%; it is not treated as
+a completed phase. Manual Compact requests keep their existing escalation
+and a second explicit request still means to compact now.
+
+Compaction requests display as a compact clickable chip after queue delivery,
+including messages with injected timestamps. Opening the chip shows the full
+request without expanding its text inside the conversation.

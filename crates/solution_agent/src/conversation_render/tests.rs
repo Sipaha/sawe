@@ -27,6 +27,16 @@ fn detects_compaction_prompt_by_heading() {
 }
 
 #[test]
+fn detects_delivered_compaction_after_queue_metadata() {
+    let heading = crate::compact::COMPACT_PROMPT_HEADING;
+    for prefix in ["[15:11:02] ".to_string(), format!("{}\n\n[15:11:02] ", crate::store::QUEUE_HINT_LINE)] {
+        assert!(is_compaction_prompt_text(&format!("{prefix}{heading}\n\nbody")));
+    }
+    assert!(!is_compaction_prompt_text("[15:11:02] # Compact the build, please"));
+    assert!(!is_compaction_prompt_text(&format!("user words\n\n{heading}")));
+}
+
+#[test]
 fn tool_call_arg_preview_prefers_command_for_bash() {
     let input = serde_json::json!({
         "description": "Run build",

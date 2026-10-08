@@ -360,6 +360,9 @@ async fn auto_compaction_does_not_force_after_a_failed_turn(cx: &mut TestAppCont
     tick(cx);
     assert_eq!(handoff(session_id, cx).unwrap().asks, 1);
     assert!(!compaction_state(session_id, cx).0);
+    set_usage(&thread, 800_000, cx);
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0, "80% is not proof of successful completion after failure");
 }
 
 #[gpui::test]
@@ -397,7 +400,7 @@ async fn a_new_failed_turn_cannot_reuse_an_old_successful_boundary(cx: &mut Test
 }
 
 #[gpui::test]
-async fn automatic_forced_handoff_still_obeys_both_escalation_windows(cx: &mut TestAppContext) {
+async fn automatic_force_waits_for_eighty_percent_after_notices(cx: &mut TestAppContext) {
     let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
     set_usage(&thread, 410_000, cx);
     start_turn(session_id, cx);
@@ -408,10 +411,30 @@ async fn automatic_forced_handoff_still_obeys_both_escalation_windows(cx: &mut T
     age_last_ask(session_id, cx);
     tick(cx);
     assert_eq!(handoff(session_id, cx).unwrap().asks, 2);
+    assert!(queued_texts(session_id, cx).iter().any(|t| t.contains("at least 80%")
+        && t.contains("elapsed time alone will not force it")));
     deliver_queue(session_id, cx);
     tick(cx);
     assert!(!compaction_state(session_id, cx).0);
     age_last_ask(session_id, cx);
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0, "elapsed time cannot force at 41%");
+    set_usage(&thread, 799_999, cx);
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0, "do not round 79.9999% up to 80%");
+    set_usage(&thread, 800_000, cx);
+    tick(cx);
+    assert!(compaction_state(session_id, cx).0);
+}
+
+#[gpui::test]
+async fn automatic_force_at_eighty_percent_does_not_wait_for_timer(cx: &mut TestAppContext) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    set_usage(&thread, 800_000, cx);
     tick(cx);
     assert!(compaction_state(session_id, cx).0);
 }

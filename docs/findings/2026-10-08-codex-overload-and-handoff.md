@@ -16,7 +16,13 @@ after a main `EndTurn`. Main messages, external starts, errors and load errors
 invalidate that proof. Without an active main turn or successful completion,
 the automatic ladder stays parked, even if side-channel activity labels the
 session Running. Explicit user compaction, successful completion, Stop, and
-the existing escalation windows retain their behavior.
+manual escalation windows retain their behavior. After the later 15:11 incident
+in session `9bfre59i`, automatic timer-only force was removed: active turns now
+require at least 80% context usage for forced handoff. The first notice at 14:41
+and repeat at 14:56 had previously forced at 15:11 with only 45.4% used. The user
+explicitly chose the 80% hard threshold. A timestamp (`[15:11:02]`) before the
+delivered prompt's heading also bypassed the chip detector; the detector now
+strips queue metadata before matching.
 
 Codex CLI 0.160.1 exposes `willRetry` in its generated ErrorNotification schema.
 Sawe leaves those nonterminal notifications to Codex. Only a terminal failed
@@ -47,3 +53,11 @@ input replay or duplicate delivery. The exhausted case made exactly four
 starts and remained Errored without a compaction prompt; quota made one start.
 The waiting UI was screenshot-verified. Scratch evidence lives in the
 Solution's `.tmp/retry` directory.
+
+Later 80% threshold and timestamp-chip verification: both policy regressions
+failed before the change, as did the delivered timestamped-prompt detector.
+All 1012 solution_agent tests passed (one ignored). Native mock verification
+kept an active turn at 45.4% with only an early notice, then moved to exactly
+80% and delivered one compact prompt on that same turn without waiting for a
+timer. The real rendered transcript showed a compact clickable chip rather
+than the full request. Evidence is in the Solution `.tmp/compact-timestamp`.

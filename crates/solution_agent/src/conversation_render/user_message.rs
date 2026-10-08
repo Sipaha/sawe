@@ -244,7 +244,8 @@ pub(crate) fn render_user_message(
 /// without a protocol change; `compact::compaction_template_starts_with_heading`
 /// keeps the heading constant in lockstep with the resource file.
 pub(crate) fn is_compaction_prompt_text(text: &str) -> bool {
-    text.trim_start()
+    strip_injected_meta(text.trim_start())
+        .trim_start()
         .starts_with(crate::compact::COMPACT_PROMPT_HEADING)
 }
 

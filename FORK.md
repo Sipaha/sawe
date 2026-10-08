@@ -6442,7 +6442,11 @@ A main-turn failure is not the natural phase boundary promised by the 40%
 notice. Automatic idle handoff requires an observed main EndTurn; new main
 input and failures invalidate that proof. A failed main turn stays parked even
 when background activity labels the session Running. Explicit user requests
-and the two 15-minute escalation windows are preserved.
+and manual compaction keeps its two 15-minute escalation windows. Automatic
+requests repeat the early notice after 15 minutes, but cannot force an active
+turn below 80% context usage, regardless of elapsed time. At 80%, the hard
+threshold permits handoff without waiting for the timer. Delivered compact
+prompts are recognized after stripping queue timestamps and render as a chip.
 
 Codex-native recovery acts only on a terminal serverOverloaded turn, after the
 runtime's own retries. It preserves the original client completion (or the

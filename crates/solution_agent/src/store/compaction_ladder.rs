@@ -4,8 +4,10 @@
 //! Dropping the compaction prompt into a working session the moment it is
 //! requested lands it mid-step, so the request escalates instead: signal that
 //! no new work should start, repeat the signal after [`COMPACT_ESCALATION_SECS`],
-//! then send the prompt. The same ladder serves the editor's auto-compaction
-//! and the user's Compact button; only who is asking differs
+//! then send the prompt for a manual request. Automatic requests can force an
+//! active turn only at 80% context usage; below that, elapsed time only permits
+//! a repeated notice. Both paths can hand off at a successful turn boundary.
+//! The same ladder serves auto-compaction and the user's Compact button
 //! ([`HandoffAsker`]). The rungs are counted per CONTEXT (reset on rotation) and
 //! advanced on the editor's own clock by `tick_supervisor`: nobody re-clicks a
 //! button to move a ladder along.
@@ -166,7 +168,7 @@ impl SolutionAgentStore {
             return false;
         };
         let now = chrono::Utc::now().timestamp_millis();
-        let (ladder, busy) = {
+        let (ladder, busy, auto_force_due) = {
             let s = session.read(cx);
             let Some(ladder) = s.handoff_ladder.clone() else {
                 return false;
@@ -187,7 +189,14 @@ impl SolutionAgentStore {
             if !main_active && ladder.asker == HandoffAsker::Auto && !ladder.end_turn_observed {
                 return false;
             }
-            (ladder, busy)
+            // Elapsed time is not context pressure. Below 80%, an automatic
+            // request may signal the agent but cannot interrupt active work.
+            // Compare exact counts, not the rounded status-row percentage.
+            let auto_force_due = ladder.asker == HandoffAsker::Auto
+                && crate::model::session_context_usage(s, cx).is_some_and(|(used, max)| {
+                    max > 0 && (used as u128) * 100 >= (max as u128) * 80
+                });
+            (ladder, busy, auto_force_due)
         };
         // Checked before the not-busy short-circuit, which would otherwise skip
         // straight past it: a permanent refusal (no headroom left) would be
@@ -198,14 +207,21 @@ impl SolutionAgentStore {
         {
             return false;
         }
-        let step = if busy {
+        let step = if !busy || auto_force_due {
+            CompactStep::Force
+        } else {
             crate::supervisor::compact_guard(
                 ladder.asks,
                 ladder.last_ask_ms.map(|at| now.saturating_sub(at)),
             )
-        } else {
-            CompactStep::Force
         };
+        if step == CompactStep::Force
+            && busy
+            && ladder.asker == HandoffAsker::Auto
+            && !auto_force_due
+        {
+            return false;
+        }
         match step {
             CompactStep::TooSoon => false,
             CompactStep::Force => {
@@ -314,7 +330,8 @@ impl SolutionAgentStore {
     /// ask the agent to compact itself: that instruction made the notice
     /// interrupt the active task by causing the agent to abandon the rest of
     /// its work and start a handoff. The editor owns the handoff and starts it
-    /// naturally when the turn ends, or forcibly after the notices expire.
+    /// naturally when the turn ends. Automatic force requires 80% context
+    /// usage; only manual requests can force after the notices expire.
     pub(crate) fn compaction_request_message(
         &self,
         id: SolutionSessionId,
@@ -365,6 +382,17 @@ impl SolutionAgentStore {
              waiting for and integrating work already underway when that belongs to the active \
              phase. Do not call a compaction tool because of this notice; the editor will start \
              the handoff when the current turn ends."
+        };
+        let instruction = if again && !user {
+            "Keep working normally on the phase that was already active when the first notice \
+             arrived. This notice does not change or shorten that phase. At its next natural \
+             boundary — after the active phase and its verification are fully complete — pause \
+             before beginning another phase or independent task. Do not call a compaction tool \
+             because of this notice. The editor will start the handoff when the current turn \
+             ends. While work remains active, automatic forced handoff requires at least 80% \
+             context usage; elapsed time alone will not force it."
+        } else {
+            instruction
         };
         let mut message = format!("{opening} {instruction}");
         if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
