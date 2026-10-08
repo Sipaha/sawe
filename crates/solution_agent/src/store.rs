@@ -235,7 +235,16 @@ fn reconnect_unanswered_user_blocks(
     let tail = entries
         .iter()
         .rev()
-        .filter(|e| e.subagent_id.is_none() && !matches!(e.kind, SessionEntryKind::System { .. }))
+        .filter(|e| {
+            e.subagent_id.is_none()
+                && !matches!(e.kind, SessionEntryKind::System { .. })
+                // Compaction is editor orchestration, even when requested by
+                // the user. Reconnect invalidates its request token; replaying
+                // the old prompt would reject the entire recovery send.
+                && !matches!(&e.kind, SessionEntryKind::UserMessage { chunks, content_md, .. }
+                    if crate::compact::is_compaction_blocks(chunks)
+                        || content_md.starts_with(crate::compact::COMPACT_PROMPT_HEADING))
+        })
         .take_while(|e| {
             matches!(&e.kind, SessionEntryKind::UserMessage { chunks, .. }
                 if !acp_thread::is_observer_nudge_blocks(chunks)
@@ -3687,11 +3696,12 @@ impl SolutionAgentStore {
                     // Appending a receipt's optimistic user entry also marks
                     // the store Running. Only the thread's actual turn status
                     // distinguishes that bookkeeping from a newly-started turn.
-                    if !matches!(session.read(cx).state, SessionState::Idle | SessionState::Running { .. })
-                        || session.read(cx).acp_thread().is_none_or(|thread| {
-                            thread.read(cx).status() != acp_thread::ThreadStatus::Idle
-                        })
-                    {
+                    if !matches!(
+                        session.read(cx).state,
+                        SessionState::Idle | SessionState::Running { .. }
+                    ) || session.read(cx).acp_thread().is_none_or(|thread| {
+                        thread.read(cx).status() != acp_thread::ThreadStatus::Idle
+                    }) {
                         return;
                     }
                     let captured = reconnect_unanswered_user_blocks(&session.read(cx).entries);
@@ -3737,14 +3747,48 @@ impl SolutionAgentStore {
                 .meta(Some(acp_thread::meta_with_editor_recovery())),
         )];
         blocks.extend(unanswered_user_blocks);
-        self.send_message_blocks_targeted(
+        let Some(expected_context) = self.session(session_id).map(|session| {
+            let s = session.read(cx);
+            (
+                s.epoch,
+                s.acp_session_id.clone(),
+                s.acp_thread().map(|t| t.entity_id()),
+            )
+        }) else {
+            return;
+        };
+        let send = self.send_message_blocks_targeted_inner(
             session_id,
             blocks,
             crate::model::QueueTarget::Main,
             false,
             cx,
-        )
-        .detach_and_log_err(cx);
+        );
+        cx.spawn(async move |this, cx| {
+            if let Err(failure) = send.await {
+                // Accepted turns already surface provider errors in the send
+                // funnel. Pre-send rejection has no event and used to leave
+                // recovery silently Idle after the successful reconnect note.
+                if !failure.consumed {
+                    this.update(cx, |store, cx| {
+                        let Some(session) = store.session(session_id) else { return; };
+                        let s = session.read(cx);
+                        if (s.epoch, s.acp_session_id.clone(), s.acp_thread().map(|t| t.entity_id()))
+                            != expected_context || !matches!(s.state, SessionState::Idle)
+                        {
+                            return;
+                        }
+                        let message = format!("Agent continuation failed after recovery: {}. Retry the agent to continue.", failure.source);
+                        store.push_system_note(session_id, acp_thread::SystemNoteLevel::Error, &message, cx);
+                        session.update(cx, |s, _| s.state = SessionState::Errored(message.into()));
+                        store.mark_state_changed(session_id, cx);
+                        cx.notify();
+                    })?;
+                }
+                return Err(failure.source);
+            }
+            Ok(())
+        }).detach_and_log_err(cx);
     }
 
     /// A successful worker turn (`Stopped`) proves the agent is responding, so a

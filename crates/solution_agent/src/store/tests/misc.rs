@@ -6605,6 +6605,110 @@ async fn reconnect_continues_a_wedged_running_session(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn reconnect_does_not_replay_cancelled_compaction(cx: &mut TestAppContext) {
+    use crate::session_entry::{SessionEntry, SessionEntryKind};
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    let compact = format!(
+        "{}\nold request\n<!-- Sawe compaction request: 7 -->",
+        crate::compact::COMPACT_PROMPT_HEADING
+    );
+    for legacy in [false, true] {
+        let entries = [std::sync::Arc::new(SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: compact.clone(),
+                chunks: if legacy {
+                    vec![]
+                } else {
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        compact.clone(),
+                    ))]
+                },
+            },
+        })];
+        let captured = reconnect_unanswered_user_blocks(&entries);
+        assert!(
+            captured.is_empty(),
+            "compaction is not human input, legacy={legacy}"
+        );
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.maybe_send_reconnect_continuation(
+                    session_id,
+                    RespawnReason::Watchdog,
+                    true,
+                    captured,
+                    cx,
+                )
+            });
+        });
+        cx.executor().run_until_parked();
+    }
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read_with(cx, |store, cx| {
+            assert!(thread_has_continuation(store, session_id, cx));
+            assert!(!last_user_text_contains(store, session_id, &compact, cx));
+        });
+    });
+}
+
+#[gpui::test]
+async fn reconnect_continuation_rejection_is_visible(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.maybe_send_reconnect_continuation(
+                session_id,
+                RespawnReason::Watchdog,
+                true,
+                vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
+                    "{}\n<!-- Sawe compaction request: 7 -->",
+                    crate::compact::COMPACT_PROMPT_HEADING
+                )))],
+                cx,
+            )
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        assert!(
+            matches!(&session.read(cx).state, SessionState::Errored(message)
+            if message.contains("continuation failed") && message.contains("no longer current")),
+            "rejected recovery must not remain silently Idle"
+        );
+    });
+}
+
+#[gpui::test]
+async fn reconnect_late_rejection_cannot_overwrite_new_context(cx: &mut TestAppContext) {
+    let (session_id, _thread, _tmp) = create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.update(cx, |store, cx| {
+            store.maybe_send_reconnect_continuation(session_id, RespawnReason::Watchdog, true,
+                vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
+                    "{}\n<!-- Sawe compaction request: 7 -->",
+                    crate::compact::COMPACT_PROMPT_HEADING)))], cx);
+            store.session(session_id).unwrap().update(cx, |s, _| s.bump_epoch());
+        });
+    });
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        assert!(matches!(store.read(cx).session(session_id).unwrap().read(cx).state,
+            SessionState::Idle), "old recovery must not change the new context");
+    });
+}
+
+#[gpui::test]
 async fn reconnect_idle_session_sends_no_continuation(cx: &mut TestAppContext) {
     // The gate: a reconnect of an already-idle session (e.g. a manual MCP
     // reconnect) must NOT inject a spurious "carry on" prompt — there was no
@@ -6895,6 +6999,8 @@ fn reconnect_captures_new_task_and_followup_without_replaying_answered_question(
             chunks: vec![AssistantChunk::Message("LDAP question answered".into())],
         }),
         user("Release ecos-model 2.39.*", vec![]),
+        user(crate::compact::COMPACT_PROMPT_HEADING, vec![acp::ContentBlock::Text(
+            acp::TextContent::new(crate::compact::COMPACT_PROMPT_HEADING))]),
         user(
             "Raise records too",
             vec![

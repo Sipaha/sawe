@@ -88,3 +88,26 @@ wait for the account quota to reset.
 
 A failed turn does not mark the current work phase complete for automatic
 context handoff. The editor keeps the early notice separate from completion.
+
+## Recovery after a stalled turn
+
+When the watchdog reconnects a stalled chat, Sawe resumes the same Codex
+thread and sends a runtime continuation. It keeps unanswered human messages
+and attachments, but excludes old compaction prompts: their request tokens
+belong to the interrupted runtime and are cancelled by reconnect.
+
+If the continuation is rejected before a turn starts, the chat shows an error
+and a persistent conversation note instead of silently remaining Idle after
+reporting a successful reconnect. A late rejection cannot change a newer
+context or an already running turn.
+
+The 2026-10-08 incident in session `9y3ub7by` reached this failure at
+03:16:26 +0700: an old compact prompt was mistaken for human input and rejected
+with `This compaction request is no longer current`. Its `c08` handoff directory
+remained empty. Reconnect had succeeded, but work had not resumed.
+
+Regression tests cover structured and legacy compact entries, preservation of
+human input around a compact request, visible pre-send failure, and stale
+recovery errors after a context change. A native headless mock verified a new
+process resuming the same thread and starting exactly one recovery turn without
+replaying the obsolete compact request; its resulting chat was screenshot-checked.
