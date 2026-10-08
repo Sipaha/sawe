@@ -37,7 +37,7 @@ use ui::{
 use util::ResultExt as _;
 use util::command::new_command;
 use util::paths::PathStyle;
-use workspace::{ModalView, Workspace};
+use workspace::{ModalView, Workspace, Toast, notifications::NotificationId};
 
 mod force_confirm;
 
@@ -183,6 +183,19 @@ impl Focusable for PushDialog {
     }
 }
 
+/// Use the same member-scoped choice as Changes, never an unrelated buffer's
+/// repository when a Solution project tab is selected.
+pub(crate) fn repository_for_push(
+    project: &Entity<project::Project>,
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    if solutions::active_member_context(project, cx).is_some() {
+        solutions::active_member_repository(project, cx)
+    } else {
+        project.read(cx).active_repository(cx)
+    }
+}
+
 impl PushDialog {
     /// Open the dialog for the active repository. Resolves branch /
     /// remote / preview asynchronously; the dialog renders a placeholder
@@ -193,8 +206,15 @@ impl PushDialog {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
-            log::info!("PushDialog: no active repository");
+        let Some(repo) = repository_for_push(workspace.project(), cx) else {
+            log::info!("PushDialog: no repository for the selected project");
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::unique::<PushDialog>(),
+                    "The selected project has no Git repository.",
+                ),
+                cx,
+            );
             return;
         };
         let workspace_handle = workspace.weak_handle();
@@ -205,7 +225,18 @@ impl PushDialog {
             .as_ref()
             .map(|b| SharedString::from(b.name().to_string()));
         let Some(branch) = branch else {
-            log::info!("PushDialog: no current branch");
+            let name = work_dir.file_name().unwrap_or_default().to_string_lossy();
+            let reason = git_conflict_ui::detect_in_progress_op(&repo.read(cx).repository_dir_abs_path)
+                .map(|op| format!("{} is in progress. Resolve or abort it in Changes before pushing.", op.cli_subcommand()))
+                .unwrap_or_else(|| "HEAD is detached. Select a branch before pushing.".into());
+            log::info!("PushDialog: cannot push {name}: {reason}");
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::unique::<PushDialog>(),
+                    format!("Cannot push {name}: {reason}"),
+                ),
+                cx,
+            );
             return;
         };
 
@@ -875,10 +906,13 @@ impl Render for PushDialog {
                 )
                 .blur_radius(gpui::px(40.)),
             ])
-            .w(rems(46.)
+            .w(rems(64.)
                 .to_pixels(window.rem_size())
-                .min(window.viewport_size().width - gpui::px(32.)))
-            .max_h(window.viewport_size().height - gpui::px(112.))
+                .min((window.viewport_size().width - gpui::px(32.)).max(gpui::px(0.))))
+            .h((window.viewport_size().height * 0.72)
+                .clamp(rems(30.).to_pixels(window.rem_size()), rems(46.).to_pixels(window.rem_size()))
+                .min((window.viewport_size().height - gpui::px(112.)).max(gpui::px(0.))))
+            .max_h((window.viewport_size().height - gpui::px(112.)).max(gpui::px(0.)))
             .overflow_hidden()
             .child(header)
             .child(body)
@@ -929,6 +963,10 @@ impl PushDialog {
             .border_color(cx.theme().colors().text_muted.opacity(0.22))
             .child(Icon::new(IconName::ArrowUp).size(IconSize::Small))
             .child(Headline::new("Push").size(HeadlineSize::Small))
+            .child(div().max_w(rems(20.)).min_w_0().child(
+                Label::new(self.work_dir.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                    .size(LabelSize::Small).color(Color::Muted).truncate()))
+            .child(Label::new("·").color(Color::Muted))
             .child(
                 div()
                     .max_w(rems(12.))
@@ -1311,23 +1349,16 @@ impl PushDialog {
         );
 
         let border = cx.theme().colors().text_muted.opacity(0.22);
-        // Keep a usable review area even for an empty preview; cap long lists so the
-        // commit list and file pane scroll rather than growing the modal.
-        let commit_height =
-            2.75 * total.clamp(1, 5) as f32 + if selected.is_some() { 4.5 } else { 2. };
-        let file_height = if selected.is_some() {
-            5. + 1.75 * self.selected_files.len().min(7) as f32
-        } else {
-            3.75
-        };
+        // The preview fills the responsive modal even with one commit. List
+        // lengths only affect scrolling, never the available review area.
         h_flex()
             .w_full()
-            .h(rems(commit_height.max(file_height).clamp(16., 20.)))
+            .flex_1()
             .min_h_0()
             .overflow_hidden()
             .child(
                 v_flex()
-                    .w(gpui::relative(0.46))
+                    .w(gpui::relative(0.4))
                     .h_full()
                     .min_h_0()
                     .flex_shrink_0()

@@ -142,6 +142,15 @@ Check the source branch and destination at the top. Select a commit in
 below the commit list; push options and the **Push** button are in the footer.
 Double-click a changed file to open its diff for the selected commit.
 
+Push follows the selected project tab and its repository choice in a Solution.
+The header names that repository alongside the source and destination branches.
+The review area keeps its size with zero or one commit, adapts to the window,
+and scrolls long lists. File rows share the font and rendering used by Changes.
+
+If the selected repository is in an interrupted rebase or has a detached HEAD,
+Push explains why it cannot open. Resolve or abort the operation in Changes, or
+select the intended project and branch.
+
 Clicking outside the dialog keeps it open. Use **Cancel** or {#kb menu::Cancel} to close it.
 If a force-push confirmation is open, the same key returns to the preview first.
 

@@ -110,6 +110,9 @@ impl RenderOnce for ChangedFileContent {
             })
             .child(label);
         h_flex()
+            // Keep the complete configured UI font (including fallbacks and
+            // features) identical in the panel and in button-based previews.
+            .font(theme::theme_settings(cx).ui_font(cx).clone())
             .min_w_0()
             .flex_1()
             .gap_1p5()

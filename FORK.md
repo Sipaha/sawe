@@ -6455,3 +6455,15 @@ same thread/model with a runtime notice instead of resending accepted input.
 Stop cancels waiting immediately. Account token/quota limits and other error
 codes are excluded. Evidence and protocol references:
 [overload and handoff](docs/findings/2026-10-08-codex-overload-and-handoff.md).
+
+### Push follows the selected Solution library
+
+Push uses the shared member-scoped repository resolver already used by Changes,
+including explicit nested-repository choices and no fallback to an unrelated
+member when the selected project has no Git repository. The header names its
+repository before the branch route. Branchless states now show a visible
+interrupted-operation/detached-HEAD diagnostic instead of silently refusing to
+open. The modal uses a responsive review height and a 64 rem width maximum;
+zero or one commit no longer makes it collapse. Shared file rows explicitly
+use the full configured UI font in both contexts. Diagnosis and live-recovery
+boundary: [selected-library Push](docs/findings/2026-10-08-push-selected-member-and-rebase.md).

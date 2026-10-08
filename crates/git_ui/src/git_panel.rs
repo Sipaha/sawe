@@ -10668,6 +10668,34 @@ mod tests {
             );
         });
     }
+    #[gpui::test]
+    async fn push_targets_the_active_member_instead_of_another_active_repository(cx: &mut TestAppContext) {
+        let fixture = setup_nested_repo_solution(cx).await;
+        let project = fixture.project;
+        let (outer, inner) = project.read_with(cx, |project, cx| {
+            let repositories = project.git_store().read(cx).repositories();
+            let find = |path: &Path| repositories.values().find(|repo|
+                repo.read(cx).work_directory_abs_path.as_ref() == path).unwrap().clone();
+            (find(&fixture.member_root), find(&fixture.nested_root))
+        });
+        cx.update(|cx| inner.update(cx, |repo, cx| repo.set_as_active_repository(cx)));
+        cx.update(|cx| {
+            assert_eq!(project.read(cx).active_repository(cx), Some(inner.clone()), "the project-wide choice is deliberately stale for this member");
+            assert_eq!(crate::push_dialog::repository_for_push(&project, cx), Some(outer.clone()));
+            solutions::set_active_member_repository(&project, &inner, cx);
+            assert_eq!(crate::push_dialog::repository_for_push(&project, cx), Some(inner.clone()));
+            let (solution_id, _, member_root) = solutions::active_member_context(&project, cx).unwrap();
+            let store = solutions::SolutionStore::global(cx);
+            store.update(cx, |store, cx| {
+                let empty = store.test_add_member_with_path(solution_id, "empty", member_root.parent().unwrap().join("empty"));
+                store.set_active_member(solution_id, empty, cx);
+            });
+            assert_eq!(project.read(cx).active_repository(cx), Some(inner));
+            assert!(crate::push_dialog::repository_for_push(&project, cx).is_none(),
+                "a member without Git must never push an unrelated member's repository");
+        });
+    }
+
     struct NestedRepoSolution {
         project: Entity<Project>,
         member_root: std::path::PathBuf,

@@ -9,6 +9,9 @@
 
 ## Entry points
 
+- Push repository target, responsive preview and interrupted-rebase diagnosis:
+  [Push uses the selected member](findings/2026-10-08-push-selected-member-and-rebase.md).
+
 - Codex overload recovery and handoff guard:
   [Overload and premature handoff](findings/2026-10-08-codex-overload-and-handoff.md).
 - Codex automatic-turn fix:
@@ -147,6 +150,7 @@ Short, dated, single-fact notes from sessions: "ran a benchmark and got X",
 
 | Date | Status | Topic |
 |---|---|---|
+| 2026-10-08 | code fixed; live recovery pending | [Push targets the selected library; responsive preview and interrupted-rebase diagnosis](findings/2026-10-08-push-selected-member-and-rebase.md) |
 | 2026-10-02 | fixed | [Nested tool-output fences](findings/2026-10-02-tool-output-fences.md) |
 | 2026-10-02 | installed | [Codex browser setup](findings/2026-10-02-codex-browser-setup.md) |
 | 2026-10-02 | fixed | [Kimi review: approvals and session lifecycle](findings/2026-10-02-kimi-review.md) |
