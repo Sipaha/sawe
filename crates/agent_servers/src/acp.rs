@@ -1802,7 +1802,7 @@ impl AgentConnection for AcpConnection {
             }
             let response = self.connection.send_request(request).block_task()
                 .await
-                .map_err(map_acp_error)?;
+                .map_err(|error| if generation_only { anyhow!(error) } else { map_acp_error(error) })?;
 
             let (modes, config_options) = config_state(response.modes, response.config_options);
 
@@ -2110,11 +2110,17 @@ impl AgentConnection for AcpConnection {
                 params.prompt.push(acp::ContentBlock::Text(acp::TextContent::new(context)));
             }
         }
+        let generation_only = self.generation_profile.is_some();
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
         cx.foreground_executor().spawn(async move {
             let result = conn.send_request(params).block_task().await;
+            if generation_only {
+                // Interactive auth/abort normalization can discard the provider's
+                // diagnostics. Interface generation must keep the original error.
+                return result.map_err(anyhow::Error::from);
+            }
 
             let mut suppress_abort_err = false;
 
