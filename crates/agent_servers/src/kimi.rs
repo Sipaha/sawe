@@ -130,7 +130,10 @@ impl AgentServer for KimiAgentServer {
             if env.get("KIMI_MODEL_NAME").is_some_and(|model| !model.is_empty()) {
                 anyhow::bail!("Kimi text generation requires the CLI subscription login; KIMI_MODEL_NAME overrides are not used.");
             }
-            let profile = cx.background_spawn(async move { generation_profile(&root, &system_prompt, &env).map(|profile| (profile, env)) }).await?;
+            let profile = cx.background_spawn(async move {
+                crate::verify_generation_cli_version(KIMI_BINARY, "2.1.1", &root, Some(&env)).await?;
+                generation_profile(&root, &system_prompt, &env).map(|profile| (profile, env))
+            }).await?;
             let (profile, mut env) = profile;
             env.insert("KIMI_CODE_HOME".into(), profile.path().join("home").to_string_lossy().into_owned());
             env.insert("KIMI_CODE_NO_AUTO_UPDATE".into(), "1".into());

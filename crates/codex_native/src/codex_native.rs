@@ -322,6 +322,10 @@ impl CodexConnection {
             }
         }
         cx.spawn(async move |cx| {
+            if generation_only {
+                let directory = directory.clone();
+                cx.background_spawn(async move { agent_servers::verify_generation_cli_version("codex", "0.160.1", &directory, None).await }).await?;
+            }
             let mut process = cx.update(|cx| {
                 if generation_only {
                     Process::spawn_with_config(&directory, config.as_object().context("Codex configuration is not an object")?, cx)

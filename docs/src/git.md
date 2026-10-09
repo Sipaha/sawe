@@ -339,6 +339,8 @@ Choose the provider from the icon immediately left of the bottom AI session tabs
 
 Provider IDs are `claude-acp`, `codex-native`, and `kimi-code`. Claude is used when no default is saved. The provider is captured when generation starts; changing the preference affects subsequent interface AI actions. These helpers do not use `agent.commit_message_model` or the LLM Providers registry.
 
+Text-only generation is verified for Codex CLI 0.160.1 and Kimi CLI 2.1.1. Other versions fail explicitly until their isolation contract is verified.
+
 Generation sessions are hidden and allow no tools, MCP servers, project customizations, hooks, or approvals. Only the supplied diff and context are used. Failures show the provider and complete error cause chain, and keep the current message intact. Authentication and account limits are reported without switching providers or replaying the request.
 
 ## Git Integrations

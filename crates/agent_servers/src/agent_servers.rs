@@ -165,3 +165,46 @@ pub fn load_proxy_env(cx: &mut App) -> HashMap<String, String> {
 
     env
 }
+
+
+pub async fn verify_generation_cli_version(
+    binary: &str,
+    expected: &str,
+    directory: &std::path::Path,
+    environment: Option<&HashMap<String, String>>,
+) -> Result<()> {
+    use anyhow::Context as _;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(binary);
+    command.arg("--version").current_dir(directory);
+    if let Some(environment) = environment { command.envs(environment); }
+    let child = util::process::Child::spawn_tracked(command, Stdio::null(), Stdio::piped(), Stdio::piped(), binary)
+        .with_context(|| format!("Cannot check {binary} CLI version"))?;
+    let output = child.output().await?;
+    if !output.status.success() {
+        anyhow::bail!("Cannot check {binary} CLI version: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    validate_generation_cli_version(binary, expected, &String::from_utf8(output.stdout)?)
+}
+
+fn validate_generation_cli_version(binary: &str, expected: &str, output: &str) -> Result<()> {
+    let output = output.trim();
+    if output != expected && output != format!("codex-cli {expected}") {
+        anyhow::bail!("{binary} CLI {output} does not have verified text-only generation support in this build. Supported version: {expected}.");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod generation_version_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_cli_versions_fail_closed() {
+        assert!(validate_generation_cli_version("codex", "0.160.1", "codex-cli 0.160.1\n").is_ok());
+        assert!(validate_generation_cli_version("kimi", "2.1.1", "2.1.1\n").is_ok());
+        for version in ["", "0.159.0", "2.1.0", "2.2.0", "unrecognized CLI"] {
+            assert!(validate_generation_cli_version("kimi", "2.1.1", version).is_err());
+        }
+    }
+}
