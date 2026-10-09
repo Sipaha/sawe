@@ -4840,71 +4840,13 @@ wants `ensure_fresh_cache`. When a step is allowed to fail softly, say so on the
 progress stream rather than only in the log — the log is not where the person
 waiting for the clone is looking.
 
-### 186. One preview window, for images and for tool arguments alike
+### 186. One in-editor preview modal for conversation content
 
-Two surfaces that both mean "show me the thing that does not fit in the row"
-were built as different kinds of thing, and each was wrong in its own way.
+October9 user instruction replaces the former global floating preview window with a workspace modal. Conversation images, full tool arguments, rendered Markdown and file information use `preview_window::open_preview`. It resolves the originating workspace (including MultiWorkspace), defers past the click update and retargets its existing PreviewWindow modal rather than toggling it closed or opening another OS window. Escape/X emit DismissEvent; they never remove the editor window. The modal is bounded by the viewport, preserves selectable read-only text and copy, and restores workspace focus through ModalLayer.
 
-**Images opened an OS window per click.** `open_image_preview` called
-`cx.open_window` unconditionally, so walking a conversation with screenshots in
-it buried the desktop under a stack of "Image preview" windows to be closed one
-by one.
+Keep the existing PreviewWindow/PreviewWindow > Editor key contexts: the latter ensures Escape in a read-only editor dismisses the modal. Tool previews still open only from their content-sized title target, avoiding accidental clicks on the command body.
 
-**The full tool argument opened a workspace modal.** A modal cannot be moved,
-cannot be resized, and covers the conversation the command came from — the worst
-surface for the one case that needs room (a heredoc, a long pipeline), which is
-exactly why the row is clickable at all.
-
-Both now go through `solution_agent::preview_window::open_preview`, which owns a
-single `WindowHandle<PreviewWindow>` in a global and retargets it: swap the
-content, retitle, `activate_window`. `PreviewContent` is `Image | Text` in ONE
-view rather than two window types, which is what lets a click on an image
-retarget a window currently showing a shell command and the other way round —
-two types would have meant closing one to open the other, i.e. the stacking
-again.
-
-**Liveness is discovered, not tracked.** There is no "the user closed it" event
-to subscribe to, and a handle to a closed window is indistinguishable from a live
-one until you use it. `WindowHandle::update` failing IS the check, so the reuse
-path falls through to opening a new window. `update` moves its closure, so a
-failed call would eat the content with it — the closure gets an `Option` to
-`take` and the caller reads afterwards whether it actually ran.
-
-The header row is a drag handle (`window.start_window_move()`) rather than
-relying on the window manager: gpui may draw this window without server-side
-decorations, and "move it aside" must not depend on that.
-
-Both properties are pinned by tests whose failure was executed, not reasoned:
-forcing the handle lookup to `None` fails "every preview lands in the same
-window", and returning early instead of falling through on a failed `update`
-fails "closing the window does not stop the next preview".
-
-**Deleting a view means deleting its key context.** Both shipped keymaps still
-bound `ctrl-enter` / `cmd-enter` under `"context": "ToolArgumentModal"` after the
-view was gone — dead bindings that can never fire, and the compiler cannot see
-them because a key context is a string. They now name `PreviewWindow`, and there
-is a second block for `PreviewWindow > Editor`: text content focuses the
-read-only editor, `Editor` is the deeper context, and without it Escape would hit
-`editor::Cancel` (nothing to cancel in a read-only buffer) and leave the window
-open. Verified by booting the editor and checking the log carries no keymap parse
-error, since nothing in the test suite loads the shipped keymaps.
-
-**The title opens it — not the preview row, and not the header row either.**
-The row under the header carries the command itself, which is the thing people
-reach for with the mouse to read or select, so making it a button meant every
-stray click popped a window open ("случайно часто стал попадать туда"). Moving
-the handler to the header row was still wrong for the same reason one step up:
-that row is full width, so the whole line lit up on hover and swallowed clicks
-aimed at nothing. The target is now a content-sized group holding just the
-hammer glyph and the `Tool: Bash` label. `MarkdownElement` does not stop mouse
-propagation, so a click on the rendered label reaches that group's handler.
-
-How to apply: a surface whose whole purpose is "this does not fit here" wants a
-window, not a modal. When one is reused, the handle is the state — keep it in a
-global keyed by nothing else, and treat a failed update as "gone", never as an
-error to report. And when a view goes, grep the keymaps for its `key_context`:
-nothing else will tell you. Put a click target on the row's LABEL, never on the
-row that holds the content itself.
+Non-text file links show metadata and an **Open in File Manager** action using the platform's reveal_path. The card includes name/path/type/exact bytes, available timestamps/read-only state, symlink/resolved target and Unix permissions/owner/group/inode/link count. Recognized binary formats and image links never open as raw text. Unknown files require valid UTF-8 without binary control bytes; preview reads are bounded to512KiB plus a UTF-8 boundary margin before clipping, so a huge linked log/archive is not read in full. Embedded conversation images retain visual preview.
 
 ### 187. The agent composer is sized by the panel, not by the code font
 
@@ -4957,7 +4899,7 @@ tried against **every** worktree root in turn rather than assumed to live under
 the first. A path that resolves nowhere stays dead: opening the wrong file is
 worse than opening none.
 
-A resolved file opens in the **shared preview window** (decision #186), not in a
+A resolved file opens in the **shared in-editor preview modal** (decision #186), not in a
 tab. Reading a report the agent just wrote is a glance, and it should not
 displace what is open in the editor — the window is already the fork's answer to
 "this does not fit here", it is a real movable window rather than a modal, and
@@ -5184,48 +5126,11 @@ operation needs an explicit answer to "who ends it when the editor goes", and
 `app_quit_reaps_live_agent_subprocesses` (mutation-checked: dropping the
 `on_app_quit` registration fails it).
 
-### 193. A markdown file previews rendered, and following a link stays in one window
+### 193. Render Markdown and follow links within the same preview modal
 
-The preview window (decision #186) showed every file as source in a read-only
-editor. For the files it is actually used on — a report or a plan doc the agent
-just wrote and linked — that is showing the reader the markup they asked to be
-spared: `#`, backticks and pipe tables instead of headings, code and a table.
-`PreviewContent::Markdown` renders it with `MarkdownElement` under
-`MarkdownFont::Preview` (the markdown-preview font settings — this window is
-showing a file, not a chat message). Its element is hosted under
-`WithRemSize(markdown_preview_font_size * 0.875)`: the window follows the
-preview setting and zoom while keeping its companion-window typography one
-step more compact than the full editor preview. Preview typography expresses
-the body and heading sizes in `rem`; if the standalone window omits that local
-root, it falls back to the window UI size and silently ignores
-`markdown_preview.font_size`, making the document look oversized whenever
-those sizes differ.
+Markdown files (.md/.markdown) render through MarkdownElement with MarkdownFont::Preview and WithRemSize(markdown_preview_font_size *0.875), preserving preview font settings and zoom. Other text remains selectable source; binary file links show information (decision186).
 
-Routing is by EXTENSION (`.md` / `.markdown`), not by sniffing the bytes: prose
-with a stray `#` in it is indistinguishable from markdown, and a wrong guess on
-a non-markdown file would swallow its formatting. A wrong guess this way can
-only come from a misnamed file.
-
-**Rendering it introduced the first link a preview ever had, and that link broke
-#186's one-window guarantee.** `open_preview` retargets via
-`WindowHandle::update`, and a click handler on rendered content runs INSIDE that
-same window's update — so the call is re-entrant and fails, which is
-indistinguishable from the window having been closed, which is
-`open_preview`'s cue to open a new one. Measured: one extra window per followed
-link. `open_link_within_preview` `cx.defer`s the retarget out of the current
-update, and `open_preview_from_app` is the entry point that needs no `Window`
-(it costs only a fallback to the primary display when a NEW window is opened).
-
-Relative links resolve against the **document's own directory**, not the
-conversation's worktrees: `./NOTES.md` in a report points at the report's
-neighbour, and the roots that `open_link` uses in the chat are the wrong
-question here.
-
-How to apply: before making previously-inert content interactive, check what its
-new handlers re-enter. Guarded by
-`a_markdown_file_previews_rendered_while_other_text_stays_source` and
-`following_a_link_inside_a_document_reuses_the_same_window` (mutation-checked:
-routing the handler back through `open_link` fails the latter).
+Relative links resolve against the document's own directory. Opening defers with the originating Window until the current modal/workspace update finishes, then replaces content in the same modal. Do not re-enter a borrowed view or use toggle_modal on an already-open preview: those approaches can fail or dismiss the document instead of following its link. Modal lifecycle and font-scale tests cover these behaviors.
 
 ### 194. A window you are not looking at gives its language servers back
 
@@ -6484,3 +6389,5 @@ Generation checks the CLI version before starting a runtime: Codex0.160.1 and Ki
 Generation's Kimi environment preserves editor process variables plus proxy overrides, matching native Codex and retaining HOME/KIMI_CODE_HOME for the CLI login. Require the configured managed subscription model and OAuth reference, reject API-key/env/header authentication routes instead of silently substituting credentials. Codex MCP disabling is idempotent: generated boolean `.enabled` overrides are not server definitions and must not become phantom quoted server names on the second application.
 
 Generation Kimi must not load a worktree login-shell/direnv environment: that can run project customizations before the restricted runtime starts. Interactive Kimi retains its project environment loader.
+
+The toolbar Update Project arrow dispatches only Pull, which includes its own fetch. Dispatching Fetch and Pull back-to-back acquired GitPanel's remote-operation guard for Fetch and silently discarded Pull, leaving the local branch behind the newly fetched origin ref. Keep the active-member scope and existing pull/error policy; never reset or force a divergent user branch.

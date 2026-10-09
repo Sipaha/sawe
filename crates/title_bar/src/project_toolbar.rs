@@ -366,14 +366,8 @@ impl ProjectToolbar {
         )
     }
 
-    /// "Update Project" button — sits to the LEFT of the branch-widget
-    /// dropdown. Fetches + pulls ONLY the active project's repo (dispatches
-    /// `git::Fetch` then `git::Pull` — they route through the git panel's
-    /// `active_repository`, which is scoped to the active member). Solution-
-    /// wide "Update All Projects" was deliberately dropped: a fetch+pull that
-    /// spans every member can leave half the repos in a conflicted state with
-    /// no good way to resolve it from this surface. Only shown when the active
-    /// project has a git repository (mirrors the branch widget's gating).
+    /// Pull the active member's repository. Git pull performs its own fetch;
+    /// dispatching Fetch first reserves the remote-operation guard and drops Pull.
     fn render_update_button(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         Self::resolve_repository(&self.project, cx)?;
         Some(
@@ -386,7 +380,6 @@ impl ProjectToolbar {
                     "Update Project — fetch updates from remote, then pull",
                 ))
                 .on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(git::Fetch), cx);
                     window.dispatch_action(Box::new(git::Pull), cx);
                 }),
         )

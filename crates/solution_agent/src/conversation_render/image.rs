@@ -85,9 +85,9 @@ pub(crate) fn decode_image_local(
     Some(std::sync::Arc::new(gpui::Image::from_bytes(format, bytes)))
 }
 
-/// Opens the given image in the shared preview window (see
+/// Opens the given image in the shared in-editor preview modal (see
 /// [`crate::preview_window`]). Used by the chat thumbnail click handler; a
-/// second click retargets the window that is already up rather than opening
+/// second click retargets the modal that is already up rather than opening
 /// another one.
 pub(crate) fn open_image_preview(
     image: std::sync::Arc<gpui::Image>,

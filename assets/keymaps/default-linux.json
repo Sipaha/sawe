@@ -279,7 +279,7 @@
     },
   },
   {
-    // The shared preview window (an image, or a tool call's full argument).
+    // The shared in-editor preview modal (an image, or a tool call's full argument).
     // Read-only, so there is one gesture and it closes: Ctrl+Enter keeps the
     // habit the tool-argument modal this replaced had.
     "context": "PreviewWindow",
@@ -291,7 +291,7 @@
   {
     // Text content focuses the read-only editor, and `Editor` is the deeper
     // context — without this, Escape hits `editor::Cancel` (which has nothing
-    // to cancel in a read-only buffer) and the window stays open.
+    // to cancel in a read-only buffer) and the modal stays open.
     "context": "PreviewWindow > Editor",
     "bindings": {
       "ctrl-enter": "menu::Cancel",

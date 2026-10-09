@@ -1,25 +1,12 @@
-//! The conversation's one floating preview window — images and full tool
-//! arguments both land here.
-//!
-//! Two things it exists to guarantee, both of them user-visible:
-//!
-//! * **There is exactly one.** Every click used to call `cx.open_window`, so
-//!   walking a conversation with screenshots in it buried the desktop under a
-//!   stack of "Image preview" windows the user then had to close one by one.
-//!   Opening a second preview now retargets the first and raises it.
-//! * **It is a real window, not a modal.** The full shell command used to open
-//!   in a workspace modal, which cannot be moved, cannot be resized, and blocks
-//!   the pane behind it — the worst surface for the one case that needs room
-//!   (a heredoc, a long pipeline). A window can be dragged aside and kept open
-//!   next to the conversation it came from.
+//! In-editor previews shared by conversation images, tool arguments and file links.
 
 use std::sync::Arc;
 
 use gpui::AnyElement;
 use gpui::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, Global, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement as _,
-    Styled, Window, WindowHandle, div, px,
+    App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, px,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use settings::Settings;
@@ -28,16 +15,18 @@ use ui::prelude::*;
 use ui::utils::WithRemSize;
 use ui::{CopyButton, IconButton, IconName, Label, LabelSize, Tooltip};
 
-/// A floating report is a compact companion to the conversation, not the
-/// full-width Markdown editor. Keep its type scale one step below the regular
+/// A report preview follows the Markdown preview font settings. Keep its type scale one step below the regular
 /// preview while still following `markdown_preview.font_size` and zoom.
 const DOCUMENT_FONT_SCALE: f32 = 0.875;
 
-/// What the preview window is showing. One window, two kinds of content —
-/// keeping them in one view is what lets a click on an image retarget a window
-/// that is currently showing a shell command, and the other way round.
+/// Content shown by the workspace preview modal.
 pub(crate) enum PreviewContent {
     Image(Arc<gpui::Image>),
+    FileInfo {
+        title: SharedString,
+        path: std::path::PathBuf,
+        details: SharedString,
+    },
     /// A tool call's full argument: the whole command, path or pattern behind
     /// the clipped preview row in the conversation.
     Text {
@@ -62,102 +51,48 @@ impl PreviewContent {
     fn window_title(&self) -> SharedString {
         match self {
             PreviewContent::Image(_) => "Image preview".into(),
-            PreviewContent::Text { title, .. } | PreviewContent::Markdown { title, .. } => {
-                title.clone()
-            }
+            PreviewContent::Text { title, .. }
+            | PreviewContent::Markdown { title, .. }
+            | PreviewContent::FileInfo { title, .. } => title.clone(),
         }
     }
 }
 
-/// The open window, if there is one. `WindowHandle::update` fails once the
-/// window is gone, which is the liveness check — there is no "was it closed"
-/// event to subscribe to, and a handle to a closed window is indistinguishable
-/// from a live one until you try to use it.
-#[derive(Default)]
-struct OpenPreview(Option<WindowHandle<PreviewWindow>>);
-
-impl Global for OpenPreview {}
-
-/// Show `content` in the preview window, opening it if it is not already up.
+/// Open or retarget a preview in the originating workspace, without creating an OS window.
 pub(crate) fn open_preview(content: PreviewContent, window: &mut Window, cx: &mut App) {
-    open_preview_inner(content, Some(window), cx)
-}
-
-/// [`open_preview`] for a caller that has no `Window` of its own — a link in a
-/// rendered document, whose click handler runs INSIDE the preview window's
-/// update and therefore has to `cx.defer` out of it before retargeting.
-///
-/// The `Window` is only ever used to pick the display a NEW window is centred
-/// on, so dropping it costs a fallback to the primary display, not a feature.
-pub(crate) fn open_preview_from_app(content: PreviewContent, cx: &mut App) {
-    open_preview_inner(content, None, cx)
-}
-
-fn open_preview_inner(content: PreviewContent, window: Option<&mut Window>, cx: &mut App) {
-    let title = content.window_title();
-    let existing = cx.try_global::<OpenPreview>().and_then(|g| g.0);
-
-    // `update` moves its closure, so a failed call would take `content` with
-    // it. Hand the closure an `Option` to `take` instead, and read afterwards
-    // whether it actually ran.
-    let mut pending = Some(content);
-    if let Some(handle) = existing {
-        let retargeted = handle.update(cx, |preview, window, cx| {
-            if let Some(content) = pending.take() {
-                preview.set_content(content, window, cx);
+    let workspace = window.root::<workspace::Workspace>().flatten().or_else(|| {
+        window
+            .root::<workspace::MultiWorkspace>()
+            .flatten()
+            .map(|multi| multi.read(cx).workspace().clone())
+    });
+    let Some(workspace) = workspace else {
+        return;
+    };
+    // Link callbacks can run while the modal/workspace is borrowed. Retarget after that update.
+    window.defer(cx, move |window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            if let Some(preview) = workspace.active_modal::<PreviewWindow>(cx) {
+                preview.update(cx, |preview, cx| {
+                    preview.set_content(content, window, cx);
+                    window.focus(&preview.focus_handle(cx), cx);
+                });
+            } else {
+                workspace.toggle_modal(window, cx, move |window, cx| {
+                    PreviewWindow::new(content, window, cx)
+                });
             }
-            window.set_window_title(&title);
-            window.activate_window();
-            cx.notify();
         });
-        if retargeted.is_ok() {
-            return;
-        }
-        // The window was closed behind our back; fall through and open a new
-        // one with the content the closure never got to consume.
-        cx.set_global(OpenPreview(None));
-    }
-    let content = match pending {
-        Some(content) => content,
-        // Unreachable: `take` only runs inside a closure whose `Ok` returns
-        // above. Nothing to show rather than a panic in a click handler.
-        None => return,
-    };
+    });
+}
 
-    let display_size = window
-        .and_then(|window| window.display(cx))
-        .or_else(|| cx.primary_display())
-        .map(|d| d.bounds().size)
-        .unwrap_or(gpui::Size {
-            width: px(800.0),
-            height: px(600.0),
-        });
-    let size = gpui::Size {
-        width: display_size.width * 0.6,
-        height: display_size.height * 0.7,
-    };
-    let bounds = gpui::WindowBounds::centered(size, cx);
-    let opened = cx.open_window(
-        gpui::WindowOptions {
-            titlebar: Some(gpui::TitlebarOptions {
-                title: Some(title),
-                appears_transparent: false,
-                traffic_light_position: None,
-            }),
-            window_bounds: Some(bounds),
-            is_resizable: true,
-            is_minimizable: true,
-            kind: gpui::WindowKind::Normal,
-            ..Default::default()
-        },
-        move |window, cx| {
-            window.activate_window();
-            cx.new(|cx| PreviewWindow::new(content, window, cx))
-        },
-    );
-    match opened {
-        Ok(handle) => cx.set_global(OpenPreview(Some(handle))),
-        Err(err) => log::error!("failed to open the preview window: {err:?}"),
+impl EventEmitter<DismissEvent> for PreviewWindow {}
+impl workspace::ModalView for PreviewWindow {
+    fn debug_kind(&self) -> &'static str {
+        "ConversationPreview"
+    }
+    fn fade_out_background(&self) -> bool {
+        true
     }
 }
 
@@ -204,10 +139,14 @@ impl PreviewWindow {
                     workspace::AppState::try_global(cx).map(|state| state.languages.clone());
                 Some(cx.new(|cx| Markdown::new(source.clone(), languages, None, cx)))
             }
-            PreviewContent::Image(_) | PreviewContent::Text { .. } => None,
+            PreviewContent::Image(_)
+            | PreviewContent::Text { .. }
+            | PreviewContent::FileInfo { .. } => None,
         };
         self.editor = match &content {
-            PreviewContent::Image(_) | PreviewContent::Markdown { .. } => None,
+            PreviewContent::Image(_)
+            | PreviewContent::Markdown { .. }
+            | PreviewContent::FileInfo { .. } => None,
             PreviewContent::Text { body, .. } => Some(cx.new(|cx| {
                 let mut editor = editor::Editor::multi_line(window, cx);
                 editor.set_show_gutter(false, cx);
@@ -249,6 +188,7 @@ impl Render for PreviewWindow {
             // is pasting the document somewhere else that also renders it.
             PreviewContent::Markdown { source, .. } => Some(source.clone()),
             PreviewContent::Image(_) => None,
+            PreviewContent::FileInfo { details, .. } => Some(details.clone()),
         };
 
         let header = h_flex()
@@ -263,11 +203,6 @@ impl Render for PreviewWindow {
             .bg(cx.theme().colors().title_bar_background)
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            // The window may be drawn without server-side decorations, in which
-            // case there is no titlebar to grab; this row is the drag handle
-            // either way, so "move it aside" never depends on the window
-            // manager's choice.
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
             .child(Label::new(title).size(LabelSize::Default).truncate())
             .child(
                 h_flex()
@@ -281,11 +216,35 @@ impl Render for PreviewWindow {
                     .child(
                         IconButton::new("preview-close", IconName::Close)
                             .tooltip(Tooltip::text("Close"))
-                            .on_click(|_, window, _| window.remove_window()),
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     ),
             );
 
         let body: AnyElement = match (&self.content, &self.editor) {
+            (PreviewContent::FileInfo { path, details, .. }, _) => {
+                let path = path.clone();
+                v_flex()
+                    .id("preview-file-info")
+                    .debug_selector(|| "PREVIEW-FILE-INFO".into())
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id("preview-file-details")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(Label::new(details.clone())),
+                    )
+                    .child(
+                        ui::Button::new("preview-reveal-file", "Open in File Manager")
+                            .end_icon(Icon::new(IconName::Folder))
+                            .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                    )
+                    .into_any_element()
+            }
             (PreviewContent::Image(image), _) => div()
                 .flex_1()
                 .min_h_0()
@@ -328,12 +287,12 @@ impl Render for PreviewWindow {
                         .child(
                             // Preview typography is rem-based. The regular
                             // MarkdownPreviewView supplies this same local rem
-                            // root; this compact window uses a smaller root,
+                            // root; this compact modal uses a smaller root,
                             // but without one it silently inherits the larger
                             // UI size and ignores markdown_preview.font_size.
                             WithRemSize::new(preview_font_size).child(
                                 MarkdownElement::new(markdown.clone(), style).on_url_click(
-                                    move |url, _window, cx| {
+                                    move |url, window, cx| {
                                         // A relative link in a document points at
                                         // its neighbours, so the document's own
                                         // directory is the root it resolves
@@ -342,6 +301,7 @@ impl Render for PreviewWindow {
                                         crate::conversation_render::link::open_link_within_preview(
                                             url.as_ref(),
                                             &roots,
+                                            window,
                                             cx,
                                         );
                                     },
@@ -357,11 +317,20 @@ impl Render for PreviewWindow {
         div()
             .key_context("PreviewWindow")
             .track_focus(&self.focus_handle)
-            .size_full()
+            .w(px(
+                (window.viewport_size().width.as_f32() * 0.85).min(1100.0)
+            ))
+            .h(px((window.viewport_size().height.as_f32() - 120.0)
+                .max(120.0)
+                .min(850.0)))
             .flex()
             .flex_col()
+            .overflow_hidden()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_lg()
             .bg(cx.theme().colors().editor_background)
-            .on_action(|_: &menu::Cancel, window, _| window.remove_window())
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .child(header)
             .child(body)
     }
@@ -370,162 +339,98 @@ impl Render for PreviewWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
+    use gpui::{TestAppContext, UpdateGlobal};
 
-    fn an_image() -> Arc<gpui::Image> {
-        // Never rendered by these tests, so the bytes do not have to decode —
-        // what is under test is which window the content lands in.
-        Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, Vec::new()))
-    }
-
-    /// The whole point of the rewrite: walking a conversation full of
-    /// screenshots used to bury the desktop under one OS window per click.
     #[gpui::test]
-    async fn every_preview_lands_in_the_same_window(cx: &mut TestAppContext) {
-        let (_solution_id, _tmp, project) =
-            crate::store::tests::setup_solution_and_project(cx).await;
-        cx.update(|cx| {
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
-
-        let before = cx.update(|_, cx| cx.windows().len());
-
-        workspace.update_in(cx, |_, window, cx| {
-            open_preview(PreviewContent::Image(an_image()), window, cx);
-        });
-        cx.run_until_parked();
-        let after_first = cx.update(|_, cx| cx.windows().len());
-        assert_eq!(
-            after_first,
-            before + 1,
-            "the first preview opens the window"
-        );
-        let first = cx
-            .update(|_, cx| cx.global::<OpenPreview>().0)
-            .expect("the window handle is remembered");
-
-        workspace.update_in(cx, |_, window, cx| {
-            open_preview(PreviewContent::Image(an_image()), window, cx);
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            cx.update(|_, cx| cx.windows().len()),
-            after_first,
-            "a second image must retarget the open window, not stack another \
-             one on top of it"
-        );
-        assert_eq!(
-            cx.update(|_, cx| cx.global::<OpenPreview>().0),
-            Some(first),
-            "and it must be the SAME window, not a replacement"
-        );
-
-        // The tool argument is the other half of the ask: it used to be a
-        // workspace modal, and it has to land in this same window.
+    async fn preview_retargets_and_dismisses_inside_the_workspace(cx: &mut TestAppContext) {
+        let (_, _tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| theme_settings::init(theme::LoadThemes::JustBase, cx));
+        let (multi, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
+        let count = cx.update(|_, cx| cx.windows().len());
         workspace.update_in(cx, |_, window, cx| {
             open_preview(
                 PreviewContent::Text {
-                    title: "Bash".into(),
-                    body: "echo hi".into(),
+                    title: "Command".into(),
+                    body: "echo hello".into(),
                 },
                 window,
                 cx,
-            );
+            )
+        });
+        cx.run_until_parked();
+        let preview = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<PreviewWindow>(cx)
+            })
+            .unwrap();
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), count);
+        assert!(preview.read_with(cx, |preview, _| preview.editor.is_some()));
+        let dir = tempfile::tempdir().unwrap();
+        let next = dir.path().join("next.md");
+        std::fs::write(&next, "# Next document").unwrap();
+        preview.update_in(cx, |_, window, cx| {
+            crate::conversation_render::link::open_link_within_preview(
+                "next.md",
+                &[dir.path().into()],
+                window,
+                cx,
+            )
         });
         cx.run_until_parked();
         assert_eq!(
-            cx.update(|_, cx| cx.windows().len()),
-            after_first,
-            "a tool argument opens no window of its own"
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_modal::<PreviewWindow>(cx)),
+            Some(preview.clone())
         );
-        assert_eq!(cx.update(|_, cx| cx.global::<OpenPreview>().0), Some(first));
-        first
-            .update(cx, |preview, _, _| {
-                assert!(
-                    matches!(preview.content, PreviewContent::Text { .. }),
-                    "the window is showing the argument now, not the stale image"
-                );
-                assert!(
-                    preview.editor.is_some(),
-                    "text is shown in a selectable read-only editor"
-                );
-            })
-            .expect("the window is still open");
-    }
-
-    /// A report the agent wrote is prose, and showing it as its own source is
-    /// showing the reader the markup they asked to be spared. The routing is by
-    /// EXTENSION, so the negative half matters as much: identical bytes under a
-    /// non-markdown name must still open as source.
-    #[gpui::test]
-    async fn a_markdown_file_previews_rendered_while_other_text_stays_source(
-        cx: &mut TestAppContext,
-    ) {
-        let (_solution_id, _tmp, project) =
-            crate::store::tests::setup_solution_and_project(cx).await;
-        cx.update(|cx| {
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        assert!(
+            preview.read_with(cx, |preview, _| preview.markdown.is_some()
+                && preview.editor.is_none())
+        );
+        preview.update(cx, |_, cx| cx.emit(DismissEvent));
+        cx.run_until_parked();
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<PreviewWindow>(cx))
+                .is_none()
+        );
+        assert_eq!(
+            cx.update(|_, cx| cx.windows().len()),
+            count,
+            "dismiss must not close the editor window"
+        );
+        workspace.update_in(cx, |_, window, cx| {
+            open_preview(
+                PreviewContent::FileInfo {
+                    title: "archive.zip".into(),
+                    path: next.clone(),
+                    details: "Size: 10 bytes".into(),
+                },
+                window,
+                cx,
+            )
         });
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let body = "# Findings\n\n- one\n- two\n";
-        let document = dir.path().join("REVIEW.md");
-        std::fs::write(&document, body).expect("write the document");
-        let plain = dir.path().join("REVIEW.txt");
-        std::fs::write(&plain, body).expect("write the plain file");
-
-        let open = |path: &std::path::Path, cx: &mut gpui::VisualTestContext| {
-            let url = path.to_string_lossy().into_owned();
-            workspace.update_in(cx, |_, window, cx| {
-                crate::conversation_render::link::open_link(&url, &[], window, cx);
-            });
-            cx.run_until_parked();
-        };
-
-        open(&document, cx);
-        let handle = cx
-            .update(|_, cx| cx.global::<OpenPreview>().0)
-            .expect("the document opened a preview");
-        handle
-            .update(cx, |preview, _, _| {
-                assert!(
-                    matches!(preview.content, PreviewContent::Markdown { .. }),
-                    "a .md file has to reach the window as markdown, not as text"
-                );
-                assert!(
-                    preview.markdown.is_some(),
-                    "and it needs a parsed document to render"
-                );
-                assert!(
-                    preview.editor.is_none(),
-                    "the read-only source editor is what this replaces"
-                );
-            })
-            .expect("the window is open");
-
-        open(&plain, cx);
-        handle
-            .update(cx, |preview, _, _| {
-                assert!(
-                    matches!(preview.content, PreviewContent::Text { .. }),
-                    "the same bytes under a .txt name are not a document"
-                );
-                assert!(preview.markdown.is_none());
-                assert!(preview.editor.is_some());
-            })
-            .expect("the window is still open");
+        cx.run_until_parked();
+        assert!(
+            workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .active_modal::<PreviewWindow>(cx))
+                .is_some()
+        );
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), count);
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            cx.debug_bounds("PREVIEW-FILE-INFO").is_some(),
+            "file information must be painted inside the modal"
+        );
     }
-
-    /// Preview styles express their entire type scale in `rem`. The regular
-    /// MarkdownPreviewView installs a local rem root, but this standalone
-    /// window once omitted it and therefore rendered at the UI font size no
-    /// matter what `markdown_preview.font_size` said.
     #[gpui::test]
-    async fn standalone_markdown_preview_respects_preview_font_size(cx: &mut TestAppContext) {
+    async fn modal_markdown_preview_respects_preview_font_size(cx: &mut TestAppContext) {
         let (_solution_id, _tmp, project) =
             crate::store::tests::setup_solution_and_project(cx).await;
         cx.update(|cx| {
@@ -537,8 +442,9 @@ mod tests {
             });
         });
         cx.run_until_parked();
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+        let (multi, cx) = cx
+            .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi.read_with(cx, |multi, _| multi.workspace().clone());
 
         workspace.update_in(cx, |_, window, cx| {
             open_preview(
@@ -552,29 +458,29 @@ mod tests {
             );
         });
         cx.run_until_parked();
-        let handle = cx
-            .update(|_, cx| cx.global::<OpenPreview>().0)
-            .expect("the document opened a preview");
-        let mut preview_cx = VisualTestContext::from_window(handle.into(), cx);
-        let small_height = preview_cx
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        let small_height = cx
             .debug_bounds("inner")
             .expect("the markdown root was drawn")
             .size
             .height;
 
-        preview_cx.update(|_, cx| {
+        cx.update(|_, cx| {
             settings::SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.markdown_preview.get_or_insert_default().font_size = Some(20.0.into());
                 });
             });
         });
-        preview_cx.run_until_parked();
-        preview_cx.update(|window, cx| {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
             window.refresh();
             window.draw(cx).clear(cx);
         });
-        let large_height = preview_cx
+        let large_height = cx
             .debug_bounds("inner")
             .expect("the markdown root was redrawn")
             .size
@@ -583,124 +489,6 @@ mod tests {
         assert!(
             large_height > small_height * 1.5,
             "the preview setting must scale this window: {small_height:?} -> {large_height:?}"
-        );
-    }
-
-    /// A link inside a rendered document is clicked from INSIDE the preview
-    /// window's own update, so retargeting it is a re-entrant
-    /// `WindowHandle::update` — which fails, and a failed update is how
-    /// `open_preview` detects a window the user closed. Unguarded, every
-    /// followed link opened another window: decision #186's stacking, back.
-    #[gpui::test]
-    async fn following_a_link_inside_a_document_reuses_the_same_window(cx: &mut TestAppContext) {
-        let (_solution_id, _tmp, project) =
-            crate::store::tests::setup_solution_and_project(cx).await;
-        cx.update(|cx| {
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let first = dir.path().join("FIRST.md");
-        let second = dir.path().join("SECOND.md");
-        std::fs::write(&first, "# First\n\n[next](./SECOND.md)\n").expect("write");
-        std::fs::write(&second, "# Second\n").expect("write");
-
-        let url = first.to_string_lossy().into_owned();
-        workspace.update_in(cx, |_, window, cx| {
-            crate::conversation_render::link::open_link(&url, &[], window, cx);
-        });
-        cx.run_until_parked();
-        let with_preview = cx.update(|_, cx| cx.windows().len());
-        let handle = cx
-            .update(|_, cx| cx.global::<OpenPreview>().0)
-            .expect("the document opened a preview");
-
-        // Exactly what the rendered link's click handler does, from exactly
-        // where it does it.
-        let roots = vec![dir.path().to_path_buf()];
-        handle
-            .update(cx, |_, _, cx| {
-                crate::conversation_render::link::open_link_within_preview(
-                    "./SECOND.md",
-                    &roots,
-                    cx,
-                );
-            })
-            .expect("the window is open");
-        cx.run_until_parked();
-
-        assert_eq!(
-            cx.update(|_, cx| cx.windows().len()),
-            with_preview,
-            "following a link must retarget the preview, not stack another one"
-        );
-        assert_eq!(
-            cx.update(|_, cx| cx.global::<OpenPreview>().0),
-            Some(handle),
-            "and it has to be the same window"
-        );
-        handle
-            .update(cx, |preview, _, _| match &preview.content {
-                PreviewContent::Markdown { title, source, .. } => {
-                    assert!(source.contains("# Second"), "the linked document is shown");
-                    assert_eq!(title.as_ref(), "./SECOND.md");
-                }
-                PreviewContent::Text { title, .. } => {
-                    panic!("expected the linked markdown, got text titled {title:?}")
-                }
-                PreviewContent::Image(_) => panic!("expected the linked markdown, got an image"),
-            })
-            .expect("the window is open");
-    }
-
-    /// A handle to a closed window is indistinguishable from a live one until
-    /// you use it, so the reopen path is only reachable through a failed
-    /// `update` — and a preview that silently stopped opening after the user
-    /// closed it once is the obvious way to get this wrong.
-    #[gpui::test]
-    async fn closing_the_window_does_not_stop_the_next_preview(cx: &mut TestAppContext) {
-        let (_solution_id, _tmp, project) =
-            crate::store::tests::setup_solution_and_project(cx).await;
-        cx.update(|cx| {
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-        });
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
-
-        workspace.update_in(cx, |_, window, cx| {
-            open_preview(PreviewContent::Image(an_image()), window, cx);
-        });
-        cx.run_until_parked();
-        let first = cx
-            .update(|_, cx| cx.global::<OpenPreview>().0)
-            .expect("handle");
-        let with_preview = cx.update(|_, cx| cx.windows().len());
-
-        first
-            .update(cx, |_, window, _| window.remove_window())
-            .expect("close the preview");
-        cx.run_until_parked();
-        assert_eq!(
-            cx.update(|_, cx| cx.windows().len()),
-            with_preview - 1,
-            "precondition: the window is really gone"
-        );
-
-        workspace.update_in(cx, |_, window, cx| {
-            open_preview(PreviewContent::Image(an_image()), window, cx);
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            cx.update(|_, cx| cx.windows().len()),
-            with_preview,
-            "the next click has to open a fresh window"
-        );
-        assert_ne!(
-            cx.update(|_, cx| cx.global::<OpenPreview>().0),
-            Some(first),
-            "and remember the new one, or the click after it reuses a corpse"
         );
     }
 }
