@@ -967,8 +967,9 @@ fn disable_mcp_servers(config: &mut Value, effective: &Value) {
     let injected: Vec<String> = config
         .as_object()
         .into_iter()
-        .flat_map(|m| m.keys())
-        .filter_map(|key| key.strip_prefix("mcp_servers.").map(str::to_owned))
+        .flat_map(|m| m.iter())
+        .filter(|(_, value)| value.is_object())
+        .filter_map(|(key, _)| key.strip_prefix("mcp_servers.").map(str::to_owned))
         .collect();
     for name in inherited.chain(injected) {
         let segment = override_key_segment(&name);
@@ -1085,6 +1086,16 @@ fn belongs_to_thread(params: &Value, id: &acp::SessionId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disabling_mcp_twice_does_not_create_phantom_servers() {
+        let mut config = session_config(&[acp::McpServer::Stdio(acp::McpServerStdio::new("sawe", "/bin/sawe"))]);
+        let resolved = json!({"mcp_servers":{"trap.name":{"command":"/bin/trap"}},"plugins":{"trap":{"enabled":true}}});
+        disable_mcp_servers(&mut config, &resolved);
+        let once = config.clone();
+        disable_mcp_servers(&mut config, &resolved);
+        assert_eq!(config, once);
+    }
+
     fn overloaded_turn(id: &str) -> Value {
         json!({"id":id,"status":"failed","error":{"message":"Selected model is at capacity.","codexErrorInfo":"serverOverloaded"}})
     }

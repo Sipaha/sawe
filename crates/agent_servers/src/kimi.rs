@@ -125,10 +125,16 @@ impl AgentServer for KimiAgentServer {
         let environment = project.read(cx).environment().downgrade();
         let store = delegate.store.downgrade();
         cx.spawn(async move |cx| {
-            let mut env = environment.update(cx, |environment, cx| environment.default_environment(cx))?.await.unwrap_or_default();
+            let mut env: HashMap<String, String> = std::env::vars_os()
+                .map(|(key, value)| (key.to_string_lossy().into_owned(), value.to_string_lossy().into_owned()))
+                .collect();
+            env.extend(environment.update(cx, |environment, cx| environment.default_environment(cx))?.await.unwrap_or_default());
             env.extend(extra_env);
             if env.get("KIMI_MODEL_NAME").is_some_and(|model| !model.is_empty()) {
                 anyhow::bail!("Kimi text generation requires the CLI subscription login; KIMI_MODEL_NAME overrides are not used.");
+            }
+            if env.get("KIMI_CODE_CUSTOM_HEADERS").is_some_and(|headers| headers.lines().any(|line| line.split(':').next().is_some_and(|key| key.trim().eq_ignore_ascii_case("authorization")))) {
+                anyhow::bail!("Kimi text generation does not use authentication header overrides.");
             }
             let profile = cx.background_spawn(async move {
                 crate::verify_generation_cli_version(KIMI_BINARY, "2.1.1", &root, Some(&env)).await?;
@@ -186,28 +192,22 @@ fn generation_profile(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(error) => return Err(error.into()),
     };
-    if let Some(model) = original.get("default_model").and_then(toml::Value::as_str) {
-        let provider = original
-            .get("models")
-            .and_then(|models| models.get(model))
-            .and_then(|model| model.get("provider"))
-            .and_then(toml::Value::as_str);
-        if provider.is_some_and(|provider| provider != "managed:kimi-code") {
-            anyhow::bail!(
-                "Kimi text generation requires the CLI subscription login; the configured model uses another provider. No fallback was attempted."
-            );
-        }
+    let model = original.get("default_model").and_then(toml::Value::as_str)
+        .context("Kimi CLI has no configured subscription model. Run `kimi login` in a terminal.")?;
+    let provider_id = original.get("models").and_then(|models| models.get(model)).and_then(|model| model.get("provider")).and_then(toml::Value::as_str);
+    anyhow::ensure!(provider_id == Some("managed:kimi-code"), "Kimi text generation requires a configured CLI subscription model. No fallback was attempted.");
+    let provider = original.get("providers").and_then(|providers| providers.get("managed:kimi-code"))
+        .context("Kimi text generation requires the CLI subscription login. Run `kimi login` in a terminal.")?;
+    anyhow::ensure!(provider.get("oauth").is_some_and(toml::Value::is_table), "Kimi text generation requires the CLI subscription login; API-key accounts are not used.");
+    anyhow::ensure!(provider.get("type").and_then(toml::Value::as_str).is_none_or(|kind| kind == "kimi"), "Kimi text generation requires the CLI subscription provider.");
+    for key in ["api_key", "api_key_env"] {
+        anyhow::ensure!(!provider.get(key).and_then(toml::Value::as_str).is_some_and(|value| !value.is_empty()), "Kimi text generation does not use {key} credentials.");
     }
-    if original
-        .get("providers")
-        .and_then(|providers| providers.get("managed:kimi-code"))
-        .and_then(|provider| provider.get("api_key"))
-        .and_then(toml::Value::as_str)
-        .is_some_and(|key| !key.is_empty())
-    {
-        anyhow::bail!(
-            "Kimi text generation requires the CLI subscription login; API keys are not used."
-        );
+    if let Some(environment) = provider.get("env").and_then(toml::Value::as_table) {
+        anyhow::ensure!(!environment.iter().any(|(key, value)| key.ends_with("_API_KEY") && value.as_str().is_some_and(|value| !value.is_empty())), "Kimi text generation does not use provider API-key environment overrides.");
+    }
+    if let Some(headers) = provider.get("custom_headers").and_then(toml::Value::as_table) {
+        anyhow::ensure!(!headers.keys().any(|key| key.eq_ignore_ascii_case("authorization")), "Kimi text generation does not use authentication header overrides.");
     }
     let mut config = toml::Table::new();
     // Keep account/model routing, while excluding executable customizations.
@@ -255,7 +255,7 @@ mod generation_tests {
         let root = tempfile::tempdir().expect("root");
         let source = root.path().join("original");
         std::fs::create_dir(&source).expect("source");
-        std::fs::write(source.join("config.toml"), "default_model = 'chosen'\nextra_skill_dirs = ['/unsafe']\n[[hooks]]\nevent = 'UserPromptSubmit'\ncommand = 'touch sentinel'\n[models.chosen]\nprovider = 'managed:kimi-code'\nmodel = 'selected-model'\n").expect("config");
+        std::fs::write(source.join("config.toml"), "default_model = 'chosen'\nextra_skill_dirs = ['/unsafe']\n[[hooks]]\nevent = 'UserPromptSubmit'\ncommand = 'touch sentinel'\n[models.chosen]\nprovider = 'managed:kimi-code'\nmodel = 'selected-model'\n[providers.\"managed:kimi-code\".oauth]\nstorage = 'file'\nkey = 'oauth/fixture'\n").expect("config");
         let env = HashMap::from_iter([(
             "KIMI_CODE_HOME".into(),
             source.to_string_lossy().into_owned(),
@@ -279,4 +279,17 @@ mod generation_tests {
         assert!(!agent.contains("${"));
         assert!(!profile.path().join("home/mcp.json").exists());
     }
+    #[test]
+    fn generation_rejects_api_key_routes_without_subscription_fallback() {
+        let root = tempfile::tempdir().expect("root");
+        let source = root.path().join("original");
+        std::fs::create_dir(&source).expect("source");
+        let env = HashMap::from_iter([("KIMI_CODE_HOME".into(), source.to_string_lossy().into_owned())]);
+        for credentials in ["api_key = 'dummy'", "api_key_env = 'FIXTURE_KEY'", "[providers.\"managed:kimi-code\".env]\nKIMI_API_KEY = 'dummy'"] {
+            let config = format!("default_model = 'chosen'\n[models.chosen]\nprovider = 'managed:kimi-code'\nmodel = 'selected-model'\n[providers.\"managed:kimi-code\"]\n{credentials}\n");
+            std::fs::write(source.join("config.toml"), config).expect("config");
+            assert!(generation_profile(root.path(), "Fixed instructions", &env).is_err());
+        }
+    }
+
 }
