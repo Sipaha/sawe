@@ -122,13 +122,11 @@ impl AgentServer for KimiAgentServer {
     ) -> Task<Result<Rc<dyn AgentConnection>>> {
         let agent_id = self.agent_id();
         let extra_env = load_proxy_env(cx);
-        let environment = project.read(cx).environment().downgrade();
         let store = delegate.store.downgrade();
         cx.spawn(async move |cx| {
             let mut env: HashMap<String, String> = std::env::vars_os()
                 .map(|(key, value)| (key.to_string_lossy().into_owned(), value.to_string_lossy().into_owned()))
                 .collect();
-            env.extend(environment.update(cx, |environment, cx| environment.default_environment(cx))?.await.unwrap_or_default());
             env.extend(extra_env);
             if env.get("KIMI_MODEL_NAME").is_some_and(|model| !model.is_empty()) {
                 anyhow::bail!("Kimi text generation requires the CLI subscription login; KIMI_MODEL_NAME overrides are not used.");
