@@ -4899,20 +4899,7 @@ tried against **every** worktree root in turn rather than assumed to live under
 the first. A path that resolves nowhere stays dead: opening the wrong file is
 worse than opening none.
 
-A resolved file opens in the **shared in-editor preview modal** (decision #186), not in a
-tab. Reading a report the agent just wrote is a glance, and it should not
-displace what is open in the editor — the window is already the fork's answer to
-"this does not fit here", it is a real movable window rather than a modal, and
-its `Text` mode is a read-only editor with soft wrap and a scrollbar, which is
-exactly a file viewer. Bodies are clipped at 512 KiB **on a character
-boundary**: a link to a large log should not freeze the conversation it was
-clicked from, and a naive byte cut renders the split character as a replacement
-glyph. (The test for that pins a three-byte character on purpose — the cap is
-even, so a two-byte one would land on a boundary by luck and prove nothing.)
-A linked **image** (`png`, `jpg`, `webp`, `gif`, `svg`, `bmp`, `tiff`, `ico`,
-`pnm`, chosen by extension) opens in the window's `Image` mode instead. Until
-2026-09-30 it went down the text path and showed its bytes as mojibake. Images
-are not clipped; one over 64 MiB is refused with a message in the window.
+A resolved file opens in the **shared in-editor preview modal** (decision #186), keeping the editor's tabs intact. Markdown renders as a document; other UTF-8 text uses a read-only editor with soft wrap and a scrollbar. Reads are bounded before clipping at512KiB on a character boundary. Non-text files, including linked images, show metadata and a file-manager reveal action; embedded chat images keep visual preview.
 
 `render_span` carries a weak handle rather than a precomputed list of roots: a
 relative link is resolved against the project **as it stands when clicked**, not
@@ -4934,12 +4921,12 @@ handler fired and logged `roots=[] -> Dead`. `link::project_roots` now goes
 through `Workspace::project`, which is alive whenever the conversation is on
 screen at all.
 
-Verified in a running editor, not only in the suite: a cold session seeded with
+The original cold-link routing was verified in a running editor, not only in the suite: a session seeded with
 an assistant message holding three links — a resolvable path, a path that is not
 there, and an `https:` URL — paints all three, and clicking the first opens the
-preview window titled `docs/audit.md` with the file's text in it. Clicking the
+preview titled `docs/audit.md` with the document in it. Current previews use the workspace modal (decision186). Clicking the
 broken one changes **zero** of 2 073 600 pixels: it does not retarget the open
-window and does not raise an error, which is the "silence beats the wrong file"
+preview and does not raise an error, which is the "silence beats the wrong file"
 rule made visible.
 
 (Driving that check needed one more thing worth writing down: a synthetic click

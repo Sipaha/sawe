@@ -9,7 +9,7 @@
 
 ## Entry points
 
-- Default CLI provider verification and queued preview/Git tasks:
+- Default CLI provider, preview modals and Git toolbar verification:
   [October 9 boundary handoff](findings/2026-10-09-session-handoff.md).
 
 - Push repository target, responsive preview and interrupted-rebase diagnosis:
