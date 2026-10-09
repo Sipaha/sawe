@@ -325,42 +325,21 @@ To view a stash's contents, select it in the stash picker and press {#kb stash_p
 
 ## AI Support in Git
 
-Zed currently supports LLM-powered commit message generation.
-You can ask AI to generate a commit message by focusing on the message editor within the Git Panel and either clicking on the pencil icon in the bottom left, or reaching for the {#action git::GenerateCommitMessage}, or through the {#kb git::GenerateCommitMessage} keybinding.
+Sawe generates commit messages through the installed Claude, Codex, or Kimi CLI using its subscription login. Focus the message editor in the Git panel and click the generation icon, use {#action git::GenerateCommitMessage}, or press {#kb git::GenerateCommitMessage}.
 
-> Note that you need to have an LLM provider configured either via your own API keys or through Zed's hosted AI models.
-> Visit [AI Quick Start](./ai/quick-start.md) to learn how to configure AI.
-
-You can specify your preferred model for this task by adding a `commit_message_model` field to your agent settings.
-See [Feature-specific models](./ai/agent-settings.md#feature-specific-models) for more information.
+Choose the provider from the icon immediately left of the bottom AI session tabs. Its menu is titled **Default Provider** and uses the same provider rows as the **+** new-session menu. Choosing a default saves the global preference for all Solutions without creating a chat or changing existing sessions.
 
 ```json [settings]
 {
-  "agent": {
-    "commit_message_model": {
-      "provider": "anthropic",
-      "model": "claude-4-5-haiku"
-    }
+  "solution_agent": {
+    "default_provider": "codex-native"
   }
 }
 ```
 
-To add custom commit instructions for the model, use the global `AGENTS.md` file located at `~/.spk/sawe/config/AGENTS.md`.
+Provider IDs are `claude-acp`, `codex-native`, and `kimi-code`. Claude is used when no default is saved. The provider is captured when generation starts; changing the preference affects subsequent interface AI actions. These helpers do not use `agent.commit_message_model` or the LLM Providers registry.
 
-To add custom instructions that apply only to commit message generation, use the `commit_message_instructions` field in your agent settings:
-
-```json [settings]
-{
-  "agent": {
-    "commit_message_instructions": "Use the Conventional Commits format: <type>(<scope>): <description>."
-  }
-}
-```
-
-These instructions are sent to the model in addition to any instruction files, such as `.rules` or `AGENTS.md`. To add instructions that apply to both commit messages and the agent more broadly, use the global `AGENTS.md` file located at `~/.spk/sawe/config/AGENTS.md`.
-
-> Before Zed v1.4.0, this was done through the Rules Library, which has been removed.
-> See [Migrating from Rules](./ai/instructions.md#migrating-from-rules) for more information.
+Generation sessions are hidden and allow no tools, MCP servers, project customizations, hooks, or approvals. Only the supplied diff and context are used. Failures show the provider and complete error cause chain, and keep the current message intact. Authentication and account limits are reported without switching providers or replaying the request.
 
 ## Git Integrations
 

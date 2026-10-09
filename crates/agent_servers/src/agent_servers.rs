@@ -59,6 +59,17 @@ pub trait AgentServer: Send {
         cx: &mut App,
     ) -> Task<Result<Rc<dyn AgentConnection>>>;
 
+    fn connect_generation_only(
+        &self,
+        delegate: AgentServerDelegate,
+        project: Entity<Project>,
+        _root: std::path::PathBuf,
+        _system_prompt: String,
+        cx: &mut App,
+    ) -> Task<Result<Rc<dyn AgentConnection>>> {
+        self.connect(delegate, project, cx)
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 
     fn default_mode(&self, _cx: &App) -> Option<acp_schema::SessionModeId> {

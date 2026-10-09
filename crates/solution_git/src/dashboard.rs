@@ -1370,7 +1370,7 @@ impl SolutionStatusDashboard {
                         this.ai_suggest.last_error = None;
                     }
                     Err(err) => {
-                        this.ai_suggest.last_error = Some(SharedString::from(format!("{err}")));
+                        this.ai_suggest.last_error = Some(SharedString::from(format!("{err:#}")));
                     }
                 }
                 cx.notify();

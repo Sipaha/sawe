@@ -346,13 +346,12 @@ pub(crate) async fn analyze_solution_with(
                 let parsed = match raw {
                     Ok(text) => parse_yes_no(&text),
                     Err(err) => {
-                        log::warn!(
-                            "ai_cherry_pick_suggest: AI call failed for {}@{} → {}: {err}",
-                            source.member_id,
-                            commit.sha,
-                            target.member_id,
-                        );
-                        continue;
+                        return Err(err).with_context(|| {
+                            format!(
+                                "Cherry-pick suggestion failed for {}@{} → {}",
+                                source.member_id, commit.sha, target.member_id,
+                            )
+                        });
                     }
                 };
 

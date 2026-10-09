@@ -7,7 +7,7 @@ description: Choose how Zed gets language models: Zed-hosted models, API access,
 
 Use this page to choose which models power [the Zed Agent](./zed-agent.md) and
 other Zed-owned AI features, including [Inline Assistant](./inline-assistant.md),
-Git commit generation, thread summaries, and similar model-backed features.
+thread summaries, and similar model-backed features.
 
 Model access paths do not configure [External Agents](./external-agents.md) or
 [Terminal Threads](./terminal-threads.md). External Agents and Terminal Threads
@@ -28,7 +28,7 @@ the difference between the Zed Agent, External Agents, and Terminal Threads.
 
 ## Edit Prediction {#edit-prediction}
 
-[Edit Prediction](./edit-prediction.md) has its own provider setup under `edit_predictions`. LLM providers on this page apply to model-backed Zed AI features such as Zed Agent, Inline Assistant, Git commit generation, and thread summaries.
+[Edit Prediction](./edit-prediction.md) has its own provider setup under `edit_predictions`. LLM providers on this page apply to model-backed Zed AI features such as Zed Agent, Inline Assistant, and thread summaries.
 
 ## Anthropic-Compatible Providers {#anthropic-api-compatible}
 

@@ -1588,8 +1588,17 @@ impl SolutionAgentStore {
             //    `adapters` registry on the store, and we already have the
             //    store borrow open.
             let (connection_task, acp_meta) = this.update(cx, |store, cx| {
-                let task =
-                    store.get_or_spawn_connection(pair.clone(), &solution, project.clone(), cx);
+                let task = if ephemeral {
+                    match store.server_registry.get(&pair.1) {
+                        Some(server) => {
+                            let delegate = agent_servers::AgentServerDelegate::new(project.read(cx).agent_server_store().clone(), None, None);
+                            server.connect_generation_only(delegate, project.clone(), solution.root.clone(), crate::message_generator::GENERATION_SYSTEM_PROMPT.into(), cx)
+                        }
+                        None => Task::ready(Err(anyhow!("No AgentServer registered for {}", pair.1))),
+                    }
+                } else {
+                    store.get_or_spawn_connection(pair.clone(), &solution, project.clone(), cx)
+                };
                 // Brand-new session — no entity exists yet, so there is no
                 // persisted `desired_model` to thread in. An explicit `model`
                 // chosen in the new-chat row is passed as the override so
@@ -1624,11 +1633,7 @@ impl SolutionAgentStore {
             })?;
             let connection = connection_task.await?;
             if ephemeral && !connection.supports_generation_only() {
-                this.update(cx, |store, cx| store.pool_release_session(pair.clone(), cx))
-                    .log_err();
-                return Err(anyhow!(
-                    "This agent does not enforce generation-only sessions"
-                ));
+                return Err(anyhow!("This agent does not enforce generation-only sessions"));
             }
 
             // 3. Create an ACP session on that connection. An explicit `cwd`
@@ -1657,7 +1662,9 @@ impl SolutionAgentStore {
                     // refcount on the pooled connection so it can debounce-
                     // close if no other sessions are active.
                     this.update(cx, |store, cx| {
-                        store.pool_release_session(pair.clone(), cx);
+                        if !ephemeral {
+                            store.pool_release_session(pair.clone(), cx);
+                        }
                     })
                     .ok();
                     return Err(err);
@@ -1669,13 +1676,16 @@ impl SolutionAgentStore {
                     let thread = acp_thread.read(cx);
                     (thread.connection().clone(), thread.session_id().clone())
                 };
+                if ephemeral {
+                    return Task::ready(Ok(()));
+                }
                 crate::native_controls::apply_acp_controls(
                     connection, &provider_id,
                     permission_mode, model.clone(), cx,
                 )
             });
             if let Err(error) = controls.await {
-                this.update(cx, |store, cx| store.pool_release_session(pair.clone(), cx)).ok();
+                this.update(cx, |store, cx| if !ephemeral { store.pool_release_session(pair.clone(), cx); }).ok();
                 return Err(error);
             }
 
@@ -5328,8 +5338,15 @@ impl SolutionAgentStore {
     /// marker. Registered with `on_app_quit`.
     fn reap_agent_subprocesses_on_quit(
         &mut self,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl Future<Output = ()> + use<> {
+        for session in self.sessions.values() {
+            if session.read(cx).is_ephemeral
+                && let Some(thread) = session.read(cx).acp_thread()
+            {
+                thread.read(cx).connection().kill_all_sessions();
+            }
+        }
         for connection in self.pool.lock().ready_connections() {
             connection.kill_all_sessions();
         }

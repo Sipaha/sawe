@@ -1,9 +1,25 @@
 use settings::{RegisterSetting, Settings};
 use std::time::Duration;
 
-#[derive(Clone, Debug, Default, RegisterSetting)]
+#[derive(Clone, Debug, RegisterSetting)]
 pub struct SolutionAgentSettings {
+    pub default_provider: gpui::SharedString,
     pub ephemeral: EphemeralPoolSettings,
+}
+
+impl Default for SolutionAgentSettings {
+    fn default() -> Self {
+        Self {
+            default_provider: crate::claude_adapter::CLAUDE_ACP_AGENT_ID.into(),
+            ephemeral: EphemeralPoolSettings::default(),
+        }
+    }
+}
+
+pub fn default_provider(cx: &gpui::App) -> gpui::SharedString {
+    SolutionAgentSettings::try_get(cx)
+        .map(|settings| settings.default_provider.clone())
+        .unwrap_or_else(|| crate::claude_adapter::CLAUDE_ACP_AGENT_ID.into())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,7 +58,16 @@ impl Settings for SolutionAgentSettings {
                     .unwrap_or(defaults.idle_ttl),
             })
             .unwrap_or(defaults);
-        Self { ephemeral }
+        let default_provider = content
+            .solution_agent
+            .as_ref()
+            .and_then(|settings| settings.default_provider.as_ref())
+            .map(|id| gpui::SharedString::from(id.clone()))
+            .unwrap_or_else(|| crate::claude_adapter::CLAUDE_ACP_AGENT_ID.into());
+        Self {
+            default_provider,
+            ephemeral,
+        }
     }
 }
 

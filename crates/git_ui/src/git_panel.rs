@@ -3731,10 +3731,8 @@ impl GitPanel {
         self.generate_commit_message_task.is_some()
     }
 
-    /// Generates a commit message via the fork's `solution_agent` ephemeral
-    /// pool (subscription-auth `claude` subprocess), NOT upstream's
-    /// `LanguageModelRegistry` (which would require a configured BYOK
-    /// provider with API key). The action button still shows the spinner
+    /// Generates a commit message through the global default CLI provider
+    /// in an isolated text-only session. The action button shows the spinner
     /// while the ephemeral session runs; cancellation drops the task.
     pub fn generate_commit_message(&mut self, cx: &mut Context<Self>) {
         if !self.can_commit() {
@@ -4936,7 +4934,7 @@ impl GitPanel {
     {
         if let Ok(Some(workspace)) = weak_this.update(cx, |this, _cx| this.workspace.upgrade()) {
             let _ = workspace.update(cx, |workspace, cx| {
-                workspace.show_error(format!("Failed to generate commit message: {err}"), cx);
+                workspace.show_error(format!("Failed to generate commit message: {err:#}"), cx);
             });
         }
     }

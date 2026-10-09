@@ -42,8 +42,19 @@ pub struct Process {
 }
 impl Process {
     pub fn spawn(directory: &Path, cx: &App) -> Result<Self> {
+        Self::spawn_with_config(directory, &serde_json::Map::new(), cx)
+    }
+
+    pub fn spawn_with_config(
+        directory: &Path,
+        config: &serde_json::Map<String, Value>,
+        cx: &App,
+    ) -> Result<Self> {
         let mut command = Command::new("codex");
         command.args(["app-server"]).current_dir(directory);
+        for (key, value) in config {
+            command.args(["-c", &format!("{key}={value}")]);
+        }
         // Tracked so a crashed editor does not leave it running; see
         // `util::orphan_registry`.
         let mut child = Child::spawn_tracked(

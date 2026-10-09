@@ -32,7 +32,7 @@ Zed supports these first-class API providers for model-backed Zed AI features:
 
 ## What API Access Applies To {#support}
 
-Use API access for the Zed Agent, Inline Assistant, Git commit generation,
+Use API access for the Zed Agent, Inline Assistant,
 thread summaries, and similar Zed-owned AI features.
 
 External Agents and Terminal Threads usually configure model access in the

@@ -729,7 +729,9 @@ impl SolutionAgentStore {
             if connection.supports_close_session() {
                 connection.close_session(&acp_session_id, cx).detach();
             }
-            self.pool_release_session((teardown.solution_id, teardown.agent_id), cx);
+            if !teardown.was_ephemeral {
+                self.pool_release_session((teardown.solution_id, teardown.agent_id), cx);
+            }
         }
     }
 

@@ -812,7 +812,7 @@ impl ConflictResolverView {
                     let Some(workspace) = workspace.upgrade() else {
                         return;
                     };
-                    let message = format!("AI merge unavailable: {err}");
+                    let message = format!("AI merge unavailable: {err:#}");
                     cx.update(|_window, cx| {
                         workspace.update(cx, |workspace, cx| {
                             workspace.show_notification(

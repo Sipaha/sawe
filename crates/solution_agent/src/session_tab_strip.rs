@@ -681,6 +681,8 @@ impl SessionTabStrip {
             }
         }));
 
+        subscriptions.push(cx.observe_global::<settings::SettingsStore>(|_, cx| cx.notify()));
+
         if let Some(mw) = multi_workspace.as_ref().and_then(|w| w.upgrade()) {
             subscriptions.push(cx.observe(&mw, |_, _, cx| cx.notify()));
         }
@@ -1047,44 +1049,102 @@ impl SessionTabStrip {
             })
     }
 
-    /// The trailing plus opens provider selection before creating a chat.
-    /// Keep the existing small button size so the status bar height is stable.
-    fn render_plus_button(&self) -> impl IntoElement {
-        PopoverMenu::new("session-tab-strip-agent-menu")
+    /// Both selectors share the provider rows; the default selector only
+    /// updates the preference and never creates a chat.
+    fn render_provider_button(&self, default: bool, cx: &Context<Self>) -> impl IntoElement {
+        let selected = crate::agent_settings::default_provider(cx);
+        let brand = crate::adapter::agent_brand(&selected);
+        let workspace = self.workspace_weak(cx);
+        let icon = if default {
+            brand.map(|b| b.logo).unwrap_or(IconName::Sparkle)
+        } else {
+            IconName::Plus
+        };
+        let id = if default {
+            "session-tab-strip-default-provider"
+        } else {
+            "session-tab-strip-plus"
+        };
+        let menu_id = if default {
+            "session-tab-strip-default-provider-menu"
+        } else {
+            "session-tab-strip-agent-menu"
+        };
+        PopoverMenu::new(menu_id)
             .trigger(
-                IconButton::new("session-tab-strip-plus", IconName::Plus)
+                IconButton::new(id, icon)
                     .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text(PLUS_TOOLTIP)),
+                    .icon_color(if default {
+                        brand.map(|b| b.tint()).unwrap_or(Color::Muted)
+                    } else {
+                        Color::Muted
+                    })
+                    .tooltip(Tooltip::text(if default {
+                        "Default Provider"
+                    } else {
+                        PLUS_TOOLTIP
+                    })),
             )
-            .menu(|window, cx| {
-                Some(ContextMenu::build(window, cx, |menu, _, _| {
-                    menu.custom_entry(
-                        |_, _| render_agent_choice(&crate::codex_adapter::BRAND),
-                        |window, cx| {
-                            if let Ok(action) = cx.build_action("console_panel::NewCodexChat", None)
-                            {
-                                window.dispatch_action(action, cx);
-                            }
-                        },
-                    )
-                    .custom_entry(
-                        |_, _| render_agent_choice(&crate::claude_adapter::BRAND),
-                        |window, cx| {
-                            if let Ok(action) = cx.build_action("console_panel::NewChat", None) {
-                                window.dispatch_action(action, cx);
-                            }
-                        },
-                    )
-                    .custom_entry(
-                        |_, _| render_agent_choice(&crate::kimi_adapter::BRAND),
-                        |window, cx| {
-                            if let Ok(action) = cx.build_action("console_panel::NewKimiChat", None)
-                            {
-                                window.dispatch_action(action, cx);
-                            }
-                        },
-                    )
+            .menu(move |window, cx| {
+                let workspace = workspace.clone();
+                let selected = selected.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let mut menu = if default {
+                        menu.header("Default Provider")
+                    } else {
+                        menu
+                    };
+                    for (id, brand, action) in [
+                        (
+                            crate::codex_adapter::CODEX_AGENT_ID,
+                            &crate::codex_adapter::BRAND,
+                            "console_panel::NewCodexChat",
+                        ),
+                        (
+                            crate::claude_adapter::CLAUDE_ACP_AGENT_ID,
+                            &crate::claude_adapter::BRAND,
+                            "console_panel::NewChat",
+                        ),
+                        (
+                            crate::kimi_adapter::KIMI_AGENT_ID,
+                            &crate::kimi_adapter::BRAND,
+                            "console_panel::NewKimiChat",
+                        ),
+                    ] {
+                        let workspace = workspace.clone();
+                        let is_selected = default && selected.as_ref() == id;
+                        menu = menu.custom_entry(
+                            move |_, _| {
+                                h_flex()
+                                    .gap_2()
+                                    .child(render_agent_choice(brand))
+                                    .when(is_selected, |row| {
+                                        row.child(Icon::new(IconName::Check).size(IconSize::Small))
+                                    })
+                                    .into_any_element()
+                            },
+                            move |window, cx| {
+                                if default {
+                                    if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
+                                        let fs = ws.read(cx).project().read(cx).fs().clone();
+                                        settings::update_settings_file(
+                                            fs,
+                                            cx,
+                                            move |content, _| {
+                                                content
+                                                    .solution_agent
+                                                    .get_or_insert_with(Default::default)
+                                                    .default_provider = Some(id.into());
+                                            },
+                                        );
+                                    }
+                                } else if let Ok(action) = cx.build_action(action, None) {
+                                    window.dispatch_action(action, cx);
+                                }
+                            },
+                        );
+                    }
+                    menu
                 }))
             })
     }
@@ -1348,6 +1408,10 @@ impl Render for SessionTabStrip {
             .child(measure_button(
                 "session-tab-strip-measure-reopen",
                 IconName::HistoryRerun,
+            ))
+            .child(measure_button(
+                "session-tab-strip-measure-default-provider",
+                IconName::Sparkle,
             ));
 
         // After layout: measure, and ask for one more frame when the fit this
@@ -1359,7 +1423,7 @@ impl Render for SessionTabStrip {
             let measure_cell = self.fit.measure.clone();
             let shown_fit = self.fit.shown_fit.clone();
             let tab_count = capped.len();
-            let trailing_count = usize::from(cap_ellipsis) + 2;
+            let trailing_count = usize::from(cap_ellipsis) + 3;
             let weak_self = weak_self.clone();
             canvas(
                 move |bounds, _window, cx| {
@@ -1371,7 +1435,7 @@ impl Render for SessionTabStrip {
                     ) else {
                         return;
                     };
-                    let fitted = fit_tabs(&measure, trailing_count == 2);
+                    let fitted = fit_tabs(&measure, trailing_count == 3);
                     let previous = measure_cell.replace(Some(measure.clone()));
                     // Only a changed measurement may ask for a frame. Render
                     // derives its count from the stored measurement, so the
@@ -1402,9 +1466,15 @@ impl Render for SessionTabStrip {
             .left_0()
             .h_full()
             .gap_1()
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector(|| "DEFAULT-PROVIDER".into())
+                    .child(self.render_provider_button(true, cx)),
+            )
             .children(tabs)
             .when_some(overflow_popover, |this, popover| this.child(popover))
-            .child(self.render_plus_button())
+            .child(self.render_provider_button(false, cx))
             .child(self.render_reopen_button(solution_id, weak_workspace.clone(), cx));
 
         let strip = div()
@@ -1992,6 +2062,10 @@ mod tests {
             !tabs.is_empty() && tabs.len() < 3,
             "some but not all of the three tabs fit in {width:?}: {tabs:?}"
         );
+        let default = cx
+            .debug_bounds("DEFAULT-PROVIDER")
+            .expect("the leading default provider paints");
+        assert!(default.right() <= tabs[0].left());
         let ellipsis = cx
             .debug_bounds("ICON-Ellipsis")
             .expect("the tabs that do not fit are behind a `…`");
@@ -2016,6 +2090,10 @@ mod tests {
     async fn every_tab_shows_and_no_ellipsis_when_there_is_room(cx: &mut TestAppContext) {
         let (tabs, mut cx) = paint_three_tabs_in(px(1500.), cx).await;
         assert_eq!(tabs.len(), 3, "all three tabs fit: {tabs:?}");
+        let default = cx
+            .debug_bounds("DEFAULT-PROVIDER")
+            .expect("the leading default provider paints");
+        assert!(default.right() <= tabs[0].left());
         assert!(cx.debug_bounds("ICON-Ellipsis").is_none());
         let plus = cx.debug_bounds("ICON-Plus").expect("the `+` paints");
         assert!(

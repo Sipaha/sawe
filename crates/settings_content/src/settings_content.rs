@@ -1439,6 +1439,9 @@ pub struct RunConfigSettingsContent {
 #[with_fallible_options]
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
 pub struct SolutionAgentSettingsContent {
+    /// Global default CLI provider for interface text-generation actions in all Solutions.
+    /// Uses the same provider ids as Solution sessions.
+    pub default_provider: Option<String>,
     /// Ephemeral-task pool sizing. Optional — when absent, defaults apply
     /// (3 concurrent / 30s queue timeout / 60s idle TTL).
     pub ephemeral: Option<SolutionAgentEphemeralSettingsContent>,

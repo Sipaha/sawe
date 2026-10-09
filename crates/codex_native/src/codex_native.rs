@@ -70,6 +70,7 @@ impl AgentServer for CodexAgentServer {
     }
 }
 struct Session {
+    _generation_profile: Option<GenerationCatalog>,
     process: Rc<Process>,
     state: Rc<RefCell<TurnState>>,
     models: Vec<CodexModelInfo>,
@@ -299,14 +300,35 @@ impl CodexConnection {
         let Some(directory) = paths.ordered_paths().next().cloned() else {
             return Task::ready(Err(anyhow!("Working directory cannot be empty")));
         };
-        let read_only = meta
+        let generation_only = meta
             .as_ref()
-            .and_then(|m| m.get("sawePermissionMode"))
-            .and_then(Value::as_str)
-            == Some("read_only");
-        let config = session_config(&mcp_servers_for_project(&project, cx));
+            .and_then(|m| m.get("generationOnly"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let read_only = generation_only
+            || meta
+                .as_ref()
+                .and_then(|m| m.get("sawePermissionMode"))
+                .and_then(Value::as_str)
+                == Some("read_only");
+        let mut config = session_config(&if generation_only {
+            vec![]
+        } else {
+            mcp_servers_for_project(&project, cx)
+        });
+        if generation_only {
+            if let Some(config) = config.as_object_mut() {
+                config.extend(generation_config());
+            }
+        }
         cx.spawn(async move |cx| {
-            let mut process = cx.update(|cx| Process::spawn(&directory, cx))?;
+            let mut process = cx.update(|cx| {
+                if generation_only {
+                    Process::spawn_with_config(&directory, config.as_object().context("Codex configuration is not an object")?, cx)
+                } else {
+                    Process::spawn(&directory, cx)
+                }
+            })?;
             process.initialize().await?;
             let effective = if read_only {
                 Some(process.request("config/read", json!({"includeLayers":false,"cwd":directory})).await?)
@@ -314,10 +336,29 @@ impl CodexConnection {
 
             let account = process.request("account/read", json!({"refreshToken":false})).await?;
             if account["requiresOpenaiAuth"].as_bool() == Some(true) && account["account"].is_null() { bail!("Codex is not signed in. Run `codex login` in a terminal, complete sign-in, then reopen this chat."); }
+            if generation_only && (account["account"]["type"].as_str() != Some("chatgpt") || account["requiresOpenaiAuth"].as_bool() != Some(true)) {
+                bail!("Codex text generation requires the CLI subscription login. Run `codex login` in a terminal; API-key accounts are not used.");
+            }
             let available_models = models(&process).await?;
+            let generation_profile = if generation_only {
+                let resolved = effective.as_ref().map(|response| response["config"].clone()).context("Generation requires resolved Codex configuration")?;
+                disable_mcp_servers(&mut config, &resolved);
+                let root = directory.clone();
+                let profile = cx.background_spawn(async move { generation_catalog(&root, &resolved) }).await?;
+                config["model_catalog_json"] = json!(profile.directory.path().join("models.json"));
+                process.kill();
+                process = cx.update(|cx| Process::spawn_with_config(&directory, config.as_object().context("Codex configuration is not an object")?, cx))?;
+                process.initialize().await?;
+                Some(profile)
+            } else { None };
             let mut params = session_open_params(&directory, config, read_only, effective.as_ref().map(|response| &response["config"]))?;
+            if generation_only {
+                params["ephemeral"] = json!(true);
+                params["baseInstructions"] = json!(meta.as_ref().and_then(|m| m.get("systemPrompt")).and_then(|prompt| prompt.as_str().or_else(|| prompt.get("append").and_then(Value::as_str))).context("Generation requires fixed system instructions")?);
+                params["developerInstructions"] = json!("");
+            }
             if let Some(meta) = &meta {
-                if let Some(prompt) = meta.get("systemPrompt").and_then(|prompt| prompt.as_str().or_else(|| prompt.get("append").and_then(Value::as_str))) { params["developerInstructions"] = json!(prompt); }
+                if let Some(prompt) = meta.get("systemPrompt").filter(|_| !generation_only).and_then(|prompt| prompt.as_str().or_else(|| prompt.get("append").and_then(Value::as_str))) { params["developerInstructions"] = json!(prompt); }
                 if let Some(model) = meta.get("modelId").and_then(Value::as_str) { params["model"] = json!(model); }
             }
             let method = if let Some(id) = &resume {
@@ -326,6 +367,12 @@ impl CodexConnection {
                 "thread/resume"
             } else { "thread/start" };
             let response = process.request(method, params).await?;
+            if let Some(profile) = &generation_profile {
+                let model = response["model"].as_str().context("Codex did not identify its generation model")?;
+                if !profile.models.iter().any(|verified| verified == model) {
+                    bail!("Codex generation model {model} has no verified tool-free metadata. No fallback was attempted.");
+                }
+            }
             let id = acp::SessionId::new(response["thread"]["id"].as_str().context("Codex did not return a thread id")?.to_owned());
             if let Some(effort) = meta.as_ref().and_then(|m| m.get("reasoningEffort")).and_then(Value::as_str) { self.set_desired_effort(&id, Some(effort.into())); }
             let active_model = response["model"].as_str().map(str::to_owned);
@@ -345,6 +392,11 @@ impl CodexConnection {
             let pump = cx.spawn(async move |cx| {
                 let mut translator = translate::Translator::default();
                 while let Some(message) = incoming.next().await {
+                    if generation_only && (message.get("id").is_some() || is_generation_tool_event(&message)) {
+                        pump_state.borrow_mut().finish(Err(anyhow!("Codex requested a tool or approval during text generation")));
+                        if let Some(process) = weak_process.upgrade() { process.kill(); }
+                        break;
+                    }
                     if message.get("id").is_some() {
                         if let Some(process) = weak_process.upgrade() { handle_approval(message, &pump_id, weak_thread.clone(), process, read_only, cx); }
                         continue;
@@ -416,12 +468,15 @@ impl CodexConnection {
                     Err(anyhow!("Codex process disconnected. Reopen this chat to reconnect.")), cx)).log_err();
             }
             });
-            self.sessions.borrow_mut().insert(id, Session {process, state, models: available_models, thread: thread.downgrade(), _pump: pump, _capacity_retry: capacity_retry});
+            self.sessions.borrow_mut().insert(id, Session {_generation_profile: generation_profile, process, state, models: available_models, thread: thread.downgrade(), _pump: pump, _capacity_retry: capacity_retry});
             Ok(thread)
         })
     }
 }
 impl AgentConnection for CodexConnection {
+    fn supports_generation_only(&self) -> bool {
+        true
+    }
     fn agent_id(&self) -> AgentId {
         self.agent_id.clone()
     }
@@ -731,6 +786,136 @@ async fn models(process: &Process) -> Result<Vec<CodexModelInfo>> {
 }
 // Shared by start and resume. Read-only construction requires the resolved
 // configuration so inherited MCP cannot accidentally survive the launch path.
+fn generation_config() -> serde_json::Map<String, Value> {
+    let mut config = serde_json::Map::new();
+    for feature in [
+        "shell_tool",
+        "unified_exec",
+        "view_image",
+        "goals",
+        "hooks",
+        "apps",
+        "plugins",
+        "multi_agent",
+        "multi_agent_v2",
+        "image_generation",
+        "code_mode",
+        "code_mode_only",
+        "code_mode_host",
+        "browser_use",
+        "computer_use",
+        "deferred_executor",
+        "request_permissions_tool",
+        "current_time_reminder",
+        "sleep_tool",
+        "token_budget",
+        "send_message_to_user_async",
+        "tool_suggest",
+        "memories",
+        "daemon_auto_start",
+    ] {
+        config.insert(format!("features.{feature}"), json!(false));
+    }
+    for key in [
+        "tools.experimental_request_user_input.enabled",
+        "tools.update_plan.enabled",
+        "skills.include_instructions",
+        "cloud.skills.enabled",
+        "include_apps_instructions",
+        "include_collaboration_mode_instructions",
+        "include_environment_context",
+        "include_permissions_instructions",
+        "agents.enabled",
+    ] {
+        config.insert(key.into(), json!(false));
+    }
+    config.insert("features.skip_host_skill_discovery".into(), json!(true));
+    config.insert("project_doc_max_bytes".into(), json!(0));
+    config.insert("web_search".into(), json!("disabled"));
+    config.insert("notify".into(), json!([]));
+    config.insert("instructions".into(), json!(""));
+    config.insert("developer_instructions".into(), json!(""));
+    config
+}
+
+struct GenerationCatalog {
+    directory: tempfile::TempDir,
+    models: Vec<String>,
+}
+
+fn generation_catalog(root: &std::path::Path, resolved: &Value) -> Result<GenerationCatalog> {
+    let source = resolved["model_catalog_json"]
+        .as_str()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+                .map(|home| home.join("models_cache.json"))
+        })
+        .context("Cannot locate Codex model metadata")?;
+    let mut catalog: Value =
+        serde_json::from_slice(&std::fs::read(&source).with_context(|| {
+            format!("Cannot read Codex model metadata at {}", source.display())
+        })?)?;
+    let models = catalog["models"]
+        .as_array_mut()
+        .context("Codex model metadata has no model list")?;
+    if models.is_empty() {
+        bail!("Codex model metadata is empty; run the installed Codex CLI to refresh it");
+    }
+    // Tools can also come from model metadata and travel in additional_tools,
+    // even with all CLI tool features disabled. Retain model identity/capacity.
+    let mut verified_models = Vec::new();
+    for model in models {
+        verified_models.push(
+            model["slug"]
+                .as_str()
+                .context("Codex metadata is missing a model id")?
+                .to_owned(),
+        );
+        let model = model
+            .as_object_mut()
+            .context("Invalid Codex model metadata")?;
+        model.insert("tool_mode".into(), json!("direct"));
+        model.insert("shell_type".into(), json!("disabled"));
+        model.insert("apply_patch_tool_type".into(), Value::Null);
+        model.insert("experimental_supported_tools".into(), json!([]));
+        model.insert("supports_search_tool".into(), json!(false));
+        model.insert("multi_agent_version".into(), Value::Null);
+    }
+    let scratch = root.join(".tmp").join("ai-generation");
+    std::fs::create_dir_all(&scratch)?;
+    let profile = tempfile::Builder::new()
+        .prefix("codex-")
+        .tempdir_in(scratch)?;
+    std::fs::write(
+        profile.path().join("models.json"),
+        serde_json::to_vec(&catalog)?,
+    )?;
+    Ok(GenerationCatalog {
+        directory: profile,
+        models: verified_models,
+    })
+}
+
+fn is_generation_tool_event(message: &Value) -> bool {
+    let method = message["method"].as_str().unwrap_or_default();
+    method.starts_with("item/")
+        && matches!(
+            message["params"]["item"]["type"].as_str(),
+            Some(
+                "commandExecution"
+                    | "fileChange"
+                    | "mcpToolCall"
+                    | "webSearch"
+                    | "imageGeneration"
+                    | "collabAgentToolCall"
+                    | "dynamicToolCall"
+            )
+        )
+}
+
 fn session_open_params(
     directory: &std::path::Path,
     mut config: Value,

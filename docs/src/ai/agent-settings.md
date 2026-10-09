@@ -20,7 +20,7 @@ For general settings mechanics, see [Configuring Zed](../configuring-zed.md).
 
 ## LLM Providers {#llm-providers}
 
-The `LLM Providers` section configures model providers for Zed AI features, including Zed Agent, Inline Assistant, Git commit generation, thread summaries, and similar model-backed features.
+The `LLM Providers` section configures model providers for Zed AI features, including Zed Agent, Inline Assistant, thread summaries, and similar model-backed features.
 
 Use this section to:
 
@@ -36,24 +36,12 @@ For the model-access paths and provider-specific setup, see [LLM Providers](./ll
 Some Zed AI features have their own model or prompt settings in `settings.json`, including:
 
 - `agent.inline_assistant_model`
-- `agent.commit_message_model`
 - `agent.thread_summary_model`
 - `agent.compaction_model`
 - `agent.subagent_model`
-- `agent.commit_message_instructions`
 - `agent.inline_alternatives`
 
-Use `agent.commit_message_instructions` for instructions that apply only to generated Git commit messages:
-
-```json [settings]
-{
-  "agent": {
-    "commit_message_instructions": "Use the Conventional Commits format: <type>(<scope>): <description>."
-  }
-}
-```
-
-For feature-specific model examples, see [Feature-specific Models](#feature-specific-models).
+Interface text generation, including Git commit messages, uses the persisted CLI [Default Provider](../git.md#ai-support-in-git).
 
 ## Automatic Compaction {#automatic-compaction}
 
@@ -152,7 +140,7 @@ Some AI settings are not configured on the AI settings pages:
 
 ## Feature-Specific Models {#feature-specific-models}
 
-Zed supports feature-specific model settings for Inline Assistant, Git commit generation, thread summaries, and subagents. Configure these in settings when you need a different model for a specific workflow.
+Zed supports feature-specific model settings for Inline Assistant, thread summaries, and subagents. Configure these in settings when you need a different model for a specific workflow.
 
 See [LLM Providers](./llm-providers.md) for model access, and [All Settings](../reference/all-settings.md) for the complete settings reference.
 

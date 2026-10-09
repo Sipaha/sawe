@@ -38,7 +38,7 @@ External Agents and Terminal Threads usually own their own auth, model configura
 
 ## Choose Which Models the Zed Agent Uses {#model-access}
 
-The Zed Agent and other model-backed Zed AI features use models configured through [LLM Providers](./llm-providers.md).
+The Zed Agent and Inline Assistant use models configured through [LLM Providers](./llm-providers.md). Sawe interface text generation uses the installed CLI selected by [Default Provider](../git.md#ai-support-in-git).
 
 | If you want to...                                                             | Use                                                               |
 | ----------------------------------------------------------------------------- | ----------------------------------------------------------------- |

@@ -285,6 +285,7 @@ impl<T> FlattenAcpResult<T> for Result<Result<T, acp::Error>, anyhow::Error> {
 
 /// Holds state needed by foreground work dispatched from background handler closures.
 struct ClientContext {
+    generation_only: bool,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
@@ -323,6 +324,15 @@ where
             responder,
             handler,
         } = *self;
+        if ctx.generation_only {
+            responder
+                .respond_with_error(
+                    acp::Error::invalid_request()
+                        .data("Tools and approvals are unavailable during text generation"),
+                )
+                .log_err();
+            return;
+        }
         handler(request, responder, cx, ctx);
     }
 
@@ -396,6 +406,7 @@ fn enqueue_notification<Notif>(
 }
 
 pub struct AcpConnection {
+    generation_profile: Option<tempfile::TempDir>,
     id: AgentId,
     telemetry_id: SharedString,
     agent_version: Option<SharedString>,
@@ -407,7 +418,7 @@ pub struct AcpConnection {
     agent_capabilities: acp::AgentCapabilities,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
-    child: Option<Child>,
+    child: RefCell<Option<Child>>,
     session_list: Option<Rc<AcpSessionList>>,
     /// Per-session model selectors, lazily created so a tier selection made in
     /// the status bar survives across status-row re-renders. See `model_selector`.
@@ -820,6 +831,51 @@ impl AcpConnection {
         default_config_options: HashMap<String, AgentConfigOptionValue>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
+        Self::stdio_with_profile(
+            agent_id,
+            project,
+            command,
+            agent_server_store,
+            default_mode,
+            default_config_options,
+            None,
+            cx,
+        )
+        .await
+    }
+
+    pub(crate) async fn stdio_generation(
+        agent_id: AgentId,
+        project: Entity<Project>,
+        command: AgentServerCommand,
+        agent_server_store: WeakEntity<AgentServerStore>,
+        profile: tempfile::TempDir,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        Self::stdio_with_profile(
+            agent_id,
+            project,
+            command,
+            agent_server_store,
+            None,
+            HashMap::default(),
+            Some(profile),
+            cx,
+        )
+        .await
+    }
+
+    async fn stdio_with_profile(
+        agent_id: AgentId,
+        project: Entity<Project>,
+        command: AgentServerCommand,
+        agent_server_store: WeakEntity<AgentServerStore>,
+        default_mode: Option<acp::SessionModeId>,
+        default_config_options: HashMap<String, AgentConfigOptionValue>,
+        generation_profile: Option<tempfile::TempDir>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let generation_only = generation_profile.is_some();
         let root_dir = project.read_with(cx, |project, cx| {
             project
                 .default_path_list(cx)
@@ -827,6 +883,10 @@ impl AcpConnection {
                 .next()
                 .cloned()
         });
+        let root_dir = generation_profile
+            .as_ref()
+            .map(|profile| profile.path().to_path_buf())
+            .or(root_dir);
         let original_command = command.clone();
         let (path, args, env) = project
             .read_with(cx, |project, cx| {
@@ -993,6 +1053,7 @@ impl AcpConnection {
 
         // Set up the foreground dispatch loop to process work items from handlers.
         let dispatch_context = ClientContext {
+            generation_only,
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
@@ -1010,10 +1071,11 @@ impl AcpConnection {
         let initialize_response = connection
             .send_request(
                 acp::InitializeRequest::new(ProtocolVersion::V1)
-                    .client_capabilities(client_capabilities_for_agent(
-                        &agent_id,
-                        beta_features_enabled,
-                    ))
+                    .client_capabilities(if generation_only {
+                        acp::ClientCapabilities::new()
+                    } else {
+                        client_capabilities_for_agent(&agent_id, beta_features_enabled)
+                    })
                     .client_info(
                         acp::Implementation::new("zed", version)
                             .title(release_channel.map(ToOwned::to_owned)),
@@ -1113,6 +1175,7 @@ impl AcpConnection {
         });
 
         Ok(Self {
+            generation_profile,
             id: agent_id,
             auth_methods,
             agent_server_store,
@@ -1132,7 +1195,7 @@ impl AcpConnection {
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
-            child: Some(child),
+            child: RefCell::new(Some(child)),
         })
     }
 
@@ -1156,6 +1219,7 @@ impl AcpConnection {
         let settings_subscription = defaults.observe_settings(agent_id.clone(), cx);
 
         Self {
+            generation_profile: None,
             id: agent_id,
             telemetry_id: "test".into(),
             agent_version: None,
@@ -1167,7 +1231,7 @@ impl AcpConnection {
             agent_capabilities,
             request_elicitations,
             defaults,
-            child: None,
+            child: RefCell::new(None),
             session_list: None,
             model_selectors: Rc::new(RefCell::new(HashMap::default())),
             debug_log: AcpDebugLog::default(),
@@ -1599,7 +1663,7 @@ fn emit_load_error_to_all_sessions(
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
+        if let Some(child) = self.child.get_mut().as_mut() {
             child.kill().log_err();
         }
     }
@@ -1661,6 +1725,26 @@ fn kimi_prompt_context(agent_id: &AgentId, meta: Option<&acp::Meta>) -> Option<S
 }
 
 impl AgentConnection for AcpConnection {
+    fn kill_all_sessions(&self) {
+        if self.generation_profile.is_some()
+            && let Some(child) = self.child.borrow_mut().as_mut()
+        {
+            child.kill().log_err();
+        }
+    }
+    fn supports_close_session(&self) -> bool {
+        self.generation_profile.is_some()
+    }
+    fn close_session(self: Rc<Self>, id: &acp::SessionId, _: &mut App) -> Task<Result<()>> {
+        self.sessions.borrow_mut().remove(id);
+        self.kill_all_sessions();
+        Task::ready(Ok(()))
+    }
+
+    fn supports_generation_only(&self) -> bool {
+        self.generation_profile.is_some()
+    }
+
     fn agent_id(&self) -> AgentId {
         self.id.clone()
     }
@@ -1689,13 +1773,27 @@ impl AgentConnection for AcpConnection {
         extra_meta: Option<acp::Meta>,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
+        let work_dirs = self
+            .generation_profile
+            .as_ref()
+            .map(|profile| PathList::new(&[profile.path().to_string_lossy().into_owned()]))
+            .unwrap_or(work_dirs);
         let directories = match self.session_directories_from_work_dirs(&work_dirs) {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let prompt_context = kimi_prompt_context(&self.id, extra_meta.as_ref());
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let generation_only = self.generation_profile.is_some();
+        let prompt_context = if generation_only {
+            None
+        } else {
+            kimi_prompt_context(&self.id, extra_meta.as_ref())
+        };
+        let mcp_servers = if generation_only {
+            vec![]
+        } else {
+            mcp_servers_for_project(&project, cx)
+        };
 
         cx.spawn(async move |cx| {
             let mut request = directories.into_new_session_request(mcp_servers);
@@ -1758,7 +1856,7 @@ impl AgentConnection for AcpConnection {
                 }
             }
 
-            if let Some(config_opts) = config_options.as_ref() {
+            if let Some(config_opts) = config_options.as_ref().filter(|_| !generation_only) {
                 self.apply_default_config_options(&response.session_id, config_opts, cx);
             }
 
@@ -2738,6 +2836,7 @@ pub mod test_support {
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let dispatch_context = ClientContext {
+            generation_only: false,
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
@@ -4336,6 +4435,7 @@ mod tests {
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let dispatch_context = ClientContext {
+            generation_only: false,
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),

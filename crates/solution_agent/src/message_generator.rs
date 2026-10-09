@@ -1,6 +1,6 @@
 //! Text generation for commit messages, conflict suggestions, explanations,
 //! rebase plans, and cherry-pick suggestions. Callers supply the source context;
-//! the native Claude session has a narrow role and no tools or project hooks.
+//! the selected CLI session has a narrow role and no tools or project hooks.
 //! Authentication continues through the installed CLI subscription login.
 
 use std::path::Path;
@@ -9,11 +9,13 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow};
 use futures::FutureExt;
 use futures::channel::oneshot;
-use gpui::{AsyncApp, Entity, SharedString};
+#[cfg(test)]
+use gpui::SharedString;
+use gpui::{AsyncApp, Entity};
 use solutions::{Solution, SolutionStore};
+use util::ResultExt as _;
 
 use crate::agent_settings::SolutionAgentSettings;
-use crate::claude_adapter::CLAUDE_ACP_AGENT_ID;
 use crate::model::{SessionState, SolutionSession};
 use crate::store::{SolutionAgentStore, SolutionAgentStoreEvent};
 
@@ -32,7 +34,7 @@ const COMMIT_MESSAGE_PROMPT: &str = "Generate a commit message for the following
      test results. Do not modify files, stage changes, or create a commit.";
 
 /// Generate a commit message for the given diff via an ephemeral
-/// `claude-acp` session under the active Solution.
+/// generation-only CLI session under the active Solution.
 ///
 /// Returns a cleaned-up message string (no surrounding whitespace, no
 /// "Here is a..." preamble). Errors when no Solution is active, when the
@@ -61,7 +63,7 @@ pub fn clean_commit_message(raw: &str) -> String {
     strip_preamble(raw)
 }
 
-/// Run a one-shot prompt against an ephemeral `claude-acp` subprocess
+/// Run a one-shot prompt against the selected generation-only CLI subprocess
 /// session in the active Solution. Public so future S-AI-* tasks
 /// (S-AI-CFL, S-AI-EXP, S-AI-CHP) can share the same plumbing.
 pub async fn run_ephemeral_task(
@@ -77,7 +79,12 @@ pub async fn run_ephemeral_task(
             .unwrap_or_else(|| Duration::from_secs(30))
     });
 
-    let agent_id: SharedString = SharedString::from(CLAUDE_ACP_AGENT_ID);
+    // Capture the user's explicit choice once; never switch or replay a task
+    // when the selection changes while its provider is working.
+    let agent_id = cx.update(|cx| crate::agent_settings::default_provider(cx));
+    let provider = crate::adapter::agent_brand(&agent_id)
+        .ok_or_else(|| anyhow!("Unknown Default Provider: {agent_id}"))?
+        .name;
 
     // Acquire a hidden, generation-only session through the shared connection
     // pool. Each native session owns its subprocess and capabilities; an
@@ -91,21 +98,48 @@ pub async fn run_ephemeral_task(
 
     let session_id = with_timeout(create_session_task, queue_timeout, cx)
         .await
-        .context("acquiring ephemeral solution_agent session")?
-        .context("create_session failed")?;
+        .with_context(|| format!("{provider}: acquiring text generation session"))?
+        .with_context(|| format!("{provider}: create_session failed"))?;
+    let mut guard = EphemeralSessionGuard {
+        session_id: Some(session_id),
+        cx: cx.clone(),
+    };
 
     // Always close the session on exit (success or failure) so we don't
     // accumulate leaked rows in the session list / DB.
     let result = drive_turn(session_id, prompt, cx).await;
 
-    let _ = cx.update(|cx| {
+    cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
-        store.update(cx, |store, cx| {
-            store.close_session(session_id, cx).ok();
-        });
+        store
+            .update(cx, |store, cx| store.close_session(session_id, cx))
+            .log_err();
     });
+    guard.session_id = None;
 
-    result
+    result.with_context(|| format!("{provider} text generation failed"))
+}
+
+struct EphemeralSessionGuard {
+    session_id: Option<crate::model::SolutionSessionId>,
+    cx: AsyncApp,
+}
+
+impl Drop for EphemeralSessionGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.session_id.take() {
+            self.cx
+                .spawn(async move |cx| {
+                    cx.update(|cx| {
+                        let store = SolutionAgentStore::global(cx);
+                        store
+                            .update(cx, |store, cx| store.close_session(id, cx))
+                            .log_err();
+                    });
+                })
+                .detach();
+        }
+    }
 }
 
 async fn drive_turn(
@@ -300,7 +334,7 @@ mod tests {
     use crate::adapter::AdapterRegistry;
     use crate::store::SolutionAgentStore;
     use crate::test_support::MockAgentServer;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal as _};
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -316,8 +350,43 @@ mod tests {
     ///     covers the production claude-acp launcher).
     #[gpui::test]
     async fn run_ephemeral_task_returns_assistant_text(cx: &mut TestAppContext) {
+        check_generation_provider(cx, crate::claude_adapter::CLAUDE_ACP_AGENT_ID, 0).await;
+    }
+
+    #[gpui::test]
+    async fn codex_generation_captures_preference(cx: &mut TestAppContext) {
+        check_generation_provider(cx, crate::codex_adapter::CODEX_AGENT_ID, 0).await;
+    }
+
+    #[gpui::test]
+    async fn kimi_generation_captures_preference(cx: &mut TestAppContext) {
+        check_generation_provider(cx, crate::kimi_adapter::KIMI_AGENT_ID, 0).await;
+    }
+
+    #[gpui::test]
+    async fn cancelling_generation_closes_hidden_session(cx: &mut TestAppContext) {
+        check_generation_provider(cx, crate::codex_adapter::CODEX_AGENT_ID, 1).await;
+    }
+
+    #[gpui::test]
+    async fn generation_errors_keep_provider_and_root_cause(cx: &mut TestAppContext) {
+        check_generation_provider(cx, crate::kimi_adapter::KIMI_AGENT_ID, 2).await;
+    }
+
+    async fn check_generation_provider(cx: &mut TestAppContext, agent_id_str: &str, outcome: u8) {
         let (solution_id, _tmp, project) = setup_solution_and_project(cx).await;
-        let agent_id_str = crate::claude_adapter::CLAUDE_ACP_AGENT_ID;
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        &serde_json::json!({"solution_agent":{"default_provider":agent_id_str}})
+                            .to_string(),
+                        cx,
+                    )
+                    .result()
+                    .expect("provider preference");
+            })
+        });
         let agent_id = SharedString::from(agent_id_str);
 
         // Use a prompt-gated mock so the test can push an assistant chunk
@@ -376,6 +445,52 @@ mod tests {
             assert_eq!(meta["systemPrompt"]["append"], GENERATION_SYSTEM_PROMPT);
         });
 
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        r#"{"solution_agent":{"default_provider":"invalid-provider"}}"#,
+                        cx,
+                    )
+                    .result()
+                    .expect("changed preference");
+            })
+        });
+        if outcome == 1 {
+            drop(task);
+            cx.executor().run_until_parked();
+            cx.update(|cx| {
+                assert!(
+                    SolutionAgentStore::global(cx)
+                        .read(cx)
+                        .sessions_for(&solution_id)
+                        .is_empty()
+                )
+            });
+            return;
+        }
+
+        if outcome == 2 {
+            prompt_gate_tx.close();
+            let error = task.await.expect_err("provider failure");
+            let message = format!("{error:#}");
+            assert!(message.contains("Kimi"), "{message}");
+            assert!(message.contains("send_message failed"), "{message}");
+            assert!(
+                message.contains("mock prompt failed (gate closed)"),
+                "{message}"
+            );
+            cx.update(|cx| {
+                assert!(
+                    SolutionAgentStore::global(cx)
+                        .read(cx)
+                        .sessions_for(&solution_id)
+                        .is_empty()
+                )
+            });
+            return;
+        }
+
         // Push an assistant chunk into the thread before releasing the
         // prompt gate. The chunk's text is what `generate_commit_message`
         // will return after `clean_commit_message`.
@@ -401,6 +516,14 @@ mod tests {
 
         let result = task.await.expect("non-empty assistant text");
         assert_eq!(result, "fix: handle empty diff");
+        cx.update(|cx| {
+            assert!(
+                SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .sessions_for(&solution_id)
+                    .is_empty()
+            )
+        });
     }
 
     /// Spin the executor until the (single) session in the store has
