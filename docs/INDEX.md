@@ -9,6 +9,9 @@
 
 ## Entry points
 
+- Related-session subagents: flat secondary tabs and working navigation:
+  [October 11 verification](findings/2026-10-11-subagent-flat-tabs.md).
+
 - Default CLI provider, preview modals and Git toolbar verification:
   [October 9 boundary handoff](findings/2026-10-09-session-handoff.md).
 
