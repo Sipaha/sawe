@@ -434,7 +434,13 @@ impl SolutionBand {
     /// `render`.
     #[cfg(test)]
     fn active_view(&self, cx: &App) -> Option<SolutionSessionId> {
-        self.band_state(cx).active_dialog_session
+        self.solution_id(cx)
+            .and_then(|id| {
+                SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .visible_dialog_session(id, cx)
+            })
+            .or(self.band_state(cx).active_dialog_session)
     }
 
     /// Test-only mirror of the height `render` would use, without needing a
@@ -566,9 +572,13 @@ impl SolutionBand {
 
         // Mirrors `render`: an `active_dialog_session` naming a session that
         // is already gone paints no half, so it must not read as one here.
-        let dialog_session = state.active_dialog_session.filter(|session_id| {
-            self.views.contains_key(session_id) || store.read(cx).session(*session_id).is_some()
-        });
+        let dialog_session = self
+            .solution_id(cx)
+            .and_then(|id| store.read(cx).visible_dialog_session(id, cx))
+            .or(state.active_dialog_session)
+            .filter(|session_id| {
+                self.views.contains_key(session_id) || store.read(cx).session(*session_id).is_some()
+            });
         let dialog_node = {
             let mut node = VisualNode::new("BandDialog").with_visible(dialog_session.is_some());
             if let Some(session_id) = dialog_session {
@@ -660,7 +670,15 @@ impl Render for SolutionBand {
             None
         };
 
-        let dialog = state.active_dialog_session.and_then(|session_id| {
+        let dialog_id = self
+            .solution_id(cx)
+            .and_then(|id| {
+                SolutionAgentStore::global(cx)
+                    .read(cx)
+                    .visible_dialog_session(id, cx)
+            })
+            .or(state.active_dialog_session);
+        let dialog = dialog_id.and_then(|session_id| {
             if let Some(view) = self.views.get(&session_id) {
                 return Some(view.clone());
             }

@@ -1,40 +1,14 @@
-//! Sub-agents bubble strip — a compact row of tiles painted above the
-//! status row when the current session has sub-agents (or is itself a
-//! sub-agent with siblings under the same parent). The strip walks up
-//! the `parent_session_id` chain to the top-most ancestor, then DFS
-//! down to enumerate the whole sub-agent tree rooted at that ancestor,
-//! collecting one [`StripRow`] per visited session. Clicking a row
-//! switches the panel to that session via the navigator's existing
-//! `open_session` path — the same intra-process mechanism the tab
-//! strip and the History popover use, so no MCP round-trip is involved.
-//!
-//! The strip auto-hides when the current session is top-level AND has
-//! no children (a degenerate single-session "tree" would just paint a
-//! line under the chat with one bubble that says "you are here").
-//! [`render_subagent_strip`] returns `None` in that case so the caller
-//! can `when_some(...)` it into the layout without reserving space.
-//!
-//! Limit: at most [`MAX_STRIP_ROWS`] rows; further descendants are
-//! collapsed into a single "… +N more" pseudo-row at the bottom so a
-//! degenerate tree (long task lists, deep recursion) can't eat the
-//! whole panel. Same-solution filter is applied even though the
-//! server rejects cross-solution parents on `create_session` — kept
-//! as defence-in-depth.
+//! Related Solution sessions use flat tabs below the status row, like Task streams.
+//! Idle children are not live work; keep only a selected idle result reachable until Main is selected.
 
 use chrono::{DateTime, Utc};
 use gpui::{AnyElement, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window};
 use solutions::SolutionId;
 use ui::prelude::*;
-use ui::{Color, Icon, IconName, IconSize, Label, LabelSize, Tooltip};
 
 use super::SolutionSessionView;
 use crate::model::{SessionState, SolutionSession, SolutionSessionId};
 use crate::store::SolutionAgentStore;
-
-/// Hard upper bound for visible rows. Past this, the strip truncates
-/// with a "… +N more" overflow line — keeps the chat panel from
-/// disappearing under a runaway sub-agent fanout.
-pub(super) const MAX_STRIP_ROWS: usize = 12;
 
 /// One pure-data row in the strip. Owned by [`render_subagent_strip`]
 /// (and the test suite) — the renderer turns this into a clickable
@@ -64,7 +38,6 @@ pub(super) enum StripRowKind {
         total_tokens: Option<u64>,
         is_current: bool,
     },
-    Overflow,
 }
 
 /// Subset of `ui::Color` used by the strip. Decoupled from the GPUI
@@ -79,21 +52,11 @@ pub(super) enum StripStateColor {
     Info,
 }
 
-impl StripStateColor {
-    fn to_ui(self) -> Color {
-        match self {
-            Self::Success => Color::Success,
-            Self::Warning => Color::Warning,
-            Self::Error => Color::Error,
-            Self::Info => Color::Info,
-        }
-    }
-}
-
 /// Compact "138.3k" / "1.2M" / "457" formatter for the token suffix.
 /// Output is meant to be appended to a `· ` separator inside the row;
 /// the unit ("tokens") is added by the caller so the same helper can
 /// be reused for a tooltip if we ever want one.
+#[cfg(test)]
 pub(super) fn abbreviate_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -162,7 +125,7 @@ fn collect_snapshots(
         // gone — see `close_session`).
         .filter(|entity| {
             let s = entity.read(cx);
-            !hidden_ids.contains(&s.id) && !s.is_supervisor_ephemeral
+            !hidden_ids.contains(&s.id) && !s.is_supervisor_ephemeral && !s.is_ephemeral
         })
         .map(|entity| {
             let s = entity.read(cx);
@@ -268,9 +231,7 @@ pub(super) fn dfs_collect(
 /// Build the row list for the strip given the pre-computed
 /// snapshots. Returns `None` when the strip should hide entirely —
 /// i.e. the tree only contains the current session and no children.
-/// Truncates at [`MAX_STRIP_ROWS`] with a single overflow row at the
-/// bottom, so a 50-child fanout still paints in a fixed band of
-/// space.
+/// Every live descendant is reachable through horizontal scrolling; the band has a fixed height.
 pub(super) fn compute_strip_rows(
     current_id: SolutionSessionId,
     current_solution: &SolutionId,
@@ -285,7 +246,10 @@ pub(super) fn compute_strip_rows(
         return None;
     }
     let root = find_root(current_id, &same_solution);
-    let visited = dfs_collect(root, &same_solution);
+    let visited: Vec<_> = dfs_collect(root, &same_solution)
+        .into_iter()
+        .filter(|(snap, _)| snap.id == root || snap.id == current_id || snap.state_label != "idle")
+        .collect();
     // Strip hides for top-level-with-no-children. `visited.len() ==
     // 1` is the same predicate either way: a top-level session with
     // children would yield ≥ 2, a sub-agent has at least its parent
@@ -293,19 +257,9 @@ pub(super) fn compute_strip_rows(
     if visited.len() <= 1 {
         return None;
     }
-    let visible_cap = MAX_STRIP_ROWS;
-    let (visible, hidden) = if visited.len() > visible_cap {
-        // Reserve one slot for the overflow row so the truncation
-        // marker is always rendered. `visible_cap - 1` is safe
-        // because `MAX_STRIP_ROWS` is a const ≥ 2.
-        let keep = visible_cap.saturating_sub(1);
-        (&visited[..keep], visited.len() - keep)
-    } else {
-        (&visited[..], 0)
-    };
-    let mut rows: Vec<StripRow> = visible
+    let rows = visited
         .iter()
-        .map(|(snap, depth)| StripRow {
+        .map(|(snap, _)| StripRow {
             kind: StripRowKind::Session {
                 session_id: snap.id,
                 state_label: snap.state_label,
@@ -313,17 +267,14 @@ pub(super) fn compute_strip_rows(
                 total_tokens: snap.total_tokens,
                 is_current: snap.id == current_id,
             },
-            label: snap.title.clone(),
-            indent_level: *depth,
+            label: if snap.id == root {
+                "Main".into()
+            } else {
+                snap.title.clone()
+            },
+            indent_level: 0,
         })
         .collect();
-    if hidden > 0 {
-        rows.push(StripRow {
-            kind: StripRowKind::Overflow,
-            label: SharedString::from(format!("… +{hidden} more")),
-            indent_level: 0,
-        });
-    }
     Some(rows)
 }
 
@@ -344,127 +295,39 @@ pub(super) fn render_subagent_strip(
     let snapshots = collect_snapshots(store, &solution_id, cx);
     let rows = compute_strip_rows(current_id, &solution_id, &snapshots)?;
 
-    let container = v_flex()
+    let root = store.read(cx).related_dialog_root(current_id, cx)?;
+    let mut strip = h_flex()
         .id("solution-session-subagent-strip")
+        .debug_selector(|| "RELATED-SESSION-TABS".into())
         .flex_none()
         .w_full()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .overflow_x_scroll()
         .border_t_1()
-        .border_color(cx.theme().colors().border_variant)
-        .bg(cx.theme().colors().surface_background)
-        .py_0p5();
-
-    let strip = rows.into_iter().fold(container, |this, row| {
-        this.child(render_row(row, store.clone(), cx))
-    });
-    Some(strip.into_any_element())
-}
-
-fn render_row(
-    row: StripRow,
-    store: Entity<SolutionAgentStore>,
-    cx: &mut Context<SolutionSessionView>,
-) -> AnyElement {
-    let indent_px = px(20.0 * row.indent_level as f32);
-    match row.kind {
-        StripRowKind::Overflow => h_flex()
-            .id(SharedString::from("subagent-strip-overflow"))
-            .w_full()
-            .gap_2()
-            .px_3()
-            .py_1()
-            .pl(indent_px + px(12.0))
-            .child(
-                Label::new(row.label)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .into_any_element(),
-        StripRowKind::Session {
+        .border_color(cx.theme().colors().border)
+        .bg(cx.theme().colors().panel_background);
+    for row in rows {
+        let StripRowKind::Session {
             session_id,
-            state_label,
-            state_color,
-            total_tokens,
             is_current,
-        } => {
-            // Filled dot for the current session, hollow Circle for
-            // others. `IconName::Bullet` doesn't exist in the fork's
-            // icon set — `Circle` (filled when tinted, muted-hollow
-            // when not) is the closest match and matches the dot
-            // language the tab strip already uses for status.
-            let dot = if is_current {
-                Icon::new(IconName::Circle)
-                    .size(IconSize::XSmall)
-                    .color(state_color.to_ui())
-            } else {
-                Icon::new(IconName::Circle)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted)
-            };
-            let tokens_label: Option<AnyElement> = total_tokens.filter(|t| *t > 0).map(|t| {
-                Label::new(SharedString::from(format!(
-                    "· {} tokens",
-                    abbreviate_tokens(t)
-                )))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element()
-            });
-            let row_id = SharedString::from(format!("subagent-strip-row-{}", session_id.as_str()));
-            let title_text = row.label.clone();
-            let tooltip_text = SharedString::from(format!("Switch to {}", title_text));
-            h_flex()
-                .id(row_id)
-                .w_full()
-                .gap_2()
-                .px_3()
-                .py_1()
-                .pl(indent_px + px(8.0))
-                .cursor_pointer()
-                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                .tooltip(Tooltip::text(tooltip_text))
-                .child(dot)
-                .child(Label::new(title_text).size(LabelSize::Small).truncate())
-                .child(
-                    Label::new(SharedString::from(state_label))
-                        .size(LabelSize::XSmall)
-                        .color(state_color.to_ui()),
-                )
-                .when_some(tokens_label, |this, el| this.child(el))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    switch_to_session(this, &store, session_id, window, cx);
-                }))
-                .into_any_element()
-        }
+            ..
+        } = row.kind;
+        let store = store.clone();
+        strip = strip.child(super::task_subagent_strip::pill(
+            format!("related-session-tab-{session_id}").into(),
+            row.label,
+            is_current,
+            cx,
+            move |_, _, _, cx| {
+                store.update(cx, |store, cx| {
+                    store.select_subagent_dialog(root, session_id, cx);
+                });
+            },
+        ));
     }
-}
-
-/// Click-target for a row: route the switch through the navigator's
-/// `open_session` — same path the tab strip uses on mouse-down and
-/// the History popover uses on "open historic session". If the
-/// target session isn't currently in the tab strip, `open_session`
-/// will append it and select it; if it is, it just toggles
-/// `selected_index`. In-process only, no MCP round-trip.
-fn switch_to_session(
-    view: &mut SolutionSessionView,
-    store: &Entity<SolutionAgentStore>,
-    target: SolutionSessionId,
-    window: &mut Window,
-    cx: &mut Context<SolutionSessionView>,
-) {
-    if store.read(cx).session(target).is_none() {
-        log::warn!("subagent strip click: session {target} no longer present in store");
-        return;
-    }
-    // TODO(B10): once ConsolePanel owns the chat-tab strip, route the
-    // subagent click into ConsolePanel's open-or-focus API so the user
-    // jumps to the subagent's session as a sibling tab. Until then this
-    // click is a no-op (logged); the user can still open the subagent
-    // from the History popover.
-    let _ = view;
-    let _ = window;
-    log::info!(
-        "subagent-strip click → session {target}: tab routing parked until ConsolePanel owns it (B10)"
-    );
+    Some(strip.into_any_element())
 }
 
 #[cfg(test)]
@@ -479,7 +342,7 @@ mod tests {
             parent_session_id: parent,
             solution_id: SolutionId(1),
             title: SharedString::from(title.to_string()),
-            state_label: "idle",
+            state_label: "running",
             state_color: StripStateColor::Success,
             total_tokens: None,
             created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(created_secs, 0)
@@ -518,18 +381,16 @@ mod tests {
             .expect("strip rows present");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].indent_level, 0);
-        assert_eq!(rows[0].label.as_ref(), "alpha");
-        assert_eq!(rows[1].indent_level, 1);
+        assert_eq!(rows[0].label.as_ref(), "Main");
+        assert_eq!(rows[1].indent_level, 0);
         assert_eq!(rows[1].label.as_ref(), "beta");
         match &rows[0].kind {
             StripRowKind::Session { is_current, .. } => {
                 assert!(!is_current, "parent is not current")
             }
-            _ => panic!("expected Session row"),
         }
         match &rows[1].kind {
             StripRowKind::Session { is_current, .. } => assert!(*is_current, "child is current"),
-            _ => panic!("expected Session row"),
         }
     }
 
@@ -548,35 +409,39 @@ mod tests {
         let rows =
             compute_strip_rows(parent_id, &SolutionId(1), &snaps).expect("strip rows present");
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
-        assert_eq!(labels, vec!["alpha", "beta", "delta", "gamma"]);
+        assert_eq!(labels, vec!["Main", "beta", "delta", "gamma"]);
         let indents: Vec<u32> = rows.iter().map(|r| r.indent_level).collect();
-        assert_eq!(indents, vec![0, 1, 2, 1]);
+        assert_eq!(indents, vec![0, 0, 0, 0]);
     }
 
     #[test]
-    fn overflow_truncates_with_pseudo_row() {
-        // 1 parent + 14 children == 15 sessions; cap is 12, so 11
-        // session rows + 1 overflow row.
+    fn fanout_keeps_all_flat_tabs_reachable() {
         let parent = snap("a", None, "root", 1);
-        let parent_id = parent.id;
+        let id = parent.id;
         let mut snaps = vec![parent];
-        for i in 0..14 {
-            let cid = format!("c{i:02}");
-            snaps.push(snap(&cid, Some("a"), &format!("kid{i}"), 10 + i as i64));
+        for i in 0..30 {
+            snaps.push(snap(&format!("c{i:02}"), Some("a"), "child", i + 2));
         }
-        let rows =
-            compute_strip_rows(parent_id, &SolutionId(1), &snaps).expect("strip rows present");
-        assert_eq!(rows.len(), MAX_STRIP_ROWS);
-        let last = rows.last().expect("last row");
-        assert!(matches!(last.kind, StripRowKind::Overflow));
+        let rows = compute_strip_rows(id, &SolutionId(1), &snaps).unwrap();
+        assert_eq!(rows.len(), 31);
+        assert!(rows.iter().all(|row| row.indent_level == 0));
+    }
+
+    #[test]
+    fn idle_children_hide_without_closing_or_losing_selected_result() {
+        let parent = snap("a", None, "root", 1);
+        let mut child = snap("b", Some("a"), "result", 2);
+        child.state_label = "idle";
         assert!(
-            last.label.as_ref().starts_with("… +"),
-            "overflow label: {:?}",
-            last.label
+            compute_strip_rows(parent.id, &SolutionId(1), &[parent.clone(), child.clone()])
+                .is_none()
         );
-        // 15 total sessions; we keep 11 sessions + 1 overflow = 12.
-        // Hidden count therefore = 15 - 11 = 4.
-        assert_eq!(last.label.as_ref(), "… +4 more");
+        assert_eq!(
+            compute_strip_rows(child.id, &SolutionId(1), &[parent, child])
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -590,7 +455,7 @@ mod tests {
             .expect("strip rows present");
         assert_eq!(rows.len(), 2, "outsider should not appear in the strip");
         let labels: Vec<&str> = rows.iter().map(|r| r.label.as_ref()).collect();
-        assert_eq!(labels, vec!["alpha", "beta"]);
+        assert_eq!(labels, vec!["Main", "beta"]);
     }
 
     #[test]
@@ -639,5 +504,59 @@ mod tests {
             2,
             "pre-fix: two rows (supervised root + judge child)"
         );
+    }
+    #[gpui::test]
+    async fn selecting_child_keeps_root_tab_and_scopes_the_visible_dialog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (solution, _tmp, project) = crate::store::tests::setup_solution_and_project(cx).await;
+        cx.update(|cx| {
+            crate::store::SolutionAgentStore::init_global(
+                cx,
+                std::sync::Arc::new(crate::adapter::AdapterRegistry::new()),
+            )
+        });
+        let store = cx.update(|cx| crate::store::SolutionAgentStore::global(cx));
+        store.update(cx, |store, cx| {
+            let root = store
+                .create_unstarted_session(solution, "codex-native".into(), project.clone(), cx)
+                .unwrap();
+            let child = store
+                .create_unstarted_session(solution, "codex-native".into(), project.clone(), cx)
+                .unwrap();
+            store.session(child).unwrap().update(cx, |child, _| {
+                child.parent_session_id = Some(root);
+                child.tab_order = None;
+            });
+            store.set_active_dialog_session(solution, Some(root), cx);
+            assert!(store.select_subagent_dialog(root, child, cx));
+            assert_eq!(store.active_dialog_session(solution), Some(root));
+            assert_eq!(store.visible_dialog_session(solution, cx), Some(child));
+            assert!(store.session(child).unwrap().read(cx).tab_order.is_none());
+            assert!(store.select_subagent_dialog(root, root, cx));
+            assert_eq!(store.visible_dialog_session(solution, cx), Some(root));
+            store
+                .session(child)
+                .unwrap()
+                .update(cx, |child, _| child.tab_order = Some(1));
+            store.set_active_dialog_session(solution, Some(child), cx);
+            assert!(store.select_subagent_dialog(root, root, cx));
+            assert_eq!(store.visible_dialog_session(solution, cx), Some(root));
+            store
+                .session(child)
+                .unwrap()
+                .update(cx, |child, _| child.is_ephemeral = true);
+            assert!(!store.select_subagent_dialog(root, child, cx));
+            store.session(child).unwrap().update(cx, |child, _| {
+                child.is_ephemeral = false;
+                child.solution_id = SolutionId(999);
+            });
+            assert!(!store.select_subagent_dialog(root, child, cx));
+            store.session(child).unwrap().update(cx, |child, _| {
+                child.solution_id = solution;
+                child.parent_session_id = Some(child.id);
+            });
+            assert!(!store.select_subagent_dialog(root, child, cx));
+        });
     }
 }

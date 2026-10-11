@@ -45,6 +45,12 @@ pub struct SeedColdSessionEntry {
 #[serde(default)]
 pub struct SeedColdSessionParams {
     pub solution_id: i64,
+    /// Related-session UI fixture; must refer to a non-ephemeral session in this Solution.
+    pub parent_session_id: Option<String>,
+    /// Built-in provider brand for cold UI verification; no runtime is started.
+    pub agent_id: Option<String>,
+    /// Synthetic running state for navigation screenshots, with no live subprocess.
+    pub running: bool,
     /// Tab title (default `"Seed"`).
     pub title: Option<String>,
     pub entries: Vec<SeedColdSessionEntry>,
@@ -195,6 +201,34 @@ impl McpServerTool for SeedColdSessionTool {
             })
             .collect();
 
+        let parent = input
+            .parent_session_id
+            .as_deref()
+            .map(crate::model::SolutionSessionId::parse)
+            .transpose()?;
+        cx.update(|cx| -> Result<()> {
+            if let Some(parent) = parent {
+                let store = SolutionAgentStore::global(cx);
+                let parent = store
+                    .read(cx)
+                    .session(parent)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown fixture parent"))?;
+                let parent = parent.read(cx);
+                anyhow::ensure!(
+                    parent.solution_id == solution_id
+                        && !parent.is_ephemeral
+                        && !parent.is_supervisor_ephemeral,
+                    "Invalid fixture parent scope"
+                );
+            }
+            if let Some(agent) = &input.agent_id {
+                anyhow::ensure!(
+                    crate::adapter::agent_brand(agent).is_some(),
+                    "Unknown fixture provider"
+                );
+            }
+            Ok(())
+        })?;
         let session_id = cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
@@ -219,6 +253,19 @@ impl McpServerTool for SeedColdSessionTool {
                 );
                 if let Some(session) = store.session(id) {
                     session.update(cx, |session, cx| {
+                        if let Some(parent) = parent {
+                            session.parent_session_id = Some(parent);
+                            session.tab_order = None;
+                        }
+                        if let Some(agent) = input.agent_id {
+                            session.agent_id = agent.into();
+                        }
+                        if input.running {
+                            session.state = crate::model::SessionState::Running {
+                                started_at: std::time::Instant::now(),
+                                notified: false,
+                            };
+                        }
                         if let Some(error) = input.error {
                             session.state = crate::model::SessionState::Errored(error.into());
                         }

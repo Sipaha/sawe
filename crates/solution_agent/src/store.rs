@@ -608,6 +608,8 @@ pub struct SolutionAgentStore {
     /// reaching into each other. Mirrored into `solution_band_state` rows so
     /// the band reopens the way the user left it.
     band_state: HashMap<SolutionId, BandState>,
+    /// Transient drill-in; the persisted/top-level dialog remains the family root.
+    selected_subagent_dialogs: HashMap<SolutionSessionId, SolutionSessionId>,
     /// The most recent non-`None` `active_dialog_session` per solution,
     /// updated every time `set_active_dialog_session` is called with
     /// `Some(..)`. NOT persisted — deliberately in-memory only (phase 2b
@@ -1217,6 +1219,7 @@ impl SolutionAgentStore {
             backoff_timers: HashMap::new(),
             raw_transcript_history: HashMap::new(),
             band_state: HashMap::new(),
+            selected_subagent_dialogs: HashMap::new(),
             last_dialog_session: HashMap::new(),
             band_state_writes: HashMap::new(),
             band_state_touched: HashMap::new(),
@@ -2183,6 +2186,80 @@ impl SolutionAgentStore {
         self.band_state(solution_id).active_dialog_session
     }
 
+    /// Resolve a related session without pinning a child into the main tab strip.
+    pub fn visible_dialog_session(
+        &self,
+        solution_id: SolutionId,
+        cx: &App,
+    ) -> Option<SolutionSessionId> {
+        let root = self.active_dialog_session(solution_id)?;
+        self.selected_subagent_dialogs
+            .get(&root)
+            .copied()
+            .filter(|child| self.related_dialog_root(*child, cx) == Some(root))
+            .or(Some(root))
+    }
+
+    pub(crate) fn related_dialog_root(
+        &self,
+        id: SolutionSessionId,
+        cx: &App,
+    ) -> Option<SolutionSessionId> {
+        let solution = self.session(id)?.read(cx).solution_id;
+        let mut current = id;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current) {
+                return None;
+            }
+            let session = self.session(current)?;
+            let session = session.read(cx);
+            if session.solution_id != solution
+                || session.is_ephemeral
+                || session.is_supervisor_ephemeral
+            {
+                return None;
+            }
+            match session.parent_session_id {
+                Some(parent) => current = parent,
+                None => return session.can_be_active_dialog().then_some(current),
+            }
+        }
+    }
+
+    pub(crate) fn select_subagent_dialog(
+        &mut self,
+        root: SolutionSessionId,
+        target: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.related_dialog_root(target, cx) != Some(root) {
+            return false;
+        }
+        let Some(session) = self.session(root) else {
+            return false;
+        };
+        let solution = session.read(cx).solution_id;
+        let active = self.active_dialog_session(solution);
+        if active.and_then(|active| self.related_dialog_root(active, cx)) != Some(root) {
+            return false;
+        }
+        // Legacy history may have pinned a child. Return navigation to its family root.
+        if active != Some(root) {
+            self.set_active_dialog_session(solution, Some(root), cx);
+        }
+        if target == root {
+            self.selected_subagent_dialogs.remove(&root);
+        } else {
+            self.selected_subagent_dialogs.insert(root, target);
+        }
+        cx.emit(SolutionAgentStoreEvent::ActiveDialogSessionChanged {
+            solution_id: solution,
+        });
+        cx.notify();
+        true
+    }
+
     /// Set which session's dialog the Solution band shows for `solution_id`.
     /// `None` collapses the band. Called by the tab strip (Task 3) when the
     /// user picks a tab, and by teardown paths (see
@@ -2551,6 +2628,8 @@ impl SolutionAgentStore {
     /// reads it later. (`toggle_dialog_session` drops a stale entry too, but
     /// only lazily, the next time the hotkey happens to be pressed.)
     fn clear_active_dialog_for_session(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        self.selected_subagent_dialogs
+            .retain(|root, selected| *root != id && *selected != id);
         self.last_dialog_session
             .retain(|_, remembered| *remembered != id);
 

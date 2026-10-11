@@ -1417,27 +1417,15 @@ impl Render for SolutionSessionView {
         // while the `session.read(cx)` borrow held for the conversation body
         // section is immutable. Borrow checker rejects nesting them.
         let find_bar = self.render_find_bar(cx);
-        // Sub-agents bubble strip: rendered between the conversation
-        // list and the status row when the current session has at
-        // least one sibling / ancestor / child in the same solution.
-        // Returns `None` when the tree is a single top-level node so
-        // the layout never reserves space for an empty band. Computed
-        // here (alongside `find_bar`) because the renderer needs `&mut
-        // cx` for click listeners and the `session.read(cx)` borrow
-        // held further down the function would otherwise conflict.
+        // Related-session tabs are built before borrowing the transcript and placed
+        // below the status row, alongside the inline Task/Shell navigation.
         let subagent_strip = {
             let session = self.session.clone();
             SolutionAgentStore::try_global(cx).and_then(|store| {
                 subagent_strip::render_subagent_strip(&session, &store, window, cx)
             })
         };
-        // Subagent-tabs strip (claude `Task` / `Agent` per-turn fanout) —
-        // distinct from `subagent_strip` above, which is the bubble row
-        // for parent/child *Solution* sessions. Built here next to its
-        // sibling because the renderer needs `&mut cx` for click
-        // listeners; placed in the layout right after the status row
-        // (see `.children(...)` below) so the pills sit above the
-        // compose box and below the status indicators.
+        // Inline Task/Agent/Shell streams retain their existing flat navigation.
         let task_subagent_strip = {
             let session = self.session.clone();
             task_subagent_strip::render_task_subagent_strip(self, &session, cx)
@@ -2060,7 +2048,6 @@ impl Render for SolutionSessionView {
                     .when_some(pending_section, |this, section| this.child(section))
                     .when_some(resuming_section, |this, section| this.child(section))
             })
-            .when_some(subagent_strip, |this, strip| this.child(strip))
             .when_some(
                 self.session.read(cx).supervisor_question.clone(),
                 |this, question| {
@@ -2098,6 +2085,7 @@ impl Render for SolutionSessionView {
                 let is_resuming = self.is_resuming();
                 crate::status_row::render_status_row(self, is_resuming, cx)
             })
+            .when_some(subagent_strip, |this, strip| this.child(strip))
             .when_some(task_subagent_strip, |this, strip| this.child(strip))
             .child(if self.compose_disabled(cx) {
                 // Shell view: a read-only background-shell transcript,

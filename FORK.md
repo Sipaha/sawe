@@ -464,7 +464,7 @@ How to apply (**as amended by decisions 91 and 93 — the chat half of this entr
 
 **Important call-site rule** (learned via double-lease panic): inside a `workspace.register_action(|workspace: &mut Workspace, …, cx|)` handler, do NOT call `self.workspace.upgrade()?.read(cx)` — the Workspace entity is already mutably borrowed. Read whatever Workspace-derived state you need (e.g. `active_solution_id_for_workspace(workspace, cx)` — public helper) before delegating to `panel.update(cx, |panel, cx| panel.add_*_tab(...))`.
 
-**Known gaps after the refactor** (TODO B10+): History popover (clock icon), history-card empty-state, `subagent_strip::switch_to_session` "click bubble → open tab" router, and `solution_agent::actions::FocusNavigator` all became no-ops with `TODO(B10)` markers. They are now the *band's* to take over, not `ConsolePanel`'s — the panel no longer knows what a chat is.
+**Navigation after the refactor:** history uses ReopenSessionModal. Related-session navigation belongs to SolutionBand, not ConsolePanel: selecting a child changes the visible dialog while retaining the family root in the persisted main tab strip. The former TODO(B10) bubble click stub is removed.
 
 ### 24. IDEA branches popup is an anchored `PopoverMenu<BranchesPopup>` from a title-bar widget, not a centered modal
 
@@ -6378,3 +6378,7 @@ Generation's Kimi environment preserves editor process variables plus proxy over
 Generation Kimi must not load a worktree login-shell/direnv environment: that can run project customizations before the restricted runtime starts. Interactive Kimi retains its project environment loader.
 
 The toolbar Update Project arrow dispatches only Pull, which includes its own fetch. Dispatching Fetch and Pull back-to-back acquired GitPanel's remote-operation guard for Fetch and silently discarded Pull, leaving the local branch behind the newly fetched origin ref. Keep the active-member scope and existing pull/error policy; never reset or force a divergent user branch.
+
+Related Solution-session subagents now use a flat horizontally scrolling secondary row below the status indicators, reusing Task-tab pills. `parent_session_id` defines family membership, not a permanent vertical block. Idle unselected children do not occupy the row; an explicitly selected idle result remains readable until Main is chosen. This is UI visibility, not phase completion or runtime termination. Errored/awaiting-input children remain actionable. All descendants remain reachable without a non-clickable overflow stub. Same-Solution/non-ephemeral ancestry guards reject dangling parents and cycles.
+
+`SolutionAgentStore::selected_subagent_dialogs` is transient drill-in state. The persisted active dialog and primary tab stay on the root; `visible_dialog_session` supplies the actual child Entity to SolutionBand and its introspection, preserving child transcript, compose target, provider and model. Missing/closed children fall back to the root, never another family. Restart opens Main; switching tabs never changes session lifecycle or replays input. Debug seed fixtures can supply a validated parent/provider and synthetic running state without launching an agent.

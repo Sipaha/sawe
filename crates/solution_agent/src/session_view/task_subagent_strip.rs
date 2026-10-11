@@ -194,7 +194,7 @@ pub(super) fn render_task_subagent_strip(
 /// the caller because the "Main" pill and each subagent pill need
 /// different captures, and trying to share one closure across them
 /// would force a runtime branch on the id inside every listener.
-fn pill<F>(
+pub(super) fn pill<F>(
     id: SharedString,
     label: SharedString,
     is_active: bool,
