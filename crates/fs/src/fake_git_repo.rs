@@ -1447,11 +1447,12 @@ impl GitRepository for FakeGitRepository {
     }
 
     fn get_push_remote(&self, _branch: String) -> BoxFuture<'_, Result<Option<Remote>>> {
-        unimplemented!()
+        // Fake branches have no upstream or push-remote configuration.
+        future::ready(Ok(None)).boxed()
     }
 
     fn get_branch_remote(&self, _branch: String) -> BoxFuture<'_, Result<Option<Remote>>> {
-        unimplemented!()
+        future::ready(Ok(None)).boxed()
     }
 
     fn check_for_pushed_commit(&self) -> BoxFuture<'_, Result<Vec<gpui::SharedString>>> {
@@ -1787,6 +1788,10 @@ impl GitRepository for FakeGitRepository {
             state.remotes.remove(&name);
             Ok(())
         })
+    }
+
+    fn commit_message_history(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        async move { Ok(Vec::new()) }.boxed()
     }
 
     fn author_history(&self) -> BoxFuture<'_, Result<Vec<AuthorHistoryEntry>>> {

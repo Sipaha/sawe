@@ -71,6 +71,50 @@ impl SolutionAgentStore {
         }
     }
 
+    pub(crate) fn cancel_short_automatic_handoff(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.session(id) else {
+            return false;
+        };
+        let fullness = {
+            let s = session.read(cx);
+            if s.handoff_ladder
+                .as_ref()
+                .is_none_or(|ladder| ladder.asker != HandoffAsker::Auto)
+                || s.is_compaction_pending()
+            {
+                return false;
+            }
+            let Some((used, max)) = crate::model::session_context_usage(s, cx) else {
+                return false;
+            };
+            if max == 0 {
+                return false;
+            }
+            used as f64 / max as f64
+        };
+        if fullness >= crate::compact::COMPACT_BUTTON_MIN_PCT {
+            return false;
+        }
+        // Native compaction can replace the context without minting a Sawe
+        // context_count. The old automatic request no longer has work to do.
+        self.reset_compaction_ladder(id, cx);
+        self.auto_compact_fired.remove(&id);
+        self.push_system_note(
+            id,
+            acp_thread::SystemNoteLevel::Info,
+            format!(
+                "Automatic context handoff cancelled: context is now {:.1}% full.",
+                fullness * 100.
+            ),
+            cx,
+        );
+        true
+    }
+
     /// A new request to hand off — the context crossing the auto-compaction
     /// threshold, or the user's Compact. Arms the ladder if nothing is climbing
     /// it yet, and moves it one rung.
@@ -168,6 +212,9 @@ impl SolutionAgentStore {
     /// that the prompt should be sent now (`true`, the Force rung — stamped, so a
     /// refused force backs off instead of retrying every tick).
     fn climb_compaction_ladder(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) -> bool {
+        if self.cancel_short_automatic_handoff(id, cx) {
+            return false;
+        }
         let Some(session) = self.session(id) else {
             return false;
         };
@@ -300,6 +347,24 @@ impl SolutionAgentStore {
             HandoffAsker::User(initiator) => initiator,
         };
         cx.defer(move |cx| {
+            let current = SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                if store.cancel_short_automatic_handoff(id, cx) {
+                    return false;
+                }
+                store.session(id).is_some_and(|session| {
+                    session
+                        .read(cx)
+                        .handoff_ladder
+                        .as_ref()
+                        .is_some_and(|current| {
+                            current.asker == ladder.asker
+                                && current.last_force_ms == ladder.last_force_ms
+                        })
+                })
+            });
+            if !current {
+                return;
+            }
             let reason = match crate::compact::start_compact_for_session(
                 id,
                 initiator,

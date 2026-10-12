@@ -685,3 +685,75 @@ async fn the_users_request_supersedes_an_in_flight_judge(cx: &mut TestAppContext
         );
     });
 }
+
+#[gpui::test]
+async fn native_context_shrink_cancels_only_automatic_handoff_and_can_rearm(
+    cx: &mut TestAppContext,
+) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 530_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    assert!(handoff(session_id, cx).is_some());
+    deliver_queue(session_id, cx);
+    set_usage(&thread, 33_000, cx);
+    assert!(handoff(session_id, cx).is_none());
+    for _ in 0..4 {
+        tick(cx);
+    }
+    assert!(!compaction_state(session_id, cx).0);
+    assert_eq!(
+        system_notes(session_id, "Automatic context handoff cancelled", cx),
+        1
+    );
+    assert_eq!(
+        system_notes(session_id, "Context compaction could not start", cx),
+        0
+    );
+    set_usage(&thread, 410_000, cx);
+    tick(cx);
+    assert_eq!(
+        handoff(session_id, cx).unwrap().asker,
+        crate::model::HandoffAsker::Auto
+    );
+    deliver_queue(session_id, cx);
+    assert!(request(session_id, cx));
+    set_usage(&thread, 33_000, cx);
+    assert!(matches!(
+        handoff(session_id, cx).unwrap().asker,
+        crate::model::HandoffAsker::User(_)
+    ));
+}
+
+#[gpui::test]
+async fn native_context_shrink_invalidates_an_already_deferred_automatic_compact(
+    cx: &mut TestAppContext,
+) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 530_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            store.run_ladder_compaction(session_id, cx);
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    Some(acp_thread::TokenUsage {
+                        used_tokens: 33_000,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                )
+            });
+        });
+    });
+    cx.run_until_parked();
+    assert!(handoff(session_id, cx).is_none());
+    assert!(!compaction_state(session_id, cx).0);
+    assert_eq!(
+        system_notes(session_id, "Context compaction could not start", cx),
+        0
+    );
+}

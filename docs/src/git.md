@@ -199,6 +199,18 @@ Zed offers two commit textareas:
 1. The first one is available right at the bottom of the Git Panel. Hitting {#kb git::Commit} immediately commits all of your staged changes.
 2. The second is available via the action {#action git::ExpandCommitEditor} or via hitting the {#kb git::ExpandCommitEditor} while focused in the Git Panel commit textarea.
 
+### Reusing Commit Messages
+
+Click the clock icon in the Changes tab's commit editor to open **Commit Message History**, or press `Ctrl+M` (`Cmd+M` on macOS) while the editor is focused. Search the last 50 commits on the current branch, then click a message or press Enter to reuse its full text, including the body. Identical messages appear once, newest first. Escape cancels without replacing your draft.
+
+Drag the top edge of the commit message field up or down to change its height. Sawe remembers the height for this workspace. Double-click the edge to restore the default size.
+
+### Commit and Push
+
+Click **Commit & Push** to commit your staged changes (or tracked changes when nothing is staged), then push that repository and branch. In amend mode the button reads **Amend & Push**. The normal commit checks and signoff options still apply.
+
+A failed commit keeps the draft and does not start a push. A failed push shows the Git error and keeps the completed commit locally. The button uses a normal push; it does not force, rebase, or retry automatically. When several remotes are available, select the destination after the commit succeeds.
+
 ### Undoing a Commit
 
 As soon as you commit in Zed, in the Git Panel, you'll see a bar right under the commit textarea, which will show the recently submitted commit.

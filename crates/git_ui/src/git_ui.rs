@@ -50,6 +50,7 @@ use crate::{
 pub mod branch_diff;
 pub mod branch_picker;
 pub(crate) mod commit_blob;
+mod commit_message_history;
 mod commit_modal;
 pub mod commit_refs;
 pub mod commit_tooltip;

@@ -200,6 +200,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/remote/src/transport.rs`, `crates/remote/src/transport/live_remote_support.rs` | **First local change.** A `#[cfg(test)]` support module for the live-remote tests. | `remote` |
 | `crates/dap/src/debugger_settings.rs` | **First local change.** `debugger.dock` / `debugger.button` are documented INERT here — the debugger is a Solution-band occupant with no `Panel` impl (decision #97). | `debugger_ui` |
 | `crates/util/src/shell.rs` | **First local change.** The WSL example path spells this fork's own remote-server directory and binary (decision #119). | rebrand |
+| `crates/git_ui/src/picker_prompt.rs` | Optional confirmation callback and asynchronously replaceable options let commit history reuse the searchable picker while preserving complete messages and selection-before-dismissal. | `git_ui` |
 
 Locked rebrand identifiers (display name, bundle ids, URL scheme, config dirs, etc.) — see `.rules` § "Locked rebrand identifiers". Changing any requires explicit approval — they're cross-referenced in spec docs.
 
@@ -6382,3 +6383,15 @@ The toolbar Update Project arrow dispatches only Pull, which includes its own fe
 Related Solution-session subagents now use a flat horizontally scrolling secondary row below the status indicators, reusing Task-tab pills. `parent_session_id` defines family membership, not a permanent vertical block. Idle unselected children do not occupy the row; an explicitly selected idle result remains readable until Main is chosen. This is UI visibility, not phase completion or runtime termination. Errored/awaiting-input children remain actionable. All descendants remain reachable without a non-clickable overflow stub. Same-Solution/non-ephemeral ancestry guards reject dangling parents and cycles.
 
 `SolutionAgentStore::selected_subagent_dialogs` is transient drill-in state. The persisted active dialog and primary tab stay on the root; `visible_dialog_session` supplies the actual child Entity to SolutionBand and its introspection, preserving child transcript, compose target, provider and model. Missing/closed children fall back to the root, never another family. Restart opens Main; switching tabs never changes session lifecycle or replays input. Debug seed fixtures can supply a validated parent/provider and synthetic running state without launching an agent.
+
+### 230. Commit composition reuses repository history, remembers height, and sequences Commit & Push
+
+The Changes editor's clock popover reads the current branch's last 50 messages through the repository backend, deduplicates newest first, and inserts the full body only on explicit selection. The picker owns a captured repository; a member switch invalidates its ability to replace the current draft. History comes from Git, so it survives restart and includes commits made outside Sawe without persisting another message store.
+
+Composition height is separate from the read-only Commit tab's `commit_message_height`: pixel geometry in `SerializedGitPanel::commit_editor_height`, updated on drag moves, with double-click reset. A custom height requires a full editor rather than the fixed six-line auto-height mode, including after repository buffer replacement. The bottom actions use two rows so history, AI generation, Commit and Commit & Push fit a narrow dock.
+
+Commit & Push runs the existing commit checks, captures the repository and branch before awaiting, and starts a normal push only after successful commit. It uses captured remote resolution, never the then-selected member. A changed branch stops with an error; failed push preserves the local commit. No force, fallback, replay, rebase or automatic retries are added. Evidence: [commit composition verification](docs/findings/2026-10-12-commit-composition.md).
+
+### 231. Native context shrink invalidates obsolete automatic handoff work
+
+Codex can compact inside the same thread without changing Sawe's `context_count`. If current context usage is below the existing 10% compaction minimum, a previously armed automatic ladder must stop rather than retry its permanent short-context refusal. Clear the automatic fired latch as well, so later real pressure can create a fresh request. Token updates, timer progression and deferred force dispatch enforce this guard; the latter also rejects a superseded request snapshot. Manual handoff intent and the 80% active automatic-force requirement are unchanged. A cancellation breadcrumb reports the current percentage without claiming that a turn or phase completed. [Verified diagnosis](docs/findings/2026-10-12-native-compaction-handoff.md).

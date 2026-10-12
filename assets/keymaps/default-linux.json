@@ -1219,6 +1219,7 @@
   {
     "context": "CommitEditor > Editor",
     "bindings": {
+      "ctrl-m": "git_panel::CommitMessageHistory",
       "escape": "git_panel::FocusChanges",
       "tab": "git_panel::FocusChanges",
       "shift-tab": "git_panel::FocusChanges",

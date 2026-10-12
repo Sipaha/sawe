@@ -9,6 +9,10 @@
 
 ## Entry points
 
+- Native Codex context shrink: [obsolete automatic handoff diagnosis](findings/2026-10-12-native-compaction-handoff.md).
+
+- Commit composition: [history, resizing and Commit & Push](findings/2026-10-12-commit-composition.md).
+
 - Related-session subagents: flat secondary tabs and working navigation:
   [October 11 verification](findings/2026-10-11-subagent-flat-tabs.md).
 

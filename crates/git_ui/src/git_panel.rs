@@ -195,6 +195,10 @@ actions!(
         OpenMenu,
         /// Focuses on the commit message editor.
         FocusEditor,
+        /// Reuses a recent commit message from the selected repository.
+        CommitMessageHistory,
+        /// Commits changes and pushes the same repository after success.
+        CommitAndPush,
         /// Focuses on the changes list.
         FocusChanges,
         /// Select next git panel menu item, and show it in the diff view
@@ -806,6 +810,8 @@ struct SerializedGitPanel {
     /// launch is not a resize.
     #[serde(default)]
     commit_message_height: Option<f32>,
+    #[serde(default)]
+    commit_editor_height: Option<f32>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -1264,6 +1270,8 @@ pub struct GitPanel {
     /// each time the user arrow-keyed to another commit — the bug
     /// `editor::split_editor_view::LastSplitRatio` exists to prevent.
     commit_message_height: Option<Pixels>,
+    commit_editor_height: Option<Pixels>,
+    commit_history_handle: PopoverMenuHandle<crate::commit_message_history::CommitMessageHistory>,
     /// Width the Commit tab's ref row was last laid out at, measured by the
     /// `canvas` in `commit_tab::GitPanel::render_commit_refs_row` and fed back
     /// into it as the budget deciding how many chips fit on the collapsed line.
@@ -1331,6 +1339,24 @@ pub(crate) fn commit_message_editor(
     let placeholder = placeholder.unwrap_or("Enter commit message".into());
     commit_editor.set_placeholder_text(&placeholder, window, cx);
     commit_editor
+}
+
+#[derive(Clone)]
+struct DraggedCommitEditorEdge;
+
+fn clamp_commit_editor_height(height: Pixels) -> Pixels {
+    if !f32::from(height).is_finite() {
+        return px(160.);
+    }
+    height.clamp(px(120.), px(600.))
+}
+
+fn commit_editor_full_mode() -> EditorMode {
+    EditorMode::Full {
+        scale_ui_elements_with_buffer_font_size: false,
+        show_active_line_background: false,
+        sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+    }
 }
 
 impl GitPanel {
@@ -1552,6 +1578,8 @@ impl GitPanel {
                 commit_tab: None,
                 diff_tab: None,
                 commit_message_height: None,
+                commit_editor_height: None,
+                commit_history_handle: PopoverMenuHandle::default(),
                 commit_refs_row_width: None,
                 _settings_subscription,
                 git_access: GitAccess::Yes,
@@ -1687,6 +1715,7 @@ impl GitPanel {
         let amend_pending = self.amend_pending;
         let signoff_enabled = self.signoff_enabled;
         let commit_message_height = self.commit_message_height.map(f32::from);
+        let commit_editor_height = self.commit_editor_height.map(f32::from);
         let kvp = KeyValueStore::global(cx);
 
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
@@ -1714,6 +1743,7 @@ impl GitPanel {
                             amend_pending,
                             signoff_enabled,
                             commit_message_height,
+                            commit_editor_height,
                         })?,
                     )
                     .await?;
@@ -3173,12 +3203,52 @@ impl GitPanel {
 
     pub(crate) fn commit_changes(
         &mut self,
-        mut options: CommitOptions,
+        options: CommitOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.commit_changes_with_push(options, false, window, cx);
+    }
+
+    pub(crate) fn commit_and_push(
+        &mut self,
+        _: &CommitAndPush,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.configure_commit_button(cx).0 && self.pending_remote_operation.is_none() {
+            self.commit_changes_with_push(self.commit_options(), true, window, cx);
+        }
+    }
+
+    fn commit_changes_with_push(
+        &mut self,
+        mut options: CommitOptions,
+        push_after_commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_commit.is_some() {
+            return;
+        }
         let Some(active_repository) = self.active_repository.clone() else {
             return;
+        };
+        let push_branch = if push_after_commit {
+            if self.pending_remote_operation.is_some() || !self.can_push_and_pull(cx) {
+                return;
+            }
+            let Some(branch) = active_repository.read(cx).branch.clone() else {
+                self.show_error_toast(
+                    "commit and push",
+                    anyhow::anyhow!("Select a branch before committing and pushing."),
+                    cx,
+                );
+                return;
+            };
+            Some(branch)
+        } else {
+            None
         };
         let error_spawn = |message, window: &mut Window, cx: &mut App| {
             let prompt = window.prompt(PromptLevel::Warning, message, None, &["OK"], cx);
@@ -3276,6 +3346,7 @@ impl GitPanel {
             }
             Some(paths)
         };
+        let committed_editor = self.commit_editor.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             // S-PCH-HK — first run the configured pre-commit checks; on
             // failure, surface a modal and abort the commit. The runner
@@ -3321,12 +3392,19 @@ impl GitPanel {
 
                 match result {
                     Ok(()) => {
+                        let same_repository = this.active_repository.as_ref() == Some(&active_repository);
                         if options.amend {
-                            this.set_amend_pending(false, cx);
+                            if same_repository { this.set_amend_pending(false, cx); }
                         } else {
-                            this.commit_editor
-                                .update(cx, |editor, cx| editor.clear(window, cx));
-                            this.original_commit_message = None;
+                            committed_editor.update(cx, |editor, cx| editor.clear(window, cx));
+                            if same_repository { this.original_commit_message = None; }
+                        }
+                        if let Some(branch) = push_branch {
+                            if active_repository.read(cx).branch.as_ref().map(|current| current.name()) != Some(branch.name()) {
+                                this.show_error_toast("push", anyhow::anyhow!("Commit succeeded, but the branch changed. Push the committed branch explicitly."), cx);
+                            } else {
+                                this.push_repository(active_repository.clone(), branch, false, false, window, cx);
+                            }
                         }
                     }
                     Err(e) => this.show_error_toast("commit", e, cx),
@@ -4116,8 +4194,20 @@ impl GitPanel {
         let Some(branch) = repo.read(cx).branch.as_ref() else {
             return;
         };
-        telemetry::event!("Git Pushed");
         let branch = branch.clone();
+        self.push_repository(repo, branch, force_push, select_remote, window, cx);
+    }
+
+    fn push_repository(
+        &mut self,
+        repo: Entity<Repository>,
+        branch: Branch,
+        force_push: bool,
+        select_remote: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        telemetry::event!("Git Pushed");
         if !self.start_remote_operation(RemoteOperationKind::Push, cx) {
             return;
         }
@@ -4134,7 +4224,14 @@ impl GitPanel {
                 _ => None,
             }
         };
-        let remote = self.get_remote(select_remote, true, window, cx);
+        let remote = self.get_remote_for_repository(
+            Some(repo.clone()),
+            Some(branch.name().to_string()),
+            select_remote,
+            true,
+            window,
+            cx,
+        );
 
         cx.spawn_in(window, async move |this, cx| {
             let _clear_pending = cx.on_drop(&this, |this, cx| this.clear_remote_operation(cx));
@@ -4298,7 +4395,7 @@ impl GitPanel {
         kind: RemoteOperationKind,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.pending_remote_operation.is_some() {
+        if self.pending_remote_operation.is_some() || self.pending_commit.is_some() {
             return false;
         }
         self.pending_remote_operation = Some(kind);
@@ -4323,6 +4420,24 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> impl Future<Output = anyhow::Result<Option<Remote>>> + use<> {
         let repo = self.active_repository.clone();
+        let branch = repo.as_ref().and_then(|repo| {
+            repo.read(cx)
+                .branch
+                .as_ref()
+                .map(|branch| branch.name().to_string())
+        });
+        self.get_remote_for_repository(repo, branch, always_select, is_push, window, cx)
+    }
+
+    fn get_remote_for_repository(
+        &self,
+        repo: Option<Entity<Repository>>,
+        branch: Option<String>,
+        always_select: bool,
+        is_push: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = anyhow::Result<Option<Remote>>> + use<> {
         let workspace = self.workspace.clone();
         let mut cx = window.to_async(cx);
 
@@ -4333,8 +4448,7 @@ impl GitPanel {
                     let current_branch = if always_select {
                         None
                     } else {
-                        let current_branch = repo.branch.as_ref().context("No active branch")?;
-                        Some(current_branch.name().to_string())
+                        Some(branch.context("No active branch")?)
                     };
                     anyhow::Ok(repo.get_remotes(current_branch, is_push))
                 })?
@@ -4741,6 +4855,12 @@ impl GitPanel {
                             cx,
                         )
                     });
+                    if git_panel.commit_editor_expanded || git_panel.commit_editor_height.is_some()
+                    {
+                        git_panel
+                            .commit_editor
+                            .update(cx, |editor, _| editor.set_mode(commit_editor_full_mode()));
+                    }
                 }
                 cx.notify();
             })
@@ -5365,6 +5485,8 @@ impl GitPanel {
                     show_active_line_background: false,
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 })
+            } else if self.commit_editor_height.is_some() {
+                editor.set_mode(commit_editor_full_mode())
             } else {
                 editor.set_mode(EditorMode::AutoHeight {
                     min_lines: MAX_PANEL_EDITOR_LINES,
@@ -5711,6 +5833,103 @@ impl GitPanel {
         .detach();
     }
 
+    pub(crate) fn use_commit_message_from_history(
+        &mut self,
+        repository: &Entity<Repository>,
+        message: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A popup opened for one member must never replace another member's draft.
+        if self.active_repository.as_ref() != Some(repository) {
+            return;
+        }
+        self.generate_commit_message_task.take();
+        self.commit_editor.update(cx, |editor, cx| {
+            editor.set_text(message, window, cx);
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn show_commit_message_history(
+        &mut self,
+        _: &CommitMessageHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_history_handle.toggle(window, cx);
+    }
+
+    fn render_commit_history_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.weak_entity();
+        let repository = self.active_repository.clone();
+        let focus = self.commit_editor.focus_handle(cx);
+        PopoverMenu::new("commit-message-history")
+            .with_handle(self.commit_history_handle.clone())
+            .anchor(Anchor::BottomLeft)
+            .trigger(
+                IconButton::new("commit-message-history-trigger", IconName::Clock)
+                    .icon_size(IconSize::Small)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action_in(
+                            "Commit Message History",
+                            &CommitMessageHistory,
+                            &focus,
+                            cx,
+                        )
+                    }),
+            )
+            .menu(move |window, cx| {
+                let repository = repository.clone()?;
+                Some(cx.new(|cx| {
+                    crate::commit_message_history::CommitMessageHistory::new(
+                        panel.clone(),
+                        repository,
+                        window,
+                        cx,
+                    )
+                }))
+            })
+    }
+
+    fn render_commit_editor_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("commit-editor-resize")
+            .debug_selector(|| "COMMIT-EDITOR-RESIZE".into())
+            .relative()
+            .flex_none()
+            .w_full()
+            .h(px(1.))
+            .bg(cx.theme().colors().border)
+            .child(deferred(
+                div()
+                    .id("commit-editor-resize-grab")
+                    .absolute()
+                    .top(px(-3.))
+                    .left_0()
+                    .right_0()
+                    .h(px(7.))
+                    .cursor_row_resize()
+                    .block_mouse_except_scroll()
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        if event.click_count() >= 2 {
+                            this.commit_editor_height = None;
+                            this.commit_editor.update(cx, |editor, _| {
+                                editor.set_mode(EditorMode::AutoHeight {
+                                    min_lines: MAX_PANEL_EDITOR_LINES,
+                                    max_lines: Some(MAX_PANEL_EDITOR_LINES),
+                                })
+                            });
+                            this.serialize(cx);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_drag(DraggedCommitEditorEdge, |_, _, _, cx| cx.new(|_| Empty)),
+            ))
+    }
+
     pub fn render_footer(
         &self,
         window: &mut Window,
@@ -5725,7 +5944,7 @@ impl GitPanel {
         let branch = active_repository.read(cx).branch.clone();
         let head_commit = active_repository.read(cx).head_commit.clone();
 
-        let footer_size = px(32.);
+        let footer_size = px(64.);
         let gap = px(9.0);
         let max_height = panel_editor_style
             .text
@@ -5756,7 +5975,9 @@ impl GitPanel {
             self.conflicted_staged_count,
         );
 
+        let custom_height = self.commit_editor_height.is_some() && !self.commit_editor_expanded;
         let footer = v_flex()
+            .min_h_0()
             .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
             .child(PanelRepoFooter::new(branch, head_commit, Some(git_panel)))
             .when_some(operation_banner, |this, banner| {
@@ -5784,16 +6005,38 @@ impl GitPanel {
                         ),
                 )
             })
+            .when(!self.commit_editor_expanded, |this| {
+                this.child(self.render_commit_editor_resize_handle(cx))
+            })
             .child(
                 panel_editor_container(window, cx)
                     .id("commit-editor-container")
+                    .debug_selector(|| "COMMIT-EDITOR-CONTAINER".into())
                     .cursor_text()
                     .relative()
                     .w_full()
                     .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
                     .when(!self.commit_editor_expanded, |this| {
-                        this.h(max_height + footer_size)
+                        this.h(self
+                            .commit_editor_height
+                            .unwrap_or(max_height + footer_size))
+                            .min_h(px(120.))
                     })
+                    .on_drag_move(cx.listener(
+                        |this, event: &DragMoveEvent<DraggedCommitEditorEdge>, _, cx| {
+                            let height = clamp_commit_editor_height(
+                                event.bounds.bottom() - event.event.position.y,
+                            );
+                            if this.commit_editor_height != Some(height) {
+                                this.commit_editor_height = Some(height);
+                                this.commit_editor.update(cx, |editor, _| {
+                                    editor.set_mode(commit_editor_full_mode())
+                                });
+                                this.serialize(cx);
+                                cx.notify();
+                            }
+                        },
+                    ))
                     .border_t_1()
                     .border_color(if title_exceeds_limit {
                         cx.theme().status().warning_border
@@ -5804,7 +6047,7 @@ impl GitPanel {
                         window.focus(&this.commit_editor.focus_handle(cx), cx);
                     }))
                     .child(
-                        h_flex()
+                        v_flex()
                             .id("commit-footer")
                             .border_t_1()
                             .when(editor_is_long, |el| {
@@ -5819,13 +6062,26 @@ impl GitPanel {
                             .flex_none()
                             .justify_between()
                             .child(
-                                self.render_generate_commit_message_button(cx)
-                                    .unwrap_or_else(|| div().into_any_element()),
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(self.render_commit_history_button(cx))
+                                            .child(
+                                                self.render_generate_commit_message_button(cx)
+                                                    .unwrap_or_else(|| div().into_any_element()),
+                                            ),
+                                    )
+                                    .children(enable_coauthors),
                             )
                             .child(
                                 h_flex()
-                                    .gap_0p5()
-                                    .children(enable_coauthors)
+                                    .w_full()
+                                    .justify_end()
+                                    .gap_1()
+                                    .child(self.render_commit_and_push_button(cx))
                                     .child(self.render_commit_button(cx)),
                             ),
                     )
@@ -5833,6 +6089,9 @@ impl GitPanel {
                         div()
                             .when(self.commit_editor_expanded, |this| {
                                 this.flex_1().min_h_0().pb(footer_size)
+                            })
+                            .when(custom_height, |this| {
+                                this.h_full().min_h_0().pb(footer_size)
                             })
                             .pr_2p5()
                             .on_action(|&zed_actions::editor::MoveUp, _, cx| {
@@ -5906,6 +6165,33 @@ impl GitPanel {
             );
 
         Some(footer)
+    }
+
+    pub(crate) fn render_commit_and_push_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = self.configure_commit_button(cx).0
+            && self.pending_remote_operation.is_none()
+            && self.can_push_and_pull(cx)
+            && self
+                .active_repository
+                .as_ref()
+                .is_some_and(|repo| repo.read(cx).branch.is_some());
+        Button::new(
+            "commit-and-push",
+            if self.amend_pending {
+                "Amend & Push"
+            } else {
+                "Commit & Push"
+            },
+        )
+        .label_size(LabelSize::Small)
+        .size(ButtonSize::Compact)
+        .disabled(!enabled || self.modal_open)
+        .tooltip(Tooltip::text(
+            "Commit changes, then push the same repository",
+        ))
+        .on_click(
+            cx.listener(|this, _, window, cx| this.commit_and_push(&CommitAndPush, window, cx)),
+        )
     }
 
     fn render_commit_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6969,6 +7255,14 @@ impl GitPanel {
                     panel.signoff_enabled = serialized_panel.signoff_enabled;
                     // Clamped on the way in: the KVP row is hand-editable, and
                     // a nonsense height here would otherwise reach the layout.
+                    panel.commit_editor_height = serialized_panel
+                        .commit_editor_height
+                        .map(|height| clamp_commit_editor_height(px(height)));
+                    if panel.commit_editor_height.is_some() {
+                        panel
+                            .commit_editor
+                            .update(cx, |editor, _| editor.set_mode(commit_editor_full_mode()));
+                    }
                     panel.commit_message_height = serialized_panel
                         .commit_message_height
                         .map(|height| commit_tab::clamp_commit_message_height(px(height)));
@@ -7120,6 +7414,8 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::restore_tracked_files))
                     .on_action(cx.listener(Self::clean_all))
                     .on_action(cx.listener(Self::generate_commit_message_action))
+                    .on_action(cx.listener(Self::show_commit_message_history))
+                    .on_action(cx.listener(Self::commit_and_push))
                     .on_action(cx.listener(Self::stash_all))
                     .on_action(cx.listener(Self::stash_pop))
                     .when(on_changes_tab, |this| {
@@ -10923,6 +11219,193 @@ mod tests {
         cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
         cx.executor().run_until_parked();
         panel.read_with(cx, |panel, _| assert_ne!(panel.changes_count, usize::MAX));
+    }
+
+    #[gpui::test]
+    async fn test_commit_message_history_does_not_replace_another_repository_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, outer, inner, mut cx) = commit_tab_fixture_with_two_repositories(cx).await;
+        let cx = &mut cx;
+        cx.executor().run_until_parked();
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_repository(Some(outer.clone()), window, cx);
+            panel.use_commit_message_from_history(
+                &outer,
+                "Subject\n\nFull body α".into(),
+                window,
+                cx,
+            );
+            assert_eq!(
+                panel.commit_editor.read(cx).text(cx),
+                "Subject\n\nFull body α"
+            );
+            panel.use_commit_message_from_history(&inner, "Wrong repository".into(), window, cx);
+            assert_eq!(
+                panel.commit_editor.read(cx).text(cx),
+                "Subject\n\nFull body α"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_commit_editor_resize_changes_painted_height_in_both_directions(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, _, mut cx) = commit_tab_fixture(cx).await;
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.upgrade().unwrap());
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.simulate_resize(size(px(1000.), px(800.)));
+        cx.run_until_parked();
+        let original = cx.debug_bounds("COMMIT-EDITOR-CONTAINER").unwrap();
+        let handle = cx.debug_bounds("COMMIT-EDITOR-RESIZE").unwrap().center();
+        cx.simulate_mouse_move(handle, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(handle, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            handle - point(px(0.), px(60.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_move(
+            handle - point(px(0.), px(100.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_up(
+            handle - point(px(0.), px(100.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let taller = cx.debug_bounds("COMMIT-EDITOR-CONTAINER").unwrap();
+        assert!(
+            taller.size.height > original.size.height + px(50.),
+            "original={original:?}, taller={taller:?}"
+        );
+        let handle = cx.debug_bounds("COMMIT-EDITOR-RESIZE").unwrap().center();
+        cx.simulate_mouse_move(handle, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_mouse_down(handle, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            handle + point(px(0.), px(70.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_move(
+            handle + point(px(0.), px(100.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_up(
+            handle + point(px(0.), px(100.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let shorter = cx.debug_bounds("COMMIT-EDITOR-CONTAINER").unwrap();
+        assert!(
+            shorter.size.height < taller.size.height - px(30.),
+            "taller={taller:?}, shorter={shorter:?}"
+        );
+        panel.update(&mut cx, |panel, cx| {
+            panel.commit_editor_height = Some(px(600.));
+            panel
+                .commit_editor
+                .update(cx, |editor, _| editor.set_mode(commit_editor_full_mode()));
+            cx.notify();
+        });
+        cx.simulate_resize(size(px(800.), px(600.)));
+        cx.run_until_parked();
+        let bounded = cx.debug_bounds("COMMIT-EDITOR-CONTAINER").unwrap();
+        assert!(
+            bounded.bottom() <= px(600.),
+            "a tall persisted editor must fit a short window: {bounded:?}"
+        );
+        assert!(bounded.size.height < px(600.));
+    }
+
+    #[gpui::test]
+    async fn test_commit_and_push_success_is_pinned_and_failure_never_pushes(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, outer, inner, mut cx) = commit_tab_fixture_with_two_repositories(cx).await;
+        let cx = &mut cx;
+        let fs = panel.read_with(cx, |panel, cx| {
+            fs::Fs::as_fake(panel.project.read(cx).fs().as_ref())
+        });
+        let outer_git = outer.read_with(cx, |repo, _| repo.repository_dir_abs_path.to_path_buf());
+        let inner_git = inner.read_with(cx, |repo, _| repo.repository_dir_abs_path.to_path_buf());
+        fs.set_branch_name(&outer_git, Some("main"));
+        fs.set_branch_name(&inner_git, Some("other"));
+        fs.set_remote_for_repo(&outer_git, "origin", "fixture");
+        fs.set_remote_for_repo(&inner_git, "wrong", "fixture");
+        cx.run_until_parked();
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_repository(Some(outer.clone()), window, cx);
+            panel.use_commit_message_from_history(&outer, "Commit and push".into(), window, cx);
+            panel.tracked_staged_count = 1;
+            panel.commit_changes_with_push(
+                CommitOptions {
+                    allow_empty: true,
+                    ..Default::default()
+                },
+                true,
+                window,
+                cx,
+            );
+            // The queued operation is for outer even if the user changes members.
+            panel.set_active_repository(Some(inner.clone()), window, cx);
+        });
+        cx.run_until_parked();
+        fs.with_git_state(&outer_git, false, |state| {
+            assert_eq!(state.commit_history.len(), 1);
+            assert_eq!(state.pushes.len(), 1);
+            assert_eq!(state.pushes[0].remote, "origin");
+            assert_eq!(state.pushes[0].branch, "main");
+            assert_eq!(state.pushes[0].options, Some(PushOptions::SetUpstream));
+        })
+        .unwrap();
+        fs.with_git_state(&inner_git, false, |state| assert!(state.pushes.is_empty()))
+            .unwrap();
+        cx.update_window_entity(&panel, |panel, window, cx| {
+            panel.set_active_repository(Some(outer.clone()), window, cx);
+            panel.use_commit_message_from_history(&outer, "Keep failed draft".into(), window, cx);
+            // Pretend the index contains changes; the backend rejects its empty tree.
+            panel.tracked_staged_count = 1;
+            panel.commit_changes_with_push(CommitOptions::default(), true, window, cx);
+        });
+        cx.run_until_parked();
+        fs.with_git_state(&outer_git, false, |state| assert_eq!(state.pushes.len(), 1))
+            .unwrap();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.commit_editor.read(cx).text(cx), "Keep failed draft")
+        });
+    }
+
+    #[test]
+    fn test_commit_editor_height_serialization_is_backward_compatible() {
+        let legacy: SerializedGitPanel = serde_json::from_str("{}").unwrap();
+        assert!(legacy.commit_editor_height.is_none());
+        assert_eq!(clamp_commit_editor_height(px(-10.)), px(120.));
+        assert_eq!(clamp_commit_editor_height(px(900.)), px(600.));
+        assert_eq!(clamp_commit_editor_height(px(f32::NAN)), px(160.));
+        let panel: SerializedGitPanel =
+            serde_json::from_str(r#"{"commit_editor_height":220}"#).unwrap();
+        let saved = serde_json::to_string(&panel).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SerializedGitPanel>(&saved)
+                .unwrap()
+                .commit_editor_height,
+            Some(220.)
+        );
     }
 
     #[gpui::test]

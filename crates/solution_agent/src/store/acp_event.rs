@@ -483,6 +483,7 @@ impl SolutionAgentStore {
                         s.cached_total_tokens = total;
                         s.cached_max_tokens = max;
                     });
+                    self.cancel_short_automatic_handoff(session_id, cx);
                     // The initialize response (carrying `models`) only lands after the
                     // first turn, so the first TokenUsageUpdated is the earliest capture.
                     let live_models = s.read(cx).acp_thread().map(|t| {

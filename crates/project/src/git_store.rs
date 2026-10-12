@@ -7695,6 +7695,24 @@ impl Repository {
     /// Run `git shortlog -sne --all` over the active local repo. Returns
     /// an empty vec for remote repos (collab) and surfaces backend errors
     /// to the caller. Powers the chip-User filter popover (S-FLT).
+    pub fn commit_message_history(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<SharedString>>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            match repository_state.await {
+                Ok(RepositoryState::Local(LocalRepositoryState { backend, .. })) => {
+                    backend.commit_message_history().await
+                }
+                Ok(RepositoryState::Remote(_)) => Err(anyhow!(
+                    "Commit message history is unavailable for remote repositories"
+                )),
+                Err(err) => Err(anyhow!("{err}")),
+            }
+        })
+    }
+
     pub fn author_history(
         &mut self,
         cx: &mut Context<Self>,

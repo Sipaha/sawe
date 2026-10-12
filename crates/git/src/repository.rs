@@ -1339,6 +1339,8 @@ pub trait GitRepository: Send + Sync {
     /// chip-User filter popover (S-FLT).
     fn author_history(&self) -> BoxFuture<'_, Result<Vec<AuthorHistoryEntry>>>;
 
+    fn commit_message_history(&self) -> BoxFuture<'_, Result<Vec<SharedString>>>;
+
     /// Runs `git rev-list --parents` to get the commit graph structure.
     /// Returns commit SHAs and their parent SHAs for building the graph visualization.
     ///
@@ -4051,6 +4053,26 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn commit_message_history(&self) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let stdout = git
+                    .run_raw(&[
+                        "log",
+                        "--ignore-missing",
+                        "-50",
+                        "-z",
+                        "--format=%B",
+                        "HEAD",
+                        "--",
+                    ])
+                    .await?;
+                Ok(parse_commit_message_history(&stdout))
+            })
+            .boxed()
+    }
+
     fn run_hook(
         &self,
         hook: RunHook,
@@ -4338,6 +4360,17 @@ impl GitRepository for RealGitRepository {
 /// don't match `<count>\t<name> <<email>>` are logged and skipped — this
 /// runs against arbitrary user-controlled data (commit author names) so
 /// we never panic on malformed rows.
+pub fn parse_commit_message_history(stdout: &str) -> Vec<SharedString> {
+    let mut messages = Vec::new();
+    for message in stdout.split('\0') {
+        let message: SharedString = message.trim_end_matches('\n').to_string().into();
+        if !message.trim().is_empty() && !messages.contains(&message) {
+            messages.push(message);
+        }
+    }
+    messages
+}
+
 fn parse_shortlog_output(stdout: &str) -> Vec<AuthorHistoryEntry> {
     let trimmed = stdout.strip_prefix('\u{feff}').unwrap_or(stdout);
     let mut entries = Vec::new();
@@ -6619,6 +6652,62 @@ mod tests {
         assert!(
             !output.status.success(),
             "hooksPath should NOT be overridden for trusted repos"
+        );
+    }
+
+    #[test]
+    fn test_commit_message_history_preserves_bodies_and_deduplicates() {
+        assert_eq!(
+            parse_commit_message_history("Subject\n\nBody α\n\0Other\n\0Subject\n\nBody α\n\0"),
+            vec![
+                SharedString::from("Subject\n\nBody α"),
+                SharedString::from("Other")
+            ]
+        );
+        assert!(parse_commit_message_history("\0\n").is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_real_commit_message_history(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        git_init_repo(dir.path());
+        let repository = RealGitRepository::new(
+            &dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        assert!(
+            repository
+                .commit_message_history()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for message in ["First\n\nBody α", "Second", "First\n\nBody α"] {
+            git_command(
+                dir.path(),
+                [
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            );
+        }
+        assert_eq!(
+            repository.commit_message_history().await.unwrap(),
+            vec![
+                SharedString::from("First\n\nBody α"),
+                SharedString::from("Second")
+            ]
         );
     }
 

@@ -92,9 +92,24 @@ pub struct PickerPromptDelegate {
     selected_index: usize,
     max_match_length: usize,
     tx: Option<oneshot::Sender<usize>>,
+    on_confirm: Option<Box<dyn Fn(SharedString, &mut Window, &mut App)>>,
 }
 
 impl PickerPromptDelegate {
+    pub(crate) fn on_confirm(
+        mut self,
+        handler: impl Fn(SharedString, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_confirm = Some(Box::new(handler));
+        self
+    }
+
+    pub(crate) fn replace_options(&mut self, options: Vec<SharedString>) {
+        self.all_options = options;
+        self.matches.clear();
+        self.selected_index = 0;
+    }
+
     pub fn new(
         prompt: Arc<str>,
         options: Vec<SharedString>,
@@ -108,6 +123,7 @@ impl PickerPromptDelegate {
             selected_index: 0,
             max_match_length: max_chars,
             tx: Some(tx),
+            on_confirm: None,
         }
     }
 }
@@ -197,11 +213,16 @@ impl PickerDelegate for PickerPromptDelegate {
         })
     }
 
-    fn confirm(&mut self, _: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let Some(option) = self.matches.get(self.selected_index()) else {
             return;
         };
 
+        if let Some(handler) = &self.on_confirm
+            && let Some(message) = self.all_options.get(option.candidate_id)
+        {
+            handler(message.clone(), window, cx);
+        }
         self.tx.take().map(|tx| tx.send(option.candidate_id));
         cx.emit(DismissEvent);
     }
@@ -218,7 +239,8 @@ impl PickerDelegate for PickerPromptDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let hit = &self.matches.get(ix)?;
-        let shortened_option = util::truncate_and_trailoff(&hit.string, self.max_match_length);
+        let shortened_option = util::truncate_and_trailoff(&hit.string, self.max_match_length)
+            .replace(['\n', '\r'], " ");
 
         Some(
             ListItem::new(format!("picker-prompt-menu-{ix}"))
