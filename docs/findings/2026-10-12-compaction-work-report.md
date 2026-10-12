@@ -24,7 +24,13 @@ including actual manual/automatic notice queue assertions and the preserved
 report contract. Debug build passed in 3m04s. A native headless screenshot
 shows the full restored report and pause boundary in a clearly labelled cold
 fixture; it verifies rendering, not model behavior or an actual provider
-rotation. The private editor is stopped. Full release verification is pending.
+rotation. Both private editors are stopped. Full release passed in 40m00s; `--help`
+exited 0, system specs reported full source SHA
+`d1ece08bf1e3bc9e2f3b45f089b14a75dace3a91`, and the isolated running
+executable hash matched the new binary. The compiled report instructions are
+present, and the labelled cold report also renders after release reload.
+Transient seed provider/token metadata is not authentication or fallback
+evidence. No actual model response was generated.
 Evidence is retained under Solution `.tmp/handoff-report`. Offline checks
 prove prompt content and transport, not model compliance. No paid model turn
 or user-editor restart was performed.
@@ -43,3 +49,6 @@ native evidence are used. Observation `p-314bf0f52c4d90026910e970b2167fa7` is pe
 curation; linked report `todo-8d170c93be035169acd716890b89a60f` remains open.
 Related: [native context shrink](2026-10-12-native-compaction-handoff.md),
 [prompt checks](../workflow/prompt-checks.md), [fork contract](../../FORK.md).
+
+Validation finding `p-4b75916906b14ddd0670a5963499f7bd` remains pending curation. Reports were not
+published, triaged or marked resolved.

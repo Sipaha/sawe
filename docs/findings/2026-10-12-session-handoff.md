@@ -1,14 +1,18 @@
 # October 12 boundary handoff
 
-All selected work is complete and verified. Preserve the boundary pause: there is no selected next task. The editor's 40%, 44% and 46% notices asked to finish the active phase and stop before independent work; no compaction tool was called.
+All selected work is complete and verified, including the later compaction-report prompt fix. Preserve the boundary pause: there is no selected next task. Earlier 40%, 44% and 46% notices asked to finish the active phase and stop before independent work; no compaction tool was called.
 
 ## Shipped
+
+Latest source `d1ece08bf1e3bc9e2f3b45f089b14a75dace3a91` preserves a substantive user-facing report in the existing handoff state and requires the resumed context to restore results, verification limits, delivery status, remaining work and exact stopping point. Ongoing work gets a recap and continues only within existing authorization; completed/paused boundaries retain their final report and pause. [Report preservation verification](2026-10-12-compaction-work-report.md).
 
 Source commit `708ce0eb1b6a60d27fe85a6b2af6509d9268f22f`: commit-message history (clock / Ctrl+M, last 50 HEAD commits, full bodies, deduplication, search, cancellation/member isolation), draggable persisted commit input height with double-click reset and short-window flex limits, visible Commit & Push with successful-commit-only normal push and captured repository/branch route, and cancellation of obsolete automatic context handoff below the existing 10% minimum after native Codex shrink. Manual handoff, successful-boundary proof, 30-minute reminders and >=80% active automatic force are preserved.
 
 Earlier completed Default Provider/generation isolation, preview modal/Git Pull and flat related-subagent navigation remain complete; do not restart them as unfinished. See [October 9](2026-10-09-session-handoff.md) and [October 11](2026-10-11-subagent-flat-tabs.md).
 
 ## Verification
+
+Latest prompt phase: `solution_agent` 1020 passed / 0 failed / 1 ignored; debug build 3m04s; full release 40m00s; `--help`, exact full source SHA and matching isolated running binary passed. Native cold report screenshots verify rendering and reload, not model compliance. No paid inference or user-editor restart. Global prompt checks have unrelated baseline drift, reproduced from `fef1b2b22c`; the affected template contract passes. Maintenance report `todo-ea31932cd60222fde79beddc9c25be0c` remains open. Earlier verification below is historical; prior passing suites were not rerun without relevant changes.
 
 - Git backend: 2 passed. Git UI final: 445 passed. Solution agent: 1019 passed, 0 failed, 1 ignored; 23 handoff scenarios included.
 - Real native screenshots and a private local bare remote prove history/full-body commit, search/Escape/member isolation, both resize directions, 800x600 bounds, restart height, double-click reset, successful push, failed commit draft/head preservation and rejected push local-commit preservation.
@@ -29,4 +33,4 @@ The new screenshot's 53% -> 3.3% was explained by a real native Codex `compacted
 
 Stable session `jh7enjs3`, Solution14, tab `Ревью Kimi и апрувов`; never rename it. Stay inside this Solution; outside paths are read-only without exact per-action approval. No user-editor restart, third-party messages, trackers or subagents without explicit scope. Normal scoped commit/push remains authorized, never force/amend/coauthor. Preserve subscription/auth isolation, fail closed on unknown generation CLIs, and add no fallback, accepted-input replay or quota/token retries.
 
-Read [commit composition verification](2026-10-12-commit-composition.md) and [native-compaction diagnosis](2026-10-12-native-compaction-handoff.md), reconcile current git/process state, then ask the user what to tackle next. No forward implementation pool is selected.
+Read [report preservation verification](2026-10-12-compaction-work-report.md), [commit composition verification](2026-10-12-commit-composition.md) and [native-compaction diagnosis](2026-10-12-native-compaction-handoff.md), reconcile current git/process state, restore the substantive work report and stopping point, then ask the user what to tackle next unless newer instructions require preserving a pause. No forward implementation pool is selected.
