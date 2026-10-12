@@ -9,6 +9,8 @@
 
 ## Entry points
 
+- Compaction work reports: [preserve the result and stopping point](findings/2026-10-12-compaction-work-report.md).
+
 - Latest verified boundary: [October 12 handoff](findings/2026-10-12-session-handoff.md).
 
 - Native Codex context shrink: [obsolete automatic handoff diagnosis](findings/2026-10-12-native-compaction-handoff.md).

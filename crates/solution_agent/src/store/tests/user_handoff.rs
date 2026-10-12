@@ -101,6 +101,16 @@ fn compaction_state(session_id: SolutionSessionId, cx: &mut TestAppContext) -> (
     })
 }
 
+fn assert_work_report_requested(texts: &[String]) {
+    assert!(
+        texts.iter().any(|text| text.contains("substantive work report in their language")
+            && text.contains("what was verified and its limits")
+            && text.contains("exactly where work stopped")
+            && text.contains("Preserve that report in the handoff")),
+        "the delivered handoff notice must preserve the user's result report: {texts:?}"
+    );
+}
+
 fn has_compaction_prompt(texts: &[String]) -> bool {
     texts
         .iter()
@@ -117,6 +127,7 @@ async fn a_running_session_is_asked_twice_then_compacted(cx: &mut TestAppContext
 
     assert!(request(session_id, cx));
     let texts = queued_texts(session_id, cx);
+    assert_work_report_requested(&texts);
     assert!(!has_compaction_prompt(&texts), "the first request only asks");
     assert!(
         texts.iter().any(|t| t.starts_with("The user asked for a context handoff")
@@ -138,6 +149,7 @@ async fn a_running_session_is_asked_twice_then_compacted(cx: &mut TestAppContext
     age_last_ask(session_id, cx);
     tick(cx);
     let texts = queued_texts(session_id, cx);
+    assert_work_report_requested(&texts);
     assert!(
         texts.iter().any(|t| t.starts_with("The user's context handoff request is still open")
             && t.contains("next natural boundary")
@@ -306,6 +318,7 @@ async fn auto_compaction_asks_when_the_context_crosses_the_threshold(cx: &mut Te
         (crate::model::HandoffAsker::Auto, 1, false)
     );
     let texts = queued_texts(session_id, cx);
+    assert_work_report_requested(&texts);
     assert!(
         texts.iter().any(|t| t.starts_with("Your context is 41% full.")
             && t.contains("Keep working normally on the phase already in progress")

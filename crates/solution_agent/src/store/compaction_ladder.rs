@@ -467,7 +467,13 @@ impl SolutionAgentStore {
         } else {
             instruction
         };
-        let mut message = format!("{opening} {instruction}");
+        let mut message = format!(
+            "{opening} {instruction} At that boundary, give the user a substantive work \
+             report in their language: what was accomplished, what was verified and its \
+             limits, delivery status where relevant, remaining work, and exactly where \
+             work stopped. Preserve that report in the handoff so the resumed context \
+             can restate it; a handoff acknowledgement is not a result report."
+        );
         if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             message.push_str(if user {
                 "\n\nThe user's note for this handoff: "

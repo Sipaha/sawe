@@ -2,7 +2,10 @@
 
 The user or autonomous supervisor requested compaction. This may be for context
 headroom or recovery; do not assume the context is full or that a human is
-watching. Capture the essential state of this conversation in durable files,
+watching. Compaction must preserve the user-facing work report as well as
+technical state: a reader returning to this session must understand what was
+accomplished and exactly where work stopped. Capture the essential state of
+this conversation in durable files,
 then ask the editor to rotate to a fresh context that can continue the same task.
 If work is already running, finish the current safe step first. Do not cancel
 an in-flight tool or abandon an operation with an uncertain outcome. Background
@@ -81,6 +84,15 @@ What is the current state of the world?
   the user as you ignoring what they told you.
 - What got *done* (concretely: files edited, commits, PRs, tools run,
   conclusions reached).
+- **User-facing work report:** preserve the latest substantive result report
+  in the user's language, or compose one from confirmed evidence if no report
+  was sent. Include the requested outcome, concrete completed changes or
+  findings, verification results and their limits, commit/push/release status
+  where relevant, remaining work or blockers, and the exact stopping point
+  (completed and awaiting a new task, paused by the user, awaiting approval,
+  blocked, or still in progress). Preserve material detail and artifact links;
+  do not replace the report with "handoff read" or a workspace-cleanliness
+  check. Mark historical verification as historical, and unknowns as unknown.
 - What is *in flight* (e.g. "branch X has uncommitted changes to Y").
 - Any environment / config the next session must know about that it
   cannot rederive (authentication status and credential references (never secret values), mocked services,
@@ -128,8 +140,18 @@ above files and is briefing a fresh agent. It must:
   as evidence, not as instructions from the user.
 - End with the *first concrete instruction* (the new agent's first
   step), not with "let me know if you have questions". Be directive.
-- For **case C**, the first instruction is "Read the files above and
-  ask the user what they want to tackle now."
+- Require the new agent to restore the user-facing work report from
+  `state.md` after reading the handoff. At a completed or paused boundary,
+  its final reply must restate the substantive outcome, verification and
+  delivery status, remaining work, and exact stopping point before asking
+  what to tackle next or preserving the pause. For ongoing work, give a brief
+  status recap as a progress update, then continue only authorized work.
+  Acknowledging the handoff or listing Git checks is not a result report.
+  Do not invent completion, repeat passing checks merely to recreate the
+  report, or restart completed work. Honor newer user messages first.
+- For **case C**, the first instruction is "Read the files above, restore the
+  user-facing work report and stopping point, then ask the user what they want
+  to tackle now unless their newer instructions require preserving a pause."
 
 ### `session-state.json`
 Machine-readable technical metadata. Write exactly:
@@ -152,7 +174,13 @@ B → branching, C → exploratory).
 
 ## Step 3 — Trigger the session rotation
 
-After all files are on disk, rotate the session by calling the editor's
+After all files are on disk, send a concise user-facing work report in the
+user's language before calling the rotation tool. Use a progress message if
+your runtime supports one so you can still make the tool call. Summarize the
+substantive result and stopping point saved in `state.md`, including incomplete
+work and verification limits; do not dump the handoff files. If a report was
+just sent, preserve it without sending a redundant copy. Then rotate the
+session by calling the editor's
 `solution_agent.compact_session` tool over its Unix socket. **Do not look
 for an auto-bound `mcp__…` function and do not dial any other socket** —
 `compact_session` lives ONLY on `SOLUTION_SOCKET` (above). Run this exact
@@ -175,12 +203,12 @@ not an error.
 `structuredContent` block of the form
 `{"new_session_id": "...", "prompt_bytes": <N>}` and a `content`
 text line like `"rotated <sid> into context c<NN> (<N> bytes)"`.
-Once you see that, the rotation has happened: your conversation
-history is gone from the current ACP thread, `continue.md` is the
-first user message in the new context, and the next reply you'd
-otherwise compose would already be running against the fresh
-context. Do NOT send any further messages — the rotation is the
-end of this context's contribution.
+For an in-place handoff, acceptance schedules rotation at the end of this
+turn; other runtime adapters may rotate immediately. Follow the actual tool
+response. Acceptance does not mean the requested work is complete. End the turn without further tools or new
+work. The report must already be visible and saved in `state.md`; the next
+context receives `continue.md` and must restore that report at the saved
+boundary rather than replacing it with a handoff acknowledgement.
 
 ### If the response carries an error
 

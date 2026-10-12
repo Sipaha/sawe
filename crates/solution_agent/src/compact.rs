@@ -713,6 +713,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compaction_preserves_the_user_facing_report_across_rotation() {
+        let template = COMPACT_INSTRUCTIONS_TEMPLATE;
+        let state = template.split("### `state.md`").nth(1).unwrap()
+            .split("### `decisions.md`").next().unwrap();
+        let continuation = template.split("### `continue.md`").nth(1).unwrap()
+            .split("### `session-state.json`").next().unwrap();
+        let rotation = template.split("## Step 3").nth(1).unwrap();
+        assert!(state.contains("User-facing work report"));
+        assert!(state.contains("verification results and their limits"));
+        assert!(state.contains("commit/push/release status"));
+        assert!(state.contains("exact stopping point"));
+        assert!(continuation.contains("its final reply must restate the substantive outcome"));
+        assert!(continuation.contains("For ongoing work, give a brief"));
+        assert!(continuation.contains("unless their newer instructions require preserving a pause"));
+        assert!(continuation.contains("Do not invent completion"));
+        assert!(rotation.contains("before calling the rotation tool"));
+        assert!(rotation.contains("acceptance schedules rotation at the end of this"));
+        assert!(!rotation.contains("Do NOT send any further messages"));
+    }
+
     /// Directory retention keeps unrelated sibling files intact.
     #[test]
     fn prune_old_compact_dirs_keeps_recent_window() {

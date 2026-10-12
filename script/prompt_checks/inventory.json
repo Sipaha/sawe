@@ -169,6 +169,7 @@
       "placeholders": [
         "{{agent_id}}",
         "{{compact_dir}}",
+        "{{compact_note}}",
         "{{compact_request_shell}}",
         "{{session_id}}",
         "{{solution_id}}",
