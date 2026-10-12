@@ -9,6 +9,8 @@
 
 ## Entry points
 
+- Latest verified boundary: [October 12 handoff](findings/2026-10-12-session-handoff.md).
+
 - Native Codex context shrink: [obsolete automatic handoff diagnosis](findings/2026-10-12-native-compaction-handoff.md).
 
 - Commit composition: [history, resizing and Commit & Push](findings/2026-10-12-commit-composition.md).
