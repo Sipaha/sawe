@@ -9,6 +9,8 @@
 
 ## Entry points
 
+- Disk pressure: [read-only inventory and missed nested incremental cache](findings/2026-10-13-disk-usage-and-nested-cache.md).
+
 - Compaction work reports: [preserve the result and stopping point](findings/2026-10-12-compaction-work-report.md).
 
 - Latest verified boundary: [October 12 handoff](findings/2026-10-12-session-handoff.md).
