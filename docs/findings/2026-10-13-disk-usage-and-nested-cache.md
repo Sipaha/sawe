@@ -26,7 +26,8 @@ the running editors were not stopped or restarted.
 
 All measurements and diagnostic outputs are under Solution `.tmp/disk-audit`
 and `.tmp/disk-*.log`. No source build/test/UI change was made, so prior passing
-builds and suites were not rerun. No files were deleted.
+builds and suites were not rerun. No files were deleted during the initial audit. The subsequently authorized
+cleanup is recorded below.
 
 Knowledge context/catalog/search returned no applicable Sawe procedure IDs or
 revisions; local source and real read-only measurements were used. Finding
@@ -35,3 +36,20 @@ revisions; local source and real read-only measurements were used. Finding
 
 Related: [pruning script](../../script/prune-build-cache),
 [October 12 boundary](2026-10-12-session-handoff.md).
+
+## Subsequently authorized cleanup
+
+The user explicitly selected debug, the old upstream build and release-fast.
+`target/debug`, `target/upstream-1.98` and `target/release-fast` were removed
+after verifying no active compiler or process used them, acquiring Cargo locks
+and rejecting nested mounts. Captured trees were renamed into an in-Solution
+quarantine before removal; the quarantine is also gone.
+
+Available filesystem space increased from 56.47 to 570.84 GiB, a measured
+increase of 514.38 GiB. Root usage fell to 68%; the remaining target is about
+29 GiB. The main `target/release/sawe` checksum and inode are unchanged, and
+it remains executable. No editor restart or source build was performed.
+User data/evidence outside the three selected build trees was preserved.
+Receipt: Solution `.tmp/disk-audit/cleanup-result.json`. Cleanup validation
+finding `p-5d3341d3ef59692c42760dcaeaa05778` is pending curation. Manual cleanup did not fix or resolve
+the separate nested-cache pruning bug report.
