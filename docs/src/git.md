@@ -9,6 +9,14 @@ Zed has built-in Git support that lets you manage version control without leavin
 
 For operations that Zed doesn't support natively, you can use the integrated terminal.
 
+## Nested Context Menus
+
+Move diagonally from a parent item toward its submenu without losing it when
+crossing other items. This works with submenus opening to either side, including
+further nested menus. Moving vertically to another parent item or reversing away
+from the submenu switches immediately. Stopping over another item switches after
+a short delay. Clicks and keyboard navigation continue to select directly.
+
 ## Repository Activation
 
 When a project is rooted at a git repository, or at a subdirectory of one, all repositories in it are active immediately.

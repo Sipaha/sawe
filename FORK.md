@@ -131,7 +131,7 @@ This fork no longer constrains itself to additive-only modifications of upstream
 | `crates/workspace/src/active_file_name.rs` | `ActiveFileName::new` now takes the `Workspace` (holds a `WeakEntity<Project>`); the status-bar label prefixes the worktree-relative path with the worktree's root name so it's unambiguous across a Solution's worktrees. (`status_bar.show_active_file` is back to upstream's `false` in `default.json`: on 2026-09-24 the maintainer asked for the path to go — *«убери вот этот путь. Он нам вкладки закрывает»* — because a deep path squeezed the session tabs that share the status bar. The label code stays for anyone who turns it on.) | rebrand / solutions |
 | `crates/editor/src/items.rs` | An editor tab's tooltip is the path from the project root (`language::File::full_path` → `sawe/Procfile.web`), not the `~`-compacted absolute path, which repeated the Solution's location on every tab — the maintainer, 2026-09-24: *«в подсказке показывать путь не от home, а от корня проекта»*. A file outside every visible worktree keeps its absolute path. Guarded by `test_tab_tooltip_shows_path_from_project_root`. | `editor` |
 | `crates/workspace/src/modal_layer.rs` | **Decision #214.** `ModalView::bottom_center()` lets a modal name its window-space bottom-centre; `ModalLayer` then anchors it there instead of at the top. | `workspace` |
-| `crates/ui/src/components/context_menu.rs` | **Decision #214.** `ContextMenu::item_height(px)` — an opt-in fixed row height for entries and submenu rows; entries carry a `context-menu-entry-{ix}` debug selector. **Decision #222.** A submenu's side is chosen by `anchored().flip_across` from its real width (the 200px guess is gone); a submenu has its own tint, border and shadow; `CONTEXT_MENU` / `CONTEXT_SUBMENU` debug selectors. | `ui` |
+| `crates/ui/src/components/context_menu.rs` | **Decision #214.** `ContextMenu::item_height(px)` — an opt-in fixed row height for entries and submenu rows; entries carry a `context-menu-entry-{ix}` debug selector. **Decision #222.** A submenu's side is chosen by `anchored().flip_across` from its real width; a submenu has its own tint, border and shadow. Pointer-intent corridors use the painted submenu bounds in either direction, with bounded sibling deferral and separate parent/child measurements; `CONTEXT_MENU` / `CONTEXT_SUBMENU` debug selectors. | `ui` |
 | `crates/gpui/src/elements/anchored.rs` | **Decision #222.** `Anchored::flip_across(width)`: on horizontal overflow, move to the far side of the box the element sits beside instead of snapping over it. | `gpui` |
 | `crates/git_ui/src/conflict_view.rs` | The merge-conflict status-bar indicator and the in-editor conflict block both dispatched agent actions whose only handler early-returns without an `AgentPanel`, which this fork never registers — two silent no-ops, one of which also dismissed itself as if it had worked. Both now open the fork's own conflict resolver (`git_conflict_ui::OpenConflictResolver`) and are relabelled accordingly; the indicator no longer self-dismisses, and neither is gated on `AgentSettings::enabled`, since neither involves the agent any more. | `git_conflict_ui` |
 | `crates/git_ui/src/commit_view.rs` | S-DET commit-view surface (header / parents / refs / contains / affected-files / footer decomposed into `commit_view::*` submodules). **(decision #136, 2026-09-02)** The `single_file: Option<RepoPath>` mode that used to live here is **deleted** — `open_file_diff`, `preview_holds_single_file_diff` and `open_internal` with it — and single-file commit diffs are served by `SoloDiffView`. What remains is the whole-commit view and the `base..head` compare-range view (#87). `open`'s `file_filter` parameter is *not* that mode and stays: it narrows which files the whole-commit diff shows while keeping the metadata chrome. | `git_ui` (S-DET) / `git_graph` |
@@ -6175,13 +6175,28 @@ How to apply:
 - The side is decided at layout time, from real sizes: `anchored().flip_across(parent_width)`. On
   horizontal overflow it tries the far side of the parent. If neither side fits, it takes the side
   that shows more, and the usual snapping follows. The parent's width comes from its own measure
-  (`ContextMenu::menu_width`). `main_menu_observed_bounds` can't be used for that: the open
-  submenu's bounds overwrite it.
+  (`ContextMenu::menu_width`). Keep the outer width separate from the menu content bounds.
+  `main_menu_observed_bounds` measures this menu; `submenu_observed_bounds` measures its open
+  child's actual surface, including horizontal flipping and vertical snapping.
 - A submenu gets a background 0.04 lighter (0.03 darker on light themes), the `border` colour rather
   than `border_variant`, and a deeper shadow.
 - Tests: `flip_across_*` in `anchored.rs` (pure placement), and two painted-geometry tests in
   `context_menu.rs` (`CONTEXT_MENU` / `CONTEXT_SUBMENU` debug bounds). The left-side test fails on
   the old code with the exact overlap reported.
+
+Pointer navigation (2026-10-15): a submenu previously closed as soon as a diagonal path crossed
+another parent row. The old X-only safety threshold also assumed a right-opening submenu.
+The shared `ContextMenu` now retains the open child inside a triangle from the last pointer
+position on its trigger to the near vertical edge of the painted child. A reversal or vertical
+sibling selection switches immediately; stopping over a sibling switches after 400ms. Ordinary,
+custom, disabled and submenu rows share the same arbitration at every level. Clicks and keyboard
+navigation remain direct. A window mouse-move observer checks actual menu-tree bounds: ancestor
+hover hitboxes can be occluded by the submenu itself, so they cannot establish entry/exit.
+Timers are cancelled when entering the child or replacing/closing it. Newly measured trigger
+bounds defer a notification outside the draw phase, guarded on a bounds change, so one stationary
+hover can initialize the child without requiring another mouse move. Regression tests move the
+pointer through painted sibling rows in both directions, click the child, and exercise expiry,
+reversal, nested descendants and leaving the tree.
 
 ### 223. Session tabs that do not fit go into the `…`; the strip's buttons never leave
 
