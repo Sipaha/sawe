@@ -1021,6 +1021,14 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn compaction_summary_keeps_authorized_work_in_progress() {
+        assert!(COMPACTION_PROMPT.contains("temporary yield, not a user-requested task pause"));
+        assert!(COMPACTION_PROMPT.contains("resume it without asking for permission again"));
+        assert!(COMPACTION_PROMPT.contains("explicit user stop that has not been superseded"));
+        assert!(COMPACTION_PROMPT.contains("editor compaction notices"));
+    }
+
+    #[test]
     fn test_parse_auto_compact_threshold() {
         use AutoCompactThreshold::*;
 

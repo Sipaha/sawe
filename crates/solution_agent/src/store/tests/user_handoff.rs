@@ -102,6 +102,12 @@ fn compaction_state(session_id: SolutionSessionId, cx: &mut TestAppContext) -> (
 }
 
 fn assert_work_report_requested(texts: &[String]) {
+    assert!(texts.iter().any(|text| text.contains("not a user request to")
+        && text.contains("not PAUSED or awaiting owner resume")
+        && text.contains("continue that work without asking for permission again")
+        && text.contains("user explicitly requested it and has not subsequently resumed it")),
+        "handoff must distinguish a technical yield from a current user pause: {texts:?}");
+    assert!(texts.iter().all(|text| !text.contains("pause before beginning another phase")));
     assert!(
         texts.iter().any(|text| text.contains("substantive work report in their language")
             && text.contains("what was verified and its limits")
@@ -322,7 +328,7 @@ async fn auto_compaction_asks_when_the_context_crosses_the_threshold(cx: &mut Te
     assert!(
         texts.iter().any(|t| t.starts_with("Your context is 41% full.")
             && t.contains("Keep working normally on the phase already in progress")
-            && t.contains("pause before beginning another phase or independent task")
+            && t.contains("end this turn to yield for context rotation before beginning the next phase")
             && t.contains("Do not call a compaction tool")),
         "the editor's wording: {texts:?}"
     );
@@ -471,6 +477,7 @@ async fn automatic_reminders_repeat_every_thirty_minutes_without_forcing(cx: &mu
         age_last_ask(session_id, cx);
         tick(cx);
         assert_eq!(handoff(session_id, cx).unwrap().asks, expected);
+        assert_work_report_requested(&queued_texts(session_id, cx));
         assert!(queued_texts(session_id, cx).iter().any(|t| t.contains("earlier handoff request is still open")));
         assert!(!compaction_state(session_id, cx).0);
         deliver_queue(session_id, cx);

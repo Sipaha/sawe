@@ -1139,6 +1139,7 @@ impl SolutionAgentStore {
         // Resume intentionally preserves the provider ID, but installs a new
         // thread. Only the original thread may settle this send's state.
         let expected_thread_id = acp_thread.entity_id();
+        let expected_context_count = session_entity.read(cx).context_count;
 
         // EVERYTHING past this point is CONSUMED. `AcpThread::send_inner` pushes
         // the `UserMessage` entry onto the thread BEFORE it calls
@@ -1147,6 +1148,25 @@ impl SolutionAgentStore {
         // session and an error entry under it). See `SendFailure`.
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = send_task.await;
+            // Clearing, rotating, reconnecting or closing a session can release
+            // the old thread while its send future is still settling. Its
+            // result no longer describes the current conversation: forwarding
+            // that error would raise a spurious compose toast (often "entity
+            // released") even though the state guards below reject it.
+            let still_current = this.read_with(cx, |store, cx| {
+                store.session(session_id).is_some_and(|session| {
+                    let session = session.read(cx);
+                    session.context_count == expected_context_count
+                        && session.acp_session_id == expected_acp_session_id
+                        && session.acp_thread().is_some_and(|thread| {
+                            thread.entity_id() == expected_thread_id
+                        })
+                })
+            }).unwrap_or(false);
+            if !still_current {
+                log::debug!("send_message_blocks: ignoring obsolete completion for {session_id}");
+                return Ok(());
+            }
             match &result {
                 Err(err) => {
                     // run_turn already emitted `AcpThreadEvent::Error`,

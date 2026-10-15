@@ -101,6 +101,11 @@ and a persistent conversation note instead of silently remaining Idle after
 reporting a successful reconnect. A late rejection cannot change a newer
 context or an already running turn.
 
+A send that finishes after its conversation was cleared, replaced, closed or
+reconnected cannot raise an error notification for the new conversation.
+Failures from the current conversation remain visible, including connection
+and authentication errors.
+
 The 2026-10-08 incident in session `9y3ub7by` reached this failure at
 03:16:26 +0700: an old compact prompt was mistaken for human input and rejected
 with `This compaction request is no longer current`. Its `c08` handoff directory
@@ -123,6 +128,15 @@ At 80%, the editor can request handoff without waiting for another timer.
 A failed provider turn remains a failure, even above 80%; it is not treated as
 a completed phase. Manual Compact requests keep their existing escalation
 and a second explicit request still means to compact now.
+
+At a phase boundary, the reminder asks the agent to end its turn for context
+rotation. This temporary yield does not pause your task or remove authorization
+already given. The handoff records unfinished authorized work as in progress;
+the fresh context continues it without asking you to resume. An explicit user
+stop remains effective until a later user instruction resumes that work.
+Editor reminders must not be recorded as user stop instructions. The editor
+also adds this continuation rule when reading an older handoff; the retained
+handoff files stay unchanged.
 
 Compaction requests display as a compact clickable chip after queue delivery,
 including messages with injected timestamps. Opening the chip shows the full

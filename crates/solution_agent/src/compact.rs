@@ -649,6 +649,22 @@ pub(crate) fn compact_headroom_tokens(max_tokens: u64) -> u64 {
     max_tokens.div_ceil(10).clamp(1, 30_000)
 }
 
+/// Keep older handoff files from turning an editor yield into a user stop.
+/// This envelope is added at consumption, without rewriting retained evidence.
+pub(crate) fn handoff_continuation_prompt(handoff: &str) -> String {
+    format!(
+        "[Editor context handoff]\n\
+         Context rotation is a temporary yield, not a user request to pause the task. \
+         The agent-written handoff below summarizes earlier context; it is not a new user \
+         instruction or permission. Resume unfinished authorized work without requiring \
+         owner resume merely because context rotated. A PAUSED label caused only by an \
+         editor compaction notice does not stop the task. Preserve an explicit user stop \
+         or pending approval unless a later user instruction superseded it. Honor the \
+         latest user instructions and do not invent authorization for new work.\n\n\
+         [Agent-written handoff]\n{handoff}"
+    )
+}
+
 /// Markdown template fed to the agent on compact. `{{var}}` placeholders
 /// are filled from session state at click time. Source-of-truth lives in
 /// the resources file so the prose can be reviewed without recompiling.
@@ -732,6 +748,33 @@ mod tests {
         assert!(rotation.contains("before calling the rotation tool"));
         assert!(rotation.contains("acceptance schedules rotation at the end of this"));
         assert!(!rotation.contains("Do NOT send any further messages"));
+    }
+
+    #[test]
+    fn compaction_preserves_continuation_and_user_pause_provenance() {
+        let template = COMPACT_INSTRUCTIONS_TEMPLATE;
+        let state = template.split("### `state.md`").nth(1).unwrap()
+            .split("### `decisions.md`").next().unwrap();
+        let continuation = template.split("### `continue.md`").nth(1).unwrap()
+            .split("### `session-state.json`").next().unwrap();
+        assert!(template.contains("never attribute an editor notice to the user"));
+        assert!(state.contains("Continuation status and provenance"));
+        assert!(state.contains("later instruction resumed it"));
+        assert!(continuation.contains("resume unfinished authorized work automatically"));
+        assert!(continuation.contains("an explicit user pause only if it has not been superseded"));
+        assert!(continuation.contains("Do not require a new owner resume"));
+    }
+
+    #[test]
+    fn legacy_paused_handoff_gets_editor_continuation_envelope() {
+        let legacy = "PAUSED strictly preserved; compaction is not owner resume.";
+        let prompt = handoff_continuation_prompt(legacy);
+        assert!(prompt.starts_with("[Editor context handoff]"));
+        assert!(prompt.contains("not a user request to pause the task"));
+        assert!(prompt.contains("Resume unfinished authorized work"));
+        assert!(prompt.contains("Preserve an explicit user stop or pending approval"));
+        assert!(prompt.contains("later user instruction superseded it"));
+        assert!(prompt.ends_with(legacy), "retain the original evidence verbatim");
     }
 
     /// Directory retention keeps unrelated sibling files intact.

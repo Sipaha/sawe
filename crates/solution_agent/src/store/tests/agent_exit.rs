@@ -35,7 +35,7 @@ fn exited_status() -> std::process::ExitStatus {
         .expect("probe exit status")
 }
 
-fn emit_process_exit(thread: &Entity<acp_thread::AcpThread>, cx: &mut gpui::App) {
+pub(crate) fn emit_process_exit(thread: &Entity<acp_thread::AcpThread>, cx: &mut gpui::App) {
     thread.update(cx, |thread, cx| {
         thread.emit_load_error(
             acp_thread::LoadError::Exited {
@@ -372,7 +372,10 @@ async fn check_process_exit_recovery(cx: &mut TestAppContext, late_error_after_r
     // The abandoned first turn never left a phantom user bubble unanswered:
     // message "one" sits in the transcript too (pushed optimistically at send
     // time), followed by the process-exit note.
-    drop(first_send);
+    assert!(
+        first_send.await.is_ok(),
+        "an obsolete send must not return a failure that compose would toast after recovery"
+    );
 }
 
 /// A process exit arriving at an ALREADY-cold session (a reconnect cold-ize

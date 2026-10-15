@@ -570,6 +570,15 @@ async fn a_refused_send_restores_the_draft_into_the_compose_box(cx: &mut gpui::T
 /// has no state-derived surface at all — is still visible.
 #[gpui::test]
 async fn a_consumed_turn_failure_does_not_restore_the_draft(cx: &mut gpui::TestAppContext) {
+    check_consumed_send_completion(cx, false).await;
+}
+
+#[gpui::test]
+async fn an_obsolete_consumed_send_does_not_raise_a_toast(cx: &mut gpui::TestAppContext) {
+    check_consumed_send_completion(cx, true).await;
+}
+
+async fn check_consumed_send_completion(cx: &mut gpui::TestAppContext, abandon_before_failure: bool) {
     use crate::store::SolutionAgentStore;
     use gpui::VisualTestContext;
 
@@ -634,7 +643,9 @@ async fn a_consumed_turn_failure_does_not_restore_the_draft(cx: &mut gpui::TestA
     // Now an ORDINARY turn failure: the prompt gate is closed, so
     // `MockConnection::prompt` resolves `Err` — but only AFTER `send_inner` has
     // already pushed the user message onto the thread.
-    prompt_tx.close();
+    if !abandon_before_failure {
+        prompt_tx.close();
+    }
     let draft = "an ordinary message whose turn fails";
     view_window
         .update(vcx, |view, window, cx| {
@@ -644,6 +655,26 @@ async fn a_consumed_turn_failure_does_not_restore_the_draft(cx: &mut gpui::TestA
         })
         .unwrap();
     vcx.run_until_parked();
+
+    if abandon_before_failure {
+        // Use the real process-exit event while compose awaits its send.
+        // Its note explains the interruption; the abandoned send must not add
+        // a raw lifecycle-error toast or restore the already consumed draft.
+        cx.update(|cx| {
+            let thread = session.read(cx).acp_thread().cloned().expect("live thread");
+            crate::store::tests::emit_process_exit(&thread, cx);
+        });
+        prompt_tx.close();
+        vcx.run_until_parked();
+        assert!(workspace_window.read_with(vcx, |workspace, _| {
+            workspace.notification_ids().is_empty()
+        }).unwrap(), "an obsolete completion must not create a notification");
+        view_window.update(vcx, |view, _, cx| {
+            assert_eq!(view.compose_editor_for_test().read(cx).text(cx), "");
+        }).unwrap();
+        assert!(session.read_with(vcx, |s, _| matches!(s.state, crate::model::SessionState::Idle)));
+        return;
+    }
 
     cx.update(|cx| {
         session.read_with(cx, |s, _| {

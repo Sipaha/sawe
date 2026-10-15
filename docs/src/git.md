@@ -43,6 +43,11 @@ In the panel you can see the state of your project at a glance: which repository
 
 Zed monitors your repository so that changes you make on the command line are instantly reflected.
 
+The commit message toolbar keeps history and AI generation beside the commit
+actions. Narrow panels wrap the controls onto adjacent rows without spreading
+them across the editor. Drag the top edge of the message editor to resize it;
+double-click the edge to restore its automatic height.
+
 ### Configuration
 
 Open the Settings Editor (`Cmd+,` on macOS, `Ctrl+,` on Linux/Windows) to customize Git behavior. Settings are spread across two pages:

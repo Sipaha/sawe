@@ -260,6 +260,7 @@ impl McpServerTool for CompactSessionTool {
             .ok_or_else(|| anyhow!("prompt_file has no parent directory"))?
             .to_path_buf();
         validate_handoff_files(&compact_dir)?;
+        let prompt_text = crate::compact::handoff_continuation_prompt(&prompt_text);
 
         // Append the agent's own `state.md` summary to the cumulative session
         // log (`.agents/<sid>/session-log.md`) BEFORE rotating, so the operator

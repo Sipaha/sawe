@@ -6049,6 +6049,7 @@ impl GitPanel {
                     .child(
                         v_flex()
                             .id("commit-footer")
+                            .debug_selector(|| "COMMIT-TOOLBAR".into())
                             .border_t_1()
                             .when(editor_is_long, |el| {
                                 el.border_color(cx.theme().colors().border_variant)
@@ -6060,29 +6061,31 @@ impl GitPanel {
                             .px_2()
                             .h(footer_size)
                             .flex_none()
-                            .justify_between()
+                            .justify_end()
+                            .pb_1()
                             .child(
                                 h_flex()
                                     .w_full()
-                                    .justify_between()
+                                    .flex_wrap()
+                                    .gap_1()
                                     .child(
                                         h_flex()
+                                            .debug_selector(|| "COMMIT-TOOLBAR-CONTROLS".into())
+                                            .flex_none()
                                             .gap_1()
                                             .child(self.render_commit_history_button(cx))
-                                            .child(
-                                                self.render_generate_commit_message_button(cx)
-                                                    .unwrap_or_else(|| div().into_any_element()),
-                                            ),
+                                            .children(self.render_generate_commit_message_button(cx))
+                                            .children(enable_coauthors),
                                     )
-                                    .children(enable_coauthors),
-                            )
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .justify_end()
-                                    .gap_1()
-                                    .child(self.render_commit_and_push_button(cx))
-                                    .child(self.render_commit_button(cx)),
+                                    .child(
+                                        h_flex()
+                                            .debug_selector(|| "COMMIT-TOOLBAR-ACTIONS".into())
+                                            .flex_none()
+                                            .ml_auto()
+                                            .gap_1()
+                                            .child(self.render_commit_and_push_button(cx))
+                                            .child(self.render_commit_button(cx)),
+                                    ),
                             ),
                     )
                     .child(
@@ -11246,6 +11249,43 @@ mod tests {
                 "Subject\n\nFull body α"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_commit_toolbar_icons_share_action_row_and_wrap_at_narrow_width(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, _, mut cx) = commit_tab_fixture(cx).await;
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.upgrade().unwrap());
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        for width in [px(450.), px(250.), px(600.)] {
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                assert!(workspace.set_panel_size_state::<GitPanel>(
+                    workspace::dock::PanelSizeState { size: Some(width), flex: None },
+                    window,
+                    cx,
+                ));
+            });
+            cx.run_until_parked();
+            let controls = cx.debug_bounds("COMMIT-TOOLBAR-CONTROLS").unwrap();
+            let actions = cx.debug_bounds("COMMIT-TOOLBAR-ACTIONS").unwrap();
+            let footer = cx.debug_bounds("COMMIT-TOOLBAR").unwrap();
+            assert!(controls.left() >= footer.left() && controls.right() <= footer.right(),
+                "controls must fit: {controls:?}, footer={footer:?}");
+            assert!(actions.left() >= footer.left() && actions.right() <= footer.right(),
+                "actions must fit: {actions:?}, footer={footer:?}");
+            assert!(actions.bottom() <= footer.bottom() && controls.bottom() <= footer.bottom());
+            if width >= px(450.) {
+                assert!((controls.center().y - actions.center().y).abs() <= px(1.),
+                    "icons and commit actions must share a row: {controls:?}, {actions:?}");
+            } else {
+                assert!(controls.bottom() <= actions.top(), "narrow toolbar must wrap without overlap");
+            }
+        }
     }
 
     #[gpui::test]

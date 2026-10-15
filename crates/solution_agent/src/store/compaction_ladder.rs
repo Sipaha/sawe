@@ -441,8 +441,8 @@ impl SolutionAgentStore {
         let instruction = if again {
             "Keep working normally on the phase that was already active when the first notice \
              arrived. This notice does not change or shorten that phase. At its next natural \
-             boundary — after the active phase and its verification are fully complete — pause \
-             before beginning another phase or independent task. Do not call a compaction tool \
+             boundary — after the active phase and its verification are fully complete — end this turn \
+             to yield for context rotation before beginning the next phase. Do not call a compaction tool \
              because of this notice. The editor will start the handoff when the current turn \
              ends. If the same phase is still active at the next check, the editor will force \
              the handoff as the final escalation."
@@ -450,7 +450,7 @@ impl SolutionAgentStore {
             "This is an early signal, not a request to stop the current work. Keep working \
              normally on the phase already in progress; this notice does not change or shorten \
              it. At the next natural boundary — after the active phase and its verification are \
-             fully complete — pause before beginning another phase or independent task. Keep \
+             fully complete — end this turn to yield for context rotation before beginning the next phase. Keep \
              waiting for and integrating work already underway when that belongs to the active \
              phase. Do not call a compaction tool because of this notice; the editor will start \
              the handoff when the current turn ends."
@@ -458,8 +458,8 @@ impl SolutionAgentStore {
         let instruction = if again && !user {
             "Keep working normally on the phase that was already active when the first notice \
              arrived. This notice does not change or shorten that phase. At its next natural \
-             boundary — after the active phase and its verification are fully complete — pause \
-             before beginning another phase or independent task. Do not call a compaction tool \
+             boundary — after the active phase and its verification are fully complete — end this turn \
+             to yield for context rotation before beginning the next phase. Do not call a compaction tool \
              because of this notice. The editor will start the handoff when the current turn \
              ends. While work remains active, automatic forced handoff requires at least 80% \
              context usage; elapsed time alone will not force it. Until then, the editor may \
@@ -468,7 +468,12 @@ impl SolutionAgentStore {
             instruction
         };
         let mut message = format!(
-            "{opening} {instruction} At that boundary, give the user a substantive work \
+            "{opening} {instruction} This is a temporary context handoff, not a user request to \
+             pause the task or revoke existing authorization. Record unfinished authorized \
+             work as still in progress, not PAUSED or awaiting owner resume. After rotation, \
+             continue that work without asking for permission again. Preserve a task pause \
+             only when the user explicitly requested it and has not subsequently resumed it. \
+             At that boundary, give the user a substantive work \
              report in their language: what was accomplished, what was verified and its \
              limits, delivery status where relevant, remaining work, and exactly where \
              work stopped. Preserve that report in the handoff so the resumed context \

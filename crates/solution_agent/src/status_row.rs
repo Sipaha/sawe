@@ -503,13 +503,13 @@ pub(crate) fn render_status_row(
         "Conversation is short — compact later".into()
     } else if let Some(asks) = handoff_asks {
         format!(
-            "Handoff requested — the agent was signalled {asks} of 2 times to stop before its \
-             next phase. \
+            "Handoff requested — the agent was signalled {asks} of 2 times to yield for \
+             context rotation, then continue. \
              Compact again to send the compaction now"
         )
         .into()
     } else if is_running {
-        "Notify the agent to pause before its next phase; two notices, then compaction"
+        "Notify the agent to yield for context rotation at a phase boundary, then continue"
             .into()
     } else if compact_warning {
         "Context is filling up — compact recommended".into()
