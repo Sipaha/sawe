@@ -168,8 +168,20 @@ fn preview_content(path: &Path, label: &str) -> crate::preview_window::PreviewCo
         path: path.to_path_buf(),
         details: file_details(path).into(),
     };
+    if let Some(format) = image_format(path) {
+        return match std::fs::read(path) {
+            Ok(bytes) => crate::preview_window::PreviewContent::Image(std::sync::Arc::new(
+                gpui::Image::from_bytes(format, bytes),
+            )),
+            Err(err) => crate::preview_window::PreviewContent::FileInfo {
+                title: label.to_string().into(),
+                path: path.to_path_buf(),
+                details: format!("Could not read image: {err}\n\n{}", file_details(path)).into(),
+            },
+        };
+    }
     // Formats that can begin with ASCII (PDF, archives, media, executables) are not text documents.
-    if image_format(path).is_some() || is_binary_extension(path) {
+    if is_binary_extension(path) {
         return file_info();
     }
     let body = match read_text_preview(path) {
@@ -512,15 +524,15 @@ mod tests {
     #[test]
     fn non_text_file_links_show_metadata_while_text_stays_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let png = dir.path().join("shot.PNG");
-        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").expect("write png");
+        let binary = dir.path().join("archive.zip");
+        std::fs::write(&binary, b"PK\0payload").expect("write binary");
         let log = dir.path().join("run.log");
         std::fs::write(&log, "plain text").expect("write log");
 
-        match preview_content(&png, "shot.PNG") {
+        match preview_content(&binary, "archive.zip") {
             crate::preview_window::PreviewContent::FileInfo { path, details, .. } => {
-                assert_eq!(path, png);
-                assert!(details.contains("Size: 8 bytes"));
+                assert_eq!(path, binary);
+                assert!(details.contains("Size: 10 bytes"));
             }
             _ => panic!("a non-text link must show file information"),
         }
@@ -528,6 +540,45 @@ mod tests {
             preview_content(&log, "run.log"),
             crate::preview_window::PreviewContent::Text { .. }
         ));
+    }
+
+    #[test]
+    fn linked_images_open_as_images_without_text_clipping() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, format) in [
+            ("shot.PNG", gpui::ImageFormat::Png),
+            ("photo.jpeg", gpui::ImageFormat::Jpeg),
+            ("drawing.svg", gpui::ImageFormat::Svg),
+            ("animation.gif", gpui::ImageFormat::Gif),
+        ] {
+            let path = dir.path().join(name);
+            let bytes = vec![42; MAX_PREVIEW_BYTES + 100];
+            std::fs::write(&path, &bytes).unwrap();
+            match preview_content(&path, name) {
+                crate::preview_window::PreviewContent::Image(image) => {
+                    assert_eq!(image.format(), format);
+                    assert_eq!(image.bytes(), bytes);
+                }
+                _ => panic!("{name} must use the image renderer"),
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_image_keeps_file_actions_and_explains_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.png");
+        match preview_content(&path, "missing.png") {
+            crate::preview_window::PreviewContent::FileInfo {
+                path: actual,
+                details,
+                ..
+            } => {
+                assert_eq!(actual, path);
+                assert!(details.contains("Could not read image:"));
+            }
+            _ => panic!("an unreadable image must explain the failure"),
+        }
     }
 
     #[test]

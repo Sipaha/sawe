@@ -222,7 +222,8 @@ impl Render for PreviewWindow {
 
         let body: AnyElement = match (&self.content, &self.editor) {
             (PreviewContent::FileInfo { path, details, .. }, _) => {
-                let path = path.clone();
+                let reveal_path = path.clone();
+                let open_path = path.clone();
                 v_flex()
                     .id("preview-file-info")
                     .debug_selector(|| "PREVIEW-FILE-INFO".into())
@@ -239,9 +240,26 @@ impl Render for PreviewWindow {
                             .child(Label::new(details.clone())),
                     )
                     .child(
-                        ui::Button::new("preview-reveal-file", "Open in File Manager")
-                            .end_icon(Icon::new(IconName::Folder))
-                            .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                        h_flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                div().debug_selector(|| "PREVIEW-REVEAL-FILE".into()).child(
+                                    ui::Button::new("preview-reveal-file", "Open in File Manager")
+                                        .end_icon(Icon::new(IconName::Folder))
+                                        .on_click(move |_, _, cx| cx.reveal_path(&reveal_path)),
+                                ),
+                            )
+                            .child(
+                                div().debug_selector(|| "PREVIEW-OPEN-FILE".into()).child(
+                                    ui::Button::new(
+                                        "preview-open-file",
+                                        "Open in Default Application",
+                                    )
+                                    .end_icon(Icon::new(IconName::ArrowUpRight))
+                                    .on_click(move |_, _, cx| cx.open_with_system(&open_path)),
+                                ),
+                            ),
                     )
                     .into_any_element()
             }
@@ -428,6 +446,39 @@ mod tests {
             cx.debug_bounds("PREVIEW-FILE-INFO").is_some(),
             "file information must be painted inside the modal"
         );
+        assert!(cx.debug_bounds("PREVIEW-REVEAL-FILE").is_some());
+        assert!(cx.debug_bounds("PREVIEW-OPEN-FILE").is_some());
+        let png = dir.path().join("image.PNG");
+        std::fs::write(
+            &png,
+            include_bytes!("../../gpui/examples/image/app-icon.png"),
+        )
+        .unwrap();
+        workspace.update_in(cx, |_, window, cx| {
+            crate::conversation_render::link::open_link_within_preview(
+                "image.PNG",
+                &[dir.path().into()],
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let preview = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<PreviewWindow>(cx).unwrap()
+        });
+        let image = preview.read_with(cx, |preview, _| match &preview.content {
+            PreviewContent::Image(image) => image.clone(),
+            _ => panic!("a document image link must retarget the modal to an image"),
+        });
+        image
+            .to_image_data(gpui::SvgRenderer::new(Arc::new(())))
+            .expect("linked PNG must decode");
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("PREVIEW-FILE-INFO").is_none());
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), count);
     }
     #[gpui::test]
     async fn modal_markdown_preview_respects_preview_font_size(cx: &mut TestAppContext) {

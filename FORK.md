@@ -4847,7 +4847,7 @@ October9 user instruction replaces the former global floating preview window wit
 
 Keep the existing PreviewWindow/PreviewWindow > Editor key contexts: the latter ensures Escape in a read-only editor dismisses the modal. Tool previews still open only from their content-sized title target, avoiding accidental clicks on the command body.
 
-Non-text file links show metadata and an **Open in File Manager** action using the platform's reveal_path. The card includes name/path/type/exact bytes, available timestamps/read-only state, symlink/resolved target and Unix permissions/owner/group/inode/link count. Recognized binary formats and image links never open as raw text. Unknown files require valid UTF-8 without binary control bytes; preview reads are bounded to512KiB plus a UTF-8 boundary margin before clipping, so a huge linked log/archive is not read in full. Embedded conversation images retain visual preview.
+Non-text file links show metadata and **Open in File Manager** / **Open in Default Application** actions using the platform's `reveal_path` / `open_with_system`. The card includes name/path/type/exact bytes, available timestamps/read-only state, symlink/resolved target and Unix permissions/owner/group/inode/link count. Recognized binary formats never open as raw text. Linked images (including PNG) use the same visual preview as embedded conversation images; image bytes are not passed through the text preview limit. Unknown files require valid UTF-8 without binary control bytes; preview reads are bounded to512KiB plus a UTF-8 boundary margin before clipping, so a huge linked log/archive is not read in full. Embedded conversation images retain visual preview.
 
 ### 187. The agent composer is sized by the panel, not by the code font
 
@@ -4900,7 +4900,7 @@ tried against **every** worktree root in turn rather than assumed to live under
 the first. A path that resolves nowhere stays dead: opening the wrong file is
 worse than opening none.
 
-A resolved file opens in the **shared in-editor preview modal** (decision #186), keeping the editor's tabs intact. Markdown renders as a document; other UTF-8 text uses a read-only editor with soft wrap and a scrollbar. Reads are bounded before clipping at512KiB on a character boundary. Non-text files, including linked images, show metadata and a file-manager reveal action; embedded chat images keep visual preview.
+A resolved file opens in the **shared in-editor preview modal** (decision #186), keeping the editor's tabs intact. Markdown renders as a document; other UTF-8 text uses a read-only editor with soft wrap and a scrollbar. Reads are bounded before clipping at512KiB on a character boundary. Linked images use visual preview. Other non-text files show metadata, a file-manager reveal action and an action to open the file in the OS default application.
 
 `render_span` carries a weak handle rather than a precomputed list of roots: a
 relative link is resolved against the project **as it stands when clicked**, not
