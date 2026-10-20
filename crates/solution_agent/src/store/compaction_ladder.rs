@@ -6,7 +6,8 @@
 //! no new work should start, repeat the signal after [`COMPACT_ESCALATION_SECS`],
 //! then send the prompt for a manual request. Automatic requests can force an
 //! active turn only at 80% context usage; below that, elapsed time only permits
-//! a notice every thirty minutes. Both paths can hand off at a successful turn boundary.
+//! a notice every thirty minutes. Automatic boundary handoff waits for fifty
+//! seconds of idle time after successful completion, allowing follow-up input.
 //! The same ladder serves auto-compaction and the user's Compact button
 //! ([`HandoffAsker`]). The rungs are counted per CONTEXT (reset on rotation) and
 //! advanced on the editor's own clock by `tick_supervisor`: nobody re-clicks a
@@ -22,6 +23,7 @@ use crate::supervisor::{COMPACT_ESCALATION_SECS, CompactStep};
 /// Automatic notices repeat while work continues; they never consume a
 /// finite escalation budget or force a handoff because time elapsed.
 const AUTO_COMPACT_REMINDER_SECS: i64 = 30 * 60;
+const AUTO_COMPACT_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(50);
 
 /// What the caller of [`SolutionAgentStore::request_handoff`] still has to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,7 @@ impl SolutionAgentStore {
                 session.handoff_ladder = Some(HandoffLadder {
                     asker: HandoffAsker::Auto,
                     end_turn_observed: false,
+                    auto_idle_since: None,
                     asks: 1,
                     last_ask_ms: Some(chrono::Utc::now().timestamp_millis()),
                     last_force_ms: None,
@@ -165,6 +168,7 @@ impl SolutionAgentStore {
                     s.handoff_ladder = Some(HandoffLadder {
                         asker,
                         end_turn_observed: false,
+                        auto_idle_since: None,
                         asks: 0,
                         last_ask_ms: None,
                         last_force_ms: None,
@@ -258,6 +262,11 @@ impl SolutionAgentStore {
         {
             return false;
         }
+        let auto_idle_ready = ladder.asker != HandoffAsker::Auto
+            || self.automatic_idle_handoff_ready(id, cx);
+        if ladder.asker == HandoffAsker::Auto && !busy && !auto_force_due && !auto_idle_ready {
+            return false;
+        }
         let step = if !busy || auto_force_due {
             CompactStep::Force
         } else if ladder.asker == HandoffAsker::Auto {
@@ -329,6 +338,37 @@ impl SolutionAgentStore {
         }
     }
 
+    fn automatic_idle_handoff_ready(
+        &mut self,
+        id: SolutionSessionId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.session(id) else {
+            return false;
+        };
+        let blocked = self.main_turn_in_flight(id, cx)
+            || {
+                let s = session.read(cx);
+                matches!(s.state, crate::model::SessionState::Running { .. })
+                    || s.has_live_background_work(chrono::Utc::now())
+                    || s.pending_messages.iter().any(|bundle| {
+                        matches!(bundle.target, crate::model::QueueTarget::Main)
+                    })
+            };
+        let now = cx.background_executor().now();
+        session.update(cx, |s, _| {
+            let Some(ladder) = s.handoff_ladder.as_mut() else {
+                return false;
+            };
+            if blocked || !ladder.end_turn_observed {
+                ladder.auto_idle_since = None;
+                return false;
+            }
+            let since = ladder.auto_idle_since.get_or_insert(now);
+            now.saturating_duration_since(*since) >= AUTO_COMPACT_IDLE_GRACE
+        })
+    }
+
     /// The ladder's last rung: send the compaction prompt on the asker's behalf.
     ///
     /// Deferred: `start_compact_for_session` re-acquires the global store and
@@ -351,7 +391,7 @@ impl SolutionAgentStore {
                 if store.cancel_short_automatic_handoff(id, cx) {
                     return false;
                 }
-                store.session(id).is_some_and(|session| {
+                let same_request = store.session(id).is_some_and(|session| {
                     session
                         .read(cx)
                         .handoff_ladder
@@ -360,7 +400,27 @@ impl SolutionAgentStore {
                             current.asker == ladder.asker
                                 && current.last_force_ms == ladder.last_force_ms
                         })
-                })
+                });
+                if !same_request {
+                    return false;
+                }
+                if ladder.asker == HandoffAsker::Auto {
+                    let force_due = store.session(id).is_some_and(|session| {
+                        crate::model::session_context_usage(session.read(cx), cx)
+                            .is_some_and(|(used, max)| max > 0 && (used as u128) * 100 >= (max as u128) * 80)
+                    });
+                    if !force_due && !store.automatic_idle_handoff_ready(id, cx) {
+                        if let Some(session) = store.session(id) {
+                            session.update(cx, |s, _| {
+                                if let Some(current) = s.handoff_ladder.as_mut() {
+                                    current.last_force_ms = None;
+                                }
+                            });
+                        }
+                        return false;
+                    }
+                }
+                true
             });
             if !current {
                 return;
@@ -402,7 +462,7 @@ impl SolutionAgentStore {
     /// ask the agent to compact itself: that instruction made the notice
     /// interrupt the active task by causing the agent to abandon the rest of
     /// its work and start a handoff. The editor owns the handoff and starts it
-    /// naturally when the turn ends. Automatic force requires 80% context
+    /// after an idle grace period when the turn ends. Automatic force requires 80% context
     /// usage; only manual requests can force after the notices expire.
     pub(crate) fn compaction_request_message(
         &self,
@@ -443,7 +503,7 @@ impl SolutionAgentStore {
              arrived. This notice does not change or shorten that phase. At its next natural \
              boundary — after the active phase and its verification are fully complete — end this turn \
              to yield for context rotation before beginning the next phase. Do not call a compaction tool \
-             because of this notice. The editor will start the handoff when the current turn \
+             because of this notice. The editor will schedule the handoff after the current turn \
              ends. If the same phase is still active at the next check, the editor will force \
              the handoff as the final escalation."
         } else {
@@ -452,23 +512,30 @@ impl SolutionAgentStore {
              it. At the next natural boundary — after the active phase and its verification are \
              fully complete — end this turn to yield for context rotation before beginning the next phase. Keep \
              waiting for and integrating work already underway when that belongs to the active \
-             phase. Do not call a compaction tool because of this notice; the editor will start \
-             the handoff when the current turn ends."
+             phase. Do not call a compaction tool because of this notice; the editor will schedule \
+             the handoff after the current turn ends."
         };
         let instruction = if again && !user {
             "Keep working normally on the phase that was already active when the first notice \
              arrived. This notice does not change or shorten that phase. At its next natural \
              boundary — after the active phase and its verification are fully complete — end this turn \
              to yield for context rotation before beginning the next phase. Do not call a compaction tool \
-             because of this notice. The editor will start the handoff when the current turn \
+             because of this notice. The editor will schedule the handoff after the current turn \
              ends. While work remains active, automatic forced handoff requires at least 80% \
              context usage; elapsed time alone will not force it. Until then, the editor may \
              repeat this reminder every thirty minutes."
         } else {
             instruction
         };
+        let idle_grace = if user {
+            ""
+        } else {
+            " After this turn ends successfully, the editor waits for 50 seconds of idle time \
+             before starting automatic handoff. Continued work, queued follow-ups or typing \
+             reset that idle window. Do not wait out the timer yourself or call a compaction tool."
+        };
         let mut message = format!(
-            "{opening} {instruction} This is a temporary context handoff, not a user request to \
+            "{opening} {instruction}{idle_grace} This is a temporary context handoff, not a user request to \
              pause the task or revoke existing authorization. Record unfinished authorized \
              work as still in progress, not PAUSED or awaiting owner resume. After rotation, \
              continue that work without asking for permission again. Preserve a task pause \

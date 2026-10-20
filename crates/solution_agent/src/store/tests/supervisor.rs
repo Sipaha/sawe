@@ -1097,7 +1097,7 @@ async fn typing_defers_supervisor_tick(cx: &mut gpui::TestAppContext) {
         });
         store.set_supervision_enabled(id, true, cx);
         // The user is mid-message: a keystroke just landed.
-        store.note_user_input(id);
+        store.note_user_input(id, cx);
     });
 
     store.update(cx, |store, cx| store.tick_supervisor(cx));
@@ -1159,7 +1159,7 @@ async fn observer_nudge_held_while_typing_then_flushed(cx: &mut gpui::TestAppCon
             },
         );
         // The user starts typing WHILE the judge is running.
-        store.note_user_input(id);
+        store.note_user_input(id, cx);
         // The judge delivers a Continue verdict — but the user is mid-message.
         store.apply_verdict(
             id,
@@ -1314,7 +1314,7 @@ async fn verdict_nonce_authenticates_and_dedups(cx: &mut gpui::TestAppContext) {
         );
         // Park the delivered nudge (user "typing") so the accepted verdict bumps
         // the counter without needing a live thread to deliver into.
-        store.note_user_input(id);
+        store.note_user_input(id, cx);
 
         // Wrong nonce → rejected, no state change, judge still in flight.
         let bad = store.apply_verdict_authenticated(
@@ -3743,6 +3743,7 @@ async fn no_judge_fires_while_the_context_is_being_handed_off(cx: &mut gpui::Tes
         let ladder = |asker| crate::model::HandoffLadder {
             asker,
             end_turn_observed: false,
+            auto_idle_since: None,
             asks: 1,
             last_ask_ms: Some(chrono::Utc::now().timestamp_millis()),
             last_force_ms: Some(chrono::Utc::now().timestamp_millis()),

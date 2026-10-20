@@ -19,6 +19,17 @@ You can keep multiple sessions in a Solution and switch their tabs without
 changing the active member project. The adjacent utility area hosts terminals,
 Git history, or the debugger.
 
+## Automatic context handoff {#automatic-context-handoff}
+
+When a session crosses its automatic compaction threshold, Sawe first notifies
+the agent to finish its current phase. After a successful answer, it waits for
+at least **50 seconds of idle time** before starting the handoff. Continuing the
+conversation or typing resets this window, as does ongoing background work.
+The check runs periodically, so the actual wait can be slightly longer.
+
+At 80% context usage, Sawe can still force an automatic handoff during active
+work. Explicit manual compaction does not use the 50-second idle delay.
+
 ## Conversation previews {#conversation-previews}
 
 Click a local file link in a conversation to preview it inside the current

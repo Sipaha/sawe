@@ -6347,8 +6347,8 @@ How to apply:
 ### Codex overload recovery and automatic handoff boundary (2026-10-08)
 
 A main-turn failure is not the natural phase boundary promised by the 40%
-notice. Automatic idle handoff requires an observed main EndTurn; new main
-input and failures invalidate that proof. A failed main turn stays parked even
+notice. Automatic idle handoff requires an observed main EndTurn followed by 50 seconds
+of continuous idle time; new main input and failures invalidate that proof. A failed main turn stays parked even
 when background activity labels the session Running. Explicit user requests
 and manual compaction keeps its two 15-minute escalation windows. Automatic
 requests repeat the early notice every 30 minutes while work continues, but cannot force an active
@@ -6414,3 +6414,17 @@ Codex can compact inside the same thread without changing Sawe's `context_count`
 ### 232. Compaction preserves and restores the user-facing work report
 
 A technical handoff acknowledgement obscured the substantive result when the user returned after automatic compaction. The shared handoff notices now request a work report at the natural boundary. The compaction template stores that report in the existing `state.md`, makes it visible before rotation, and requires `continue.md` to restore outcome, verification limits, delivery status, remaining work and stopping point in the user's language. Completed/paused boundaries retain their final report; ongoing work gets a recap and continues only within existing authorization. Compaction never invents completion or authorizes a new phase. No handoff schema or runtime/provider policy changed. Tool acceptance is distinguished from actual rotation: in-place adapters defer until turn end, others can rotate immediately. Related: [report preservation finding](docs/findings/2026-10-12-compaction-work-report.md).
+
+
+### 233. Automatic boundary compaction allows fifty seconds for continuation
+
+After the context threshold arms an automatic handoff, a successful main turn no
+longer rotates on the next five-second tick. The editor waits for at least 50
+seconds of continuous idle time. New main work, queued main messages, tracked
+background work and compose edits reset the transient monotonic timer. Compose
+edits reset it even when supervision is disabled. Recheck idle readiness at
+deferred dispatch; a cancelled dispatch must not leave the force-retry backoff
+armed. Explicit manual compaction remains immediate when idle, and the existing
+80% automatic active-force threshold is unchanged. Failed/aborted turns still do
+not establish a successful boundary. Automatic notices explain the grace period;
+the editor owns the timer, so the agent must not sleep or compact itself.

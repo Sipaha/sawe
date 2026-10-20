@@ -397,6 +397,8 @@ pub(crate) struct HandoffLadder {
     /// An idle automatic handoff requires a successful main-turn EndTurn.
     /// A failed/aborted transport is not the user's natural work boundary.
     pub end_turn_observed: bool,
+    /// Continuous idle time after successful completion; renewed work clears it.
+    pub auto_idle_since: Option<Instant>,
     /// How many early signals the agent has received so far.
     pub asks: u32,
     pub last_ask_ms: Option<i64>,

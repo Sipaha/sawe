@@ -1603,7 +1603,14 @@ impl SolutionAgentStore {
     /// watchdog treats the session as active for another `IDLE_THRESHOLD_SECS`
     /// and never fires a nudge while the user is mid-message. Cheap + frequent
     /// (one per keystroke burst): in-memory only, no persist, no event.
-    pub(crate) fn note_user_input(&mut self, id: SolutionSessionId) {
+    pub(crate) fn note_user_input(&mut self, id: SolutionSessionId, cx: &mut Context<Self>) {
+        if let Some(session) = self.session(id) {
+            session.update(cx, |s, _| {
+                if let Some(ladder) = s.handoff_ladder.as_mut() {
+                    ladder.auto_idle_since = None;
+                }
+            });
+        }
         if let Some(state) = self.supervisor_states.get_mut(&id)
             && state.enabled
         {

@@ -223,7 +223,7 @@ impl SolutionSessionView {
                 if matches!(event, editor::EditorEvent::BufferEdited) {
                     let id = this.session_id;
                     if let Some(store) = SolutionAgentStore::try_global(cx) {
-                        store.update(cx, |store, _| store.note_user_input(id));
+                        store.update(cx, |store, cx| store.note_user_input(id, cx));
                     }
                 }
             });

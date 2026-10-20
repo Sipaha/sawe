@@ -325,6 +325,7 @@ async fn auto_compaction_asks_when_the_context_crosses_the_threshold(cx: &mut Te
     );
     let texts = queued_texts(session_id, cx);
     assert_work_report_requested(&texts);
+    assert!(texts.iter().any(|t| t.contains("50 seconds of idle time")));
     assert!(
         texts.iter().any(|t| t.starts_with("Your context is 41% full.")
             && t.contains("Keep working normally on the phase already in progress")
@@ -394,6 +395,148 @@ async fn automatic_handoff_follows_a_successful_end_turn(cx: &mut TestAppContext
     gate.send(()).await.unwrap();
     cx.executor().run_until_parked();
     assert!(handoff(session_id, cx).unwrap().end_turn_observed);
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0);
+    cx.executor().advance_clock(std::time::Duration::from_secs(49));
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0, "49 seconds is still the continuation window");
+    cx.executor().advance_clock(std::time::Duration::from_secs(1));
+    tick(cx);
+    assert!(compaction_state(session_id, cx).0);
+}
+
+#[gpui::test]
+async fn resumed_work_requires_a_new_fifty_second_idle_window(cx: &mut TestAppContext) {
+    let (session_id, thread, gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    gate.send(()).await.unwrap();
+    cx.executor().run_until_parked();
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(49));
+    start_turn(session_id, cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(60));
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0, "continued work must not inherit the old deadline");
+    gate.send(()).await.unwrap();
+    cx.executor().run_until_parked();
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(49));
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0);
+    cx.executor().advance_clock(std::time::Duration::from_secs(1));
+    tick(cx);
+    assert!(compaction_state(session_id, cx).0);
+}
+
+#[gpui::test]
+async fn typing_cancels_even_a_deferred_idle_handoff_without_supervision(cx: &mut TestAppContext) {
+    let (session_id, thread, gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    gate.send(()).await.unwrap();
+    cx.executor().run_until_parked();
+    tick(cx);
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let now = cx.background_executor().now();
+            store.session(session_id).unwrap().update(cx, |s, _| {
+                s.handoff_ladder.as_mut().unwrap().auto_idle_since =
+                    Some(now - std::time::Duration::from_secs(50));
+            });
+            assert!(!store.supervisor_state(session_id).is_some_and(|s| s.enabled));
+            store.tick_context_handoffs(cx);
+            store.note_user_input(session_id, cx);
+        });
+    });
+    cx.executor().run_until_parked();
+    assert!(!compaction_state(session_id, cx).0, "typing wins before deferred dispatch");
+    assert!(handoff(session_id, cx).unwrap().last_force_ms.is_none(), "cancelled dispatch must not impose the force retry backoff");
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(49));
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0);
+    cx.executor().advance_clock(std::time::Duration::from_secs(1));
+    tick(cx);
+    assert!(compaction_state(session_id, cx).0);
+}
+
+#[gpui::test]
+async fn queued_continuation_defers_idle_compaction(cx: &mut TestAppContext) {
+    let (session_id, thread, gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    gate.send(()).await.unwrap();
+    cx.executor().run_until_parked();
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(49));
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read(cx).session(session_id).unwrap().update(cx, |s, _| {
+            s.pending_messages.push_back(crate::model::PendingBundle {
+                id: uuid::Uuid::new_v4(),
+                origin: crate::model::MessageOrigin::User,
+                target: crate::model::QueueTarget::Main,
+                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new("continue"))],
+            });
+        });
+    });
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(60));
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0);
+    deliver_queue(session_id, cx);
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(50));
+    tick(cx);
+    assert!(compaction_state(session_id, cx).0);
+}
+
+#[gpui::test]
+async fn background_work_restarts_the_idle_grace(cx: &mut TestAppContext) {
+    let (session_id, thread, gate, tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    deliver_queue(session_id, cx);
+    gate.send(()).await.unwrap();
+    cx.executor().run_until_parked();
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(49));
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read(cx).session(session_id).unwrap().update(cx, |s, _| {
+            let id = crate::background_shell::BackgroundShellId::new("idle-grace");
+            s.background_shells.insert(id.clone(), crate::background_shell::BackgroundShell {
+                id,
+                command: "fixture".into(),
+                output_path: tmp.path().join("fixture.output"),
+                registered_at: chrono::Utc::now(),
+                latest: None,
+                last_offset: 0,
+                state: crate::background_shell::ShellRuntimeState::Running,
+            });
+        });
+    });
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(60));
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0);
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        store.read(cx).session(session_id).unwrap().update(cx, |s, _| s.background_shells.clear());
+    });
+    tick(cx);
+    cx.executor().advance_clock(std::time::Duration::from_secs(49));
+    tick(cx);
+    assert!(!compaction_state(session_id, cx).0);
+    cx.executor().advance_clock(std::time::Duration::from_secs(1));
     tick(cx);
     assert!(compaction_state(session_id, cx).0);
 }

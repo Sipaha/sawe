@@ -26,6 +26,7 @@ impl SolutionAgentStore {
                 session_entity.update(cx, |s, _| {
                     if let Some(ladder) = s.handoff_ladder.as_mut() {
                         ladder.end_turn_observed = false;
+                        ladder.auto_idle_since = None;
                     }
                     if !matches!(s.state, SessionState::Stopping { .. }) {
                         // A distinct anchor also prevents the old prompt future's
@@ -70,7 +71,12 @@ impl SolutionAgentStore {
                         cx,
                     );
                     if let Some(s) = self.sessions.get(&session_id).cloned() {
-                        s.update(cx, |s, _| s.last_activity_at = Utc::now());
+                        s.update(cx, |s, _| {
+                            s.last_activity_at = Utc::now();
+                            if let Some(ladder) = s.handoff_ladder.as_mut() {
+                                ladder.auto_idle_since = None;
+                            }
+                        });
                     }
                     // Genuinely-new agent activity (NOT a system note) on a
                     // session parked in `WaitingUser`/`Stopped(Done)` means it
@@ -216,6 +222,7 @@ impl SolutionAgentStore {
                 session_entity.update(cx, |s, _| {
                     if let Some(ladder) = s.handoff_ladder.as_mut() {
                         ladder.end_turn_observed = matches!(stop_reason, acp::StopReason::EndTurn);
+                        ladder.auto_idle_since = None;
                     }
                 });
                 // Not every `Stopped` proves a round trip to the model
@@ -538,6 +545,7 @@ impl SolutionAgentStore {
                 session_entity.update(cx, |s, _| {
                     if let Some(ladder) = s.handoff_ladder.as_mut() {
                         ladder.end_turn_observed = false;
+                        ladder.auto_idle_since = None;
                     }
                 });
                 // Symmetric with the `Stopped` arm: flush any pending end-of-turn
@@ -598,6 +606,7 @@ impl SolutionAgentStore {
                 session_entity.update(cx, |s, _| {
                     if let Some(ladder) = s.handoff_ladder.as_mut() {
                         ladder.end_turn_observed = false;
+                        ladder.auto_idle_since = None;
                     }
                 });
                 // No wall-classification here (a stale prior wall in the
