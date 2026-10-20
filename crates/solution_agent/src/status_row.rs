@@ -321,6 +321,10 @@ pub(crate) fn render_status_row(
     // while `s` is still borrowed, and compared far below where the meter's
     // ratchet is applied.
     let live_thread_id = s.acp_thread().map(Entity::entity_id);
+    // Codex reports the current context in tokenUsage.last, including native
+    // in-thread compaction. Claude's per-call flicker ratchet would retain an
+    // obsolete pre-compaction peak and disagree with the compaction gate.
+    let uses_current_context_usage = s.agent_id.as_ref() == "codex-native";
     // Synchronous read of the agent's current session mode
     // ("default", "plan", …). Claude exposes this via ACP — when
     // the connection doesn't implement modes (e.g. mock test
@@ -410,10 +414,10 @@ pub(crate) fn render_status_row(
         .or_else(|| selected_value.clone().map(SharedString::from));
 
     let raw_used = usage.as_ref().map(|u| u.used_tokens).unwrap_or(0);
-    let used = if task_subagent_id.is_some() {
-        // A subagent's meter isn't ratcheted through the parent view's peak
-        // state (`status_peak_used_tokens` belongs to the Main session); show
-        // its raw latest context so switching tabs can't pollute either peak.
+    let used = if task_subagent_id.is_some() || uses_current_context_usage {
+        // Task subagents have their own context, and Codex's current-context
+        // readings are authoritative even when compaction keeps the thread.
+        // Neither should inherit the main view's historical high-watermark.
         raw_used
     } else {
         // The ratchet only means anything within one conversation. A

@@ -458,12 +458,11 @@ impl SolutionAgentStore {
         });
     }
 
-    /// The early notice sent before the force rung. It deliberately does not
-    /// ask the agent to compact itself: that instruction made the notice
-    /// interrupt the active task by causing the agent to abandon the rest of
-    /// its work and start a handoff. The editor owns the handoff and starts it
-    /// after an idle grace period when the turn ends. Automatic force requires 80% context
-    /// usage; only manual requests can force after the notices expire.
+    /// The early notice sent before the force rung. Preserve the entire active
+    /// phase before allowing an explicit agent-initiated handoff at its boundary.
+    /// Ordinary completed turns use the editor's automatic idle grace period.
+    /// Automatic force requires 80% context usage; only manual requests can
+    /// force after the notices expire.
     pub(crate) fn compaction_request_message(
         &self,
         id: SolutionSessionId,
@@ -501,27 +500,26 @@ impl SolutionAgentStore {
         let instruction = if again {
             "Keep working normally on the phase that was already active when the first notice \
              arrived. This notice does not change or shorten that phase. At its next natural \
-             boundary — after the active phase and its verification are fully complete — end this turn \
-             to yield for context rotation before beginning the next phase. Do not call a compaction tool \
-             because of this notice. The editor will schedule the handoff after the current turn \
-             ends. If the same phase is still active at the next check, the editor will force \
+             boundary — after the active phase and its verification are fully complete — yield \
+             for context rotation before beginning the next phase. Do not interrupt active work \
+             to compact merely because this notice arrived. If the same phase is still active at the next \
+             check, the editor will force \
              the handoff as the final escalation."
         } else {
             "This is an early signal, not a request to stop the current work. Keep working \
              normally on the phase already in progress; this notice does not change or shorten \
              it. At the next natural boundary — after the active phase and its verification are \
-             fully complete — end this turn to yield for context rotation before beginning the next phase. Keep \
+             fully complete — yield for context rotation before beginning the next phase. Keep \
              waiting for and integrating work already underway when that belongs to the active \
-             phase. Do not call a compaction tool because of this notice; the editor will schedule \
-             the handoff after the current turn ends."
+             phase. Do not interrupt active work to compact merely because this notice arrived."
         };
         let instruction = if again && !user {
             "Keep working normally on the phase that was already active when the first notice \
              arrived. This notice does not change or shorten that phase. At its next natural \
-             boundary — after the active phase and its verification are fully complete — end this turn \
-             to yield for context rotation before beginning the next phase. Do not call a compaction tool \
-             because of this notice. The editor will schedule the handoff after the current turn \
-             ends. While work remains active, automatic forced handoff requires at least 80% \
+             boundary — after the active phase and its verification are fully complete — yield \
+             for context rotation before beginning the next phase. Do not interrupt active work \
+             to compact merely because this notice arrived. While work remains active, automatic forced \
+             handoff requires at least 80% \
              context usage; elapsed time alone will not force it. Until then, the editor may \
              repeat this reminder every thirty minutes."
         } else {
@@ -530,12 +528,24 @@ impl SolutionAgentStore {
         let idle_grace = if user {
             ""
         } else {
-            " After this turn ends successfully, the editor waits for 50 seconds of idle time \
-             before starting automatic handoff. Continued work, queued follow-ups or typing \
-             reset that idle window. Do not wait out the timer yourself or call a compaction tool."
+            " If you finish this turn without explicitly requesting compaction, the editor waits \
+             for 50 seconds of idle time after successful completion before starting automatic \
+             handoff. Continued work, queued follow-ups or typing \
+             reset that idle window. Do not wait out the timer yourself."
         };
+        let explicit_handoff = format!(
+            " If, after completing that phase and its verification, you are deliberately yielding \
+             to reset context, first give the substantive work report described below, then call \
+             `solution_agent.start_compact` with `session_id: \"{id}\"` and `initiator: \"agent\"`. \
+             If accepted (`queued: true`), follow the compaction instructions delivered into \
+             this turn to prepare the handoff. If they are queued for the next turn instead, \
+             finish this turn to receive them. This explicit request \
+             does not wait for the automatic idle timer. Do not call `solution_agent.compact_session` \
+             until the required handoff files are ready. If the request is declined, respect its \
+             reason and continue authorized work or report the blocker; do not retry in a loop."
+        );
         let mut message = format!(
-            "{opening} {instruction}{idle_grace} This is a temporary context handoff, not a user request to \
+            "{opening} {instruction}{explicit_handoff}{idle_grace} This is a temporary context handoff, not a user request to \
              pause the task or revoke existing authorization. Record unfinished authorized \
              work as still in progress, not PAUSED or awaiting owner resume. After rotation, \
              continue that work without asking for permission again. Preserve a task pause \

@@ -6427,4 +6427,32 @@ deferred dispatch; a cancelled dispatch must not leave the force-retry backoff
 armed. Explicit manual compaction remains immediate when idle, and the existing
 80% automatic active-force threshold is unchanged. Failed/aborted turns still do
 not establish a successful boundary. Automatic notices explain the grace period;
-the editor owns the timer, so the agent must not sleep or compact itself.
+the editor owns the timer, so the agent must not sleep to wait it out. An agent
+intentionally yielding for rotation after completing the phase can explicitly
+request its own handoff, as described below.
+
+### 234. Intentional agent handoff explicitly requests compaction at the completed phase boundary
+
+Early notices preserve the entire active phase and verification. If the agent
+then deliberately yields to reset context, it reports the work and calls
+`solution_agent.start_compact` with its own session ID and `initiator: "agent"`,
+then follows the handoff instructions in the current turn when steered, or ends
+the turn to receive them when the provider queues them. This uses
+the existing guarded agent path, bypasses automatic idle grace, and does not
+claim human authority to reset observer memory. `compact_session` remains the
+final step after preparing the required files. A declined request is handled by
+its reason, without a retry loop. Ordinary successful answers retain the
+50-second automatic grace; threshold arrival alone never authorizes interrupting
+unfinished work. Manual controls and the 80% automatic force gate are unchanged.
+
+### 235. Codex's current context bypasses the Claude usage high-watermark
+
+Codex reports current input/output context through `tokenUsage.last.totalTokens`.
+Its native compaction can keep the same thread while shrinking 503.9k to 75.5k,
+which is above the old display ratchet's ten-percent-of-peak reset threshold.
+Holding that peak made the meter show 60.8% while the real compaction gate refused
+9.1% as short context. Render Codex's latest usage directly, like the gate and
+MCP metadata; retain the existing Claude flicker protection and Task isolation.
+Automatic short-context cancellation and the manual ten-percent minimum remain
+unchanged. An agent whose explicit handoff is declined must handle the reason
+rather than silently waiting for a rotation that cannot start.

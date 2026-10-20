@@ -102,17 +102,36 @@ fn compaction_state(session_id: SolutionSessionId, cx: &mut TestAppContext) -> (
 }
 
 fn assert_work_report_requested(texts: &[String]) {
-    assert!(texts.iter().any(|text| text.contains("not a user request to")
-        && text.contains("not PAUSED or awaiting owner resume")
-        && text.contains("continue that work without asking for permission again")
-        && text.contains("user explicitly requested it and has not subsequently resumed it")),
-        "handoff must distinguish a technical yield from a current user pause: {texts:?}");
-    assert!(texts.iter().all(|text| !text.contains("pause before beginning another phase")));
     assert!(
-        texts.iter().any(|text| text.contains("substantive work report in their language")
-            && text.contains("what was verified and its limits")
-            && text.contains("exactly where work stopped")
-            && text.contains("Preserve that report in the handoff")),
+        texts.iter().any(
+            |text| text.contains("after completing that phase and its verification")
+                && text.contains("solution_agent.start_compact")
+                && text.contains("initiator: \"agent\"")
+        ),
+        "the phase boundary must offer an explicit agent handoff: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("not a user request to")
+                && text.contains("not PAUSED or awaiting owner resume")
+                && text.contains("continue that work without asking for permission again")
+                && text
+                    .contains("user explicitly requested it and has not subsequently resumed it")),
+        "handoff must distinguish a technical yield from a current user pause: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .all(|text| !text.contains("pause before beginning another phase"))
+    );
+    assert!(
+        texts.iter().any(
+            |text| text.contains("substantive work report in their language")
+                && text.contains("what was verified and its limits")
+                && text.contains("exactly where work stopped")
+                && text.contains("Preserve that report in the handoff")
+        ),
         "the delivered handoff notice must preserve the user's result report: {texts:?}"
     );
 }
@@ -139,12 +158,18 @@ async fn a_running_session_is_asked_twice_then_compacted(cx: &mut TestAppContext
         texts.iter().any(|t| t.starts_with("The user asked for a context handoff")
             && t.contains("next natural boundary")
             && t.contains("does not change or shorten")
-            && t.contains("Do not call a compaction tool")),
+            && t.contains("Do not interrupt active work")),
         "the signal preserves the active phase and names its natural boundary: {texts:?}"
     );
     assert!(
-        texts.iter().all(|t| !t.contains("solution_agent.start_compact")),
-        "an early signal must not tell the agent to interrupt itself: {texts:?}"
+        texts.iter().any(|t| t.contains("after completing that phase and its verification")
+            && t.contains("solution_agent.start_compact")
+            && t.contains(&format!("session_id: \"{session_id}\""))
+            && t.contains("initiator: \"agent\"")
+            && t.contains("If they are queued for the next turn instead")
+            && t.contains("until the required handoff files are ready")
+            && t.contains("do not retry in a loop")),
+        "intentional yield explicitly requests the existing guarded workflow: {texts:?}"
     );
     assert_eq!(handoff(session_id, cx).map(|h| h.asks), Some(1));
     deliver_queue(session_id, cx);
@@ -164,8 +189,10 @@ async fn a_running_session_is_asked_twice_then_compacted(cx: &mut TestAppContext
         "second ask: {texts:?}"
     );
     assert!(
-        texts.iter().all(|t| !t.contains("solution_agent.start_compact")),
-        "the second signal still must not tell the agent to interrupt itself: {texts:?}"
+        texts.iter().any(|t| t.contains("after completing that phase and its verification")
+            && t.contains("solution_agent.start_compact")
+            && t.contains("Do not interrupt active work")),
+        "the repeated notice preserves work and offers explicit boundary handoff: {texts:?}"
     );
     assert!(!has_compaction_prompt(&texts));
     assert_eq!(handoff(session_id, cx).map(|h| h.asks), Some(2));
@@ -329,13 +356,19 @@ async fn auto_compaction_asks_when_the_context_crosses_the_threshold(cx: &mut Te
     assert!(
         texts.iter().any(|t| t.starts_with("Your context is 41% full.")
             && t.contains("Keep working normally on the phase already in progress")
-            && t.contains("end this turn to yield for context rotation before beginning the next phase")
-            && t.contains("Do not call a compaction tool")),
+            && t.contains("yield for context rotation before beginning the next phase")
+            && t.contains("Do not interrupt active work")),
         "the editor's wording: {texts:?}"
     );
     assert!(
-        texts.iter().all(|t| !t.contains("solution_agent.start_compact")),
-        "the threshold is a signal inside the turn, not a self-interrupt command: {texts:?}"
+        texts.iter().any(|t| t.contains("after completing that phase and its verification")
+            && t.contains("solution_agent.start_compact")
+            && t.contains(&format!("session_id: \"{session_id}\""))
+            && t.contains("initiator: \"agent\"")
+            && t.contains("If they are queued for the next turn instead")
+            && t.contains("until the required handoff files are ready")
+            && t.contains("do not retry in a loop")),
+        "intentional yield explicitly requests the existing guarded workflow: {texts:?}"
     );
     cx.update(|cx| {
         let store = SolutionAgentStore::global(cx);
@@ -918,5 +951,47 @@ async fn native_context_shrink_invalidates_an_already_deferred_automatic_compact
     assert_eq!(
         system_notes(session_id, "Context compaction could not start", cx),
         0
+    );
+}
+
+/// Intentional rotation uses the existing explicit path even while automatic
+/// grace has not begun. It consumes the ladder without gaining user authority.
+#[gpui::test]
+async fn agent_requested_handoff_bypasses_automatic_idle_grace(cx: &mut TestAppContext) {
+    let (session_id, thread, _gate, _tmp) = create_gated_session(cx).await;
+    set_usage(&thread, 410_000, cx);
+    start_turn(session_id, cx);
+    tick(cx);
+    assert_eq!(
+        handoff(session_id, cx).unwrap().asker,
+        crate::model::HandoffAsker::Auto
+    );
+    deliver_queue(session_id, cx);
+
+    use context_server::listener::McpServerTool;
+    let result = crate::mcp::StartCompactTool
+        .run(
+            crate::mcp::StartCompactParams {
+                session_id: session_id.to_string(),
+                initiator: Some("agent".into()),
+                comment: None,
+            },
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("explicit agent handoff dispatches");
+    assert!(result.structured_content.queued);
+    assert!(
+        handoff(session_id, cx).is_none(),
+        "accepted request consumes the ladder"
+    );
+    assert_eq!(
+        compaction_state(session_id, cx),
+        (true, false),
+        "agent handoff is pending without resetting observer memory"
+    );
+    assert!(
+        has_compaction_prompt(&queued_texts(session_id, cx)),
+        "handoff instructions are queued immediately without waiting fifty seconds"
     );
 }

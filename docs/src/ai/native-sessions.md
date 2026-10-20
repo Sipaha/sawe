@@ -27,8 +27,23 @@ at least **50 seconds of idle time** before starting the handoff. Continuing the
 conversation or typing resets this window, as does ongoing background work.
 The check runs periodically, so the actual wait can be slightly longer.
 
+When the agent deliberately yields for context rotation after finishing its
+current phase and verification, the notice tells it to report the result and
+call `solution_agent.start_compact` for its own session with `initiator: "agent"`.
+An accepted explicit request bypasses the idle delay. The agent follows the
+handoff instructions delivered into its active turn, or ends the turn to receive
+them when the provider queues them for the next turn. A threshold notice alone must
+never interrupt unfinished work. Ordinary successful answers retain the idle
+grace period.
+
 At 80% context usage, Sawe can still force an automatic handoff during active
 work. Explicit manual compaction does not use the 50-second idle delay.
+
+Codex can also compact its context internally within the same session. The
+context meter follows its latest reported usage, including decreases. If that
+usage falls below 10%, Sawe cancels the obsolete automatic handoff and manual
+compaction is unavailable until the context grows again. This does not indicate
+a stuck agent; a finished turn remains idle until further work is requested.
 
 ## Conversation previews {#conversation-previews}
 
