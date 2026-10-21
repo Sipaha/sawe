@@ -45,6 +45,10 @@ usage falls below 10%, Sawe cancels the obsolete automatic handoff and manual
 compaction is unavailable until the context grows again. This does not indicate
 a stuck agent; a finished turn remains idle until further work is requested.
 
+Messages submitted while an editor handoff is pending remain queued for the
+continued context. They can stay visible until the current turn completes; a
+lower context meter alone does not mean the turn has finished.
+
 ## Conversation previews {#conversation-previews}
 
 Click a local file link in a conversation to preview it inside the current

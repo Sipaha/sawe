@@ -24,6 +24,14 @@ Sidebar are disabled in Sawe.
 Solution checkouts live under `~/.spk/sawe/ss` on every platform. This directory
 contains project files, not disposable application state.
 
+## Removing a Member Project
+
+Removing a member opens a confirmation listing the Solution entry and local
+folder that will be permanently deleted. Long names and paths wrap within the
+dialog; the folder size appears beside its target. Check the full path before
+clicking **Delete**. **Cancel** or Escape dismisses the dialog, and Enter does
+not confirm deletion.
+
 ## How Projects Open
 
 Open an ordinary folder with **File > Open** or the CLI:

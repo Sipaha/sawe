@@ -6456,3 +6456,13 @@ MCP metadata; retain the existing Claude flicker protection and Task isolation.
 Automatic short-context cancellation and the manual ten-percent minimum remain
 unchanged. An agent whose explicit handoff is declined must handle the reason
 rather than silently waiting for a rotation that cannot start.
+
+### 236. Destructive confirmation text stays within the dialog
+
+`DeleteConfirmModal` keeps full project names and folder paths readable by
+wrapping them in shrinking, zero-minimum-width text columns. The size label
+reserves its own width instead of being pushed outside the surface. The dialog
+is capped at the viewport width minus a margin, so the same constraints hold
+in narrow windows. Do not truncate the deletion target: the confirmation must
+show what will be removed. Cancel, Escape and deliberate Delete semantics stay
+unchanged.

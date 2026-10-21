@@ -1,8 +1,8 @@
 //! Generic destructive-action confirmation modal.
 //!
 //! Used by the solution-tab context menu and the `+` dropdown trash icon
-//! to confirm deletion of a solution (registry + folder on disk). Phase 3
-//! will reuse it for member removal from a solution.
+//! to confirm deletion of a solution, catalog project, or member (registry
+//! entry and folder on disk).
 //!
 //! UX rules:
 //!   * Default focus is `Cancel`. Esc cancels.
@@ -161,7 +161,7 @@ impl ModalView for DeleteConfirmModal {
 }
 
 impl Render for DeleteConfirmModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Snapshot per-item rows up front — `cx.listener` borrows `self`
         // again below, so `self.items` cannot be borrowed inside the
         // child builders.
@@ -177,10 +177,14 @@ impl Render for DeleteConfirmModal {
                     Some(bytes) => format_size(bytes),
                 };
                 h_flex()
+                    .w_full()
+                    .items_start()
                     .gap_2()
-                    .child(Label::new(format!("• {}", item.label.clone())).color(Color::Default))
+                    .child(div().flex_1().min_w_0().child(
+                        Label::new(format!("• {}", item.label.clone())).color(Color::Default),
+                    ))
                     .when(!size_label.is_empty(), |this| {
-                        this.child(Label::new(size_label).color(Color::Muted))
+                        this.child(Label::new(size_label).color(Color::Muted).flex_shrink_0())
                     })
                     .into_any_element()
             })
@@ -193,7 +197,9 @@ impl Render for DeleteConfirmModal {
             // a destructive action. The user has to click Delete on purpose.
             .on_action(cx.listener(Self::cancel))
             .track_focus(&self.focus_handle)
-            .w(rems(34.))
+            .w(rems(34.)
+                .to_pixels(window.rem_size())
+                .min((window.viewport_size().width - px(32.)).max(px(0.))))
             .p_4()
             .gap_3()
             .bg(cx.theme().colors().elevated_surface_background)
@@ -203,16 +209,22 @@ impl Render for DeleteConfirmModal {
             .child(
                 h_flex()
                     .gap_2()
-                    .items_center()
+                    .items_start()
+                    .w_full()
                     .child(
                         Icon::new(IconName::Warning)
                             .color(Color::Warning)
                             .size(IconSize::Medium),
                     )
-                    .child(Label::new(self.title.clone()).size(LabelSize::Large)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(self.title.clone()).size(LabelSize::Large)),
+                    ),
             )
             .child(Label::new(self.intro.clone()).color(Color::Default))
-            .child(v_flex().gap_0p5().pl_3().children(item_rows))
+            .child(v_flex().w_full().gap_0p5().pl_3().children(item_rows))
             .child(Label::new("This action cannot be undone.").color(Color::Warning))
             .child(
                 h_flex()
