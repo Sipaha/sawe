@@ -4212,7 +4212,7 @@ impl SolutionAgentStore {
         }
         if !followups.is_empty() {
             blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
-                "New user messages received during the context handoff. Apply these before resuming work:",
+                "\n\nNew user messages received during the context handoff. Apply these before resuming work:\n\n",
             )));
             blocks.extend(followups);
             self.mark_queue_changed(session_id, cx);
