@@ -6488,4 +6488,5 @@ instructions so persisted notices fold without a data migration. For content
 blocks, require every non-metadata block to be a notice; mixed human replies
 and images remain visible. Apply the same rule to delivered history and the
 pending queue. This is presentation only and does not change agent prompts or
-compaction timing.
+compaction timing. The shared details popover handles `menu::Cancel` so Escape
+dismisses it, just like clicking outside.

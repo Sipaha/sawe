@@ -384,6 +384,7 @@ impl Render for CompactPromptPopover {
 
         v_flex()
             .key_context("CompactPromptPopover")
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .track_focus(&self.focus_handle)
             .elevation_2(cx)
             // Definite height (not just max_h): an anchored popover is

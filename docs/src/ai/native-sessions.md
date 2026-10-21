@@ -23,7 +23,8 @@ Git history, or the debugger.
 
 Standard context threshold notices and reminders appear as compact **Context
 handoff notice** badges. Click a badge to read the full instructions in a
-scrollable popover. Compaction requests use the same presentation. Ordinary
+scrollable popover. Escape or a click outside closes the details. Compaction
+requests use the same presentation. Ordinary
 messages stay visible, including replies queued beside a notice.
 
 When a session crosses its automatic compaction threshold, Sawe first notifies
