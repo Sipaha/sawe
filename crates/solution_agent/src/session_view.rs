@@ -1857,18 +1857,22 @@ impl Render for SolutionSessionView {
                                     }
                                 });
 
-                                // The auto-injected compact-context prompt is
-                                // a large, agent-only template. Render it as a
+                                // Compaction prompts and standard handoff notices are
+                                // editor instructions. Render it as a
                                 // distinct chip that opens the full text in a
                                 // popover (detected by its stable heading) —
                                 // never inline, which would balloon the scroll.
                                 if let crate::session_entry::SessionEntryKind::UserMessage {
                                     content_md,
+                                    chunks,
                                     ..
                                 } = &entry.kind
-                                    && crate::conversation_render::is_compaction_prompt_text(
-                                        content_md,
-                                    )
+                                    && (crate::conversation_render::is_compaction_prompt_text(content_md)
+                                        || if chunks.is_empty() {
+                                            crate::conversation_render::is_handoff_notice_text(content_md)
+                                        } else {
+                                            crate::conversation_render::is_handoff_notice_blocks(chunks)
+                                        })
                                 {
                                     let prompt_markdown =
                                         this.markdown_for_render.get(&(idx, 0)).cloned();

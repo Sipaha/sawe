@@ -8,7 +8,7 @@
 //! empty so the caller can `when_some(...)` it into the layout without
 //! reserving spacing.
 //!
-//! The bubble is always shown in full. (An earlier collapse-to-one-line
+//! Human messages are always shown in full; standard context notices use chips. (An earlier collapse-to-one-line
 //! affordance existed for when delivery could lag minutes-to-hours and the
 //! ghost cluttered the view; the queue-unification work made delivery
 //! prompt, so the collapse was pure friction and was removed.)
@@ -57,9 +57,10 @@ impl SolutionSessionView {
         // unfolded into the chat while it waited. Fold it here too. Only when
         // EVERY queued bundle is the compact prompt: a merged bundle carrying a
         // real follow-up alongside it must still show the user their own words.
-        let is_compaction = bundles
-            .iter()
-            .all(|bundle| crate::compact::is_compaction_blocks(&bundle.blocks));
+        let is_compaction = bundles.iter().all(|bundle| {
+            crate::compact::is_compaction_blocks(&bundle.blocks)
+                || crate::conversation_render::is_handoff_notice_blocks(&bundle.blocks)
+        });
 
         // Ghost bubble: selectable markdown text + clickable `[image #N]`
         // links wired through `spk-image://` to `open_image_preview`. Reuses

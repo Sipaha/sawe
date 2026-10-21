@@ -1447,6 +1447,24 @@ async fn a_queued_compaction_prompt_paints_the_folded_chip(cx: &mut gpui::TestAp
         "…and must NOT also dump the whole template into the queued bubble"
     );
 
+    // The standard context notice uses the same folded presentation.
+    let notice = "Your context is 52% full. This is an early signal, not a request to stop the current work. Keep working normally on the phase already in progress; this notice does not change or shorten it. At the next natural boundary yield for context rotation before beginning the next phase.";
+    vcx.update(|_window, cx| {
+        queue_bundle(vec![text_block("[14:24:00] "), text_block(notice)], cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("CONTEXT-HANDOFF-NOTICE-CHIP").is_some());
+    assert!(vcx.debug_bounds(QUEUED_COMPACT_CHIP_SELECTOR).is_some());
+    assert!(vcx.debug_bounds(QUEUED_BODY_FULL_SELECTOR).is_none());
+
+    // A real follow-up beside a standard notice must not disappear in a chip.
+    vcx.update(|_window, cx| {
+        queue_bundle(vec![text_block(notice), text_block("also fix this")], cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("CONTEXT-HANDOFF-NOTICE-CHIP").is_none());
+    assert!(vcx.debug_bounds(QUEUED_BODY_FULL_SELECTOR).is_some());
+
     // An ordinary follow-up is unaffected.
     vcx.update(|_window, cx| {
         queue_bundle(

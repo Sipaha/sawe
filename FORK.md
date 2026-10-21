@@ -6478,3 +6478,14 @@ submission order and content blocks; peer and subagent bundles retain their
 own routing and provenance. Rotation already waits for steering receipts before
 committing the new context. Both deferred in-place rotation and the direct
 MCP process-replacement path must use this helper.
+
+### 238. Standard handoff notices reuse expandable context chips
+
+Context threshold warnings and reminders occupy one compact badge, like the
+compaction request, with the unchanged full instructions in the existing
+scrollable popover. Recognize the generated opening and distinctive phase
+instructions so persisted notices fold without a data migration. For content
+blocks, require every non-metadata block to be a notice; mixed human replies
+and images remain visible. Apply the same rule to delivered history and the
+pending queue. This is presentation only and does not change agent prompts or
+compaction timing.

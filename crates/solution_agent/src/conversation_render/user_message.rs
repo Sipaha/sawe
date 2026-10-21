@@ -249,6 +249,42 @@ pub(crate) fn is_compaction_prompt_text(text: &str) -> bool {
         .starts_with(crate::compact::COMPACT_PROMPT_HEADING)
 }
 
+/// Standard ladder notices, including already-persisted history. Require both
+/// the generated opening and distinctive instructions, not a mention of context.
+pub(crate) fn is_handoff_notice_text(text: &str) -> bool {
+    let clean = strip_injected_meta(text.trim_start());
+    let text = clean.trim_start();
+    let standard_opening = text.starts_with("Your context is ")
+        || text.starts_with(
+            "The earlier handoff request is still open and your context keeps growing.",
+        )
+        || text.starts_with("The user asked for a context handoff")
+        || text.starts_with("The user's context handoff request is still open.");
+    standard_opening
+        && text.contains("notice does not change or shorten")
+        && text.contains("yield for context rotation before beginning the next phase.")
+}
+
+/// A merged human reply or image must remain visible, even beside a notice.
+pub(crate) fn is_handoff_notice_blocks(blocks: &[acp::ContentBlock]) -> bool {
+    let mut found = false;
+    blocks.iter().all(|block| match block {
+        acp::ContentBlock::Text(text) => {
+            let clean = strip_injected_meta(text.text.trim_start());
+            let text = clean.trim();
+            if text.is_empty() {
+                true
+            } else if is_handoff_notice_text(text) {
+                found = true;
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }) && found
+}
+
 /// Renders the compact-context prompt as a distinct, clickable chip that
 /// opens the full prompt text in a popover. We deliberately do NOT expand
 /// it inline: the prompt is hundreds of lines, and splicing it into the
@@ -263,7 +299,13 @@ pub(crate) fn render_compaction_prompt_chip(
     raw_text: String,
     _cx: &App,
 ) -> AnyElement {
-    let trigger = Button::new(("compact-prompt", idx), "Compact-context request")
+    let notice = is_handoff_notice_text(&raw_text);
+    let label = if notice {
+        "Context handoff notice"
+    } else {
+        "Compact-context request"
+    };
+    let trigger = Button::new(("compact-prompt", idx), label)
         .style(ButtonStyle::Outlined)
         .label_size(LabelSize::Small)
         .color(Color::Accent)
@@ -274,6 +316,9 @@ pub(crate) fn render_compaction_prompt_chip(
         );
 
     v_flex()
+        .when(notice, |this| {
+            this.debug_selector(|| "CONTEXT-HANDOFF-NOTICE-CHIP".into())
+        })
         .px_1()
         .mb_3()
         .child(
@@ -293,7 +338,6 @@ pub(crate) fn render_compaction_prompt_chip(
         )
         .into_any_element()
 }
-
 /// Popover body for the compact-context prompt: a bounded, scrollable panel
 /// showing the full prompt so it never bloats the conversation. A
 /// [`ManagedView`](ui::prelude) — `PopoverMenu` owns its open/close state

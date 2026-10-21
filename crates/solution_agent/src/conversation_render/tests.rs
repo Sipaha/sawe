@@ -566,3 +566,55 @@ fn a_thought_span_is_the_thought_verbatim() {
         ]
     );
 }
+
+#[gpui::test]
+async fn all_standard_handoff_notices_fold_without_folding_human_replies(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (id, thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+    cx.update(|cx| {
+        for usage in [None, Some(520_000)] {
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    usage.map(|used_tokens| acp_thread::TokenUsage {
+                        used_tokens,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                )
+            });
+            let store = crate::store::SolutionAgentStore::global(cx);
+            for asker in [
+                crate::model::HandoffAsker::Auto,
+                crate::model::HandoffAsker::User(crate::compact::CompactInitiator::User),
+            ] {
+                for again in [false, true] {
+                    let text = store
+                        .read(cx)
+                        .compaction_request_message(id, asker, again, None, cx);
+                    assert!(is_handoff_notice_text(&text), "{text}");
+                    let mut blocks = vec![
+                        acp::ContentBlock::Text(acp::TextContent::new("[14:32:58] ")),
+                        acp::ContentBlock::Text(acp::TextContent::new(text)),
+                    ];
+                    assert!(is_handoff_notice_blocks(&blocks));
+                    blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
+                        "Please also fix this issue.",
+                    )));
+                    assert!(
+                        !is_handoff_notice_blocks(&blocks),
+                        "a merged human reply stays visible"
+                    );
+                }
+            }
+        }
+    });
+    assert!(!is_handoff_notice_text(
+        "Your context is getting large. Please explain it."
+    ));
+    assert!(!is_handoff_notice_text(
+        "Please compact the context after finishing this work."
+    ));
+    assert!(!is_handoff_notice_blocks(&[]));
+}
