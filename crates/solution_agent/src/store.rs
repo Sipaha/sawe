@@ -4184,6 +4184,42 @@ impl SolutionAgentStore {
         true
     }
 
+    pub(crate) fn send_handoff_continuation(
+        &mut self,
+        session_id: SolutionSessionId,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        // The handoff file predates messages held back during compaction.
+        // Deliver that newer human intent in the FIRST replacement turn,
+        // before the agent can resume work based on an obsolete handoff.
+        // Peer/subagent bundles keep their own routing and provenance.
+        let mut blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))];
+        let mut followups = Vec::new();
+        if let Some(session) = self.session(session_id) {
+            session.update(cx, |s, _| {
+                s.pending_messages.retain(|bundle| {
+                    if bundle.target == crate::model::QueueTarget::Main
+                        && bundle.origin == crate::model::MessageOrigin::User
+                    {
+                        followups.extend(bundle.blocks.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            });
+        }
+        if !followups.is_empty() {
+            blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
+                "New user messages received during the context handoff. Apply these before resuming work:",
+            )));
+            blocks.extend(followups);
+            self.mark_queue_changed(session_id, cx);
+        }
+        self.send_message_blocks(session_id, blocks, cx)
+    }
+
     fn run_rotation_and_continue(
         &mut self,
         session_id: SolutionSessionId,
@@ -4194,7 +4230,7 @@ impl SolutionAgentStore {
         cx.spawn(async move |this, cx: &mut AsyncApp| match rotation.await {
             Ok(_) => {
                 this.update(cx, |store, cx| {
-                    store.send_message(session_id, prompt, cx).detach_and_log_err(cx);
+                    store.send_handoff_continuation(session_id, prompt, cx).detach_and_log_err(cx);
                 })
                 .log_err();
             }

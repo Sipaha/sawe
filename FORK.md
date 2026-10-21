@@ -6466,3 +6466,15 @@ is capped at the viewport width minus a margin, so the same constraints hold
 in narrow windows. Do not truncate the deletion target: the confirmation must
 show what will be removed. Cancel, Escape and deliberate Delete semantics stay
 unchanged.
+
+### 237. Handoff continuation includes human messages held during rotation
+
+Compaction steering deliberately holds newer user messages for the replacement
+context. The shared `send_handoff_continuation` must include those Main/User
+bundles in its first request, after the handoff envelope, rather than leaving them queued
+until an entire continuation turn finishes. Otherwise the agent resumes stale
+intent and the queue appears stuck even after the context meter resets. Preserve
+submission order and content blocks; peer and subagent bundles retain their
+own routing and provenance. Rotation already waits for steering receipts before
+committing the new context. Both deferred in-place rotation and the direct
+MCP process-replacement path must use this helper.

@@ -290,3 +290,96 @@ async fn a_stopped_turn_abandons_the_parked_handoff(cx: &mut TestAppContext) {
     assert!(!pending);
     assert_eq!(connection.in_place_clears(), 0);
 }
+
+/// Human corrections queued during handoff must be available before the first
+/// continued turn finishes; otherwise it works from stale intent for minutes.
+#[gpui::test]
+async fn handoff_delivers_queued_human_intent_in_the_first_replacement_turn(
+    cx: &mut TestAppContext,
+) {
+    assert_handoff_delivers_queued_human_intent(cx, true).await;
+}
+
+#[gpui::test]
+async fn replacing_handoff_delivers_queued_human_intent_in_the_first_turn(cx: &mut TestAppContext) {
+    assert_handoff_delivers_queued_human_intent(cx, false).await;
+}
+
+async fn assert_handoff_delivers_queued_human_intent(cx: &mut TestAppContext, in_place: bool) {
+    let (session_id, thread, gate, _tmp) = create_gated_session(cx).await;
+    let connection = mock_connection(&thread, cx);
+    connection.set_in_place_clear(in_place);
+    start_turn(session_id, cx);
+    cx.update(|cx| {
+        SolutionAgentStore::global(cx).update(cx, |store, cx| {
+            let session = store.session(session_id).unwrap();
+            session.update(cx, |s, _| {
+                s.begin_compaction_request();
+                for (text, target, origin) in [
+                    (
+                        "new human correction",
+                        crate::model::QueueTarget::Main,
+                        crate::model::MessageOrigin::User,
+                    ),
+                    (
+                        "peer-only context",
+                        crate::model::QueueTarget::Main,
+                        crate::model::MessageOrigin::Peer,
+                    ),
+                    (
+                        "teammate-only context",
+                        crate::model::QueueTarget::Subagent("worker".into()),
+                        crate::model::MessageOrigin::User,
+                    ),
+                ] {
+                    s.pending_messages.push_back(crate::model::PendingBundle {
+                        id: uuid::Uuid::new_v4(),
+                        target,
+                        origin,
+                        blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+                    });
+                }
+            });
+            assert!(store.rotate_and_continue(session_id, "handoff instructions".into(), cx));
+        });
+    });
+    gate.send(()).await.unwrap();
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let s = session.read(cx);
+        let thread = s.acp_thread().unwrap().read(cx);
+        assert_eq!(thread.status(), acp_thread::ThreadStatus::Generating);
+        let messages: Vec<_> = thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::UserMessage(message) => Some(&message.chunks),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "one initial continuation, no extra completed turn"
+        );
+        let text = messages[0]
+            .iter()
+            .filter_map(|block| match block {
+                acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.starts_with("handoff instructions"));
+        assert!(text.contains("new human correction"));
+        assert!(!text.contains("peer-only context"));
+        assert!(!text.contains("teammate-only context"));
+        assert_eq!(
+            s.pending_messages.len(),
+            2,
+            "other routes keep their bundles"
+        );
+    });
+}

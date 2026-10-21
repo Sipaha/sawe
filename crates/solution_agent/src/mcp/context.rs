@@ -337,7 +337,7 @@ impl McpServerTool for CompactSessionTool {
         cx.update(|cx| {
             let store = SolutionAgentStore::global(cx);
             store.update(cx, |store, cx| {
-                store.send_message(old_session_id, prompt_text, cx).detach();
+                store.send_handoff_continuation(old_session_id, prompt_text, cx).detach();
             });
         });
 
