@@ -373,7 +373,22 @@ async fn assert_handoff_delivers_queued_human_intent(cx: &mut TestAppContext, in
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.starts_with("handoff instructions"));
-        assert!(text.contains("new human correction"));
+        let restore = text
+            .find("1. Reconstruct the prior task context")
+            .expect("restore context first");
+        let interpret = text
+            .find("2. Interpret the messages below in that restored context")
+            .expect("interpret follow-ups after restoring context");
+        let resume = text
+            .find("3. Only then resume the remaining authorized work")
+            .expect("resume only after reconciling follow-ups");
+        let correction = text
+            .find("new human correction")
+            .expect("queued human correction delivered");
+        assert!(restore < interpret && interpret < resume && resume < correction);
+        assert!(text.contains("Read its referenced handoff/state files first."));
+        assert!(text.contains("change or cancel the handed-off plan"));
+        assert!(text.contains("ask a focused clarification instead of guessing"));
         assert!(!text.contains("peer-only context"));
         assert!(!text.contains("teammate-only context"));
         assert_eq!(

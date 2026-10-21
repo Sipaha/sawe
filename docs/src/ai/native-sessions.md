@@ -53,8 +53,13 @@ a stuck agent; a finished turn remains idle until further work is requested.
 
 Messages submitted while an editor handoff is pending remain queued until the
 rotation. Your messages to the main agent are included in the first request to
-the new context, so it sees your latest instructions before resuming work. A
-lower context meter alone does not mean the current turn has finished.
+the new context. The agent is instructed to first reconstruct the task from the
+handoff and its referenced state files, then interpret your queued messages in
+that context, and only then resume the remaining authorized work. Your latest
+instructions can change or cancel the handed-off plan. For references that
+cannot be resolved from the handoff files, the agent is instructed to ask a
+focused clarification instead of guessing. A lower context meter alone does not mean the current turn has
+finished.
 
 ## Conversation previews {#conversation-previews}
 

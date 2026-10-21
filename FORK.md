@@ -6477,7 +6477,12 @@ intent and the queue appears stuck even after the context meter resets. Preserve
 submission order and content blocks; peer and subagent bundles retain their
 own routing and provenance. Rotation already waits for steering receipts before
 committing the new context. Both deferred in-place rotation and the direct
-MCP process-replacement path must use this helper.
+MCP process-replacement path must use this helper. The follow-up envelope explicitly
+orders context reconstruction from the handoff and referenced state files before
+interpreting the queued messages, then permits resuming the remaining authorized
+work. Latest user instructions can change or cancel the old plan; unresolved
+references require focused clarification. This is a prompt contract, not a
+runtime guarantee of model compliance.
 
 ### 238. Standard handoff notices reuse expandable context chips
 

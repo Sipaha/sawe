@@ -4212,7 +4212,13 @@ impl SolutionAgentStore {
         }
         if !followups.is_empty() {
             blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
-                "\n\nNew user messages received during the context handoff. Apply these before resuming work:\n\n",
+                "\n\nNew user messages received during the context handoff. Before resuming work:\n\
+                 1. Reconstruct the prior task context from the handoff above. Read its referenced \
+                 handoff/state files first.\n\
+                 2. Interpret the messages below in that restored context, in submission order. \
+                 Honor the latest user instructions if they change or cancel the handed-off plan.\n\
+                 3. Only then resume the remaining authorized work. If a reference in these messages \
+                 cannot be resolved from the handoff files, ask a focused clarification instead of guessing.\n\n",
             )));
             blocks.extend(followups);
             self.mark_queue_changed(session_id, cx);
