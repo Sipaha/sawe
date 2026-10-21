@@ -405,7 +405,11 @@ impl Render for CompactPromptPopover {
                             .color(Color::Accent),
                     )
                     .child(
-                        Label::new(SharedString::from("Compact-context request"))
+                        Label::new(if is_handoff_notice_text(&self.raw_text) {
+                            "Context handoff notice"
+                        } else {
+                            "Compact-context request"
+                        })
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     ),
