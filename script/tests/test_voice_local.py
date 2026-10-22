@@ -97,6 +97,21 @@ time.sleep(30)
             finally:
                 runtime.close()
 
+    def test_transcription_gate_blocks_late_tts_spawn(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = voice.Runtime(SimpleNamespace(runtime_dir=Path(temp), idle_seconds=60, threads=2))
+            try:
+                runtime.begin_transcription()
+                with patch.object(voice.subprocess, "Popen") as spawn:
+                    with self.assertRaises(voice.EngineBusy):
+                        runtime.speech({"input": "answer raced with microphone"})
+                    spawn.assert_not_called()
+                self.assertEqual(list(Path(temp).iterdir()), [])
+                runtime.end_transcription()
+                self.assertFalse(runtime.transcribing)
+            finally:
+                runtime.close()
+
     def test_checksum_detects_corruption(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
             file = Path(temp) / "ggml-base-q5_1.bin"
@@ -130,7 +145,7 @@ time.sleep(30)
 
     def test_http_bounds_busy_errors_success_and_no_cors(self):
         runtime = SimpleNamespace(args=SimpleNamespace(model="small"), lock=threading.Lock(), speech_lock=threading.Lock(),
-                                  interrupt_speech=Mock(),
+                                  begin_transcription=Mock(), end_transcription=Mock(),
                                   transcribe=Mock(return_value={"text": "Проверка"}),
                                   speech=Mock(return_value=wav()), last_used=0)
         server = voice.Server(("127.0.0.1", 0), runtime)
@@ -167,7 +182,7 @@ time.sleep(30)
                     raise RuntimeError("STT failed to interrupt TTS")
                 return wav()
             runtime.speech.side_effect = slow_tts
-            runtime.interrupt_speech.side_effect = tts_canceled.set
+            runtime.begin_transcription.side_effect = tts_canceled.set
             tts_result = []
             def request_speech():
                 with post("/v1/audio/speech", b'{"input":"long answer"}') as response:
@@ -178,7 +193,7 @@ time.sleep(30)
             body = b'--x\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\n\r\nabc\r\n--x--\r\n'
             with post("/v1/audio/transcriptions", body, {"Content-Type": "multipart/form-data; boundary=x"}) as response:
                 self.assertEqual(json.load(response)["text"], "Проверка")
-            runtime.interrupt_speech.assert_called_once()
+            runtime.begin_transcription.assert_called_once()
             tts_thread.join(3)
             self.assertEqual(tts_result, [200])
             runtime.speech.side_effect = None

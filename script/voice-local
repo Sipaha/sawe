@@ -153,6 +153,10 @@ def multipart(content_type, body):
     return result
 
 
+class EngineBusy(RuntimeError):
+    pass
+
+
 class Runtime:
     def __init__(self, args):
         self.args = args
@@ -164,6 +168,7 @@ class Runtime:
         self.child = None
         self.child_log = None
         self.tts_child = None
+        self.transcribing = False
         self.last_used = time.monotonic()
         self.closed = threading.Event()
         self.watchdog = threading.Thread(target=self.reap_idle, daemon=True)
@@ -183,10 +188,15 @@ class Runtime:
                 self.child_log.close()
                 self.child_log = None
 
-    def interrupt_speech(self):
+    def begin_transcription(self):
         with self.child_lock:
+            self.transcribing = True
             if self.tts_child and self.tts_child.poll() is None:
                 self.tts_child.terminate()
+
+    def end_transcription(self):
+        with self.child_lock:
+            self.transcribing = False
 
     def close(self):
         self.closed.set()
@@ -280,6 +290,8 @@ class Runtime:
             with self.child_lock:
                 if self.closed.is_set():
                     raise RuntimeError("Service shutting down")
+                if self.transcribing:
+                    raise EngineBusy("Transcription has priority; retry speech afterwards")
                 self.tts_child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE, cwd=self.root,
                     env={**os.environ, "TMPDIR": str(self.root), "OMP_NUM_THREADS": str(self.args.threads)})
@@ -371,7 +383,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             try:
                 if transcribing:
-                    runtime.interrupt_speech()
+                    runtime.begin_transcription()
                     fields = multipart(self.headers.get("Content-Type", ""), body)
                     if "file" not in fields:
                         raise ValueError("Missing file field")
@@ -383,8 +395,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         raise ValueError("Expected JSON object")
                     self.reply(200, runtime.speech(payload), "audio/wav")
             finally:
+                if transcribing:
+                    runtime.end_transcription()
                 runtime.last_used = time.monotonic()
                 request_lock.release()
+        except EngineBusy as exc:
+            self.reply(429, {"error": str(exc)})
         except (ValueError, UnicodeError) as exc:
             self.reply(400, {"error": str(exc)})
         except (OSError, RuntimeError, subprocess.SubprocessError):
