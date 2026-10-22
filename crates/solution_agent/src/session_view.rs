@@ -37,6 +37,7 @@ mod subagent_strip;
 mod task_subagent_strip;
 #[cfg(test)]
 mod tests;
+mod voice;
 
 struct PendingImage {
     mime_type: String,
@@ -212,6 +213,7 @@ const COMPOSE_YIELD_PRIORITY: f32 = 1024.0;
 
 pub struct SolutionSessionView {
     session_id: SolutionSessionId,
+    voice: voice::SessionVoice,
     session: Entity<SolutionSession>,
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
@@ -562,6 +564,9 @@ impl SolutionSessionView {
         cx: &mut Context<Self>,
     ) {
         use acp_thread::AcpThreadEvent::*;
+        if let Stopped(reason) = event {
+            self.voice_turn_stopped(reason, cx);
+        }
         match event {
             NewEntry => {
                 self.recompute_rewind_table(cx);
@@ -571,6 +576,7 @@ impl SolutionSessionView {
                 self.invalidate_find_matches();
             }
             EntriesRemoved(_range) => {
+                self.stop_voice(cx);
                 self.recompute_rewind_table(cx);
                 self.invalidate_find_matches();
             }
@@ -1628,6 +1634,10 @@ impl Render for SolutionSessionView {
             // action next and moves the cursor as usual.
             .capture_action(cx.listener(Self::recall_queued_message))
             .on_action(cx.listener(Self::submit_compose_action))
+            .on_action(cx.listener(Self::toggle_voice_recording_action))
+            .on_action(cx.listener(Self::toggle_voice_conversation_action))
+            .on_action(cx.listener(Self::toggle_read_aloud_action))
+            .on_action(cx.listener(Self::stop_speaking_action))
             .on_drag_move(
                 cx.listener(|this, e: &DragMoveEvent<DraggedComposeHandle>, _, cx| {
                     log::debug!(
@@ -2186,7 +2196,7 @@ impl Render for SolutionSessionView {
                         // popup forward instead. The placeholder div is
                         // sized + styled so the layout doesn't jump when
                         // we swap.
-                        div()
+                        v_flex()
                             .id("solution-session-compose-area")
                             .flex_1()
                             .h_full()
@@ -2208,7 +2218,8 @@ impl Render for SolutionSessionView {
                                             }),
                                         )
                                 } else {
-                                    this.child(self.compose_editor.clone())
+                                    this.child(div().flex_1().min_h_0().child(self.compose_editor.clone()))
+                                        .child(self.render_voice_controls(cx))
                                 }
                             }),
                     )

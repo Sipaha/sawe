@@ -1,7 +1,7 @@
 //! OpenAI-compatible speech transport, independent of the selected coding agent.
 use crate::agent_settings::VoiceSettings;
 use anyhow::{Result, anyhow, bail, ensure};
-use futures::{AsyncReadExt, FutureExt};
+use futures::AsyncReadExt;
 use http_client::{AsyncBody, HttpClient, HttpRequestExt, RedirectPolicy, Request, Url};
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use std::{sync::Arc, time::Duration};
@@ -23,8 +23,49 @@ pub struct VoiceService {
     client: Arc<dyn HttpClient>,
 }
 
+struct VoiceHttpClient {
+    remote: Arc<dyn HttpClient>,
+    local: Arc<dyn HttpClient>,
+}
+
+impl HttpClient for VoiceHttpClient {
+    fn user_agent(&self) -> Option<&http_client::http::HeaderValue> {
+        self.remote.user_agent()
+    }
+    fn proxy(&self) -> Option<&Url> {
+        self.remote.proxy()
+    }
+    fn send(
+        &self,
+        request: Request<AsyncBody>,
+    ) -> futures::future::BoxFuture<'static, Result<http_client::Response<AsyncBody>>> {
+        let local = request.uri().host().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+        if local {
+            self.local.send(request)
+        } else {
+            self.remote.send(request)
+        }
+    }
+}
+
 impl VoiceService {
     pub fn new(settings: VoiceSettings, client: Arc<dyn HttpClient>) -> Result<Self> {
+        let direct = reqwest::Client::builder()
+            .no_proxy()
+            .redirect_policy(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|_| anyhow!("Could not initialize local voice connection"))?;
+        let client = Arc::new(VoiceHttpClient {
+            remote: client,
+            local: Arc::new(reqwest_client::ReqwestClient::from(direct)),
+        });
         Self::with_environment(settings, client, |name| std::env::var(name).ok())
     }
 
@@ -168,44 +209,37 @@ impl VoiceService {
         let request = builder
             .body(AsyncBody::from(body))
             .map_err(|_| anyhow!("Could not prepare voice service request"))?;
-        let operation = async {
-            // Discard transport errors and error bodies: either may contain credentials,
-            // private transcript text, or an endpoint URL supplied by the service.
-            let mut response = self.client.send(request).await.map_err(|_| {
-                anyhow!("Could not connect to voice service; check its URL and network connection")
-            })?;
-            let status = response.status();
-            if !status.is_success() {
-                bail!(
-                    "Voice service returned HTTP {}{}",
-                    status.as_u16(),
-                    match status.as_u16() {
-                        401 | 403 => "; check speech service credentials",
-                        429 => "; check speech service quota or retry later",
-                        _ => "",
-                    }
-                );
-            }
-            let mut bytes = Vec::new();
-            response
-                .body_mut()
-                .take(limit as u64 + 1)
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|_| anyhow!("Could not read voice service response"))?;
-            ensure!(
-                bytes.len() <= limit,
-                "Voice service response exceeds the size limit"
+        // RequestTimeout covers connection and body reads in the HTTP client.
+        // Keep the deadline on I/O rather than creating an untracked UI timer.
+        // Discard transport errors and error bodies: either may contain credentials,
+        // private transcript text, or an endpoint URL supplied by the service.
+        let mut response = self.client.send(request).await.map_err(|_| {
+            anyhow!("Could not connect to voice service. See docs/guides/voice-conversations.md for local setup, or configure solution_agent.voice.api_url")
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(
+                "Voice service returned HTTP {}{}",
+                status.as_u16(),
+                match status.as_u16() {
+                    401 | 403 => "; check speech service credentials",
+                    429 => "; check speech service quota or retry later",
+                    _ => "",
+                }
             );
-            Ok(bytes)
         }
-        .fuse();
-        let timeout = smol::Timer::after(REQUEST_TIMEOUT).fuse();
-        futures::pin_mut!(operation, timeout);
-        futures::select! {
-            result = operation => result,
-            _ = timeout => Err(anyhow!("Voice service request timed out")),
-        }
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| anyhow!("Could not read voice service response"))?;
+        ensure!(
+            bytes.len() <= limit,
+            "Voice service response exceeds the size limit"
+        );
+        Ok(bytes)
     }
 }
 
@@ -296,7 +330,7 @@ fn is_wav(bytes: &[u8]) -> bool {
     let mut position = 12usize;
     let mut has_format = false;
     while let Some(header) = bytes.get(position..position.saturating_add(8)) {
-        let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         position += 8;
         let remaining = bytes.len() - position;
         if &header[..4] == b"data" {
@@ -353,6 +387,8 @@ mod tests {
     fn settings() -> VoiceSettings {
         VoiceSettings {
             api_url: "http://127.0.0.1:12345/v1".into(),
+            transcription_model: "gpt-4o-mini-transcribe".into(),
+            speech_voice: "coral".into(),
             ..Default::default()
         }
     }
@@ -405,15 +441,19 @@ mod tests {
         })
         .unwrap();
         assert!(local.transcription_authorization.is_none());
-        let official =
-            VoiceService::with_environment(VoiceSettings::default(), client.clone(), |name| {
-                (name == "OPENAI_API_KEY").then(|| "secret".into())
-            })
-            .unwrap();
+        let official = VoiceService::with_environment(
+            VoiceSettings {
+                api_url: "https://api.openai.com/v1".into(),
+                ..VoiceSettings::default()
+            },
+            client.clone(),
+            |name| (name == "OPENAI_API_KEY").then(|| "secret".into()),
+        )
+        .unwrap();
         assert!(official.transcription_authorization.unwrap().is_sensitive());
         let mut custom = settings();
         custom.api_url = "https://api.openai.com.example/v1".into();
-        let service = VoiceService::with_environment(custom, client.clone(), |name| {
+        let service = VoiceService::with_environment(custom, client, |name| {
             assert_ne!(name, "OPENAI_API_KEY");
             None
         })
@@ -424,7 +464,10 @@ mod tests {
     #[test]
     fn isolates_endpoint_overrides_and_allows_local_transcription_without_cloud_key() {
         smol::block_on(async {
-            let mut config = VoiceSettings::default();
+            let mut config = VoiceSettings {
+                api_url: "https://api.openai.com/v1".into(),
+                ..VoiceSettings::default()
+            };
             config.transcription_url = Some("http://127.0.0.1:8080/inference".into());
             let client = FakeHttpClient::create(|request| async move {
                 assert_eq!(request.uri().path(), "/inference");
@@ -595,5 +638,57 @@ mod tests {
             "Done Fixed tests. Use cargo test. Next step."
         );
         assert_eq!(speech_text("```\nonly code\n```"), "");
+    }
+    #[test]
+    fn local_voice_uses_direct_http_instead_of_the_application_proxy() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"text":"Direct local transcript"}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let remote = FakeHttpClient::create(|_| async {
+            panic!("local audio must not use application proxy client")
+        });
+        let service = VoiceService::new(
+            VoiceSettings {
+                api_url: format!("http://{address}/v1"),
+                ..VoiceSettings::default()
+            },
+            remote,
+        )
+        .unwrap();
+        assert_eq!(
+            smol::block_on(service.transcribe(wav())).unwrap(),
+            "Direct local transcript"
+        );
+        server.join().unwrap();
     }
 }

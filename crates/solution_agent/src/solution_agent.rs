@@ -44,6 +44,7 @@ pub mod supervisor_instruction_modal;
 pub(crate) mod teammate_watchers;
 pub mod upload;
 pub mod utility_buttons;
+pub mod voice_service;
 
 pub use acp_thread::NativeAgentModelInfo as ModelInfo;
 pub use metrics_emitter::MetricsEmitter;

@@ -7152,7 +7152,7 @@ async fn reconnect_waits_for_receipt_and_recaptures_accepted_input(cx: &mut Test
                     }
                     _ => None,
                 })
-                .last()
+                .next_back()
                 .unwrap();
             assert!(recovery.chunks.iter().any(
                 |b| matches!(b, acp::ContentBlock::Text(t) if t.text == "ACCEPTED DURING RECONNECT")

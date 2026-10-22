@@ -27,6 +27,14 @@ actions!(
         FindClose,
         /// Cancel the agent's in-flight response in the active session.
         StopResponse,
+        /// Start or finish a voice recording in the active chat.
+        ToggleVoiceRecording,
+        /// Toggle hands-free voice conversation in the active chat.
+        ToggleVoiceConversation,
+        /// Toggle AI-generated read-aloud for new assistant replies.
+        ToggleReadAloud,
+        /// Stop speech playback without cancelling the agent.
+        StopSpeaking,
         /// Paste only the text portion of the clipboard into the
         /// compose editor — skips images / file paths / any rich
         /// content the default Ctrl-V would have wrapped into a

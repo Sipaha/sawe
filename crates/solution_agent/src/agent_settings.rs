@@ -44,8 +44,6 @@ impl Default for EphemeralPoolSettings {
 /// Speech service configuration; contains an environment variable name, never a credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoiceSettings {
-    pub enabled: bool,
-    pub read_aloud: bool,
     pub api_url: String,
     pub api_key_env: String,
     pub transcription_url: Option<String>,
@@ -60,17 +58,15 @@ pub struct VoiceSettings {
 impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
-            read_aloud: false,
-            api_url: "https://api.openai.com/v1".into(),
+            api_url: "http://127.0.0.1:8095/v1".into(),
             api_key_env: "SAWE_VOICE_API_KEY".into(),
             transcription_url: None,
             speech_url: None,
             transcription_api_key_env: None,
             speech_api_key_env: None,
-            transcription_model: "gpt-4o-mini-transcribe".into(),
-            speech_model: "gpt-4o-mini-tts".into(),
-            speech_voice: "coral".into(),
+            transcription_model: "small".into(),
+            speech_model: "piper".into(),
+            speech_voice: "ru_RU-denis-medium".into(),
         }
     }
 }
@@ -106,8 +102,6 @@ impl Settings for SolutionAgentSettings {
             .as_ref()
             .and_then(|s| s.voice.as_ref())
         {
-            voice.enabled = content.enabled.unwrap_or(voice.enabled);
-            voice.read_aloud = content.read_aloud.unwrap_or(voice.read_aloud);
             if let Some(value) = &content.api_url {
                 voice.api_url = value.clone();
             }
@@ -143,12 +137,9 @@ mod tests {
     #[test]
     fn voice_defaults_are_opt_in_and_endpoint_overrides_survive_settings() {
         let defaults = SolutionAgentSettings::default().voice;
-        assert!(!defaults.enabled);
-        assert!(!defaults.read_aloud);
+        assert_eq!(defaults.api_url, "http://127.0.0.1:8095/v1");
         let content: settings::SettingsContent = serde_json::from_value(serde_json::json!({
             "solution_agent": {"voice": {
-                "enabled": true,
-                "read_aloud": true,
                 "transcription_url": "http://127.0.0.1:8080/inference",
                 "speech_url": "http://127.0.0.1:8081/v1/audio/speech",
                 "transcription_api_key_env": "LOCAL_STT_KEY",
@@ -159,7 +150,6 @@ mod tests {
         }))
         .unwrap();
         let voice = SolutionAgentSettings::from_settings(&content).voice;
-        assert!(voice.enabled && voice.read_aloud);
         assert_eq!(
             voice.transcription_url.as_deref(),
             Some("http://127.0.0.1:8080/inference")

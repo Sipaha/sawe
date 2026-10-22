@@ -67,6 +67,8 @@ This fork no longer constrains itself to additive-only modifications of upstream
 
 | File | Change | Owning fork crate |
 |---|---|---|
+| `script/clippy` | Adds an explicit `--debug` mode for agent-only verification; the default release gate is preserved. | verification tooling |
+| `crates/audio/src/audio.rs`, `crates/audio/src/audio_pipeline.rs`, `crates/audio/src/voice.rs` | Bounded voice capture/VAD, PCM WAV recordings, immediate cancellable speech and a shared output mixer for echo cancellation. | `solution_agent` voice |
 | `crates/zed/src/main.rs` | `editor_mcp::init`, `solutions::init`, `solutions_ui::init`, `solution_agent::init`, `run_config::init`, `run_config_ui::init` calls inserted in startup flow. Various subsystem inits commented out. Adds `--headless` CLI flag forwarded to `gpui_platform::current_platform(headless)` (ADR-0002 native headless platform). | mixed |
 | `crates/zed/src/zed.rs` | `initialize_agent_panel` call commented out in `futures::join!` (fn kept under `#[allow(dead_code)]` for one-line re-enable). | `solution_agent` |
 | `crates/zed/Cargo.toml` | Workspace deps on all fork crates (`editor_mcp`, `solutions`, `solutions_ui`, `solution_agent`, `solution_git`, `git_conflict_ui`, `run_config`, `run_config_ui`). | mixed |
@@ -6495,3 +6497,14 @@ and images remain visible. Apply the same rule to delivered history and the
 pending queue. This is presentation only and does not change agent prompts or
 compaction timing. The shared details popover handles `menu::Cancel` so Escape
 dismisses it, just like clicking outside.
+
+### 239. Voice is shared above coding-provider adapters
+
+Solution chat voice uses local or configurable compatible STT/TTS around the
+existing composer/queue. Speaking interrupts audio only; stopping the agent
+remains explicit. Completion follows real turn events, with bounded capture and
+stale-result rejection on navigation or history replacement. Audio playback
+shares the application mixer for echo cancellation. Local whisper.cpp models
+load lazily and unload on idle, avoiding a permanently resident speech stack.
+See [ADR-0007](docs/architecture/decisions/0007-provider-independent-voice.md)
+and the [voice guide](docs/guides/voice-conversations.md).

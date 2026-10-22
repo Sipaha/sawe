@@ -18166,6 +18166,7 @@ dependencies = [
  "anyhow",
  "ashpd",
  "async-channel 2.5.0",
+ "audio",
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
@@ -18178,6 +18179,7 @@ dependencies = [
  "fs",
  "futures 0.3.34",
  "gpui",
+ "http_client",
  "indexmap 2.14.0",
  "indoc",
  "language",
@@ -18192,6 +18194,7 @@ dependencies = [
  "pulldown-cmark 0.13.4",
  "rand 0.9.4",
  "regex",
+ "reqwest_client",
  "schemars 1.0.4",
  "serde",
  "serde_json",
@@ -18209,6 +18212,7 @@ dependencies = [
  "uuid",
  "watch",
  "workspace",
+ "zed-reqwest",
  "zed_actions",
 ]
 

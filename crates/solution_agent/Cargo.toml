@@ -32,6 +32,7 @@ agent-client-protocol.workspace = true
 agent_servers.workspace = true
 agent_settings.workspace = true
 anyhow.workspace = true
+audio.workspace = true
 async-channel = { workspace = true, optional = true }
 base64.workspace = true
 chrono.workspace = true
@@ -46,6 +47,8 @@ fs.workspace = true
 futures.workspace = true
 menu.workspace = true
 gpui.workspace = true
+http_client.workspace = true
+pulldown-cmark.workspace = true
 indoc.workspace = true
 indexmap.workspace = true
 language.workspace = true
@@ -58,6 +61,8 @@ paths.workspace = true
 project.workspace = true
 rand.workspace = true
 regex.workspace = true
+reqwest.workspace = true
+reqwest_client.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -79,7 +84,7 @@ zed_actions.workspace = true
 ashpd.workspace = true
 
 [dev-dependencies]
-pulldown-cmark.workspace = true
+http_client = { workspace = true, features = ["test-support"] }
 acp_thread = { workspace = true, features = ["test-support"] }
 action_log.workspace = true
 agent_servers = { workspace = true, features = ["test-support"] }

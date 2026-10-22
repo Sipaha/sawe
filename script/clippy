@@ -2,12 +2,24 @@
 
 set -euo pipefail
 
+# Match agent-only debug verification without changing the default release gate.
+profile_args=(--release)
+clippy_args=()
+for argument in "$@"; do
+    if [[ "$argument" == "--debug" ]]; then
+        profile_args=()
+    else
+        clippy_args+=("$argument")
+    fi
+done
+set -- "${clippy_args[@]}"
+
 if [[ ! " $* " == *" -p "* && ! " $* " == *" --package "* ]]; then
     set -- "$@" --workspace
 fi
 
 set -x
-"${CARGO:-cargo}" clippy "$@" --release --all-targets --all-features -- --deny warnings
+"${CARGO:-cargo}" clippy "$@" "${profile_args[@]}" --all-targets --all-features -- --deny warnings
 
 # If local, run other checks if we have the tools installed.
 if [[ -z "${GITHUB_ACTIONS+x}" ]]; then

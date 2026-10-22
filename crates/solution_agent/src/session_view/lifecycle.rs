@@ -206,6 +206,7 @@ impl SolutionSessionView {
                         // left to the magnitude heuristic. `cached_max` is
                         // cleared too so the denominator re-resolves from the
                         // new context's first usage report.
+                        this.stop_voice(cx);
                         this.status_peak_used_tokens = 0;
                         this.status_peak_thread = None;
                         this.status_cached_max_tokens = None;
@@ -229,6 +230,7 @@ impl SolutionSessionView {
             });
         let mut view = Self {
             session_id,
+            voice: super::voice::SessionVoice::default(),
             session,
             focus_handle: cx.focus_handle(),
             workspace,

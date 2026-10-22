@@ -50,12 +50,12 @@ be treated as idle-machine performance.
 
 Measured on AMD Ryzen 7 260 / RTX 5070 Laptop 8 GB, four CPU threads:
 
-| Model/backend | Warm request, 6.91s audio | Sampled RSS | GPU memory |
-| --- | --- | --- | --- |
-| base Q5_1 / CPU | 4.87–6.04s | 159 MiB | — |
-| small Q5_1 / CPU | 11.70–26.81s | 352 MiB | — |
-| base Q5_1 / CUDA, beam 3 | 0.10–0.11s | 401 MiB | 404 MiB |
-| small Q5_1 / CUDA, beam 3 | 0.16–0.17s | 398 MiB | 642 MiB |
+| Model/backend             | Warm request, 6.91s audio | Sampled RSS | GPU memory |
+| ------------------------- | ------------------------- | ----------- | ---------- |
+| base Q5_1 / CPU           | 4.87–6.04s                | 159 MiB     | —          |
+| small Q5_1 / CPU          | 11.70–26.81s              | 352 MiB     | —          |
+| base Q5_1 / CUDA, beam 3  | 0.10–0.11s                | 401 MiB     | 404 MiB    |
+| small Q5_1 / CUDA, beam 3 | 0.16–0.17s                | 398 MiB     | 642 MiB    |
 
 CPU runs overlapped compilation. CUDA small model load took 1.51s after driver
 initialization; first CUDA initialization in the earlier run took 6.73s. Piper

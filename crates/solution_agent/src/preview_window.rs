@@ -338,9 +338,7 @@ impl Render for PreviewWindow {
             .w(px(
                 (window.viewport_size().width.as_f32() * 0.85).min(1100.0)
             ))
-            .h(px((window.viewport_size().height.as_f32() - 120.0)
-                .max(120.0)
-                .min(850.0)))
+            .h(px((window.viewport_size().height.as_f32() - 120.0).clamp(120.0, 850.0)))
             .flex()
             .flex_col()
             .overflow_hidden()

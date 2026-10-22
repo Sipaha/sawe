@@ -1452,12 +1452,8 @@ pub struct SolutionAgentSettingsContent {
 #[with_fallible_options]
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
 pub struct SolutionAgentVoiceSettingsContent {
-    /// Allow voice controls. Recording always requires an explicit user action. Default: false.
-    pub enabled: Option<bool>,
-    /// Automatically speak newly completed assistant answers. Default: false.
-    pub read_aloud: Option<bool>,
     /// OpenAI-compatible API base URL. HTTPS, or HTTP on loopback only.
-    /// Default: https://api.openai.com/v1
+    /// Default: http://127.0.0.1:8095/v1 (local speech service).
     pub api_url: Option<String>,
     /// Environment variable containing the speech service API key. Never put a key here.
     /// Default: SAWE_VOICE_API_KEY. OPENAI_API_KEY is a fallback only for the official API.
@@ -1472,11 +1468,11 @@ pub struct SolutionAgentVoiceSettingsContent {
     pub transcription_api_key_env: Option<String>,
     /// Optional environment variable containing a key specifically for speech_url.
     pub speech_api_key_env: Option<String>,
-    /// Speech recognition model. Default: gpt-4o-mini-transcribe.
+    /// Speech recognition model. Default: small (local runtime).
     pub transcription_model: Option<String>,
-    /// Speech synthesis model. Default: gpt-4o-mini-tts.
+    /// Speech synthesis model. Default: piper (local runtime).
     pub speech_model: Option<String>,
-    /// Speech synthesis voice. Default: coral.
+    /// Speech synthesis voice. Default: ru_RU-denis-medium (local runtime).
     pub speech_voice: Option<String>,
 }
 

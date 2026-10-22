@@ -9,6 +9,8 @@
 
 ## Entry points
 
+- [Voice conversations: local setup and chat controls](guides/voice-conversations.md).
+
 - Disk pressure: [read-only inventory and missed nested incremental cache](findings/2026-10-13-disk-usage-and-nested-cache.md).
 
 - Compaction work reports: [preserve the result and stopping point](findings/2026-10-12-compaction-work-report.md).
@@ -62,6 +64,7 @@ contracts, multi-crate invariants). Each ADR is dated `accepted`/`superseded`.
 
 | # | Title | Status | Document |
 |---|---|---|---|
+| 0007 | Provider-independent voice conversations | accepted | [architecture/decisions/0007-provider-independent-voice.md](architecture/decisions/0007-provider-independent-voice.md) |
 | 0006 | Explicit upstream integrations preserve Sawe contracts | accepted | [architecture/decisions/0006-explicit-upstream-integrations.md](architecture/decisions/0006-explicit-upstream-integrations.md) |
 | 0001 | Fork philosophy: no scheduled upstream merge | superseded by 0006 | [`architecture/decisions/0001-fork-philosophy.md`](architecture/decisions/0001-fork-philosophy.md) |
 | 0002 | Native headless GPUI platform for autonomous agent driving | accepted | [`architecture/decisions/0002-native-headless-platform.md`](architecture/decisions/0002-native-headless-platform.md) |
@@ -82,6 +85,7 @@ can read them.
 
 | Date | Status | Plan |
 |---|---|---|
+| 2026-10-22 | in progress | [Provider-independent voice conversations](plans/2026-10-22-provider-independent-voice.md) |
 | 2026-10-02 | complete | [Kimi integration review and approval fixes](plans/2026-10-02-kimi-approval-review.md) |
 | 2026-09-22 | complete | [Integrate current upstream Zed](plans/2026-09-22-upstream-main-integration.md) — merged upstream `b54cc1d0ac` as `790aa911ab`, preserving the fork's product contracts. |
 | 2026-09-22 | complete | [Git panel refresh correctness](plans/2026-09-22-git-panel-refresh.md) |
@@ -166,6 +170,7 @@ Short, dated, single-fact notes from sessions: "ran a benchmark and got X",
 
 | Date | Status | Topic |
 |---|---|---|
+| 2026-10 | verified foundations | [Local whisper.cpp and Piper runtime](findings/2026-10-local-voice-runtime.md) |
 | 2026-10-08 | fixed; approved recovery completed | [Push targets the selected library; responsive preview and interrupted-rebase diagnosis](findings/2026-10-08-push-selected-member-and-rebase.md) |
 | 2026-10-02 | fixed | [Nested tool-output fences](findings/2026-10-02-tool-output-fences.md) |
 | 2026-10-02 | installed | [Codex browser setup](findings/2026-10-02-codex-browser-setup.md) |
@@ -260,9 +265,7 @@ Short, dated, single-fact notes from sessions: "ran a benchmark and got X",
 Per-crate documentation of public API + invariants + pitfalls. Created on
 first non-trivial public API in a crate; updated when that API changes.
 
-(None yet — the first fork-owned crate to get one will be one of
-`solutions` / `solution_agent` / `solutions_ui` / `editor_mcp` since those
-are where the fork's public surface lives.)
+- [solution_agent voice boundary](architecture/modules/solution_agent.md) — service API, cancellation, transcript and audio invariants.
 
 ---
 
