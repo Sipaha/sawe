@@ -11,6 +11,7 @@ pub const MAX_SPEECH_CHARACTERS: usize = 4000;
 const MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
 const MAX_SPEECH_BYTES: usize = 24 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Does not implement Debug: the authorization header is private and must not be logged.
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub struct VoiceService {
     settings: VoiceSettings,
     transcription_url: Url,
     speech_url: Url,
+    keepalive_url: Option<Url>,
     transcription_authorization: Option<http_client::http::HeaderValue>,
     speech_authorization: Option<http_client::http::HeaderValue>,
     client: Arc<dyn HttpClient>,
@@ -97,6 +99,11 @@ impl VoiceService {
             "audio/transcriptions",
         )?;
         let speech_url = endpoint_url(&base_url, settings.speech_url.as_deref(), "audio/speech")?;
+        // Keepalive is a local sidecar extension, not part of the remote speech
+        // API contract. An explicit transcription override opts out entirely.
+        let keepalive_url = (is_loopback(&base_url) && settings.transcription_url.is_none())
+            .then(|| endpoint_url(&base_url, None, "audio/keepalive"))
+            .transpose()?;
         let transcription_authorization = authorization(
             &settings,
             &base_url,
@@ -115,10 +122,47 @@ impl VoiceService {
             settings,
             transcription_url,
             speech_url,
+            keepalive_url,
             transcription_authorization,
             speech_authorization,
             client,
         })
+    }
+
+    pub(crate) fn keepalive_url(&self) -> Option<&Url> {
+        self.keepalive_url.as_ref()
+    }
+
+    /// Refresh an already-loaded local worker's idle clock without loading it.
+    /// False means the endpoint is ineligible or does not implement this extension.
+    pub(crate) async fn keepalive(&self) -> Result<bool> {
+        let Some(url) = self.keepalive_url.as_ref() else {
+            return Ok(false);
+        };
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(url.as_str())
+            .header("Content-Type", "application/json")
+            .follow_redirects(RedirectPolicy::NoFollow)
+            .timeout(KEEPALIVE_TIMEOUT);
+        if let Some(authorization) = &self.transcription_authorization {
+            builder = builder.header("Authorization", authorization);
+        }
+        let request = builder
+            .body(AsyncBody::from(b"{}".to_vec()))
+            .map_err(|_| anyhow!("Could not prepare voice keepalive request"))?;
+        let response = self
+            .client
+            .send(request)
+            .await
+            .map_err(|_| anyhow!("Could not connect to local voice keepalive service"))?;
+        // No response body is needed, including on success. Dropping it bounds
+        // reads to zero bytes and cannot disclose service errors or transcripts.
+        match response.status().as_u16() {
+            200..=299 => Ok(true),
+            404 | 405 => Ok(false),
+            _ => bail!("Local voice keepalive request failed"),
+        }
     }
 
     pub async fn transcribe(&self, wav: Vec<u8>) -> Result<String> {
@@ -296,14 +340,8 @@ fn authorization(
 
 fn validate_url(value: &str) -> Result<Url> {
     let url = Url::parse(value).map_err(|_| anyhow!("Voice API URL is invalid"))?;
-    let loopback = match url.host() {
-        Some(http_client::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(http_client::Host::Ipv4(address)) => address.is_loopback(),
-        Some(http_client::Host::Ipv6(address)) => address.is_loopback(),
-        None => false,
-    };
     ensure!(
-        url.scheme() == "https" || (url.scheme() == "http" && loopback),
+        url.scheme() == "https" || (url.scheme() == "http" && is_loopback(&url)),
         "Voice API URL must use HTTPS, or HTTP on loopback"
     );
     ensure!(
@@ -315,6 +353,15 @@ fn validate_url(value: &str) -> Result<Url> {
         "Voice API URL must have a host and contain no credentials, query or fragment"
     );
     Ok(url)
+}
+
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(http_client::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(http_client::Host::Ipv4(address)) => address.is_loopback(),
+        Some(http_client::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 fn valid_env_name(value: &str) -> bool {
@@ -408,6 +455,133 @@ mod tests {
         bytes[36..40].copy_from_slice(b"data");
         bytes[40..44].copy_from_slice(&2u32.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn local_keepalive_has_a_short_private_json_request() {
+        smol::block_on(async {
+            let client = FakeHttpClient::create(|mut request| async move {
+                assert_eq!(request.method(), "POST");
+                assert_eq!(request.uri(), "http://127.0.0.1:12345/v1/audio/keepalive");
+                assert_eq!(request.headers()["Content-Type"], "application/json");
+                assert_eq!(request.headers()["Authorization"], "Bearer local-key");
+                assert!(request.headers()["Authorization"].is_sensitive());
+                assert_eq!(
+                    request.extensions().get::<RedirectPolicy>(),
+                    Some(&RedirectPolicy::NoFollow)
+                );
+                assert_eq!(
+                    request
+                        .extensions()
+                        .get::<http_client::RequestTimeout>()
+                        .unwrap()
+                        .0,
+                    KEEPALIVE_TIMEOUT
+                );
+                let mut body = Vec::new();
+                request.body_mut().read_to_end(&mut body).await.unwrap();
+                assert_eq!(body, b"{}");
+                Ok(Response::new(r#"{"status":"ok"}"#.into()))
+            });
+            let service = VoiceService::with_environment(settings(), client, |name| {
+                (name == "SAWE_VOICE_API_KEY").then(|| "local-key".into())
+            })
+            .unwrap();
+            assert!(service.keepalive().await.unwrap());
+        });
+    }
+
+    #[test]
+    fn keepalive_never_targets_remote_or_explicit_transcription_overrides() {
+        smol::block_on(async {
+            for (base, transcription) in [
+                ("https://api.openai.com/v1", None),
+                ("https://speech.example/v1", None),
+                (
+                    "http://localhost:12345/v1",
+                    Some("http://localhost:12345/inference"),
+                ),
+                (
+                    "http://127.0.0.1:12345/v1",
+                    Some("https://speech.example/transcribe"),
+                ),
+            ] {
+                let config = VoiceSettings {
+                    api_url: base.into(),
+                    transcription_url: transcription.map(str::to_owned),
+                    ..settings()
+                };
+                let client = FakeHttpClient::create(|_| async {
+                    panic!("keepalive must not send to an ineligible endpoint")
+                });
+                let service =
+                    VoiceService::with_environment(config, client, |_| Some("secret".into()))
+                        .unwrap();
+                assert!(service.keepalive_url().is_none());
+                assert!(!service.keepalive().await.unwrap());
+            }
+            for base in [
+                "http://localhost:12345/v1",
+                "http://127.0.0.2/v1",
+                "https://[::1]/v1",
+            ] {
+                let service = VoiceService::with_environment(
+                    VoiceSettings {
+                        api_url: base.into(),
+                        ..settings()
+                    },
+                    FakeHttpClient::with_200_response(),
+                    |_| None,
+                )
+                .unwrap();
+                assert!(service.keepalive_url().is_some());
+                assert!(service.transcription_authorization.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn keepalive_ignores_response_bodies_and_distinguishes_unsupported_services() {
+        struct NeverRead;
+        impl futures::AsyncRead for NeverRead {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                panic!("keepalive must not read service response bodies")
+            }
+        }
+        smol::block_on(async {
+            for status in [200, 204, 404, 405, 302, 401, 500] {
+                let client = FakeHttpClient::create(move |_| async move {
+                    Ok(Response::builder()
+                        .status(status)
+                        .body(AsyncBody::from_reader(NeverRead))
+                        .unwrap())
+                });
+                let service = VoiceService::with_environment(settings(), client, |_| None).unwrap();
+                let result = service.keepalive().await;
+                match status {
+                    200 | 204 => assert!(result.unwrap()),
+                    404 | 405 => assert!(!result.unwrap()),
+                    _ => assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "Local voice keepalive request failed"
+                    ),
+                }
+            }
+            let service = VoiceService::with_environment(
+                settings(),
+                FakeHttpClient::create(|_| async { Err(anyhow!("secret transport failure")) }),
+                |_| None,
+            )
+            .unwrap();
+            assert_eq!(
+                service.keepalive().await.unwrap_err().to_string(),
+                "Could not connect to local voice keepalive service"
+            );
+        });
     }
 
     #[test]

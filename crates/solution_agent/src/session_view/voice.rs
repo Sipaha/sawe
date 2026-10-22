@@ -30,6 +30,8 @@ pub(super) struct SessionVoice {
     synthesis: Option<Task<()>>,
     playback: Option<CancellablePlayback>,
     poll: Option<Task<()>>,
+    keepalive: Option<Task<()>>,
+    unsupported_keepalive_url: Option<String>,
     reply_start: Option<usize>,
     status: &'static str,
 }
@@ -46,17 +48,22 @@ impl SessionVoice {
         self.playback.take();
     }
 
+    fn capture_stopped(&mut self) {
+        self.capture.take();
+        self.keepalive.take();
+        self.user_speaking = false;
+        self.finishing = false;
+        self.continuous = false;
+        self.status = "";
+    }
+
     fn cancel(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.cancel_speech();
-        self.capture.take();
+        self.capture_stopped();
         self.transcription.take();
         self.pending_recordings.clear();
-        self.continuous = false;
-        self.finishing = false;
-        self.user_speaking = false;
         self.reply_start = None;
-        self.status = "";
     }
 }
 
@@ -209,6 +216,7 @@ impl SolutionSessionView {
                 };
                 let session = self.session.read(cx);
                 self.voice.reply_start = Some(reply_start_index(&session.entries, &session.state));
+                self.ensure_voice_keepalive(cx);
                 self.ensure_voice_poll(window, cx);
             }
             Err(error) => self.show_toast(format!("Could not open microphone: {error}").into(), cx),
@@ -287,6 +295,53 @@ impl SolutionSessionView {
         }));
     }
 
+    fn ensure_voice_keepalive(&mut self, cx: &mut Context<Self>) {
+        if !self.voice.continuous || self.voice.keepalive.is_some() {
+            return;
+        }
+        let generation = self.voice.generation;
+        self.voice.keepalive = Some(cx.spawn(async move |this, cx| {
+            loop {
+                // Resolve current settings each time, just as transcription does.
+                // Never retain an old target after the user changes speech servers.
+                let service = this.update(cx, |this, cx| {
+                    if this.voice.generation != generation
+                        || !this.voice.continuous
+                        || !this.voice_is_visible(cx)
+                        || this.compose_disabled(cx)
+                        || this.expanded_window.is_some()
+                    {
+                        return None;
+                    }
+                    Some(this.voice_service(cx).ok().filter(|service| {
+                        service.keepalive_url().is_some_and(|url| {
+                            this.voice.unsupported_keepalive_url.as_deref() != Some(url.as_str())
+                        })
+                    }))
+                });
+                let Ok(Some(service)) = service else {
+                    break;
+                };
+                if let Some(service) = service
+                    && matches!(service.keepalive().await, Ok(false))
+                {
+                    this.update(cx, |this, _| {
+                        if this.voice.generation == generation {
+                            this.voice.unsupported_keepalive_url =
+                                service.keepalive_url().map(|url| url.as_str().to_owned());
+                        }
+                    })
+                    .ok();
+                }
+                // One bounded request at a time. Transient failures retry quietly
+                // while active so restarting the local service can recover.
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+            }
+        }));
+    }
+
     fn poll_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.voice_is_visible(cx) || self.compose_disabled(cx) || self.expanded_window.is_some()
         {
@@ -341,11 +396,7 @@ impl SolutionSessionView {
                     return false;
                 }
                 VoiceCaptureEvent::Stopped => {
-                    self.voice.capture.take();
-                    self.voice.user_speaking = false;
-                    self.voice.finishing = false;
-                    self.voice.continuous = false;
-                    self.voice.status = "";
+                    self.voice.capture_stopped();
                 }
             }
             cx.notify();
@@ -581,6 +632,47 @@ mod tests {
         assert!(!voice.speaking());
         assert!(voice.pending_speech.is_empty());
     }
+
+    #[gpui::test]
+    fn stopping_capture_or_voice_cancels_inflight_keepalive(cx: &mut gpui::TestAppContext) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct RequestGuard(Arc<AtomicBool>);
+        impl Drop for RequestGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        for stop_all in [false, true] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = RequestGuard(dropped.clone());
+            let request = cx.executor().spawn(async move {
+                let _guard = guard;
+                futures::future::pending::<()>().await;
+            });
+            let mut voice = SessionVoice {
+                continuous: true,
+                keepalive: Some(request),
+                ..Default::default()
+            };
+            cx.executor().run_until_parked();
+            assert!(!dropped.load(Ordering::SeqCst));
+            if stop_all {
+                voice.cancel();
+            } else {
+                voice.capture_stopped();
+            }
+            cx.executor().run_until_parked();
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "an in-flight request must be dropped"
+            );
+            assert!(voice.keepalive.is_none());
+            assert!(!voice.continuous);
+        }
+    }
     async fn voice_fixture(
         cx: &mut gpui::TestAppContext,
     ) -> (
@@ -711,6 +803,45 @@ mod tests {
             assert!(session.read(cx).pending_messages.is_empty());
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    async fn hands_free_keepalive_task_stops_when_dialog_is_hidden(cx: &mut gpui::TestAppContext) {
+        let (view, _workspace, session, _tmp) = voice_fixture(cx).await;
+        // A remote target opts out without contacting any real voice service.
+        cx.update(|cx| {
+            let mut settings = SolutionAgentSettings::get_global(cx).clone();
+            settings.voice.api_url = "https://speech.example/v1".into();
+            SolutionAgentSettings::override_global(settings, cx);
+        });
+        view.update(cx, |view, _, cx| {
+            view.ensure_voice_keepalive(cx);
+            assert!(
+                view.voice.keepalive.is_none(),
+                "read-aloud or recording alone must not retain the worker"
+            );
+            view.voice.continuous = true;
+            view.ensure_voice_keepalive(cx);
+            assert!(view.voice.keepalive.is_some());
+        })
+        .unwrap();
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            let solution = session.read(cx).solution_id;
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_active_dialog_session(solution, None, cx)
+            });
+        });
+        view.update(cx, |view, window, cx| {
+            assert!(!view.poll_voice(window, cx));
+            assert!(view.voice.keepalive.is_none());
+            assert!(!view.voice.continuous);
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.executor().run_until_parked();
+        view.update(cx, |view, _, _| assert!(view.voice.keepalive.is_none()))
+            .unwrap();
     }
 
     #[gpui::test]
