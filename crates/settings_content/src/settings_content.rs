@@ -1445,6 +1445,39 @@ pub struct SolutionAgentSettingsContent {
     /// Ephemeral-task pool sizing. Optional — when absent, defaults apply
     /// (3 concurrent / 30s queue timeout / 60s idle TTL).
     pub ephemeral: Option<SolutionAgentEphemeralSettingsContent>,
+    /// Provider-independent speech recognition and synthesis.
+    pub voice: Option<SolutionAgentVoiceSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct SolutionAgentVoiceSettingsContent {
+    /// Allow voice controls. Recording always requires an explicit user action. Default: false.
+    pub enabled: Option<bool>,
+    /// Automatically speak newly completed assistant answers. Default: false.
+    pub read_aloud: Option<bool>,
+    /// OpenAI-compatible API base URL. HTTPS, or HTTP on loopback only.
+    /// Default: https://api.openai.com/v1
+    pub api_url: Option<String>,
+    /// Environment variable containing the speech service API key. Never put a key here.
+    /// Default: SAWE_VOICE_API_KEY. OPENAI_API_KEY is a fallback only for the official API.
+    /// Custom endpoints can omit authentication when this variable is unset.
+    pub api_key_env: Option<String>,
+    /// Optional full transcription endpoint URL, e.g. http://127.0.0.1:8080/inference.
+    /// Overrides api_url for recognition only; credentials never cross origins implicitly.
+    pub transcription_url: Option<String>,
+    /// Optional full speech synthesis endpoint URL; overrides api_url for synthesis only.
+    pub speech_url: Option<String>,
+    /// Optional environment variable containing a key specifically for transcription_url.
+    pub transcription_api_key_env: Option<String>,
+    /// Optional environment variable containing a key specifically for speech_url.
+    pub speech_api_key_env: Option<String>,
+    /// Speech recognition model. Default: gpt-4o-mini-transcribe.
+    pub transcription_model: Option<String>,
+    /// Speech synthesis model. Default: gpt-4o-mini-tts.
+    pub speech_model: Option<String>,
+    /// Speech synthesis voice. Default: coral.
+    pub speech_voice: Option<String>,
 }
 
 #[with_fallible_options]
