@@ -36,6 +36,8 @@ const MAX_PLAYBACK_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Debug)]
 pub enum VoiceCaptureEvent {
     SpeechStarted,
+    /// Balances every started segment, even noise too short for transcription.
+    SpeechEnded,
     /// Mono, 16kHz, signed PCM16 RIFF/WAV, no longer than 30 seconds.
     Utterance(Vec<u8>),
     Error(String),
@@ -375,7 +377,7 @@ impl CaptureProcessor {
             }
             self.frame.clear();
         }
-        if let Some(event) = self.segmenter.finish() {
+        for event in self.segmenter.finish() {
             send_event(events, event)?;
         }
         Ok(())
@@ -494,7 +496,9 @@ impl Segmenter {
             }
             self.start_frames = if voiced { self.start_frames + 1 } else { 0 };
             if !voiced {
-                self.noise_floor = self.noise_floor * 0.98 + energy * 0.02;
+                // Do not let a slowly rising background raise the gate until
+                // ordinary quiet speech is permanently classified as noise.
+                self.noise_floor = (self.noise_floor * 0.98 + energy * 0.02).min(0.004);
             }
             if self.start_frames >= START_FRAMES {
                 self.frames = self.pre_roll.len();
@@ -515,9 +519,7 @@ impl Segmenter {
             if self.frames >= MAX_FRAMES
                 || (self.continuous && self.silent_frames >= SILENCE_FRAMES)
             {
-                if let Some(event) = self.finish() {
-                    events.push(event);
-                }
+                events.extend(self.finish());
                 if !self.continuous {
                     self.done = true;
                 }
@@ -526,7 +528,7 @@ impl Segmenter {
         events
     }
 
-    fn finish(&mut self) -> Option<VoiceCaptureEvent> {
+    fn finish(&mut self) -> Vec<VoiceCaptureEvent> {
         let recording = std::mem::take(&mut self.recording);
         let voiced = self.voiced_frames;
         self.pre_roll.clear();
@@ -534,7 +536,14 @@ impl Segmenter {
         self.voiced_frames = 0;
         self.silent_frames = 0;
         self.frames = 0;
-        (voiced >= MIN_VOICED_FRAMES).then(|| VoiceCaptureEvent::Utterance(pcm_wav(&recording)))
+        let mut events = Vec::new();
+        if !recording.is_empty() {
+            events.push(VoiceCaptureEvent::SpeechEnded);
+        }
+        if voiced >= MIN_VOICED_FRAMES {
+            events.push(VoiceCaptureEvent::Utterance(pcm_wav(&recording)));
+        }
+        events
     }
 }
 
@@ -695,8 +704,53 @@ mod tests {
         assert!(frames(&mut segmenter, 500, 40).is_empty());
         assert!(frames(&mut segmenter, 2, 4_000).is_empty());
         assert!(frames(&mut segmenter, 100, 0).is_empty());
-        assert!(segmenter.finish().is_none());
+        assert!(segmenter.finish().is_empty());
         assert!(segmenter.pre_roll.len() <= PRE_ROLL_FRAMES);
+    }
+
+    #[test]
+    fn discarded_short_segments_end_and_rearm() {
+        for continuous in [true, false] {
+            let mut segmenter = Segmenter::new(continuous);
+            let onset = frames(&mut segmenter, START_FRAMES, 4_000);
+            assert!(matches!(
+                onset.as_slice(),
+                [VoiceCaptureEvent::SpeechStarted]
+            ));
+            let ended = if continuous {
+                frames(&mut segmenter, SILENCE_FRAMES, 0)
+            } else {
+                segmenter.finish()
+            };
+            assert!(matches!(ended.as_slice(), [VoiceCaptureEvent::SpeechEnded]));
+            assert!(matches!(
+                frames(&mut segmenter, MIN_VOICED_FRAMES, 4_000).as_slice(),
+                [VoiceCaptureEvent::SpeechStarted]
+            ));
+            assert!(matches!(
+                segmenter.finish().as_slice(),
+                [
+                    VoiceCaptureEvent::SpeechEnded,
+                    VoiceCaptureEvent::Utterance(_)
+                ]
+            ));
+        }
+    }
+
+    #[test]
+    fn adaptive_noise_gate_cannot_drift_above_quiet_speech() {
+        let mut segmenter = Segmenter::new(true);
+        for amplitude in (10..2_000).step_by(10) {
+            frames(&mut segmenter, 10, amplitude);
+            assert!(segmenter.noise_floor <= 0.004);
+        }
+        frames(&mut segmenter, SILENCE_FRAMES, 0);
+        let events = frames(&mut segmenter, 20, 600);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, VoiceCaptureEvent::SpeechStarted))
+        );
     }
 
     #[test]
@@ -708,7 +762,8 @@ mod tests {
         assert!(matches!(speech[0], VoiceCaptureEvent::SpeechStarted));
         assert!(frames(&mut segmenter, SILENCE_FRAMES - 1, 0).is_empty());
         let ended = frames(&mut segmenter, 1, 0);
-        let VoiceCaptureEvent::Utterance(wav) = &ended[0] else {
+        assert!(matches!(ended[0], VoiceCaptureEvent::SpeechEnded));
+        let VoiceCaptureEvent::Utterance(wav) = &ended[1] else {
             panic!("Expected utterance")
         };
         // Pre-roll retains 17 silent frames plus the 3 onset frames.
@@ -719,7 +774,7 @@ mod tests {
                 .any(|event| matches!(event, VoiceCaptureEvent::SpeechStarted))
         );
         assert!(matches!(
-            segmenter.finish(),
+            segmenter.finish().last(),
             Some(VoiceCaptureEvent::Utterance(_))
         ));
     }
@@ -734,10 +789,10 @@ mod tests {
         assert!(frames(&mut segmenter, SILENCE_FRAMES * 2, 0).is_empty());
         assert!(frames(&mut segmenter, 20, 4_000).is_empty());
         assert!(matches!(
-            segmenter.finish(),
+            segmenter.finish().last(),
             Some(VoiceCaptureEvent::Utterance(_))
         ));
-        assert!(segmenter.finish().is_none());
+        assert!(segmenter.finish().is_empty());
     }
 
     #[test]
