@@ -4,12 +4,12 @@ Solution chats own voice independently of their coding-provider adapter. See the
 [voice guide](../../guides/voice-conversations.md) for setup and user controls.
 
 `agent_settings::VoiceSettings` configures a compatible STT/TTS service.
-Its local default selects Russian GigaAM v3 CTC recognition and Piper synthesis;
-the sidecar retains its recognition model for one idle hour. A cancellable
-Hands-free task refreshes eligible local servers every 30 seconds. Remote or
-explicit transcription overrides do not receive this extension; unsupported
-servers keep normal speech behavior without repeated requests. Custom endpoints
-and model overrides remain independent of coding-provider selection.
+Its local default targets the compatible speech API on port 8095. SPK LAIHub
+owns the engines, installation and all model lifetime/idle policy. Sawe has no
+model workers, load/unload commands or retention settings. A cancellable
+Hands-free task sends activity pings every 30 seconds to eligible local APIs.
+Unsupported services quietly disable that extension; custom endpoints and model
+request fields remain independent of coding-provider selection.
 `voice_service::VoiceService` transcribes bounded PCM WAV recordings and requests
 bounded WAV speech; it uses the HTTP client's complete-request timeout. Endpoint
 overrides isolate credentials by origin, and loopback transport bypasses proxies.

@@ -28,15 +28,16 @@ voice activity detection and cancellable playback. Speech shares the application
 output mixer so echo cancellation sees a single reverse stream. Every started
 speech segment ends explicitly, including short discarded noises.
 
-A configurable OpenAI-compatible HTTP service supplies STT/TTS. The default is a
-loopback sidecar with Russian GigaAM v3 CTC INT8 on CPU and Piper. The user selected
-GigaAM after the [Russian model comparison](../../findings/2026-10-russian-asr-comparison.md)
-and chose an hour of idle retention to avoid repeated cold starts. Active
-Hands-free refreshes the local service's activity clock every 30 seconds; closing
-or stopping voice cancels that task. This prevents silence from evicting a model
-while avoiding a permanent server-side pin after a client exits. Explicit
-Whisper models remain available for multilingual recognition. Engine setup is
-explicit; models load lazily and are released on idle. Endpoint credentials are selected
+A configurable OpenAI-compatible HTTP service supplies STT/TTS. SPK LAIHub is
+an independently managed service and owns installation, model processes,
+CPU limits, retention and idle unloading. Sawe owns only capture/playback and
+API requests. It never launches or terminates inference engines and has no model
+idle timer or load/unload commands. Active Hands-free sends an activity ping
+every 30 seconds; stopping, navigation or closing cancels those pings. LAIHub
+alone applies retention policy, including the user's requirement to retain
+models during active real-time conversation. Default speech remains on loopback
+port 8095; the LAIHub control panel can use its separate port 5195. The previous
+standalone Python runtime is removed from Sawe. Endpoint credentials are selected
 from environment variables, scoped by origin, and excluded from transcript and
 settings data. Loopback connections bypass proxies.
 

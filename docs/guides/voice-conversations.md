@@ -4,39 +4,29 @@ Voice works above the existing Solution chat adapters, so Codex, Claude and Kimi
 use the same microphone and speech controls. The default speech service is local
 at `http://127.0.0.1:8095/v1`; a coding-provider subscription is not used for audio.
 
-## Start the local engines
+## Connect LAIHub
 
-From the Sawe repository, install and launch the pinned local runtime:
+Sawe is an API client. SPK LAIHub owns model installation, inference processes,
+CPU limits, memory retention and idle unloading. Start LAIHub from its repository:
 
 ```sh
-script/voice-local --runtime-dir /home/spk/.spk/sawe/ss/Sawe1/.tmp/voice-runtime setup
-script/voice-local --runtime-dir /home/spk/.spk/sawe/ss/Sawe1/.tmp/voice-runtime serve
+./build/spk-laihub-browser --browser --listen 127.0.0.1:5195 --speech-listen 127.0.0.1:8095
 ```
 
-Setup installs the pinned Russian GigaAM v3 CTC INT8 model, a CPU runtime and the
-Russian Piper Denis voice. It does not require CUDA or install system packages.
-The runtime directory holds models, its Python environment and caches; keep it
-when cleaning unrelated scratch files. Recognition emits lowercase Russian
-without punctuation. The launch command selects the model; the API model field
-is accepted for compatibility.
+The control panel is on port 5195; the dedicated speech listener on port 8095
+matches Sawe's default endpoint. Install/import and manage models in LAIHub.
+Select the Russian synthesis voice in LAIHub Settings; LAIHub owns that selection
+for connected clients. Sawe never launches, loads, unloads or stops model workers. GigaAM returns
+unpunctuated Russian; other languages require a compatible speech service.
 
-The service listens on loopback only. GigaAM loads on demand. While Hands-free
-is active, Sawe sends a small keepalive every 30 seconds so silence does not
-unload the model. After the mode ends, recognition is released after one hour
-without speech-service activity. Use `--idle-seconds` to change this interval.
-Closing the chat or app stops keepalives; no permanent model pin remains.
-Piper uses a separate model and exits after synthesis. The microphone never
-starts automatically.
-See [local runtime details](../findings/2026-10-local-voice-runtime.md) for pinned
-revisions, limits, licensing and measured performance.
+While Hands-free is active, Sawe sends an activity ping every 30 seconds. LAIHub
+alone decides what that activity means for model retention. Stopping voice,
+navigation or closing the chat stops pings. There are no model idle timers or
+unload commands in Sawe. Keepalives do not load models or leave a permanent pin.
+The microphone never starts automatically.
 
-Whisper remains an explicit alternative for multilingual recognition. For
-example, use `--model small --backend cuda --cuda-arch 120` during setup and
-`--model small --backend cuda` during serve on the verified RTX 5070 Laptop.
-Other GPUs can use `--cuda-arch native`; `--backend cpu` avoids CUDA. The smaller
-Whisper model is selected with `--model base`. Set
-`solution_agent.voice.transcription_model` when using a different compatible
-server that selects models from the request.
+Custom speech endpoints remain configurable through `solution_agent.voice`.
+The API connection is independent of the selected coding provider.
 
 ## Chat controls
 
