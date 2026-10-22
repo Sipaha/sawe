@@ -35,7 +35,7 @@ The API connection is independent of the selected coding provider.
 - **Hands-free:** listen continuously, submit each phrase after a pause and enable
   read-aloud. Click again to end the voice session. Recognition is based on
   completed utterances, rather than live partial text.
-- **Speaker:** toggle AI-generated read-aloud for newly completed replies.
+- **Speaker:** toggle AI-generated read-aloud for new assistant prose as it arrives.
 - **Stop speaking:** cancel playback and pending speech. The coding agent keeps
   running; its existing Stop control remains a separate action.
 
@@ -47,13 +47,22 @@ activity detection can also react to loud non-speech sounds.
 Recognized text follows the ordinary send/queue path. If a typed draft, images or
 an in-progress resume would be affected, recognition appends to the draft for
 review instead of submitting it. Agent errors use the existing draft-restoration
-path. Read-aloud speaks the last assistant message of each completed turn and
-skips tool output, reasoning, fenced code and images. The complete text stays in
-chat; speech is limited to 32,000 characters per reply and 12 queued chunks.
+path. Read-aloud queues complete sentences while the assistant is streaming,
+including progress commentary before tools. Tool boundaries and the final turn
+event flush remaining prose. It skips tool output, reasoning, fenced code and
+images. Short synthesis chunks avoid waiting for a whole reply; at most 12 chunks
+are queued, with backpressure preserving the unspoken tail. Each assistant
+message is limited to 32,000 source characters for speech. Stop Speaking or
+interruption suppresses the old reply until new user input.
 
-Changing the visible chat/Solution, hiding its dialog, rewinding history, clearing
-context or closing the view ends its voice activity. Voice choices are not
-persisted across application restarts. These actions are also available in the
+Hands-free stays attached to the original dialog when switching tabs, including
+its recognition, reply playback and activity pings. Recognized text continues to
+that original dialog, not the newly selected tab. Explicitly enabling Hands-free
+in another dialog stops the previous owner before starting the new microphone.
+Turning it off, closing the dialog or replacing its history/context ends it.
+Ordinary recording and read-aloud without Hands-free still stop on navigation.
+Per-chat voice toggles are not persisted across application restarts; the selected
+Piper voice remains a persistent LAIHub setting. These actions are available in the
 command palette: `Toggle Voice Recording`, `Toggle Voice Conversation`,
 `Toggle Read Aloud` and `Stop Speaking` in the Solution Agent namespace.
 

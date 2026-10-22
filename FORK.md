@@ -6502,8 +6502,11 @@ dismisses it, just like clicking outside.
 
 Solution chat voice uses local or configurable compatible STT/TTS around the
 existing composer/queue. Speaking interrupts audio only; stopping the agent
-remains explicit. Completion follows real turn events, with bounded capture and
-stale-result rejection on navigation or history replacement. Audio playback
+remains explicit. Incremental sentence chunks include commentary before tools;
+real turn events flush remaining prose without repeating it. Hands-free retains
+one original dialog across tab navigation until explicit transfer or Off;
+ordinary voice modes keep visibility guards. History replacement invalidates
+voice state, and queue backpressure preserves unspoken text. Audio playback
 shares the application mixer for echo cancellation. Speech engines are owned
 entirely by SPK LAIHub, a separate model management application. Sawe communicates
 through its compatible HTTP API and emits activity pings during Hands-free.

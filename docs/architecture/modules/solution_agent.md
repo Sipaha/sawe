@@ -17,9 +17,15 @@ overrides isolate credentials by origin, and loopback transport bypasses proxies
 
 The session view owns capture, request tasks and cancellable playback. It sends
 recognized text through ordinary compose/queue behavior, preserving typed drafts.
-Actual `Stopped` events delimit spoken replies; state polling alone can miss
-back-to-back turns. Navigation, history replacement and generation checks reject
-stale results. Interrupting audio never cancels the coding agent.
+An incremental prose cursor queues sentences and pre-tool commentary while the
+agent is running; actual `Stopped` events flush the final tail without replay.
+Short chunks and bounded queue backpressure limit synthesis latency. Reasoning,
+tool output, fenced code, images and child-agent output stay silent.
+One global weak view owner keeps Hands-free on the original dialog across tab
+navigation; claiming it in another dialog synchronously stops the old capture.
+Ordinary dictation/read-aloud retain visibility checks. Closing, history replacement
+and request generations reject stale results. Interrupting audio suppresses the
+old reply until new user input and never cancels the coding agent.
 
 The audio crate's shared mixer provides the AEC reverse stream. Started speech
 segments always have an explicit ending, including discarded short noises. See

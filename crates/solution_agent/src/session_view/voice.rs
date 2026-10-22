@@ -1,7 +1,10 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use audio::voice::{CancellablePlayback, VoiceCapture, VoiceCaptureEvent};
-use gpui::{App, Context, IntoElement, Task, Window, div};
+use gpui::{App, Context, IntoElement, Task, WeakEntity, Window, div};
 use settings::Settings as _;
 use ui::{IconButton, IconName, Tooltip, prelude::*};
 
@@ -9,7 +12,7 @@ use super::SolutionSessionView;
 use crate::{
     actions::{StopSpeaking, ToggleReadAloud, ToggleVoiceConversation, ToggleVoiceRecording},
     agent_settings::SolutionAgentSettings,
-    model::SessionState,
+    model::{SessionState, SolutionSessionId},
     session_entry::{AssistantChunk, SessionEntry, SessionEntryKind},
     store::SolutionAgentStore,
     voice_service::{VoiceService, speech_text},
@@ -33,8 +36,18 @@ pub(super) struct SessionVoice {
     keepalive: Option<Task<()>>,
     unsupported_keepalive_url: Option<String>,
     reply_start: Option<usize>,
+    reply_spoken: String,
+    reply_observed: String,
+    reply_changed_at: Option<Instant>,
+    reply_finished: usize,
+    awaiting_user: bool,
     status: &'static str,
 }
+
+#[derive(Default)]
+struct HandsFreeOwner(Option<(SolutionSessionId, WeakEntity<SolutionSessionView>)>);
+
+impl gpui::Global for HandsFreeOwner {}
 
 impl SessionVoice {
     fn speaking(&self) -> bool {
@@ -46,6 +59,94 @@ impl SessionVoice {
         self.synthesis.take();
         self.pending_speech.clear();
         self.playback.take();
+        self.awaiting_user = true;
+    }
+
+    fn reset_reply_cursor(&mut self, start: usize) {
+        self.reply_start = Some(start);
+        self.reply_spoken.clear();
+        self.reply_observed.clear();
+        self.reply_changed_at = None;
+        self.reply_finished = start;
+        self.awaiting_user = false;
+    }
+
+    fn advance_reply_cursor(&mut self, start: usize) {
+        self.reply_start = Some(start);
+        self.reply_spoken.clear();
+        self.reply_observed.clear();
+        self.reply_changed_at = None;
+    }
+
+    fn queue_replies(&mut self, entries: &[std::sync::Arc<SessionEntry>], now: Instant) {
+        let Some(start) = self.reply_start else {
+            return;
+        };
+        if start > entries.len() {
+            self.reset_reply_cursor(entries.len());
+            return;
+        }
+        // The transcript owns history; only the unspoken current entry is scanned.
+        for index in start..entries.len().min(start.saturating_add(64)) {
+            let entry = &entries[index];
+            if entry.subagent_id.is_some() {
+                self.advance_reply_cursor(index + 1);
+                continue;
+            }
+            if matches!(entry.kind, SessionEntryKind::UserMessage { .. }) {
+                self.awaiting_user = false;
+            }
+            let SessionEntryKind::AssistantMessage { chunks } = &entry.kind else {
+                self.advance_reply_cursor(index + 1);
+                continue;
+            };
+            if self.awaiting_user {
+                self.advance_reply_cursor(index + 1);
+                continue;
+            }
+            let complete = index < self.reply_finished
+                || entries[index + 1..]
+                    .iter()
+                    .any(|entry| entry.subagent_id.is_none());
+            let markdown = chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    AssistantChunk::Message(message) => Some(message.as_str()),
+                    AssistantChunk::Thought(_) => None,
+                })
+                .flat_map(str::chars)
+                .take(32_000)
+                .collect::<String>();
+            let text = streaming_speech_text(&markdown, complete);
+            if !text.starts_with(&self.reply_spoken) {
+                // A rewritten entry must not replay prose that was already heard.
+                self.advance_reply_cursor(index + 1);
+                continue;
+            }
+            if text != self.reply_observed {
+                self.reply_observed = text.clone();
+                self.reply_changed_at = Some(now);
+            }
+            let settled = self.reply_changed_at.is_some_and(|changed| {
+                now.saturating_duration_since(changed) >= Duration::from_millis(180)
+            });
+            while self.pending_speech.len() < 12 {
+                let remaining = &text[self.reply_spoken.len()..];
+                let Some(end) = speech_chunk_end(remaining, complete, settled) else {
+                    break;
+                };
+                let chunk = &remaining[..end];
+                if !chunk.trim().is_empty() {
+                    self.pending_speech.push_back(chunk.trim().to_owned());
+                }
+                self.reply_spoken.push_str(chunk);
+            }
+            if complete && self.reply_spoken.len() == text.len() {
+                self.advance_reply_cursor(index + 1);
+            } else {
+                break;
+            }
+        }
     }
 
     fn capture_stopped(&mut self) {
@@ -81,47 +182,83 @@ fn reply_start_index(entries: &[std::sync::Arc<SessionEntry>], state: &SessionSt
     }
 }
 
-fn reply_text(entries: &[std::sync::Arc<SessionEntry>], start: usize) -> String {
-    // Read the last assistant message of a completed turn. Earlier messages
-    // are progress commentary; reasoning and tool output are never spoken.
-    let chunks = entries.iter().skip(start).rev().find_map(|entry| {
-        if entry.subagent_id.is_some() {
-            return None;
+fn streaming_speech_text(markdown: &str, complete: bool) -> String {
+    if complete {
+        return speech_text(markdown);
+    }
+    // Unfinished Markdown may still become an image, link or inline code.
+    // Wait at its opening delimiter so a later token cannot change spoken prose.
+    let mut brackets = Vec::new();
+    let mut parentheses = Vec::new();
+    let mut closed_bracket = None;
+    let mut backtick = None;
+    let mut escaped = false;
+    let mut previous = None;
+    for (index, character) in markdown.char_indices() {
+        if escaped {
+            escaped = false;
+            previous = Some(character);
+            continue;
         }
-        match &entry.kind {
-            SessionEntryKind::AssistantMessage { chunks } => Some(chunks),
-            _ => None,
+        match character {
+            '\\' => escaped = true,
+            '[' => brackets.push(if previous == Some('!') {
+                index - 1
+            } else {
+                index
+            }),
+            ']' => closed_bracket = brackets.pop(),
+            '(' => parentheses.push(if previous == Some(']') {
+                closed_bracket.unwrap_or(index)
+            } else {
+                index
+            }),
+            ')' => {
+                parentheses.pop();
+            }
+            '`' => {
+                backtick = if backtick.is_some() {
+                    None
+                } else {
+                    Some(index)
+                }
+            }
+            _ => {}
         }
-    });
-    let text = chunks
+        previous = Some(character);
+    }
+    let end = brackets
         .into_iter()
-        .flatten()
-        .filter_map(|chunk| match chunk {
-            AssistantChunk::Message(message) => Some(message.as_str()),
-            AssistantChunk::Thought(_) => None,
-        })
-        .collect::<String>();
-    speech_text(&text)
+        .chain(parentheses)
+        .chain(backtick)
+        .min()
+        .unwrap_or(markdown.len());
+    speech_text(&markdown[..end])
 }
 
-fn speech_chunks(text: &str) -> VecDeque<String> {
-    // Bound queued synthesis independently of the transcript. A coding agent can
-    // return a whole generated document; speaking that must not allocate forever.
-    let mut result = VecDeque::new();
-    let mut chunk = String::new();
+fn speech_chunk_end(text: &str, complete: bool, settled: bool) -> Option<usize> {
+    let mut last_space = None;
+    let mut characters = text.char_indices().peekable();
     let mut count = 0;
-    for character in text.chars().take(32_000) {
-        chunk.push(character);
+    while let Some((index, character)) = characters.next() {
         count += 1;
-        if count >= 3_000 {
-            count = 0;
-            result.push_back(std::mem::take(&mut chunk));
+        let end = index + character.len_utf8();
+        if character.is_whitespace() && index > 0 {
+            last_space = Some(end);
+        }
+        if matches!(character, '.' | '!' | '?' | '…')
+            && (characters
+                .peek()
+                .is_some_and(|(_, next)| next.is_whitespace())
+                || (characters.peek().is_none() && (complete || settled)))
+        {
+            return Some(end);
+        }
+        if count >= 240 {
+            return Some(last_space.unwrap_or(end));
         }
     }
-    if !chunk.trim().is_empty() {
-        result.push_back(chunk);
-    }
-    result
+    (complete && !text.is_empty()).then_some(text.len())
 }
 
 impl SolutionSessionView {
@@ -147,7 +284,69 @@ impl SolutionSessionView {
             })
     }
 
+    fn voice_can_run(&self, cx: &App) -> bool {
+        if !self.voice.continuous {
+            return self.voice_is_visible(cx);
+        }
+        cx.try_global::<HandsFreeOwner>()
+            .and_then(|owner| owner.0.as_ref())
+            .is_some_and(|(id, _)| *id == self.session_id)
+            && self.workspace.upgrade().is_some()
+            && SolutionAgentStore::try_global(cx)
+                .is_some_and(|store| store.read(cx).session(self.session_id).is_some())
+            && solutions::SolutionStore::try_global(cx).is_some_and(|store| {
+                store
+                    .read(cx)
+                    .solutions()
+                    .iter()
+                    .any(|solution| solution.id == self.session.read(cx).solution_id)
+            })
+    }
+
+    fn claim_hands_free(&mut self, cx: &mut Context<Self>) {
+        let previous = cx
+            .try_global::<HandsFreeOwner>()
+            .and_then(|owner| owner.0.as_ref())
+            .map(|(_, view)| view.clone());
+        if let Some(previous) = previous.and_then(|view| view.upgrade())
+            && previous.entity_id() != cx.entity_id()
+        {
+            previous.update(cx, |view, cx| view.stop_voice(cx));
+        }
+        cx.set_global(HandsFreeOwner(Some((
+            self.session_id,
+            cx.entity().downgrade(),
+        ))));
+    }
+
+    fn release_hands_free(&self, cx: &mut Context<Self>) {
+        if cx
+            .try_global::<HandsFreeOwner>()
+            .and_then(|owner| owner.0.as_ref())
+            .is_some_and(|(_, view)| view.entity_id() == cx.entity_id())
+        {
+            cx.set_global(HandsFreeOwner::default());
+        }
+    }
+
+    fn interrupt_speech(&mut self, cx: &App) {
+        self.voice.cancel_speech();
+        self.voice
+            .reset_reply_cursor(self.session.read(cx).entries.len());
+        self.voice.awaiting_user = true;
+    }
+
+    fn queue_voice_replies(&mut self, cx: &App) {
+        if self.voice.read_aloud && self.voice_can_run(cx) {
+            self.voice.queue_replies(
+                &self.session.read(cx).entries,
+                cx.background_executor().now(),
+            );
+        }
+    }
+
     pub(super) fn stop_voice(&mut self, cx: &mut Context<Self>) {
+        self.release_hands_free(cx);
         self.voice.cancel();
         self.voice.read_aloud = false;
         self.voice.poll.take();
@@ -200,6 +399,9 @@ impl SolutionSessionView {
             return;
         }
         self.voice.cancel();
+        if continuous {
+            self.claim_hands_free(cx);
+        }
         let device = audio::AudioSettings::get_global(cx)
             .input_audio_device
             .clone();
@@ -215,11 +417,15 @@ impl SolutionSessionView {
                     "Recording… click mic to send"
                 };
                 let session = self.session.read(cx);
-                self.voice.reply_start = Some(reply_start_index(&session.entries, &session.state));
+                self.voice
+                    .reset_reply_cursor(reply_start_index(&session.entries, &session.state));
                 self.ensure_voice_keepalive(cx);
                 self.ensure_voice_poll(window, cx);
             }
-            Err(error) => self.show_toast(format!("Could not open microphone: {error}").into(), cx),
+            Err(error) => {
+                self.release_hands_free(cx);
+                self.show_toast(format!("Could not open microphone: {error}").into(), cx);
+            }
         }
         cx.notify();
     }
@@ -240,7 +446,8 @@ impl SolutionSessionView {
             }
             self.voice.read_aloud = true;
             let session = self.session.read(cx);
-            self.voice.reply_start = Some(reply_start_index(&session.entries, &session.state));
+            self.voice
+                .reset_reply_cursor(reply_start_index(&session.entries, &session.state));
             self.ensure_voice_poll(window, cx);
         }
         cx.notify();
@@ -252,7 +459,7 @@ impl SolutionSessionView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.voice.cancel_speech();
+        self.interrupt_speech(cx);
         cx.notify();
     }
 
@@ -261,19 +468,17 @@ impl SolutionSessionView {
         reason: &agent_client_protocol::schema::v1::StopReason,
         cx: &mut Context<Self>,
     ) {
-        if !self.voice.read_aloud || !self.voice_is_visible(cx) {
+        if !self.voice.read_aloud || !self.voice_can_run(cx) {
             return;
         }
         let session = self.session.read(cx);
-        let start = self.voice.reply_start.unwrap_or(session.entries.len());
         if *reason == agent_client_protocol::schema::v1::StopReason::EndTurn {
-            let text = reply_text(&session.entries, start);
-            let available = 12usize.saturating_sub(self.voice.pending_speech.len());
+            self.voice.reply_finished = session.entries.len();
             self.voice
-                .pending_speech
-                .extend(speech_chunks(&text).into_iter().take(available));
+                .queue_replies(&session.entries, cx.background_executor().now());
+        } else {
+            self.voice.advance_reply_cursor(session.entries.len());
         }
-        self.voice.reply_start = Some(session.entries.len());
         cx.notify();
     }
 
@@ -307,7 +512,7 @@ impl SolutionSessionView {
                 let service = this.update(cx, |this, cx| {
                     if this.voice.generation != generation
                         || !this.voice.continuous
-                        || !this.voice_is_visible(cx)
+                        || !this.voice_can_run(cx)
                         || this.compose_disabled(cx)
                         || this.expanded_window.is_some()
                     {
@@ -343,8 +548,7 @@ impl SolutionSessionView {
     }
 
     fn poll_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.voice_is_visible(cx) || self.compose_disabled(cx) || self.expanded_window.is_some()
-        {
+        if !self.voice_can_run(cx) || self.compose_disabled(cx) || self.expanded_window.is_some() {
             self.stop_voice(cx);
             return false;
         }
@@ -361,7 +565,7 @@ impl SolutionSessionView {
         for event in events {
             match event {
                 VoiceCaptureEvent::SpeechStarted => {
-                    self.voice.cancel_speech();
+                    self.interrupt_speech(cx);
                     self.voice.user_speaking = true;
                     self.voice.status = "Recording…";
                     if let Some(store) = SolutionAgentStore::try_global(cx) {
@@ -410,6 +614,7 @@ impl SolutionSessionView {
             self.voice.playback.take();
             cx.notify();
         }
+        self.queue_voice_replies(cx);
         self.start_next_transcription(window, cx);
         self.start_next_speech(cx);
         let active = self.voice.capture.is_some()
@@ -468,11 +673,10 @@ impl SolutionSessionView {
     }
 
     fn deliver_voice_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.voice_is_visible(cx) || self.compose_disabled(cx) || self.expanded_window.is_some()
-        {
+        if !self.voice_can_run(cx) || self.compose_disabled(cx) || self.expanded_window.is_some() {
             return;
         }
-        self.voice.cancel_speech();
+        self.interrupt_speech(cx);
         let draft = self.compose_editor.read(cx).text(cx);
         let may_send = draft.trim().is_empty() && self.pending_images.is_empty() && !self.resuming;
         let combined = if draft.is_empty() {
@@ -517,7 +721,7 @@ impl SolutionSessionView {
                 if this.voice.speech_generation != generation {
                     return;
                 }
-                if !this.voice_is_visible(cx)
+                if !this.voice_can_run(cx)
                     || this.compose_disabled(cx)
                     || this.expanded_window.is_some()
                 {
@@ -589,10 +793,15 @@ mod tests {
     #[test]
     fn speech_chunks_preserve_unicode_and_fit_service_limit() {
         let source = "Привет, Sawe! ".repeat(800);
-        let chunks = speech_chunks(&source);
+        let mut chunks = Vec::new();
+        let mut remaining = source.as_str();
+        while let Some(end) = speech_chunk_end(remaining, true, true) {
+            chunks.push(remaining[..end].to_owned());
+            remaining = &remaining[end..];
+        }
         assert!(chunks.len() > 1);
         assert_eq!(chunks.iter().cloned().collect::<String>(), source);
-        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 3000));
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 240));
     }
 
     #[test]
@@ -619,7 +828,11 @@ mod tests {
                 Some("child".into()),
             ),
         ];
-        assert_eq!(reply_text(&entries, 1).trim(), "New answer.");
+        let mut voice = SessionVoice::default();
+        voice.reset_reply_cursor(1);
+        voice.reply_finished = entries.len();
+        voice.queue_replies(&entries, Instant::now());
+        assert_eq!(voice.pending_speech, ["New answer."]);
     }
 
     #[test]
@@ -709,6 +922,253 @@ mod tests {
                 chunks: vec![AssistantChunk::Message(text.into())],
             },
         })
+    }
+
+    fn user(text: &str) -> std::sync::Arc<SessionEntry> {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: None,
+            kind: SessionEntryKind::UserMessage {
+                id: None,
+                content_md: text.into(),
+                chunks: Vec::new(),
+            },
+        })
+    }
+
+    fn tool() -> std::sync::Arc<SessionEntry> {
+        std::sync::Arc::new(SessionEntry {
+            created_ms: 0,
+            mod_seq: 0,
+            subagent_id: None,
+            kind: SessionEntryKind::ToolCall {
+                id: "long-command".into(),
+                label_md: "sleep 30".into(),
+                kind: agent_client_protocol::schema::v1::ToolKind::Execute,
+                status: crate::session_entry::ToolStatus::InProgress,
+                content_md: vec!["Tool output must stay silent".into()],
+                raw_input: None,
+                raw_output: None,
+                tool_name: None,
+                locations: Vec::new(),
+                status_started_at: None,
+            },
+        })
+    }
+
+    #[test]
+    fn streaming_speech_reads_sentences_and_tool_preludes_before_end_turn() {
+        let mut voice = SessionVoice::default();
+        voice.reset_reply_cursor(0);
+        let now = Instant::now();
+        let mut entries = vec![assistant("Проверю, установлен ли k9s")];
+        voice.queue_replies(&entries, now);
+        assert!(voice.pending_speech.is_empty());
+        entries.push(tool());
+        voice.queue_replies(&entries, now);
+        assert_eq!(voice.pending_speech, ["Проверю, установлен ли k9s"]);
+        entries.push(assistant("Первая фраза. Следующая ещё поступает"));
+        voice.queue_replies(&entries, now);
+        assert_eq!(voice.pending_speech.back().unwrap(), "Первая фраза.");
+        voice.queue_replies(&entries, now + Duration::from_secs(2));
+        assert_eq!(
+            voice.pending_speech.len(),
+            2,
+            "unfinished words are not flushed on idle"
+        );
+        voice.reply_finished = entries.len();
+        voice.queue_replies(&entries, now + Duration::from_secs(2));
+        assert_eq!(
+            voice.pending_speech.back().unwrap(),
+            "Следующая ещё поступает"
+        );
+        voice.queue_replies(&entries, now + Duration::from_secs(3));
+        assert_eq!(
+            voice.pending_speech.len(),
+            3,
+            "terminal notifications cannot repeat speech"
+        );
+    }
+
+    #[test]
+    fn sentence_tail_settles_without_waiting_for_agent_turn_completion() {
+        let mut voice = SessionVoice::default();
+        voice.reset_reply_cursor(0);
+        let now = Instant::now();
+        let entries = vec![assistant("Готово.")];
+        voice.queue_replies(&entries, now);
+        assert!(voice.pending_speech.is_empty());
+        voice.queue_replies(&entries, now + Duration::from_millis(180));
+        assert_eq!(voice.pending_speech, ["Готово."]);
+        assert_eq!(voice.reply_finished, 0, "no EndTurn is needed");
+    }
+
+    #[test]
+    fn streaming_markdown_never_reads_fenced_code_or_repeats_prose() {
+        let mut voice = SessionVoice::default();
+        voice.reset_reply_cursor(0);
+        let now = Instant::now();
+        let mut entries = vec![assistant("Ready.\n\n```rust\nsecret_code();")];
+        voice.queue_replies(&entries, now);
+        voice.queue_replies(&entries, now + Duration::from_millis(200));
+        assert_eq!(voice.pending_speech, ["Ready."]);
+        entries[0] = assistant("Ready.\n\n```rust\nsecret_code();\n```\n\nNext. Done");
+        voice.queue_replies(&entries, now + Duration::from_millis(220));
+        assert_eq!(voice.pending_speech, ["Ready.", "Next."]);
+        voice.reply_finished = 1;
+        voice.queue_replies(&entries, now + Duration::from_millis(230));
+        assert_eq!(voice.pending_speech, ["Ready.", "Next.", "Done"]);
+    }
+
+    #[test]
+    fn incomplete_images_and_links_cannot_leak_or_rewrite_spoken_text() {
+        let now = Instant::now();
+        let mut voice = SessionVoice::default();
+        voice.reset_reply_cursor(0);
+        let mut entries = vec![assistant("First. ![Image description. Do not speak")];
+        voice.queue_replies(&entries, now);
+        voice.queue_replies(&entries, now + Duration::from_millis(200));
+        assert_eq!(voice.pending_speech, ["First."]);
+        entries[0] = assistant(
+            "First. ![Image description. Do not speak](image.png) [Read more.](https://example.",
+        );
+        voice.queue_replies(&entries, now + Duration::from_millis(220));
+        assert_eq!(voice.pending_speech, ["First."]);
+        entries[0] = assistant(
+            "First. ![Image description. Do not speak](image.png) [Read more.](https://example.com) Tail",
+        );
+        voice.queue_replies(&entries, now + Duration::from_millis(240));
+        assert_eq!(voice.pending_speech, ["First.", "Read more."]);
+        voice.reply_finished = 1;
+        voice.queue_replies(&entries, now + Duration::from_millis(260));
+        assert_eq!(voice.pending_speech, ["First.", "Read more.", "Tail"]);
+    }
+
+    #[test]
+    fn speech_queue_backpressure_preserves_unspoken_tail() {
+        let text = (0..80)
+            .map(|i| format!("Sentence {i}. "))
+            .collect::<String>();
+        let entries = vec![assistant(&text)];
+        let mut voice = SessionVoice::default();
+        voice.reset_reply_cursor(0);
+        voice.reply_finished = entries.len();
+        let mut spoken = Vec::new();
+        for _ in 0..10 {
+            voice.queue_replies(&entries, Instant::now());
+            assert!(voice.pending_speech.len() <= 12);
+            spoken.extend(voice.pending_speech.drain(..));
+        }
+        assert_eq!(spoken.join(" "), text.trim());
+        assert_eq!(voice.reply_start, Some(1));
+    }
+
+    #[test]
+    fn interruption_suppresses_old_stream_until_new_user_input() {
+        let now = Instant::now();
+        let mut voice = SessionVoice::default();
+        voice.reset_reply_cursor(0);
+        let mut entries = vec![assistant("Old sentence. Unfinished")];
+        voice.queue_replies(&entries, now);
+        assert_eq!(voice.pending_speech.len(), 1);
+        voice.cancel_speech();
+        entries[0] = assistant("Old sentence. Unfinished old answer now complete.");
+        entries.push(tool());
+        entries.push(assistant("Old continuation must also stay silent."));
+        voice.reply_finished = entries.len();
+        voice.queue_replies(&entries, now);
+        assert!(voice.pending_speech.is_empty());
+        entries.push(user("New question"));
+        entries.push(assistant("New answer."));
+        voice.reply_finished = entries.len();
+        voice.queue_replies(&entries, now);
+        assert_eq!(voice.pending_speech, ["New answer."]);
+    }
+
+    #[gpui::test]
+    async fn hands_free_stays_with_original_chat_until_explicit_transfer(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (first, workspace, original, _tmp) = voice_fixture(cx).await;
+        let (solution, agent, project) = cx.update(|cx| {
+            let session = original.read(cx);
+            (
+                session.solution_id,
+                session.agent_id.clone(),
+                session.project.clone().unwrap(),
+            )
+        });
+        let second_id = cx
+            .update(|cx| {
+                SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                    store.create_session(solution, agent, project, cx)
+                })
+            })
+            .await
+            .unwrap();
+        let second_session = cx.update(|cx| {
+            SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(second_id)
+                .unwrap()
+        });
+        let weak = cx.update(|cx| workspace.root(cx).unwrap().downgrade());
+        let second = cx.add_window(|window, cx| {
+            SolutionSessionView::for_test(second_id, second_session, weak, window, cx)
+        });
+        first
+            .update(cx, |view, window, cx| {
+                view.claim_hands_free(cx);
+                view.voice.continuous = true;
+                view.voice.read_aloud = true;
+                view.compose_editor.update(cx, |editor, cx| {
+                    editor.set_text("Original draft", window, cx)
+                });
+            })
+            .unwrap();
+        cx.update(|cx| {
+            SolutionAgentStore::global(cx).update(cx, |store, cx| {
+                store.set_active_dialog_session(solution, Some(second_id), cx)
+            })
+        });
+        first
+            .update(cx, |view, window, cx| {
+                assert!(!view.voice_is_visible(cx));
+                assert!(view.voice_can_run(cx));
+                assert!(view.poll_voice(window, cx));
+                assert!(view.voice.continuous);
+                view.deliver_voice_text("Spoken original input".into(), window, cx);
+                assert_eq!(
+                    view.compose_editor.read(cx).text(cx),
+                    "Original draft\nSpoken original input"
+                );
+                view.voice
+                    .pending_speech
+                    .push_back("Old queued audio".into());
+            })
+            .unwrap();
+        second
+            .update(cx, |view, _, cx| {
+                assert!(view.compose_editor.read(cx).text(cx).is_empty());
+                view.claim_hands_free(cx);
+                view.voice.continuous = true;
+                assert!(view.voice_can_run(cx));
+            })
+            .unwrap();
+        first
+            .update(cx, |view, _, cx| {
+                assert!(!view.voice.continuous);
+                assert!(!view.voice_can_run(cx));
+                assert!(view.voice.pending_speech.is_empty());
+            })
+            .unwrap();
+        second
+            .update(cx, |view, _, cx| {
+                view.stop_voice(cx);
+                assert!(cx.global::<HandsFreeOwner>().0.is_none());
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -806,7 +1266,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn hands_free_keepalive_task_stops_when_dialog_is_hidden(cx: &mut gpui::TestAppContext) {
+    async fn hands_free_keepalive_ownership_survives_hidden_dialog(cx: &mut gpui::TestAppContext) {
         let (view, _workspace, session, _tmp) = voice_fixture(cx).await;
         // A remote target opts out without contacting any real voice service.
         cx.update(|cx| {
@@ -820,7 +1280,9 @@ mod tests {
                 view.voice.keepalive.is_none(),
                 "read-aloud or recording alone must not retain the worker"
             );
+            view.claim_hands_free(cx);
             view.voice.continuous = true;
+            view.voice.read_aloud = true;
             view.ensure_voice_keepalive(cx);
             assert!(view.voice.keepalive.is_some());
         })
@@ -833,9 +1295,10 @@ mod tests {
             });
         });
         view.update(cx, |view, window, cx| {
-            assert!(!view.poll_voice(window, cx));
-            assert!(view.voice.keepalive.is_none());
-            assert!(!view.voice.continuous);
+            assert!(view.poll_voice(window, cx));
+            assert!(view.voice.continuous);
+            assert!(view.voice_can_run(cx));
+            view.stop_voice(cx);
         })
         .unwrap();
         cx.executor().advance_clock(Duration::from_secs(60));
@@ -905,6 +1368,62 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["Actual final reply."]
             );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    async fn actual_thread_tool_start_flushes_commentary_without_end_turn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use agent_client_protocol::schema::v1 as acp;
+        let (view, _workspace, session, _tmp) = voice_fixture(cx).await;
+        view.update(cx, |view, _, cx| {
+            view.voice.read_aloud = true;
+            view.voice
+                .reset_reply_cursor(session.read(cx).entries.len());
+        })
+        .unwrap();
+        let thread = cx.update(|cx| session.read(cx).acp_thread().unwrap().clone());
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            "Проверю, установлен ли k9s".into(),
+                        )),
+                        cx,
+                    )
+                    .unwrap();
+                thread.flush_end_of_turn_tail(cx);
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::ToolCall(
+                            acp::ToolCall::new(
+                                acp::ToolCallId::new("pending-command"),
+                                "Long command".to_string(),
+                            )
+                            .kind(acp::ToolKind::Execute)
+                            .status(acp::ToolCallStatus::InProgress),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        cx.executor().run_until_parked();
+        view.update(cx, |view, _, cx| {
+            view.queue_voice_replies(cx);
+            assert_eq!(view.voice.pending_speech, ["Проверю, установлен ли k9s"]);
+            assert!(session.read(cx).entries.iter().any(|entry| matches!(
+                entry.kind,
+                SessionEntryKind::ToolCall {
+                    status: crate::session_entry::ToolStatus::InProgress,
+                    ..
+                }
+            )));
+            view.voice_turn_stopped(&acp::StopReason::EndTurn, cx);
+            assert_eq!(view.voice.pending_speech.len(), 1);
         })
         .unwrap();
     }
