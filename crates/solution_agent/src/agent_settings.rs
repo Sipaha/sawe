@@ -64,7 +64,7 @@ impl Default for VoiceSettings {
             speech_url: None,
             transcription_api_key_env: None,
             speech_api_key_env: None,
-            transcription_model: "small".into(),
+            transcription_model: "gigaam-v3-ctc".into(),
             speech_model: "piper".into(),
             speech_voice: "ru_RU-denis-medium".into(),
         }
@@ -138,6 +138,7 @@ mod tests {
     fn voice_defaults_are_opt_in_and_endpoint_overrides_survive_settings() {
         let defaults = SolutionAgentSettings::default().voice;
         assert_eq!(defaults.api_url, "http://127.0.0.1:8095/v1");
+        assert_eq!(defaults.transcription_model, "gigaam-v3-ctc");
         let content: settings::SettingsContent = serde_json::from_value(serde_json::json!({
             "solution_agent": {"voice": {
                 "transcription_url": "http://127.0.0.1:8080/inference",

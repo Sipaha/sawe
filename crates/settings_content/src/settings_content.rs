@@ -1468,7 +1468,7 @@ pub struct SolutionAgentVoiceSettingsContent {
     pub transcription_api_key_env: Option<String>,
     /// Optional environment variable containing a key specifically for speech_url.
     pub speech_api_key_env: Option<String>,
-    /// Speech recognition model. Default: small (local runtime).
+    /// Speech recognition model. Default: gigaam-v3-ctc (local Russian CPU runtime).
     pub transcription_model: Option<String>,
     /// Speech synthesis model. Default: piper (local runtime).
     pub speech_model: Option<String>,

@@ -21,7 +21,7 @@ full sidecar cold request time must also be measured. See the
 2. Keep the public loopback STT/TTS HTTP contract, bounds, busy behavior,
    transcription priority, browser rejection, timeouts and proxy bypass.
 3. Use an owned persistent child for GigaAM inference, loaded lazily and killed
-   after 60 idle seconds. Enforce CPU thread limits and offline model loading.
+   after one idle hour (user choice at 21:03:16). Enforce CPU thread limits and offline model loading.
    Do not retain recognized text in logs or create orphan model processes.
 4. `solution_agent` voice default names GigaAM; custom endpoint/model overrides
    remain intact. Existing voice controls/composer/queue behavior remain intact.
