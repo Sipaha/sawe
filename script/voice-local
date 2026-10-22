@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Bounded loopback OpenAI-compatible whisper.cpp/Piper speech service."""
+"""Bounded loopback GigaAM (or optional whisper.cpp) and Piper speech service."""
 import argparse
-from concurrent.futures import Future
+from concurrent.futures import Future, CancelledError, InvalidStateError, TimeoutError as FutureTimeout
 import email.policy
 import hashlib
 import http.server
@@ -9,6 +9,8 @@ import io
 import json
 import os
 import queue
+import select
+import struct
 from pathlib import Path
 import signal
 import socket
@@ -26,6 +28,22 @@ WHISPER_REV = "2eeeba56e9edd762b4b38467bab96c2517163158"
 WHISPER_MODELS_REV = "5359861c739e955e79d9a303bcbc70fb988958b1"
 PIPER_MODELS_REV = "5041a7a49ae5b3a0f30e6837769eb03fdbb231bd"
 VOICE = "ru_RU-denis-medium"
+GIGAAM_MODEL = "gigaam-v3-ctc"
+GIGAAM_REV = "322c3b29492673eb7d0b434bfa9dfb8653e34d02"
+GIGAAM_HASHES = {
+    "config.json": "0641fcf73f4af791c73f05083e38a658ff5dcbee3534a0c61396c10f4b97f0fe",
+    "v3_ctc.int8.onnx": "ceb61454e2e1a2dec5872cbac1de0fe0a4271d1148f6b26b5bda53ff30a12acd",
+    "v3_vocab.txt": "a9143c30844d3c0bee3e9e927e4084774eb1b9eeaafc473b2c4521e4911a7c07",
+    "v3_ctc.yaml": "37790b3abd82bcd090db277b2ec79489a20fdabfc3d205463f0c4ad17022fbf0",
+    "LICENSE.txt": "f00de6715714c7a63d08639cdbfaa40224eefc407302614bd19f1a8b98c875aa",
+    "README.md": "5fe26483daa57aaccaa0b59981c0787951df3fc90444f26c7c454dc4342f9f57",
+}
+DEPENDENCIES = ["piper-tts==1.3.0", "onnxruntime==1.31.0", "numpy==2.5.4",
+                "flatbuffers==25.12.19", "packaging==26.3", "protobuf==7.36.2"]
+LAUNCH_TIMEOUT = 10
+WORKER_START_TIMEOUT = 60
+WORKER_REQUEST_TIMEOUT = 120
+MAX_WORKER_OUTPUT = 64 * 1024
 MODEL_HASHES = {
     "ggml-small-q5_1.bin": "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
     "ggml-base-q5_1.bin": "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
@@ -59,6 +77,111 @@ voice = PiperVoice(
 with wave.open(sys.argv[2], "wb") as output:
     voice.synthesize_wav(sys.stdin.read(), output)
 """
+# Private worker protocol: four-byte big-endian size followed by WAV / JSON.
+# Both directions have a shared per-operation deadline, including pipe writes.
+GIGAAM_WORKER = PARENT_GUARD + """
+import io, json, struct, sys, wave
+protocol = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
+os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+sys.stdout = sys.stderr  # Dependencies must never write into the framed channel.
+import numpy as np
+import onnxruntime as ort
+import onnx_asr
+
+def send(payload):
+    data = json.dumps(payload, ensure_ascii=False).encode()
+    if len(data) > 65536:
+        raise ValueError("Recognition response exceeds limit")
+    protocol.write(struct.pack("!I", len(data)) + data)
+    protocol.flush()
+
+def read_exact(size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = sys.stdin.buffer.read(size - len(data))
+        if not chunk:
+            raise EOFError
+        data.extend(chunk)
+    return bytes(data)
+
+options = ort.SessionOptions()
+options.intra_op_num_threads = int(sys.argv[2])
+options.inter_op_num_threads = 1
+options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+model = onnx_asr.load_model("gigaam-v3-ctc", path=sys.argv[1], quantization="int8",
+                           providers=["CPUExecutionProvider"], sess_options=options)
+send({"ready": True})
+while True:
+    try:
+        size, = struct.unpack("!I", read_exact(4))
+        if not 0 < size <= 4 * 1024 * 1024:
+            raise ValueError("Invalid audio frame size")
+        with wave.open(io.BytesIO(read_exact(size)), "rb") as audio:
+            if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) != (1, 2, 16000):
+                raise ValueError("Invalid audio format")
+            count = audio.getnframes()
+            if not 1600 <= count <= 60 * 16000:
+                raise ValueError("Invalid audio duration")
+            pcm = audio.readframes(count)
+            if len(pcm) != count * 2:
+                raise ValueError("Truncated audio")
+        waveform = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        text = model.recognize(waveform, sample_rate=16000)
+        if not isinstance(text, str):
+            raise ValueError("Invalid recognition output")
+        send({"text": text})
+    except EOFError:
+        break
+"""
+
+
+def read_worker_bytes(pipe, size, deadline, cancelled=None):
+    data = bytearray()
+    while len(data) < size:
+        remaining = deadline - time.monotonic()
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Service shutting down")
+        if remaining <= 0:
+            raise RuntimeError("Recognition worker response timed out")
+        if not select.select([pipe], [], [], min(remaining, .2))[0]:
+            continue
+        chunk = os.read(pipe.fileno(), min(size - len(data), 65536))
+        if not chunk:
+            raise RuntimeError("Recognition worker closed its output")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def read_worker_frame(pipe, deadline, cancelled=None):
+    size, = struct.unpack("!I", read_worker_bytes(pipe, 4, deadline, cancelled))
+    if not 0 < size <= MAX_WORKER_OUTPUT:
+        raise ValueError("Recognition worker output exceeds limit")
+    return json.loads(read_worker_bytes(pipe, size, deadline, cancelled))
+
+
+def write_worker_frame(pipe, data, deadline, cancelled=None):
+    if not 0 < len(data) <= MAX_BODY:
+        raise ValueError("Recognition worker input exceeds limit")
+    frame = memoryview(struct.pack("!I", len(data)) + data)
+    # Even a selected pipe can block on a large write; use nonblocking fd IO.
+    os.set_blocking(pipe.fileno(), False)
+    while frame:
+        remaining = deadline - time.monotonic()
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Service shutting down")
+        if remaining <= 0:
+            raise RuntimeError("Recognition worker input timed out")
+        if not select.select([], [pipe], [], min(remaining, .2))[1]:
+            continue
+        try:
+            count = os.write(pipe.fileno(), frame[:65536])
+        except BlockingIOError:
+            continue
+        if count <= 0:
+            raise RuntimeError("Recognition worker closed its input")
+        frame = frame[count:]
+
+
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -67,8 +190,12 @@ def run(argv, **kwargs):
 
 
 def verify_download(path, name=None):
-    expected = MODEL_HASHES.get(name or path.name)
-    if expected and hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+    expected = {**MODEL_HASHES, **GIGAAM_HASHES}.get(name or path.name)
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    if expected and digest.hexdigest() != expected:
         raise ValueError(f"Checksum mismatch: {name or path.name}; remove and retry setup")
 
 
@@ -91,37 +218,48 @@ def setup(args):
     root = args.runtime_dir
     root.mkdir(parents=True, exist_ok=True)
     os.environ.update(TMPDIR=str(root), PIP_CACHE_DIR=str(root / "pip-cache"))
-    source = root / "whisper.cpp"
-    if not source.exists():
-        run(["git", "clone", "--depth", "1", "--branch", "v1.8.3",
-             "https://github.com/ggml-org/whisper.cpp.git", source])
-    if subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip() != WHISPER_REV:
-        raise ValueError("whisper.cpp source does not match pinned revision")
-    build = root / ("build-" + args.backend)
-    config = ["cmake", "-S", source, "-B", build, "-DCMAKE_BUILD_TYPE=Release",
-              "-DWHISPER_BUILD_TESTS=OFF", "-DWHISPER_BUILD_SERVER=ON", "-DGGML_CCACHE=OFF",
-              "-DGGML_CUDA=" + ("ON" if args.backend == "cuda" else "OFF")]
-    if args.backend == "cuda":
-        config += ["-DCMAKE_CUDA_COMPILER=" + args.cuda_compiler,
-                   "-DCMAKE_CUDA_ARCHITECTURES=" + args.cuda_arch]
-    run(config)
-    run(["cmake", "--build", build, "--target", "whisper-server", "whisper-cli", "-j4"])
+    if args.model != GIGAAM_MODEL:
+        source = root / "whisper.cpp"
+        if not source.exists():
+            run(["git", "clone", "--depth", "1", "--branch", "v1.8.3",
+                 "https://github.com/ggml-org/whisper.cpp.git", source])
+        if subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip() != WHISPER_REV:
+            raise ValueError("whisper.cpp source does not match pinned revision")
+        build = root / ("build-" + args.backend)
+        config = ["cmake", "-S", source, "-B", build, "-DCMAKE_BUILD_TYPE=Release",
+                  "-DWHISPER_BUILD_TESTS=OFF", "-DWHISPER_BUILD_SERVER=ON", "-DGGML_CCACHE=OFF",
+                  "-DGGML_CUDA=" + ("ON" if args.backend == "cuda" else "OFF")]
+        if args.backend == "cuda":
+            config += ["-DCMAKE_CUDA_COMPILER=" + args.cuda_compiler,
+                       "-DCMAKE_CUDA_ARCHITECTURES=" + args.cuda_arch]
+        run(config)
+        run(["cmake", "--build", build, "--target", "whisper-server", "whisper-cli", "-j4"])
     venv = root / "venv"
     if not (venv / "bin/python").exists():
         run([sys.executable, "-m", "venv", venv])
-    run([venv / "bin/pip", "install", "piper-tts==1.3.0", "onnxruntime==1.31.0",
-         "numpy==2.5.4", "flatbuffers==25.12.19", "packaging==26.3", "protobuf==7.36.2"])
+    dependencies = DEPENDENCIES + (["onnx-asr==0.12.0"] if args.model == GIGAAM_MODEL else [])
+    # No hub extra: serve only opens pinned local files and never installs/downloads.
+    run([venv / "bin/pip", "install", *dependencies])
     models = root / "models"
     models.mkdir(exist_ok=True)
-    name = f"ggml-{args.model}-q5_1.bin"
-    download(f"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_MODELS_REV}/{name}", models / name)
+    if args.model == GIGAAM_MODEL:
+        gigaam = models / GIGAAM_MODEL
+        gigaam.mkdir(exist_ok=True)
+        prefix = f"https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/{GIGAAM_REV}/"
+        for name in GIGAAM_HASHES:
+            download(prefix + name, gigaam / name)
+    else:
+        name = f"ggml-{args.model}-q5_1.bin"
+        download(f"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_MODELS_REV}/{name}", models / name)
     prefix = f"https://huggingface.co/rhasspy/piper-voices/resolve/{PIPER_MODELS_REV}/ru/ru_RU/denis/medium/"
     for suffix in (".onnx", ".onnx.json"):
         download(prefix + VOICE + suffix, models / (VOICE + suffix))
     download(prefix + "MODEL_CARD", models / "denis-MODEL_CARD")
-    manifest = {"whisper_revision": WHISPER_REV, "whisper_models_revision": WHISPER_MODELS_REV,
+    manifest = {"model": args.model, "gigaam_revision": GIGAAM_REV if args.model == GIGAAM_MODEL else None,
+                "whisper_revision": WHISPER_REV, "whisper_models_revision": WHISPER_MODELS_REV,
                 "piper_models_revision": PIPER_MODELS_REV,
-                "sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in models.iterdir() if p.is_file()}}
+                "sha256": {str(p.relative_to(models)): hashlib.sha256(p.read_bytes()).hexdigest()
+                           for p in models.rglob("*") if p.is_file()}}
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
@@ -173,41 +311,82 @@ class Runtime:
         self.transcribing = False
         self.last_used = time.monotonic()
         self.closed = threading.Event()
-        self.launches = queue.Queue()
+        self.launches = queue.Queue(maxsize=8)
         self.launch_thread = threading.Thread(target=self.launch_owned_children, daemon=True)
         self.launch_thread.start()
         self.watchdog = threading.Thread(target=self.reap_idle, daemon=True)
         self.watchdog.start()
+
+    @staticmethod
+    def terminate_child(child):
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
 
     def launch_owned_children(self):
         # Linux parent-death signals belong to the spawning thread. HTTP request
         # threads end after each request, so a persistent thread must own models.
         while not self.closed.is_set():
             try:
-                argv, kwargs, future = self.launches.get(timeout=.2)
+                argv, kwargs, future, deadline = self.launches.get(timeout=.2)
             except queue.Empty:
                 continue
+            child = None
             try:
-                future.set_result(subprocess.Popen(argv, **kwargs))
+                if future.cancelled() or self.closed.is_set() or time.monotonic() >= deadline:
+                    future.cancel()
+                    continue
+                child = subprocess.Popen(argv, **kwargs)
+                if self.closed.is_set() or time.monotonic() >= deadline:
+                    future.cancel()
+                # Cancellation may race Popen: never leave an undelivered child.
+                future.set_result(child)
+                child = None
+            except InvalidStateError:
+                pass
             except Exception as exc:
-                future.set_exception(exc)
+                try:
+                    future.set_exception(exc)
+                except InvalidStateError:
+                    pass
+            finally:
+                if child is not None:
+                    self.terminate_child(child)
+                    for pipe in (child.stdin, child.stdout, child.stderr):
+                        if pipe:
+                            pipe.close()
+        while True:
+            try:
+                self.launches.get_nowait()[2].cancel()
+            except queue.Empty:
+                break
 
     def spawn_owned(self, argv, **kwargs):
         if self.closed.is_set():
             raise RuntimeError("Service shutting down")
         future = Future()
-        self.launches.put((argv, kwargs, future))
-        return future.result(timeout=10)
+        try:
+            self.launches.put_nowait((argv, kwargs, future, time.monotonic() + LAUNCH_TIMEOUT))
+        except queue.Full as exc:
+            raise RuntimeError("Speech process launch queue full") from exc
+        if self.closed.is_set():
+            future.cancel()
+        try:
+            return future.result(timeout=LAUNCH_TIMEOUT)
+        except (FutureTimeout, CancelledError) as exc:
+            future.cancel()
+            raise RuntimeError("Speech process launch timed out") from exc
 
-    def stop_whisper(self):
+    def stop_recognizer(self):
         with self.child_lock:
             if self.child:
-                self.child.terminate()
-                try:
-                    self.child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.child.kill()
-                    self.child.wait()
+                self.terminate_child(self.child)
+                for pipe in (self.child.stdin, self.child.stdout, self.child.stderr):
+                    if pipe:
+                        pipe.close()
                 self.child = None
             if self.child_log:
                 self.child_log.close()
@@ -225,7 +404,7 @@ class Runtime:
 
     def close(self):
         self.closed.set()
-        self.stop_whisper()
+        self.stop_recognizer()
         with self.child_lock:
             if self.tts_child and self.tts_child.poll() is None:
                 self.tts_child.terminate()
@@ -239,7 +418,7 @@ class Runtime:
         while not self.closed.wait(1):
             if time.monotonic() - self.last_used > self.args.idle_seconds and self.lock.acquire(False):
                 try:
-                    self.stop_whisper()
+                    self.stop_recognizer()
                 finally:
                     self.lock.release()
 
@@ -249,7 +428,7 @@ class Runtime:
                 raise RuntimeError("Service shutting down")
             if self.child and self.child.poll() is None:
                 return self.whisper_url
-            self.stop_whisper()
+            self.stop_recognizer()
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
@@ -279,11 +458,61 @@ class Runtime:
                 return self.whisper_url
             except (OSError, urllib.error.URLError):
                 self.closed.wait(.1)
-        self.stop_whisper()
+        self.stop_recognizer()
         raise RuntimeError("whisper-server startup timed out")
+
+    def gigaam(self):
+        with self.child_lock:
+            if self.closed.is_set():
+                raise RuntimeError("Service shutting down")
+            if self.child and self.child.poll() is None:
+                return self.child
+            self.stop_recognizer()
+            model_dir = self.root / "models" / GIGAAM_MODEL
+            python = self.root / "venv/bin/python"
+            try:
+                if not python.is_file():
+                    raise ValueError("Missing recognition runtime")
+                for name in GIGAAM_HASHES:
+                    verify_download(model_dir / name)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("Local recognition files missing/corrupt; run voice-local setup") from exc
+            self.child = self.spawn_owned([str(python), "-u", "-c", GIGAAM_WORKER,
+                                           str(model_dir), str(self.args.threads)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                bufsize=0, cwd=self.root,
+                env={**os.environ, "TMPDIR": str(self.root), "XDG_CACHE_HOME": str(self.root / "cache"),
+                     "HF_HOME": str(self.root / "cache/huggingface"), "HF_HUB_OFFLINE": "1",
+                     "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": str(self.args.threads),
+                     "OPENBLAS_NUM_THREADS": str(self.args.threads)})
+            try:
+                ready = read_worker_frame(self.child.stdout, time.monotonic() + WORKER_START_TIMEOUT, self.closed)
+                if ready != {"ready": True}:
+                    raise RuntimeError("Invalid recognition worker readiness")
+                return self.child
+            except (OSError, ValueError, RuntimeError):
+                self.stop_recognizer()
+                raise RuntimeError("GigaAM worker startup failed; check local setup") from None
+
+    def transcribe_gigaam(self, data):
+        child = self.gigaam()
+        deadline = time.monotonic() + WORKER_REQUEST_TIMEOUT
+        try:
+            write_worker_frame(child.stdin, data, deadline, self.closed)
+            result = read_worker_frame(child.stdout, deadline, self.closed)
+            if not isinstance(result, dict) or set(result) != {"text"} or not isinstance(result["text"], str):
+                raise ValueError("Invalid recognition worker response")
+            return {"text": result["text"].strip()}
+        except (OSError, ValueError, RuntimeError):
+            self.stop_recognizer()
+            raise RuntimeError("GigaAM transcription failed; worker reset for retry") from None
 
     def transcribe(self, data, language):
         validate_wav(data)
+        if self.args.model == GIGAAM_MODEL:
+            if language not in ("ru", "auto"):
+                raise ValueError("GigaAM supports Russian only; use language ru or auto")
+            return self.transcribe_gigaam(data)
         if language not in ("ru", "en", "auto"):
             raise ValueError("Supported languages: ru, en, auto")
         boundary = "sawe-local-speech"
@@ -302,7 +531,7 @@ class Runtime:
                 result = json.loads(response.read(MAX_BODY))
             return {"text": result["text"].strip()}
         except (OSError, KeyError, json.JSONDecodeError) as exc:
-            self.stop_whisper()
+            self.stop_recognizer()
             raise RuntimeError("Local transcription failed; inspect runtime log") from exc
 
     def speech(self, payload):
@@ -381,7 +610,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self.reply(200, {"status": "ok", "model": self.server.runtime.args.model})
+            args = self.server.runtime.args
+            self.reply(200, {"status": "ok", "model": args.model,
+                             "engine": "gigaam" if args.model == GIGAAM_MODEL else "whisper.cpp",
+                             "idle_seconds": args.idle_seconds})
         else:
             self.reply(404, {"error": "Unknown endpoint"})
 
@@ -443,17 +675,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-dir", type=Path, required=True)
     parser.add_argument("command", choices=("setup", "serve"))
-    parser.add_argument("--model", choices=("small", "base"), default="small")
+    parser.add_argument("--model", choices=(GIGAAM_MODEL, "small", "base"), default=GIGAAM_MODEL)
     parser.add_argument("--backend", choices=("cuda", "cpu"), default="cpu")
     parser.add_argument("--threads", type=int, choices=range(1, 17), default=4)
     parser.add_argument("--port", type=int, default=8095)
-    parser.add_argument("--idle-seconds", type=int, default=60)
+    parser.add_argument("--idle-seconds", type=int, default=3600)
     parser.add_argument("--cuda-compiler", default="/usr/local/cuda/bin/nvcc")
     parser.add_argument("--cuda-arch", default="native")
     args = parser.parse_args()
     args.runtime_dir = args.runtime_dir.expanduser().resolve()
     if args.idle_seconds < 1 or not 1 <= args.port <= 65535:
         parser.error("idle-seconds and port must be positive and valid")
+    if args.model == GIGAAM_MODEL and args.backend != "cpu":
+        parser.error("GigaAM uses CPU INT8; --backend cuda is only available with small/base Whisper")
     if args.command == "setup":
         setup(args)
         return

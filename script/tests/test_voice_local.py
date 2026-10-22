@@ -159,14 +159,14 @@ time.sleep(30)
             runtime = voice.Runtime(SimpleNamespace(runtime_dir=Path(temp), idle_seconds=1))
             child = Mock()
             runtime.child = child
-            runtime.stop_whisper()
+            runtime.stop_recognizer()
             child.terminate.assert_called_once()
             child.wait.assert_called_once_with(timeout=5)
             runtime.close()
             self.assertTrue(runtime.closed.is_set())
 
     def test_http_bounds_busy_errors_success_and_no_cors(self):
-        runtime = SimpleNamespace(args=SimpleNamespace(model="small"), lock=threading.Lock(), speech_lock=threading.Lock(),
+        runtime = SimpleNamespace(args=SimpleNamespace(model="small", idle_seconds=60), lock=threading.Lock(), speech_lock=threading.Lock(),
                                   begin_transcription=Mock(), end_transcription=Mock(),
                                   transcribe=Mock(return_value={"text": "Проверка"}),
                                   speech=Mock(return_value=wav()), last_used=0)
@@ -179,7 +179,10 @@ time.sleep(30)
             return http.open(urllib.request.Request(base + path, data=body, headers=headers or {}))
         try:
             with http.open(base + "/health") as response:
-                self.assertEqual(json.load(response)["model"], "small")
+                health = json.load(response)
+                self.assertEqual(health["model"], "small")
+                self.assertEqual(health["engine"], "whisper.cpp")
+                self.assertEqual(health["idle_seconds"], 60)
                 self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
             for path, data, code in (("/wrong", b"{}", 404), ("/v1/audio/speech", b"[1]", 400),
                                      ("/v1/audio/speech", b"", 413)):
@@ -231,6 +234,310 @@ time.sleep(30)
             server.shutdown()
             server.server_close()
             thread.join(2)
+
+class GigaAMTests(unittest.TestCase):
+    def runtime(self, root, idle_seconds=60):
+        root = Path(root)
+        (root / "venv/bin").mkdir(parents=True)
+        (root / "venv/bin/python").symlink_to(sys.executable)
+        models = root / "models" / voice.GIGAAM_MODEL
+        models.mkdir(parents=True)
+        for name in voice.GIGAAM_HASHES:
+            (models / name).write_bytes(b"test model")
+        return voice.Runtime(SimpleNamespace(runtime_dir=root, idle_seconds=idle_seconds,
+            model=voice.GIGAAM_MODEL, backend="cpu", threads=4))
+
+    FAKE_WORKER = voice.PARENT_GUARD + '''
+import json, struct, sys, time
+from pathlib import Path
+mode = (Path(sys.argv[1]).parent.parent / "mode")
+mode = mode.read_text() if mode.exists() else "ok"
+def send(value):
+    data = json.dumps(value).encode()
+    sys.stdout.buffer.write(struct.pack("!I", len(data)) + data)
+    sys.stdout.buffer.flush()
+if mode == "no-ready":
+    time.sleep(30)
+if mode == "bad-ready":
+    send({"ready": False})
+else:
+    send({"ready": True})
+if mode == "no-read":
+    time.sleep(30)
+while True:
+    header = sys.stdin.buffer.read(4)
+    if not header:
+        break
+    size, = struct.unpack("!I", header)
+    data = sys.stdin.buffer.read(size)
+    if mode == "crash":
+        sys.exit(1)
+    if mode == "no-reply":
+        time.sleep(30)
+    if mode == "oversized":
+        sys.stdout.buffer.write(struct.pack("!I", 65537)); sys.stdout.buffer.flush()
+    elif mode == "bad-json":
+        sys.stdout.buffer.write(struct.pack("!I", 1) + b"{"); sys.stdout.buffer.flush()
+    elif mode == "bad-result":
+        send({"text": 42})
+    else:
+        send({"text": "  проверка  "})
+'''
+
+    def test_cli_defaults_and_gigaam_rejects_cuda(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            argv = [str(SOURCE), "--runtime-dir", temp, "setup"]
+            with patch.object(sys, "argv", argv), patch.object(voice, "setup") as setup:
+                voice.main()
+                args = setup.call_args.args[0]
+                self.assertEqual((args.model, args.backend, args.threads, args.idle_seconds),
+                                 (voice.GIGAAM_MODEL, "cpu", 4, 3600))
+            with patch.object(sys, "argv", argv + ["--backend", "cuda"]), self.assertRaises(SystemExit):
+                voice.main()
+
+    def test_gigaam_setup_pins_files_without_whisper_cuda_or_hub(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            root = Path(temp)
+            def download(url, target):
+                target.write_bytes(b"fixture")
+            args = SimpleNamespace(runtime_dir=root, model=voice.GIGAAM_MODEL, backend="cpu")
+            with patch.dict(os.environ, clear=False), patch.object(voice, "run") as run, \
+                    patch.object(voice, "download", side_effect=download) as fetch:
+                voice.setup(args)
+            commands = [[str(x) for x in call.args[0]] for call in run.call_args_list]
+            self.assertFalse(any(cmd[0] in ("git", "cmake") for cmd in commands))
+            packages = commands[-1]
+            self.assertIn("onnx-asr==0.12.0", packages)
+            self.assertIn("onnxruntime==1.31.0", packages)
+            self.assertFalse(any("hub" in x or "gpu" in x for x in packages))
+            urls = [call.args[0] for call in fetch.call_args_list]
+            self.assertFalse(any("whisper" in url for url in urls))
+            for name in voice.GIGAAM_HASHES:
+                self.assertTrue(any(voice.GIGAAM_REV in url and url.endswith("/" + name) for url in urls))
+            manifest = json.loads((root / "manifest.json").read_text())
+            self.assertEqual(manifest["gigaam_revision"], voice.GIGAAM_REV)
+            self.assertIn(voice.GIGAAM_MODEL + "/LICENSE.txt", manifest["sha256"])
+
+    def test_gigaam_startup_rejects_corrupt_model_before_spawn(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp)
+            try:
+                with patch.object(runtime, "spawn_owned") as spawn:
+                    with self.assertRaisesRegex(RuntimeError, "missing/corrupt"):
+                        runtime.transcribe(wav(), "ru")
+                    spawn.assert_not_called()
+            finally:
+                runtime.close()
+
+    def test_gigaam_language_rejected_before_worker_load(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp)
+            try:
+                with patch.object(runtime, "gigaam") as load:
+                    for language in ("en", "fr", ""):
+                        with self.assertRaisesRegex(ValueError, "Russian only"):
+                            runtime.transcribe(wav(), language)
+                    load.assert_not_called()
+            finally:
+                runtime.close()
+
+    def test_worker_reused_then_shutdown_reaps_and_closes_pipes(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp)
+            try:
+                with patch.object(voice, "verify_download"), patch.object(voice, "GIGAAM_WORKER", self.FAKE_WORKER):
+                    self.assertEqual(runtime.transcribe(wav(), "ru"), {"text": "проверка"})
+                    child = runtime.child
+                    self.assertEqual(runtime.transcribe(wav(), "auto"), {"text": "проверка"})
+                    self.assertIs(runtime.child, child)
+                    runtime.close()
+                    self.assertIsNotNone(child.poll())
+                    self.assertTrue(child.stdin.closed)
+                    self.assertTrue(child.stdout.closed)
+            finally:
+                runtime.close()
+
+    def test_worker_bad_readiness_and_timeout_reset_then_recover(self):
+        for mode in ("bad-ready", "no-ready"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+                runtime = self.runtime(temp)
+                Path(temp, "mode").write_text(mode)
+                try:
+                    with patch.object(voice, "verify_download"), patch.object(voice, "GIGAAM_WORKER", self.FAKE_WORKER), \
+                            patch.object(voice, "WORKER_START_TIMEOUT", .1):
+                        with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                            runtime.transcribe(wav(), "ru")
+                        self.assertIsNone(runtime.child)
+                        Path(temp, "mode").unlink()
+                        self.assertEqual(runtime.transcribe(wav(), "ru"), {"text": "проверка"})
+                finally:
+                    runtime.close()
+
+    def test_worker_io_failure_reset_then_recovery_including_blocked_write(self):
+        for mode in ("crash", "no-read", "no-reply", "oversized", "bad-json", "bad-result"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+                runtime = self.runtime(temp)
+                Path(temp, "mode").write_text(mode)
+                try:
+                    with patch.object(voice, "verify_download"), patch.object(voice, "GIGAAM_WORKER", self.FAKE_WORKER), \
+                            patch.object(voice, "WORKER_REQUEST_TIMEOUT", .1):
+                        start = time.monotonic()
+                        with self.assertRaisesRegex(RuntimeError, "worker reset"):
+                            runtime.transcribe(wav(60), "ru")
+                        self.assertLess(time.monotonic() - start, 2)
+                        self.assertIsNone(runtime.child)
+                        Path(temp, "mode").unlink()
+                        self.assertEqual(runtime.transcribe(wav(), "ru"), {"text": "проверка"})
+                finally:
+                    runtime.close()
+
+    def test_worker_idle_unload_and_lazy_reload(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp, idle_seconds=1)
+            try:
+                with patch.object(voice, "verify_download"), patch.object(voice, "GIGAAM_WORKER", self.FAKE_WORKER):
+                    self.assertIsNone(runtime.child)
+                    runtime.transcribe(wav(), "ru")
+                    child = runtime.child
+                    runtime.last_used = 0
+                    deadline = time.monotonic() + 2
+                    while runtime.child is child and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertIsNone(runtime.child)
+                    self.assertIsNotNone(child.poll())
+                    runtime.transcribe(wav(), "ru")
+                    self.assertIsNot(runtime.child, child)
+            finally:
+                runtime.close()
+
+    def test_shutdown_interrupts_worker_startup_without_waiting_full_deadline(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp)
+            Path(temp, "mode").write_text("no-ready")
+            errors = []
+            def request():
+                try:
+                    runtime.transcribe(wav(), "ru")
+                except RuntimeError as exc:
+                    errors.append(str(exc))
+            try:
+                with patch.object(voice, "verify_download"), patch.object(voice, "GIGAAM_WORKER", self.FAKE_WORKER):
+                    thread = threading.Thread(target=request)
+                    thread.start()
+                    deadline = time.monotonic() + 2
+                    while runtime.child is None and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertIsNotNone(runtime.child)
+                    start = time.monotonic()
+                    runtime.close()
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+                    self.assertLess(time.monotonic() - start, 2)
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsNone(runtime.child)
+            finally:
+                runtime.close()
+
+    def test_late_launch_after_caller_timeout_is_reaped(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp)
+            entered, release = threading.Event(), threading.Event()
+            real_popen = subprocess.Popen
+            children = []
+            def slow_spawn(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                children.append(child)
+                entered.set()
+                release.wait(2)
+                return child
+            try:
+                with patch.object(voice.subprocess, "Popen", side_effect=slow_spawn), \
+                        patch.object(voice, "LAUNCH_TIMEOUT", .05):
+                    with self.assertRaisesRegex(RuntimeError, "launch timed out"):
+                        runtime.spawn_owned([sys.executable, "-c", "import time; time.sleep(30)"])
+                    self.assertTrue(entered.is_set())
+                    release.set()
+                    deadline = time.monotonic() + 2
+                    while children[0].poll() is None and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertIsNotNone(children[0].poll())
+            finally:
+                release.set()
+                runtime.close()
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
+
+    def test_shutdown_reaps_inflight_launch_and_cancels_queued_launch(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp)
+            entered, release = threading.Event(), threading.Event()
+            real_popen = subprocess.Popen
+            children, errors = [], []
+            def slow_spawn(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                children.append(child)
+                entered.set()
+                release.wait(2)
+                return child
+            def request():
+                try:
+                    runtime.spawn_owned([sys.executable, "-c", "import time; time.sleep(30)"])
+                except RuntimeError as exc:
+                    errors.append(str(exc))
+            threads = [threading.Thread(target=request) for _ in range(2)]
+            try:
+                with patch.object(voice.subprocess, "Popen", side_effect=slow_spawn):
+                    threads[0].start()
+                    self.assertTrue(entered.wait(2))
+                    threads[1].start()
+                    deadline = time.monotonic() + 2
+                    while runtime.launches.qsize() == 0 and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertEqual(runtime.launches.qsize(), 1)
+                    runtime.close()
+                    release.set()
+                    for thread in threads:
+                        thread.join(2)
+                        self.assertFalse(thread.is_alive())
+                    self.assertEqual(len(children), 1, "Queued process launched after shutdown")
+                    self.assertIsNotNone(children[0].poll(), "Undelivered process survived shutdown")
+                    self.assertEqual(len(errors), 2)
+            finally:
+                release.set()
+                runtime.close()
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(2)
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
+
+    def test_queued_launch_cannot_start_after_shutdown(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp)
+            runtime.close()
+            with patch.object(voice.subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "shutting down"):
+                    runtime.spawn_owned([sys.executable, "-c", "pass"])
+                spawn.assert_not_called()
+
+    def test_whisper_explicit_language_contract_is_retained(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = voice.Runtime(SimpleNamespace(runtime_dir=Path(temp), idle_seconds=60,
+                                                   model="base", backend="cpu", threads=4))
+            response = Mock()
+            response.read.return_value = b'{"text":" English "}'
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            try:
+                with patch.object(runtime, "whisper", return_value="http://127.0.0.1:1"), \
+                        patch.object(voice.HTTP, "open", return_value=response):
+                    self.assertEqual(runtime.transcribe(wav(), "en"), {"text": "English"})
+            finally:
+                runtime.close()
 
 
 if __name__ == "__main__":
