@@ -19,7 +19,7 @@ use cpal::{
     DeviceId, SampleFormat, SizedSample,
     traits::{DeviceTrait, StreamTrait},
 };
-use rodio::{Decoder, MixerDeviceSink, Player, mixer::Mixer};
+use rodio::{Decoder, MixerDeviceSink, Player, Source, mixer::Mixer};
 
 use crate::{EchoCanceller, audio_pipeline::open_output_stream, resolve_device};
 
@@ -96,15 +96,26 @@ impl VoiceCapture {
             cancel,
             worker: Some(worker),
         };
-        match ready_rx.recv() {
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(capture),
             Ok(Err(message)) => {
                 capture.stop();
                 bail!(message)
             }
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 capture.stop();
                 bail!("Microphone capture stopped during initialization")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A driver can block inside device initialization. It cannot be
+                // killed safely; detach only this pending open, and cancel as
+                // soon as it returns instead of blocking the UI in Drop.
+                capture.cancel.store(true, Ordering::Release);
+                capture.worker.take();
+                log::warn!(
+                    "Microphone initialization timed out; cancelling the pending device open"
+                );
+                bail!("Microphone initialization timed out; check the selected input device")
             }
         }
     }
@@ -122,7 +133,9 @@ impl VoiceCapture {
     fn stop(&mut self) {
         self.cancel.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            if let Err(panic) = worker.join() {
+                log::error!("Voice capture worker panicked: {panic:?}");
+            }
         }
     }
 }
@@ -148,15 +161,33 @@ fn capture_worker(
     let (stream, rate) = match opened {
         Ok(value) => value,
         Err(error) => {
-            let _ = ready.send(Err(format!("Could not open microphone: {error:#}")));
+            if ready
+                .send(Err(format!("Could not open microphone: {error:#}")))
+                .is_err()
+            {
+                // The caller timed out while the device was opening.
+                log::debug!("Microphone initialization receiver was cancelled");
+            }
             return Ok(());
         }
     };
-    if let Err(error) = stream.play() {
-        let _ = ready.send(Err(format!("Could not start microphone: {error}")));
+    if cancel.load(Ordering::Acquire) {
         return Ok(());
     }
-    let _ = ready.send(Ok(()));
+    if let Err(error) = stream.play() {
+        if ready
+            .send(Err(format!("Could not start microphone: {error}")))
+            .is_err()
+        {
+            // The caller timed out while the device was opening.
+            log::debug!("Microphone initialization receiver was cancelled");
+        }
+        return Ok(());
+    }
+    if ready.send(Ok(())).is_err() {
+        // The caller timed out; drop the stream without starting capture work.
+        return Ok(());
+    }
     let mut processor = CaptureProcessor::new(rate, continuous);
     let started = Instant::now();
     loop {
@@ -368,7 +399,10 @@ impl EventSender {
     }
 
     fn terminal(&self, event: VoiceCaptureEvent) {
-        let _ = self.enqueue(event);
+        if let Err(error) = self.enqueue(event) {
+            // Expected if the consumer dropped capture during worker shutdown.
+            log::debug!("Voice terminal event was not delivered: {error:#}");
+        }
     }
 }
 
@@ -533,7 +567,7 @@ pub struct CancellablePlayback {
 
 struct PlaybackControl {
     player: Player,
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl PlaybackControl {
@@ -575,13 +609,17 @@ impl CancellablePlayback {
         mixer: &Mixer,
         output: Option<MixerDeviceSink>,
     ) -> Self {
-        let player = Player::connect_new(mixer);
+        let (player, queue) = Player::new();
         player.append(source);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // The outer guard checks each sample, independent of Player's periodic
+        // control polling. The mixer may retain at most a resampling frame.
+        mixer.add(InterruptibleSource {
+            inner: queue,
+            cancelled: cancelled.clone(),
+        });
         Self {
-            control: PlaybackControl {
-                player,
-                cancelled: AtomicBool::new(false),
-            },
+            control: PlaybackControl { player, cancelled },
             _output: output,
         }
     }
@@ -592,6 +630,37 @@ impl CancellablePlayback {
 
     pub fn is_finished(&self) -> bool {
         self.control.is_finished()
+    }
+}
+
+struct InterruptibleSource<S> {
+    inner: S,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<S: Source> Iterator for InterruptibleSource<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cancelled.load(Ordering::Acquire) {
+            None
+        } else {
+            self.inner.next()
+        }
+    }
+}
+
+impl<S: Source> Source for InterruptibleSource<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+    fn channels(&self) -> rodio::ChannelCount {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
     }
 }
 
@@ -761,6 +830,9 @@ mod tests {
     fn playback_cancellation_and_drop_stop_the_owned_source() {
         for drop_control in [false, true] {
             let (mixer, mut source) = rodio::mixer::mixer(rodio::nz!(1), rodio::nz!(48_000));
+            // Match the shared output stream's permanent silence source. Without
+            // it, dropping playback can end the mixer before a silent tail.
+            mixer.add(rodio::source::Zero::new(rodio::nz!(1), rodio::nz!(48_000)));
             let control =
                 CancellablePlayback::start_on_mixer(pcm_wav(&[1_000; WAV_RATE as usize]), mixer)
                     .unwrap();
@@ -772,13 +844,26 @@ mod tests {
                 control.cancel();
                 assert!(control.is_finished());
             }
-            // Rodio applies controls on a bounded periodic poll, not every sample.
-            let tail: Vec<_> = source.take(4_800).collect();
+            let tail: Vec<_> = source.take(480).collect();
+            assert_eq!(tail.len(), 480);
             assert!(
-                tail.iter().rev().take(480).all(|sample| *sample == 0.0),
-                "Stopped source must be silent within 100ms"
+                tail.iter().skip(48).all(|sample| *sample == 0.0),
+                "Stopped source must be silent within 1ms, including resampler lookahead"
             );
         }
+    }
+
+    #[test]
+    fn playback_guard_stops_before_reading_another_sample() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut source = InterruptibleSource {
+            inner: rodio::source::SineWave::new(440.0),
+            cancelled: cancelled.clone(),
+        };
+        assert!(source.next().is_some());
+        cancelled.store(true, Ordering::Release);
+        assert!(source.next().is_none());
+        assert!(source.next().is_none());
     }
 
     #[test]
