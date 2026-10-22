@@ -54,6 +54,12 @@ pub struct Audio {
 impl Global for Audio {}
 
 impl Audio {
+    /// Reuse the application's output stream for speech so the shared echo
+    /// canceller receives one mixed reverse stream, including sound effects.
+    pub fn speech_output_mixer(&mut self, output_audio_device: Option<DeviceId>) -> Result<Mixer> {
+        self.ensure_output_exists(output_audio_device).cloned()
+    }
+
     fn ensure_output_exists(&mut self, output_audio_device: Option<DeviceId>) -> Result<&Mixer> {
         #[cfg(debug_assertions)]
         log::warn!(

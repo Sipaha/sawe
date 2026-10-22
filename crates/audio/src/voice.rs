@@ -19,7 +19,7 @@ use cpal::{
     DeviceId, SampleFormat, SizedSample,
     traits::{DeviceTrait, StreamTrait},
 };
-use rodio::{Decoder, MixerDeviceSink, Player};
+use rodio::{Decoder, MixerDeviceSink, Player, mixer::Mixer};
 
 use crate::{EchoCanceller, audio_pipeline::open_output_stream, resolve_device};
 
@@ -528,7 +528,7 @@ fn pcm_wav(samples: &[i16]) -> Vec<u8> {
 /// Owns the output device and queue. Cancellation never affects an agent task.
 pub struct CancellablePlayback {
     control: PlaybackControl,
-    _output: MixerDeviceSink,
+    _output: Option<MixerDeviceSink>,
 }
 
 struct PlaybackControl {
@@ -559,21 +559,31 @@ impl CancellablePlayback {
         output_device: Option<DeviceId>,
         echo_canceller: EchoCanceller,
     ) -> Result<Self> {
-        anyhow::ensure!(
-            wav.len() <= MAX_PLAYBACK_BYTES,
-            "Speech audio exceeds the playback size limit"
-        );
-        let source = Decoder::new(Cursor::new(wav)).context("Could not decode speech audio")?;
+        let source = decode_speech(wav)?;
         let (output, mixer) = open_output_stream(output_device, echo_canceller)?;
-        let player = Player::connect_new(&mixer);
+        Ok(Self::with_source(source, &mixer, Some(output)))
+    }
+
+    /// Prefer the mixer's shared `Audio` output when sound effects also use AEC.
+    /// Its owner must keep the output stream alive for the duration of playback.
+    pub fn start_on_mixer(wav: Vec<u8>, mixer: Mixer) -> Result<Self> {
+        Ok(Self::with_source(decode_speech(wav)?, &mixer, None))
+    }
+
+    fn with_source(
+        source: Decoder<Cursor<Vec<u8>>>,
+        mixer: &Mixer,
+        output: Option<MixerDeviceSink>,
+    ) -> Self {
+        let player = Player::connect_new(mixer);
         player.append(source);
-        Ok(Self {
+        Self {
             control: PlaybackControl {
                 player,
                 cancelled: AtomicBool::new(false),
             },
             _output: output,
-        })
+        }
     }
 
     pub fn cancel(&self) {
@@ -583,6 +593,14 @@ impl CancellablePlayback {
     pub fn is_finished(&self) -> bool {
         self.control.is_finished()
     }
+}
+
+fn decode_speech(wav: Vec<u8>) -> Result<Decoder<Cursor<Vec<u8>>>> {
+    anyhow::ensure!(
+        wav.len() <= MAX_PLAYBACK_BYTES,
+        "Speech audio exceeds the playback size limit"
+    );
+    Decoder::new(Cursor::new(wav)).context("Could not decode speech audio")
 }
 
 #[cfg(test)]
@@ -743,12 +761,9 @@ mod tests {
     fn playback_cancellation_and_drop_stop_the_owned_source() {
         for drop_control in [false, true] {
             let (mixer, mut source) = rodio::mixer::mixer(rodio::nz!(1), rodio::nz!(48_000));
-            let player = Player::connect_new(&mixer);
-            player.append(rodio::source::SineWave::new(440.0));
-            let control = PlaybackControl {
-                player,
-                cancelled: AtomicBool::new(false),
-            };
+            let control =
+                CancellablePlayback::start_on_mixer(pcm_wav(&[1_000; WAV_RATE as usize]), mixer)
+                    .unwrap();
             assert!(!control.is_finished());
             assert!(source.by_ref().take(100).any(|sample| sample != 0.0));
             if drop_control {
@@ -769,12 +784,7 @@ mod tests {
     #[test]
     fn playback_reports_natural_completion() {
         let (mixer, source) = rodio::mixer::mixer(rodio::nz!(1), rodio::nz!(16_000));
-        let player = Player::connect_new(&mixer);
-        player.append(Decoder::new(Cursor::new(pcm_wav(&[1_000; 160]))).unwrap());
-        let control = PlaybackControl {
-            player,
-            cancelled: AtomicBool::new(false),
-        };
+        let control = CancellablePlayback::start_on_mixer(pcm_wav(&[1_000; 160]), mixer).unwrap();
         assert!(!control.is_finished());
         let tail: Vec<_> = source.take(2_000).collect();
         assert!(tail.iter().rev().take(160).all(|sample| *sample == 0.0));
