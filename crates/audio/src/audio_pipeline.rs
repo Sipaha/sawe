@@ -14,7 +14,7 @@ use std::io::Cursor;
 use util::ResultExt;
 
 mod echo_canceller;
-use echo_canceller::EchoCanceller;
+pub use echo_canceller::EchoCanceller;
 mod rodio_ext;
 pub use crate::audio_settings::AudioSettings;
 pub use rodio_ext::RodioExt;
