@@ -6504,7 +6504,13 @@ Solution chat voice uses local or configurable compatible STT/TTS around the
 existing composer/queue. Speaking interrupts audio only; stopping the agent
 remains explicit. Completion follows real turn events, with bounded capture and
 stale-result rejection on navigation or history replacement. Audio playback
-shares the application mixer for echo cancellation. Local whisper.cpp models
-load lazily and unload on idle, avoiding a permanently resident speech stack.
+shares the application mixer for echo cancellation. Default recognition uses
+Russian GigaAM v3 CTC INT8 on CPU, selected after the local accuracy/memory
+comparison. Its owned worker loads lazily and unloads after one idle hour, the
+user's chosen balance between cold-start latency and roughly 430 MiB worker
+RAM. Active Hands-free periodically renews service activity to retain the model
+through silence; client cancellation stops renewal without leaving a permanent
+pin. Explicit Whisper alternatives retain multilingual recognition; Piper
+remains separate, transient synthesis.
 See [ADR-0007](docs/architecture/decisions/0007-provider-independent-voice.md)
 and the [voice guide](docs/guides/voice-conversations.md).

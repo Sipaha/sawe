@@ -1,6 +1,6 @@
 # GigaAM CTC as the local recognition default
 
-**Status:** ready to dispatch
+**Status:** complete
 **Goal:** Use the verified low-memory Russian GigaAM v3 CTC INT8 CPU model for
 Sawe's existing provider-independent voice conversations.
 
@@ -23,6 +23,8 @@ full sidecar cold request time must also be measured. See the
 3. Use an owned persistent child for GigaAM inference, loaded lazily and killed
    after one idle hour (user choice at 21:03:16). Enforce CPU thread limits and offline model loading.
    Do not retain recognized text in logs or create orphan model processes.
+   Active Hands-free must prevent eviction through bounded activity keepalives
+   (user choice at 21:28:06); cancellation, navigation and close stop renewal.
 4. `solution_agent` voice default names GigaAM; custom endpoint/model overrides
    remain intact. Existing voice controls/composer/queue behavior remain intact.
 5. Update the guide, runtime architecture/evidence and ADR-0007/FORK decision.
@@ -52,6 +54,8 @@ Punctuation/number rewriting, language translation, a different TTS voice,
 new microphone controls, cloud credentials, startup registration and installing
 system packages. CTC output is unpunctuated Russian; digits are not considered
 a product error. Do not delete the working Whisper runtime/models.
+The user confirmed retaining Python for this iteration at 21:41:26; native Rust
+ONNX inference is a separate possible implementation, not required here.
 
 ## Risks
 
@@ -79,11 +83,11 @@ a product error. Do not delete the working Whisper runtime/models.
 
 ## Completion
 
-- [ ] Runtime and dependency/model setup implemented and reviewed.
-- [ ] Desktop defaults and custom override regressions verified.
-- [ ] Real HTTP, lifecycle and UI verification completed with evidence.
-- [ ] Working local service switched to GigaAM; previous models preserved.
-- [ ] Release built/launched, docs current, changes committed/pushed.
+- [x] Runtime and dependency/model setup implemented and reviewed.
+- [x] Desktop defaults and custom override regressions verified.
+- [x] Real HTTP, lifecycle and UI verification completed with evidence.
+- [x] Working local service switched to GigaAM; previous models preserved.
+- [x] Release built/launched, docs current, changes committed/pushed.
 
 Operational progress, blockers and acceptance are recorded in task
 `sawe-gigaam-ctc-default-20261022`.

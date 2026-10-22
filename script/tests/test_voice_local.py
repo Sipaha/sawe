@@ -381,8 +381,6 @@ def send(value):
     sys.stdout.buffer.flush()
 if mode == "no-ready":
     time.sleep(30)
-if mode == "slow-ready-no-reply":
-    time.sleep(.5)
 if mode == "bad-ready":
     send({"ready": False})
 else:
@@ -397,7 +395,7 @@ while True:
     data = sys.stdin.buffer.read(size)
     if mode == "crash":
         sys.exit(1)
-    if mode in ("no-reply", "slow-ready-no-reply"):
+    if mode == "no-reply":
         time.sleep(30)
     if mode == "oversized":
         sys.stdout.buffer.write(struct.pack("!I", 65537)); sys.stdout.buffer.flush()
@@ -517,20 +515,25 @@ while True:
                     runtime.close()
 
     def test_cold_start_and_inference_share_the_request_deadline(self):
-        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
-            runtime = self.runtime(temp)
-            Path(temp, "mode").write_text("slow-ready-no-reply")
-            try:
-                with patch.object(voice, "verify_download"), patch.object(voice, "GIGAAM_WORKER", self.FAKE_WORKER), \
-                        patch.object(voice, "WORKER_REQUEST_TIMEOUT", .8):
-                    start = time.monotonic()
-                    with self.assertRaisesRegex(RuntimeError, "worker reset"):
-                        runtime.transcribe(wav(), "ru")
-                    self.assertLess(time.monotonic() - start, 1.05,
-                                    "Cold startup must consume the inference request budget")
-                    self.assertIsNone(runtime.child)
-            finally:
-                runtime.close()
+        read_fd, write_fd = os.pipe()
+        response = b'{"text":"late valid response"}'
+        os.write(write_fd, len(response).to_bytes(4, "big") + response)
+        os.close(write_fd)
+        clock = [100.0]
+        with os.fdopen(read_fd, "rb", buffering=0) as output:
+            child = SimpleNamespace(stdin=None, stdout=output)
+            def startup(_deadline=None):
+                clock[0] += .5
+                return child
+            def write(*_args):
+                clock[0] += .31
+            runtime = SimpleNamespace(gigaam=startup, closed=threading.Event(), stop_recognizer=Mock())
+            with patch.object(voice.time, "monotonic", side_effect=lambda: clock[0]), \
+                    patch.object(voice, "write_worker_frame", side_effect=write), \
+                    patch.object(voice, "WORKER_REQUEST_TIMEOUT", .8):
+                with self.assertRaisesRegex(RuntimeError, "worker reset"):
+                    voice.Runtime.transcribe_gigaam(runtime, wav())
+            runtime.stop_recognizer.assert_called_once()
 
     def test_worker_idle_unload_and_lazy_reload(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:

@@ -9,23 +9,34 @@ at `http://127.0.0.1:8095/v1`; a coding-provider subscription is not used for au
 From the Sawe repository, install and launch the pinned local runtime:
 
 ```sh
-script/voice-local --runtime-dir /home/spk/.spk/sawe/ss/Sawe1/.tmp/voice-runtime setup --backend cuda --cuda-arch 120 --model small
-script/voice-local --runtime-dir /home/spk/.spk/sawe/ss/Sawe1/.tmp/voice-runtime serve --backend cuda --model small
+script/voice-local --runtime-dir /home/spk/.spk/sawe/ss/Sawe1/.tmp/voice-runtime setup
+script/voice-local --runtime-dir /home/spk/.spk/sawe/ss/Sawe1/.tmp/voice-runtime serve
 ```
 
-Setup downloads whisper.cpp, a multilingual quantized model and a Russian Piper
-voice. It does not install system packages. The runtime directory holds models,
-its Python environment and caches; keep it when cleaning unrelated scratch files.
-The `120` CUDA architecture above matches the verified RTX 5070 Laptop. Other
-GPUs can use `--cuda-arch native`; use `--backend cpu` when CUDA is unavailable.
-For the smaller base model, use `--model base` during setup and serve. The model
-selected by the local server's launch command determines recognition; the API
-model field is accepted for compatibility.
+Setup installs the pinned Russian GigaAM v3 CTC INT8 model, a CPU runtime and the
+Russian Piper Denis voice. It does not require CUDA or install system packages.
+The runtime directory holds models, its Python environment and caches; keep it
+when cleaning unrelated scratch files. Recognition emits lowercase Russian
+without punctuation. The launch command selects the model; the API model field
+is accepted for compatibility.
 
-The service listens on loopback only. Models load on demand; Whisper releases
-its model after 60 idle seconds. The microphone never starts automatically.
+The service listens on loopback only. GigaAM loads on demand. While Hands-free
+is active, Sawe sends a small keepalive every 30 seconds so silence does not
+unload the model. After the mode ends, recognition is released after one hour
+without speech-service activity. Use `--idle-seconds` to change this interval.
+Closing the chat or app stops keepalives; no permanent model pin remains.
+Piper uses a separate model and exits after synthesis. The microphone never
+starts automatically.
 See [local runtime details](../findings/2026-10-local-voice-runtime.md) for pinned
 revisions, limits, licensing and measured performance.
+
+Whisper remains an explicit alternative for multilingual recognition. For
+example, use `--model small --backend cuda --cuda-arch 120` during setup and
+`--model small --backend cuda` during serve on the verified RTX 5070 Laptop.
+Other GPUs can use `--cuda-arch native`; `--backend cpu` avoids CUDA. The smaller
+Whisper model is selected with `--model base`. Set
+`solution_agent.voice.transcription_model` when using a different compatible
+server that selects models from the request.
 
 ## Chat controls
 

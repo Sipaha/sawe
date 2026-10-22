@@ -29,8 +29,14 @@ output mixer so echo cancellation sees a single reverse stream. Every started
 speech segment ends explicitly, including short discarded noises.
 
 A configurable OpenAI-compatible HTTP service supplies STT/TTS. The default is a
-loopback sidecar with quantized whisper.cpp and Piper. Engine setup is explicit;
-models load lazily and are released on idle. Endpoint credentials are selected
+loopback sidecar with Russian GigaAM v3 CTC INT8 on CPU and Piper. The user selected
+GigaAM after the [Russian model comparison](../../findings/2026-10-russian-asr-comparison.md)
+and chose an hour of idle retention to avoid repeated cold starts. Active
+Hands-free refreshes the local service's activity clock every 30 seconds; closing
+or stopping voice cancels that task. This prevents silence from evicting a model
+while avoiding a permanent server-side pin after a client exits. Explicit
+Whisper models remain available for multilingual recognition. Engine setup is
+explicit; models load lazily and are released on idle. Endpoint credentials are selected
 from environment variables, scoped by origin, and excluded from transcript and
 settings data. Loopback connections bypass proxies.
 
