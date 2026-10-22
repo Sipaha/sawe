@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use cpal::{
-    DeviceId, Sample, SampleFormat, SizedSample,
+    DeviceId, SampleFormat, SizedSample,
     traits::{DeviceTrait, StreamTrait},
 };
 use rodio::{Decoder, MixerDeviceSink, Player};
@@ -759,7 +759,10 @@ mod tests {
             }
             // Rodio applies controls on a bounded periodic poll, not every sample.
             let tail: Vec<_> = source.take(4_800).collect();
-            assert!(tail.len() < 4_800, "Stopped source must end within 100ms");
+            assert!(
+                tail.iter().rev().take(480).all(|sample| *sample == 0.0),
+                "Stopped source must be silent within 100ms"
+            );
         }
     }
 
@@ -773,7 +776,8 @@ mod tests {
             cancelled: AtomicBool::new(false),
         };
         assert!(!control.is_finished());
-        assert!(source.take(2_000).count() < 2_000);
+        let tail: Vec<_> = source.take(2_000).collect();
+        assert!(tail.iter().rev().take(160).all(|sample| *sample == 0.0));
         assert!(control.is_finished());
     }
 
