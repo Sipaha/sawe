@@ -614,6 +614,11 @@ impl CancellablePlayback {
         let cancelled = Arc::new(AtomicBool::new(false));
         // The outer guard checks each sample, independent of Player's periodic
         // control polling. The mixer may retain at most a resampling frame.
+        let queue = rodio::source::UniformSourceIterator::new(
+            queue,
+            crate::CHANNEL_COUNT,
+            crate::SAMPLE_RATE,
+        );
         mixer.add(InterruptibleSource {
             inner: queue,
             cancelled: cancelled.clone(),
@@ -851,6 +856,22 @@ mod tests {
                 "Stopped source must be silent within 1ms, including resampler lookahead"
             );
         }
+    }
+
+    #[test]
+    fn interruption_does_not_wait_for_low_rate_wav_resampling() {
+        let mut wav = pcm_wav(&[1_000; 2]);
+        wav[24..28].copy_from_slice(&1u32.to_le_bytes());
+        wav[28..32].copy_from_slice(&2u32.to_le_bytes());
+        let (mixer, mut source) = rodio::mixer::mixer(crate::CHANNEL_COUNT, crate::SAMPLE_RATE);
+        mixer.add(rodio::source::Zero::new(
+            crate::CHANNEL_COUNT,
+            crate::SAMPLE_RATE,
+        ));
+        let playback = CancellablePlayback::start_on_mixer(wav, mixer).unwrap();
+        assert!(source.by_ref().take(100).any(|sample| sample != 0.0));
+        playback.cancel();
+        assert!(source.take(96).skip(2).all(|sample| sample == 0.0));
     }
 
     #[test]
