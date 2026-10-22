@@ -97,6 +97,28 @@ time.sleep(30)
             finally:
                 runtime.close()
 
+    def test_model_survives_short_lived_request_thread(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = voice.Runtime(SimpleNamespace(runtime_dir=Path(temp), idle_seconds=60))
+            def request():
+                runtime.child = runtime.spawn_owned([sys.executable, "-c", voice.EXEC_GUARD,
+                    sys.executable, "-u", "-c", 'import time; print("ready", flush=True); time.sleep(30)'],
+                    stdout=subprocess.PIPE, text=True)
+                self.assertEqual(runtime.child.stdout.readline().strip(), "ready")
+            thread = threading.Thread(target=request)
+            try:
+                thread.start()
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                child = runtime.child
+                time.sleep(.1)
+                self.assertIsNone(child.poll(), "Model was killed with HTTP handler thread")
+                runtime.close()
+                self.assertIsNotNone(child.poll())
+                child.stdout.close()
+            finally:
+                runtime.close()
+
     def test_transcription_gate_blocks_late_tts_spawn(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
             runtime = voice.Runtime(SimpleNamespace(runtime_dir=Path(temp), idle_seconds=60, threads=2))

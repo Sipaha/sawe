@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Bounded loopback OpenAI-compatible whisper.cpp/Piper speech service."""
 import argparse
+from concurrent.futures import Future
 import email.policy
 import hashlib
 import http.server
 import io
 import json
 import os
+import queue
 from pathlib import Path
 import signal
 import socket
@@ -171,8 +173,31 @@ class Runtime:
         self.transcribing = False
         self.last_used = time.monotonic()
         self.closed = threading.Event()
+        self.launches = queue.Queue()
+        self.launch_thread = threading.Thread(target=self.launch_owned_children, daemon=True)
+        self.launch_thread.start()
         self.watchdog = threading.Thread(target=self.reap_idle, daemon=True)
         self.watchdog.start()
+
+    def launch_owned_children(self):
+        # Linux parent-death signals belong to the spawning thread. HTTP request
+        # threads end after each request, so a persistent thread must own models.
+        while not self.closed.is_set():
+            try:
+                argv, kwargs, future = self.launches.get(timeout=.2)
+            except queue.Empty:
+                continue
+            try:
+                future.set_result(subprocess.Popen(argv, **kwargs))
+            except Exception as exc:
+                future.set_exception(exc)
+
+    def spawn_owned(self, argv, **kwargs):
+        if self.closed.is_set():
+            raise RuntimeError("Service shutting down")
+        future = Future()
+        self.launches.put((argv, kwargs, future))
+        return future.result(timeout=10)
 
     def stop_whisper(self):
         with self.child_lock:
@@ -232,14 +257,17 @@ class Runtime:
             model = self.root / "models" / f"ggml-{self.args.model}-q5_1.bin"
             if not binary.is_file() or not model.is_file():
                 raise RuntimeError("Local models are missing; run voice-local setup first")
+            (self.root / "cuda-cache").mkdir(exist_ok=True)
             self.child_log = (self.root / "whisper-server.log").open("wb")
+            beam = "3" if self.args.backend == "cuda" else "1"
             argv = [str(binary), "--host", "127.0.0.1", "--port", str(port), "-m", str(model),
-                    "-t", str(self.args.threads), "-l", "ru", "-nt", "-bo", "1", "-bs", "1"]
+                    "-t", str(self.args.threads), "-l", "ru", "-nt", "-bo", beam, "-bs", beam]
             if self.args.backend == "cpu":
                 argv += ["-ng"]
-            self.child = subprocess.Popen([sys.executable, "-c", EXEC_GUARD, *argv],
+            self.child = self.spawn_owned([sys.executable, "-c", EXEC_GUARD, *argv],
                                           cwd=self.root, stdout=self.child_log, stderr=self.child_log,
-                                          env={**os.environ, "TMPDIR": str(self.root)})
+                                          env={**os.environ, "TMPDIR": str(self.root),
+                                               "CUDA_CACHE_PATH": str(self.root / "cuda-cache")})
             self.whisper_url = f"http://127.0.0.1:{port}"
             child = self.child
         deadline = time.monotonic() + 60
@@ -292,7 +320,7 @@ class Runtime:
                     raise RuntimeError("Service shutting down")
                 if self.transcribing:
                     raise EngineBusy("Transcription has priority; retry speech afterwards")
-                self.tts_child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                self.tts_child = self.spawn_owned(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE, cwd=self.root,
                     env={**os.environ, "TMPDIR": str(self.root), "OMP_NUM_THREADS": str(self.args.threads)})
                 child = self.tts_child

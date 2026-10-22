@@ -30,9 +30,12 @@ Transcription interrupts active synthesis and proceeds without waiting for it.
 Requests are limited to
 4 MiB, speech text to 4,000 characters, and inference to 120 seconds. Whisper
 loads lazily, stays warm during conversation, and unloads after 60 idle seconds
-(`--idle-seconds`). Piper uses four CPU threads by default and exits after each
+(`--idle-seconds`). CUDA uses beam search with size three; CPU uses greedy decoding. Piper uses
+four CPU threads by default and exits after each
 utterance. SIGTERM/SIGINT stops owned model children. On Linux a parent-death signal also
-prevents orphan model processes if the sidecar is killed abruptly. Canceling playback in the
+prevents orphan model processes if the sidecar is killed abruptly. A persistent
+owner thread launches children: Linux parent-death signals track the spawning
+thread, so launching from a disposable HTTP thread would unload a warm model. Canceling playback in the
 app does not cancel the coding agent. Killing the owned sidecar also cancels its
 inference. This is utterance-based recognition, not token-streamed transcription.
 
@@ -44,3 +47,19 @@ model checksum validation, idle model release and process cleanup without models
 The live Russian benchmark uses a 6.91-second synthesized test utterance, not a
 microphone or an accuracy corpus. Timings under concurrent compilation must not
 be treated as idle-machine performance.
+
+Measured on AMD Ryzen 7 260 / RTX 5070 Laptop 8 GB, four CPU threads:
+
+| Model/backend | Warm request, 6.91s audio | Sampled RSS | GPU memory |
+| --- | --- | --- | --- |
+| base Q5_1 / CPU | 4.87–6.04s | 159 MiB | — |
+| small Q5_1 / CPU | 11.70–26.81s | 352 MiB | — |
+| base Q5_1 / CUDA, beam 3 | 0.10–0.11s | 401 MiB | 404 MiB |
+| small Q5_1 / CUDA, beam 3 | 0.16–0.17s | 398 MiB | 642 MiB |
+
+CPU runs overlapped compilation. CUDA small model load took 1.51s after driver
+initialization; first CUDA initialization in the earlier run took 6.73s. Piper
+synthesized the 6.91s test phrase in 2.90s with 206 MiB peak RSS, including cold
+Python/model startup. Small recognized the phrase better than base, but still
+made word errors; this sample does not establish microphone accuracy. Live HTTP
+checks verified cold/warm recognition, WAV speech, and actual idle process reap.
