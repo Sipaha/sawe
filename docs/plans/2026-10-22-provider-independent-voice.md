@@ -1,6 +1,6 @@
 # Provider-independent voice conversations
 
-**Status:** in progress
+**Status:** complete
 **Goal:** Speak to any Solution chat provider and hear replies, with interruptible playback.
 
 ## Context
@@ -41,7 +41,7 @@ The user chose STT → the existing text-agent adapter → TTS rather than Codex
 - [x] Read newly completed assistant answers without replaying old history or reasoning/tools.
 - [x] Interrupt playback without stopping the agent; reject stale audio.
 - [x] Explicit visible recording and bounded resources with cleanup.
-- [ ] Tests, builds, visual evidence and dedicated documentation complete.
+- [x] Tests, builds, visual evidence and dedicated documentation complete.
 
 ## Verified behavior
 
@@ -54,3 +54,14 @@ waveform playback starting. Screenshots were inspected at 1920×1080 and 1000×7
 The first measurement was corrected for the monitor's default buffering by
 requesting 10 ms capture latency. Physical microphone accuracy and acoustic
 echo cancellation were not established by this virtual test.
+
+## Delivery verification
+
+Source commit `f8672698b4` passed the debug build, 24 audio tests, 1053
+solution-agent tests (one existing ignored), 10 local-runtime tests and strict
+scoped Clippy. The optimized release profile was built with
+`cargo rustc --release -p zed --bin sawe -- -C llvm-args=-threads=2` to bound
+compiler parallelism; the resulting `target/release/sawe` was launched in an
+isolated profile. Its startup identified source `f8672698b4`, MCP reported the
+new binary timestamp, and the real release screenshot showed the voice controls.
+The isolated release app was closed; the user's existing editor was preserved.

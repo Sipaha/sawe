@@ -85,7 +85,7 @@ can read them.
 
 | Date | Status | Plan |
 |---|---|---|
-| 2026-10-22 | in progress | [Provider-independent voice conversations](plans/2026-10-22-provider-independent-voice.md) |
+| 2026-10-22 | complete | [Provider-independent voice conversations](plans/2026-10-22-provider-independent-voice.md) |
 | 2026-10-02 | complete | [Kimi integration review and approval fixes](plans/2026-10-02-kimi-approval-review.md) |
 | 2026-09-22 | complete | [Integrate current upstream Zed](plans/2026-09-22-upstream-main-integration.md) — merged upstream `b54cc1d0ac` as `790aa911ab`, preserving the fork's product contracts. |
 | 2026-09-22 | complete | [Git panel refresh correctness](plans/2026-09-22-git-panel-refresh.md) |
