@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""Bounded loopback OpenAI-compatible whisper.cpp/Piper speech service."""
+import argparse
+import email.policy
+import hashlib
+import http.server
+import io
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import wave
+from email.parser import BytesParser
+
+WHISPER_REV = "2eeeba56e9edd762b4b38467bab96c2517163158"
+WHISPER_MODELS_REV = "5359861c739e955e79d9a303bcbc70fb988958b1"
+PIPER_MODELS_REV = "5041a7a49ae5b3a0f30e6837769eb03fdbb231bd"
+VOICE = "ru_RU-denis-medium"
+MODEL_HASHES = {
+    "ggml-small-q5_1.bin": "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
+    "ggml-base-q5_1.bin": "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
+    "ru_RU-denis-medium.onnx": "15fab56e11a097858ee115545d0f697fc2a316c41a291a5362349fb870411b0a",
+    "ru_RU-denis-medium.onnx.json": "831c860dac0b5073eaa81610a0a638ec23d90a6cf8e5f871b4485c2cec3767c8",
+}
+MAX_BODY = 4 * 1024 * 1024
+MAX_TEXT = 4000
+PARENT_GUARD = """
+import os, sys
+if sys.platform.startswith("linux"):
+    import ctypes, signal
+    parent = os.getppid()
+    if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM) != 0:
+        raise OSError(ctypes.get_errno(), "Unable to install parent-death signal")
+    if os.getppid() != parent:
+        sys.exit(1)
+"""
+EXEC_GUARD = PARENT_GUARD + "\nimport os, sys\nos.execv(sys.argv[1], sys.argv[1:])\n"
+PIPER_WORKER = PARENT_GUARD + """
+import json, sys, wave
+import onnxruntime
+from piper.voice import PiperVoice
+from piper.config import PiperConfig
+options = onnxruntime.SessionOptions()
+options.intra_op_num_threads = int(sys.argv[3])
+options.inter_op_num_threads = 1
+voice = PiperVoice(
+    session=onnxruntime.InferenceSession(sys.argv[1], sess_options=options, providers=["CPUExecutionProvider"]),
+    config=PiperConfig.from_dict(json.load(open(sys.argv[1] + ".json"))))
+with wave.open(sys.argv[2], "wb") as output:
+    voice.synthesize_wav(sys.stdin.read(), output)
+"""
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def run(argv, **kwargs):
+    return subprocess.run([str(x) for x in argv], check=True, **kwargs)
+
+
+def verify_download(path, name=None):
+    expected = MODEL_HASHES.get(name or path.name)
+    if expected and hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise ValueError(f"Checksum mismatch: {name or path.name}; remove and retry setup")
+
+
+def download(url, target):
+    if target.exists():
+        verify_download(target)
+        return
+    partial = target.with_suffix(target.suffix + ".partial")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as src, partial.open("wb") as dst:
+            while chunk := src.read(1024 * 1024):
+                dst.write(chunk)
+        verify_download(partial, target.name)
+        partial.replace(target)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def setup(args):
+    root = args.runtime_dir
+    root.mkdir(parents=True, exist_ok=True)
+    os.environ.update(TMPDIR=str(root), PIP_CACHE_DIR=str(root / "pip-cache"))
+    source = root / "whisper.cpp"
+    if not source.exists():
+        run(["git", "clone", "--depth", "1", "--branch", "v1.8.3",
+             "https://github.com/ggml-org/whisper.cpp.git", source])
+    if subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip() != WHISPER_REV:
+        raise ValueError("whisper.cpp source does not match pinned revision")
+    build = root / ("build-" + args.backend)
+    config = ["cmake", "-S", source, "-B", build, "-DCMAKE_BUILD_TYPE=Release",
+              "-DWHISPER_BUILD_TESTS=OFF", "-DWHISPER_BUILD_SERVER=ON", "-DGGML_CCACHE=OFF",
+              "-DGGML_CUDA=" + ("ON" if args.backend == "cuda" else "OFF")]
+    if args.backend == "cuda":
+        config += ["-DCMAKE_CUDA_COMPILER=" + args.cuda_compiler,
+                   "-DCMAKE_CUDA_ARCHITECTURES=" + args.cuda_arch]
+    run(config)
+    run(["cmake", "--build", build, "--target", "whisper-server", "whisper-cli", "-j4"])
+    venv = root / "venv"
+    if not (venv / "bin/python").exists():
+        run([sys.executable, "-m", "venv", venv])
+    run([venv / "bin/pip", "install", "piper-tts==1.3.0", "onnxruntime==1.31.0",
+         "numpy==2.5.4", "flatbuffers==25.12.19", "packaging==26.3", "protobuf==7.36.2"])
+    models = root / "models"
+    models.mkdir(exist_ok=True)
+    name = f"ggml-{args.model}-q5_1.bin"
+    download(f"https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_MODELS_REV}/{name}", models / name)
+    prefix = f"https://huggingface.co/rhasspy/piper-voices/resolve/{PIPER_MODELS_REV}/ru/ru_RU/denis/medium/"
+    for suffix in (".onnx", ".onnx.json"):
+        download(prefix + VOICE + suffix, models / (VOICE + suffix))
+    download(prefix + "MODEL_CARD", models / "denis-MODEL_CARD")
+    manifest = {"whisper_revision": WHISPER_REV, "whisper_models_revision": WHISPER_MODELS_REV,
+                "piper_models_revision": PIPER_MODELS_REV,
+                "sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in models.iterdir() if p.is_file()}}
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def validate_wav(data):
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wav:
+            if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 16000):
+                raise ValueError("Use PCM16 mono WAV at 16000 Hz")
+            frames = wav.getnframes()
+            if not 1600 <= frames <= 60 * 16000:
+                raise ValueError("Recording must be between 0.1 and 60 seconds")
+            if len(wav.readframes(frames)) != frames * 2:
+                raise ValueError("Truncated WAV")
+    except (wave.Error, EOFError) as exc:
+        raise ValueError("Invalid PCM WAV") from exc
+
+
+def multipart(content_type, body):
+    if not content_type.startswith("multipart/form-data;"):
+        raise ValueError("Expected multipart/form-data")
+    message = BytesParser(policy=email.policy.default).parsebytes(
+        b"Content-Type: " + content_type.encode("ascii") + b"\r\nMIME-Version: 1.0\r\n\r\n" + body)
+    if not message.is_multipart():
+        raise ValueError("Invalid multipart boundary")
+    result = {}
+    for part in message.iter_parts():
+        key = part.get_param("name", header="content-disposition")
+        if key in result:
+            raise ValueError("Duplicate multipart field")
+        result[key] = part.get_payload(decode=True)
+    return result
+
+
+class Runtime:
+    def __init__(self, args):
+        self.args = args
+        self.root = args.runtime_dir
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.speech_lock = threading.Lock()
+        self.child_lock = threading.RLock()
+        self.child = None
+        self.child_log = None
+        self.tts_child = None
+        self.last_used = time.monotonic()
+        self.closed = threading.Event()
+        self.watchdog = threading.Thread(target=self.reap_idle, daemon=True)
+        self.watchdog.start()
+
+    def stop_whisper(self):
+        with self.child_lock:
+            if self.child:
+                self.child.terminate()
+                try:
+                    self.child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.child.kill()
+                    self.child.wait()
+                self.child = None
+            if self.child_log:
+                self.child_log.close()
+                self.child_log = None
+
+    def interrupt_speech(self):
+        with self.child_lock:
+            if self.tts_child and self.tts_child.poll() is None:
+                self.tts_child.terminate()
+
+    def close(self):
+        self.closed.set()
+        self.stop_whisper()
+        with self.child_lock:
+            if self.tts_child and self.tts_child.poll() is None:
+                self.tts_child.terminate()
+                try:
+                    self.tts_child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.tts_child.kill()
+                    self.tts_child.wait()
+
+    def reap_idle(self):
+        while not self.closed.wait(1):
+            if time.monotonic() - self.last_used > self.args.idle_seconds and self.lock.acquire(False):
+                try:
+                    self.stop_whisper()
+                finally:
+                    self.lock.release()
+
+    def whisper(self):
+        with self.child_lock:
+            if self.closed.is_set():
+                raise RuntimeError("Service shutting down")
+            if self.child and self.child.poll() is None:
+                return self.whisper_url
+            self.stop_whisper()
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            binary = self.root / ("build-" + self.args.backend) / "bin/whisper-server"
+            model = self.root / "models" / f"ggml-{self.args.model}-q5_1.bin"
+            if not binary.is_file() or not model.is_file():
+                raise RuntimeError("Local models are missing; run voice-local setup first")
+            self.child_log = (self.root / "whisper-server.log").open("wb")
+            argv = [str(binary), "--host", "127.0.0.1", "--port", str(port), "-m", str(model),
+                    "-t", str(self.args.threads), "-l", "ru", "-nt", "-bo", "1", "-bs", "1"]
+            if self.args.backend == "cpu":
+                argv += ["-ng"]
+            self.child = subprocess.Popen([sys.executable, "-c", EXEC_GUARD, *argv],
+                                          cwd=self.root, stdout=self.child_log, stderr=self.child_log,
+                                          env={**os.environ, "TMPDIR": str(self.root)})
+            self.whisper_url = f"http://127.0.0.1:{port}"
+            child = self.child
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if self.closed.is_set() or child.poll() is not None:
+                raise RuntimeError("whisper-server failed; inspect runtime whisper-server.log")
+            try:
+                HTTP.open(self.whisper_url + "/", timeout=1).close()
+                return self.whisper_url
+            except (OSError, urllib.error.URLError):
+                self.closed.wait(.1)
+        self.stop_whisper()
+        raise RuntimeError("whisper-server startup timed out")
+
+    def transcribe(self, data, language):
+        validate_wav(data)
+        if language not in ("ru", "en", "auto"):
+            raise ValueError("Supported languages: ru, en, auto")
+        boundary = "sawe-local-speech"
+        body = bytearray()
+        for key, value, filename in (("file", data, "audio.wav"), ("language", language.encode(), None),
+                                      ("response_format", b"json", None), ("temperature", b"0.0", None)):
+            body += f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"'.encode()
+            if filename:
+                body += f'; filename="{filename}"\r\nContent-Type: audio/wav'.encode()
+            body += b"\r\n\r\n" + value + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        req = urllib.request.Request(self.whisper() + "/inference", data=bytes(body),
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with HTTP.open(req, timeout=120) as response:
+                result = json.loads(response.read(MAX_BODY))
+            return {"text": result["text"].strip()}
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
+            self.stop_whisper()
+            raise RuntimeError("Local transcription failed; inspect runtime log") from exc
+
+    def speech(self, payload):
+        text = payload.get("input")
+        if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
+            raise ValueError("input must contain 1–4000 characters")
+        if payload.get("response_format", "wav") != "wav":
+            raise ValueError("Only WAV speech output is supported")
+        with tempfile.TemporaryDirectory(prefix="speech-", dir=self.root) as temp:
+            output = Path(temp) / "speech.wav"
+            argv = [str(self.root / "venv/bin/python"), "-c", PIPER_WORKER,
+                    str(self.root / "models" / (VOICE + ".onnx")), str(output), str(self.args.threads)]
+            with self.child_lock:
+                if self.closed.is_set():
+                    raise RuntimeError("Service shutting down")
+                self.tts_child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, cwd=self.root,
+                    env={**os.environ, "TMPDIR": str(self.root), "OMP_NUM_THREADS": str(self.args.threads)})
+                child = self.tts_child
+            try:
+                _, err = child.communicate(text.encode(), timeout=120)
+                if child.returncode:
+                    raise RuntimeError("Piper failed; check that setup completed")
+                if output.stat().st_size > 20 * 1024 * 1024:
+                    raise RuntimeError("Speech output exceeds limit")
+                return output.read_bytes()
+            except subprocess.TimeoutExpired as exc:
+                child.kill()
+                child.communicate()
+                raise RuntimeError("Local speech synthesis timed out") from exc
+            finally:
+                with self.child_lock:
+                    self.tts_child = None
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    def __init__(self, address, runtime):
+        self.runtime = runtime
+        self.slots = threading.BoundedSemaphore(8)
+        super().__init__(address, Handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(False):
+            request.close()
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.slots.release()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
+    def reply(self, status, data, mime="application/json"):
+        if not isinstance(data, bytes):
+            data = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.reply(200, {"status": "ok", "model": self.server.runtime.args.model})
+        else:
+            self.reply(404, {"error": "Unknown endpoint"})
+
+    def do_POST(self):
+        runtime = self.server.runtime
+        if self.headers.get("Origin"):
+            self.reply(403, {"error": "Browser-origin requests are not allowed"})
+            return
+        if self.path not in ("/v1/audio/transcriptions", "/v1/audio/speech"):
+            self.reply(404, {"error": "Unknown endpoint"})
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self.reply(400, {"error": "Content-Length required"})
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "-1"))
+            if not 0 < size <= MAX_BODY:
+                self.reply(413, {"error": "Request body must be at most 4 MiB"})
+                return
+            body = self.rfile.read(size)
+            if len(body) != size:
+                raise ValueError("Truncated request body")
+            transcribing = self.path.endswith("transcriptions")
+            request_lock = runtime.lock if transcribing else runtime.speech_lock
+            if not request_lock.acquire(False):
+                self.reply(429, {"error": "Speech engine busy; retry after current utterance"})
+                return
+            try:
+                if transcribing:
+                    runtime.interrupt_speech()
+                    fields = multipart(self.headers.get("Content-Type", ""), body)
+                    if "file" not in fields:
+                        raise ValueError("Missing file field")
+                    result = runtime.transcribe(fields["file"], fields.get("language", b"ru").decode())
+                    self.reply(200, result)
+                else:
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict):
+                        raise ValueError("Expected JSON object")
+                    self.reply(200, runtime.speech(payload), "audio/wav")
+            finally:
+                runtime.last_used = time.monotonic()
+                request_lock.release()
+        except (ValueError, UnicodeError) as exc:
+            self.reply(400, {"error": str(exc)})
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            self.reply(503, {"error": "Local speech unavailable; inspect sidecar setup and runtime logs"})
+
+    def log_message(self, fmt, *args):
+        # Log paths/status only; never recognized text or speech input.
+        sys.stderr.write("voice-local: " + fmt % args + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runtime-dir", type=Path, required=True)
+    parser.add_argument("command", choices=("setup", "serve"))
+    parser.add_argument("--model", choices=("small", "base"), default="small")
+    parser.add_argument("--backend", choices=("cuda", "cpu"), default="cpu")
+    parser.add_argument("--threads", type=int, choices=range(1, 17), default=4)
+    parser.add_argument("--port", type=int, default=8095)
+    parser.add_argument("--idle-seconds", type=int, default=60)
+    parser.add_argument("--cuda-compiler", default="/usr/local/cuda/bin/nvcc")
+    parser.add_argument("--cuda-arch", default="native")
+    args = parser.parse_args()
+    args.runtime_dir = args.runtime_dir.expanduser().resolve()
+    if args.idle_seconds < 1 or not 1 <= args.port <= 65535:
+        parser.error("idle-seconds and port must be positive and valid")
+    if args.command == "setup":
+        setup(args)
+        return
+    runtime = Runtime(args)
+    server = Server(("127.0.0.1", args.port), runtime)
+    def stop(signum, frame):
+        runtime.close()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        print(f"voice-local listening at http://127.0.0.1:{args.port}/v1", flush=True)
+        server.serve_forever(poll_interval=.2)
+    finally:
+        runtime.close()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
