@@ -25,7 +25,9 @@ use crate::{EchoCanceller, audio_pipeline::open_output_stream, resolve_device};
 
 const FRAME_SAMPLES: usize = 480; // 10ms at the AEC's required 48kHz
 const WAV_RATE: u32 = 16_000;
-const PRE_ROLL_FRAMES: usize = 20;
+// Quiet first words can precede a strong VAD onset by several hundred ms.
+// Retaining them does not delay the onset event or lower the noise threshold.
+const PRE_ROLL_FRAMES: usize = 100;
 const START_FRAMES: usize = 3;
 const MIN_VOICED_FRAMES: usize = 12;
 const SILENCE_FRAMES: usize = 70;
@@ -766,8 +768,7 @@ mod tests {
         let VoiceCaptureEvent::Utterance(wav) = &ended[1] else {
             panic!("Expected utterance")
         };
-        // Pre-roll retains 17 silent frames plus the 3 onset frames.
-        assert_eq!(wav.len(), 44 + (17 + 20 + SILENCE_FRAMES) * 160 * 2);
+        assert_eq!(wav.len(), 44 + (50 + 20 + SILENCE_FRAMES) * 160 * 2);
         assert!(
             frames(&mut segmenter, 15, 4_000)
                 .iter()
@@ -777,6 +778,26 @@ mod tests {
             segmenter.finish().last(),
             Some(VoiceCaptureEvent::Utterance(_))
         ));
+    }
+
+    #[test]
+    fn quiet_first_words_survive_a_later_strong_vad_onset() {
+        let mut segmenter = Segmenter::new(true);
+        assert!(frames(&mut segmenter, 60, 180).is_empty());
+        assert!(matches!(
+            frames(&mut segmenter, START_FRAMES, 4_000).as_slice(),
+            [VoiceCaptureEvent::SpeechStarted]
+        ));
+        frames(&mut segmenter, MIN_VOICED_FRAMES, 4_000);
+        let ended = frames(&mut segmenter, SILENCE_FRAMES, 0);
+        let VoiceCaptureEvent::Utterance(wav) = &ended[1] else {
+            panic!("Expected utterance")
+        };
+        let prefix: Vec<i16> = wav[44..44 + 60 * 160 * 2]
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert!(prefix.iter().all(|sample| sample.abs() == 180));
     }
 
     #[test]

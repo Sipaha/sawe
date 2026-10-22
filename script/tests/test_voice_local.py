@@ -71,7 +71,7 @@ time.sleep(30)
                     status = Path(f"/proc/{child_pid}/status").read_text()
                     if "State:\tZ" in status:
                         return
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     return
                 time.sleep(.02)
             self.fail("Inference process survived killed sidecar")
@@ -96,6 +96,42 @@ time.sleep(30)
                 self.assertEqual(list(Path(temp).iterdir()), [])
             finally:
                 runtime.close()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux parent-death guard")
+    def test_guard_exits_if_parent_died_before_guard_started(self):
+        code = """
+import os, subprocess, sys, time
+env = {**os.environ, "SAWE_VOICE_PARENT_PID": str(os.getpid())}
+child = subprocess.Popen([sys.executable, '-u', '-c',
+    'import time,sys; time.sleep(.3); exec(sys.argv[1]); time.sleep(30)', sys.argv[1]], env=env)
+print(child.pid, flush=True)
+time.sleep(30)
+"""
+        parent = subprocess.Popen([sys.executable, "-u", "-c", code, voice.PARENT_GUARD], stdout=subprocess.PIPE, text=True)
+        child_pid = None
+        try:
+            child_pid = int(parent.stdout.readline())
+            parent.kill()
+            parent.wait(timeout=3)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    if "State:\tZ" in Path(f"/proc/{child_pid}/status").read_text():
+                        return
+                except (FileNotFoundError, ProcessLookupError):
+                    return
+                time.sleep(.02)
+            self.fail("Child survived when parent died before guard startup")
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait()
+            parent.stdout.close()
+            if child_pid:
+                try:
+                    os.kill(child_pid, 9)
+                except ProcessLookupError:
+                    pass
 
     def test_model_survives_short_lived_request_thread(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
@@ -153,6 +189,93 @@ time.sleep(30)
                 self.assertIsNone(runtime.child)
             finally:
                 runtime.close()
+
+    def test_idle_watchdog_rechecks_expiry_after_acquiring_request_lock(self):
+        runtime = object.__new__(voice.Runtime)
+        runtime.args = SimpleNamespace(idle_seconds=1)
+        runtime.child_lock = threading.RLock()
+        runtime.closed = Mock()
+        runtime.closed.wait.side_effect = [False, True]
+        runtime.last_used = 0
+        runtime.lock = Mock()
+        def acquire(_blocking):
+            runtime.last_used = time.monotonic()
+            return True
+        runtime.lock.acquire.side_effect = acquire
+        runtime.stop_recognizer = Mock()
+        runtime.reap_idle()
+        runtime.stop_recognizer.assert_not_called()
+        runtime.lock.release.assert_called_once()
+
+    def test_keepalive_retains_idle_recognizer_without_loading_or_interrupting(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = voice.Runtime(SimpleNamespace(runtime_dir=Path(temp), idle_seconds=60))
+            child = Mock()
+            runtime.child = child
+            runtime.last_used = 0
+            runtime.closed.wait = Mock(side_effect=[False, True])
+            try:
+                runtime.keep_alive()
+                runtime.reap_idle()
+                child.terminate.assert_not_called()
+                self.assertGreater(runtime.last_used, 0)
+                self.assertIs(runtime.child, child)
+                runtime.last_used -= 61
+                runtime.closed.wait = Mock(side_effect=[False, True])
+                runtime.reap_idle()
+                child.terminate.assert_called_once()
+                self.assertIsNone(runtime.child)
+            finally:
+                runtime.close()
+
+    def test_keepalive_http_is_bounded_and_does_not_take_recognition_lock(self):
+        runtime = SimpleNamespace(lock=threading.Lock(), speech_lock=threading.Lock(), keep_alive=Mock())
+        server = voice.Server(("127.0.0.1", 0), runtime)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        def post(data, headers=None):
+            return http.open(urllib.request.Request(f"http://127.0.0.1:{server.server_port}/v1/audio/keepalive",
+                             data=data, headers=headers or {"Content-Type": "application/json"}))
+        try:
+            runtime.lock.acquire()
+            with post(b"{}") as response:
+                self.assertEqual(json.load(response), {"status": "ok"})
+            runtime.keep_alive.assert_called_once()
+            for data, headers, status in [(b"[]", None, 400), (b'{"input":"private"}', None, 400),
+                                          (b"{}", {"Origin": "https://example.com"}, 403),
+                                          (b"", None, 413)]:
+                with self.subTest(status=status), self.assertRaises(urllib.error.HTTPError) as error:
+                    post(data, headers)
+                self.assertEqual(error.exception.code, status)
+            runtime.keep_alive.assert_called_once()
+        finally:
+            runtime.lock.release()
+            server.shutdown()
+            server.server_close()
+
+    def test_launch_delivered_between_timeout_and_cancel_is_reaped(self):
+        class DeliveredAtTimeout(voice.Future):
+            def result(self, timeout=None):
+                child = super().result(timeout=timeout)
+                if timeout and timeout > 0:
+                    raise voice.FutureTimeout()
+                return child
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = voice.Runtime(SimpleNamespace(runtime_dir=Path(temp), idle_seconds=60))
+            future = DeliveredAtTimeout()
+            child = None
+            try:
+                with patch.object(voice, "Future", return_value=future):
+                    with self.assertRaisesRegex(RuntimeError, "launch timed out"):
+                        runtime.spawn_owned([sys.executable, "-c", "import time; time.sleep(30)"])
+                child = future.result(timeout=0)
+                self.assertIsNotNone(child.poll(), "Delivered child survived caller timeout")
+            finally:
+                runtime.close()
+                if child is not None and child.poll() is None:
+                    child.kill()
+                    child.wait()
 
     def test_idle_and_shutdown_terminate_owned_child(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
@@ -258,6 +381,8 @@ def send(value):
     sys.stdout.buffer.flush()
 if mode == "no-ready":
     time.sleep(30)
+if mode == "slow-ready-no-reply":
+    time.sleep(.5)
 if mode == "bad-ready":
     send({"ready": False})
 else:
@@ -272,7 +397,7 @@ while True:
     data = sys.stdin.buffer.read(size)
     if mode == "crash":
         sys.exit(1)
-    if mode == "no-reply":
+    if mode in ("no-reply", "slow-ready-no-reply"):
         time.sleep(30)
     if mode == "oversized":
         sys.stdout.buffer.write(struct.pack("!I", 65537)); sys.stdout.buffer.flush()
@@ -390,6 +515,22 @@ while True:
                         self.assertEqual(runtime.transcribe(wav(), "ru"), {"text": "проверка"})
                 finally:
                     runtime.close()
+
+    def test_cold_start_and_inference_share_the_request_deadline(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            runtime = self.runtime(temp)
+            Path(temp, "mode").write_text("slow-ready-no-reply")
+            try:
+                with patch.object(voice, "verify_download"), patch.object(voice, "GIGAAM_WORKER", self.FAKE_WORKER), \
+                        patch.object(voice, "WORKER_REQUEST_TIMEOUT", .8):
+                    start = time.monotonic()
+                    with self.assertRaisesRegex(RuntimeError, "worker reset"):
+                        runtime.transcribe(wav(), "ru")
+                    self.assertLess(time.monotonic() - start, 1.05,
+                                    "Cold startup must consume the inference request budget")
+                    self.assertIsNone(runtime.child)
+            finally:
+                runtime.close()
 
     def test_worker_idle_unload_and_lazy_reload(self):
         with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:

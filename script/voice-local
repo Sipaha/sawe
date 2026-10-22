@@ -56,7 +56,9 @@ PARENT_GUARD = """
 import os, sys
 if sys.platform.startswith("linux"):
     import ctypes, signal
-    parent = os.getppid()
+    parent = int(os.environ.get("SAWE_VOICE_PARENT_PID", os.getppid()))
+    if os.getppid() != parent:
+        sys.exit(1)
     if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM) != 0:
         raise OSError(ctypes.get_errno(), "Unable to install parent-death signal")
     if os.getppid() != parent:
@@ -367,6 +369,7 @@ class Runtime:
     def spawn_owned(self, argv, **kwargs):
         if self.closed.is_set():
             raise RuntimeError("Service shutting down")
+        kwargs["env"] = {**kwargs.get("env", os.environ), "SAWE_VOICE_PARENT_PID": str(os.getpid())}
         future = Future()
         try:
             self.launches.put_nowait((argv, kwargs, future, time.monotonic() + LAUNCH_TIMEOUT))
@@ -377,7 +380,18 @@ class Runtime:
         try:
             return future.result(timeout=LAUNCH_TIMEOUT)
         except (FutureTimeout, CancelledError) as exc:
-            future.cancel()
+            if not future.cancel():
+                # Delivery can win the race after result() timed out but before
+                # cancellation. This caller still owns reaping that child.
+                try:
+                    child = future.result(timeout=0)
+                except Exception:
+                    pass
+                else:
+                    self.terminate_child(child)
+                    for pipe in (child.stdin, child.stdout, child.stderr):
+                        if pipe:
+                            pipe.close()
             raise RuntimeError("Speech process launch timed out") from exc
 
     def stop_recognizer(self):
@@ -418,9 +432,17 @@ class Runtime:
         while not self.closed.wait(1):
             if time.monotonic() - self.last_used > self.args.idle_seconds and self.lock.acquire(False):
                 try:
-                    self.stop_recognizer()
+                    with self.child_lock:
+                        if time.monotonic() - self.last_used > self.args.idle_seconds:
+                            self.stop_recognizer()
                 finally:
                     self.lock.release()
+
+    def keep_alive(self):
+        with self.child_lock:
+            if self.closed.is_set():
+                raise RuntimeError("Service shutting down")
+            self.last_used = time.monotonic()
 
     def whisper(self):
         with self.child_lock:
@@ -461,7 +483,7 @@ class Runtime:
         self.stop_recognizer()
         raise RuntimeError("whisper-server startup timed out")
 
-    def gigaam(self):
+    def gigaam(self, deadline):
         with self.child_lock:
             if self.closed.is_set():
                 raise RuntimeError("Service shutting down")
@@ -486,7 +508,8 @@ class Runtime:
                      "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": str(self.args.threads),
                      "OPENBLAS_NUM_THREADS": str(self.args.threads)})
             try:
-                ready = read_worker_frame(self.child.stdout, time.monotonic() + WORKER_START_TIMEOUT, self.closed)
+                ready = read_worker_frame(self.child.stdout,
+                    min(deadline, time.monotonic() + WORKER_START_TIMEOUT), self.closed)
                 if ready != {"ready": True}:
                     raise RuntimeError("Invalid recognition worker readiness")
                 return self.child
@@ -495,8 +518,8 @@ class Runtime:
                 raise RuntimeError("GigaAM worker startup failed; check local setup") from None
 
     def transcribe_gigaam(self, data):
-        child = self.gigaam()
         deadline = time.monotonic() + WORKER_REQUEST_TIMEOUT
+        child = self.gigaam(deadline)
         try:
             write_worker_frame(child.stdin, data, deadline, self.closed)
             result = read_worker_frame(child.stdout, deadline, self.closed)
@@ -622,7 +645,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.headers.get("Origin"):
             self.reply(403, {"error": "Browser-origin requests are not allowed"})
             return
-        if self.path not in ("/v1/audio/transcriptions", "/v1/audio/speech"):
+        if self.path not in ("/v1/audio/transcriptions", "/v1/audio/speech", "/v1/audio/keepalive"):
             self.reply(404, {"error": "Unknown endpoint"})
             return
         if self.headers.get("Transfer-Encoding"):
@@ -636,6 +659,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(size)
             if len(body) != size:
                 raise ValueError("Truncated request body")
+            if self.path == "/v1/audio/keepalive":
+                if json.loads(body) != {}:
+                    raise ValueError("Keepalive requires an empty JSON object")
+                runtime.keep_alive()
+                self.reply(200, {"status": "ok"})
+                return
             transcribing = self.path.endswith("transcriptions")
             request_lock = runtime.lock if transcribing else runtime.speech_lock
             if not request_lock.acquire(False):
