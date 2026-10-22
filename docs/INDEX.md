@@ -170,6 +170,8 @@ Short, dated, single-fact notes from sessions: "ran a benchmark and got X",
 
 | Date | Status | Topic |
 |---|---|---|
+| 2026-10 | measured | [Russian ASR model screening](findings/2026-10-russian-asr-comparison.md) |
+| 2026-10 | verified access | [Codex voice through a ChatGPT subscription](findings/2026-10-codex-subscription-voice.md) |
 | 2026-10 | verified foundations | [Local whisper.cpp and Piper runtime](findings/2026-10-local-voice-runtime.md) |
 | 2026-10-08 | fixed; approved recovery completed | [Push targets the selected library; responsive preview and interrupted-rebase diagnosis](findings/2026-10-08-push-selected-member-and-rebase.md) |
 | 2026-10-02 | fixed | [Nested tool-output fences](findings/2026-10-02-tool-output-fences.md) |
