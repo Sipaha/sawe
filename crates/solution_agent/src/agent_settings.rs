@@ -11,7 +11,7 @@ pub struct SolutionAgentSettings {
 impl Default for SolutionAgentSettings {
     fn default() -> Self {
         Self {
-            default_provider: crate::claude_adapter::CLAUDE_ACP_AGENT_ID.into(),
+            default_provider: crate::adapter::default_harness(),
             ephemeral: EphemeralPoolSettings::default(),
             voice: VoiceSettings::default(),
         }
@@ -20,8 +20,8 @@ impl Default for SolutionAgentSettings {
 
 pub fn default_provider(cx: &gpui::App) -> gpui::SharedString {
     SolutionAgentSettings::try_get(cx)
-        .map(|settings| settings.default_provider.clone())
-        .unwrap_or_else(|| crate::claude_adapter::CLAUDE_ACP_AGENT_ID.into())
+        .map(|settings|if settings.default_provider.is_empty(){crate::adapter::default_harness()}else{settings.default_provider.clone()})
+        .unwrap_or_else(|| crate::adapter::default_harness())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,7 +95,7 @@ impl Settings for SolutionAgentSettings {
             .as_ref()
             .and_then(|settings| settings.default_provider.as_ref())
             .map(|id| gpui::SharedString::from(id.clone()))
-            .unwrap_or_else(|| crate::claude_adapter::CLAUDE_ACP_AGENT_ID.into());
+            .unwrap_or_else(|| crate::adapter::default_harness());
         let mut voice = VoiceSettings::default();
         if let Some(content) = content
             .solution_agent

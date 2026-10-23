@@ -1237,7 +1237,7 @@ impl SolutionSession {
                 entries: vec![Arc::new(shell.stream_entry(shell_now))],
                 seq: 0,
                 state: crate::stream::StreamState::Live,
-                source: crate::stream::StreamSource::FileTail(shell.output_path.clone()),
+                source: if shell.output_path.as_os_str().is_empty() { crate::stream::StreamSource::HubSnapshot } else { crate::stream::StreamSource::FileTail(shell.output_path.clone()) },
             };
             streams.insert(crate::stream::StreamId::Shell(id.clone()), stream);
         }
@@ -1293,7 +1293,7 @@ impl SolutionSession {
                 entries: vec![Arc::new(agent.stream_entry(agent_now))],
                 seq: 0,
                 state: agent.stream_state(),
-                source: crate::stream::StreamSource::FileTail(agent.jsonl_path.clone()),
+                source: if agent.jsonl_path.as_os_str().is_empty() { crate::stream::StreamSource::HubSnapshot } else { crate::stream::StreamSource::FileTail(agent.jsonl_path.clone()) },
             };
             streams.insert(key, stream);
         }

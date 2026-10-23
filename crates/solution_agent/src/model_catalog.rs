@@ -15,6 +15,7 @@ use crate::model::AgentServerId;
 
 /// The fixed effort options offered in the UI (no per-agent list — these are
 /// Claude Code's effort levels; `ultracode` = "xhigh + workflows").
+#[cfg(any(test,feature="test-support"))]
 pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultracode"];
 
 /// Global per-agent model catalog. Owned by `SolutionAgentStore`.

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -28,6 +29,7 @@ use crate::model::{
 use crate::model_catalog::ModelCatalog;
 use crate::notifier;
 use crate::pool::SubprocessPool;
+#[cfg(any(test, feature = "test-support"))]
 use crate::teammate_watchers::TeammateWatchers;
 
 mod acp_event;
@@ -42,6 +44,7 @@ pub(crate) use peer::is_peer_only_blocks;
 mod steering;
 mod supervisor_engine;
 mod teammate_reconciler;
+mod hub_background;
 mod teardown;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -54,6 +57,7 @@ pub(crate) use supervisor_engine::{JudgeHandle, VerdictAuth};
 // so `crate::store::X` stays reachable for the sibling `supervisor_engine` module
 // (`use super::*`), the inline `#[cfg(test)]` modules below, and the
 // `store/tests/{teammate_reconciler,teardown}.rs` buckets that call them.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use teammate_reconciler::{
     KEEP_RAW_TRANSCRIPTS, claude_project_dir_for, parent_session_jsonl_for,
     push_and_evict_transcripts,
@@ -94,6 +98,7 @@ const BACKGROUND_SHELL_LIVE_PARENT_MAX_SECS: u64 = 60 * 60;
 /// race, dropped OS event) is picked up on the next tick rather than staying
 /// unobserved until the reaper. Comfortably above the watch debounce so a
 /// healthy agent is never double-tailed, and far below any liveness cutoff.
+#[cfg(any(test, feature = "test-support"))]
 const BACKGROUND_AGENT_TAIL_FALLBACK_SECS: u64 = 30;
 /// How long a session may sit in `Running` with zero streaming activity AND no
 /// in-progress tool call before the stuck-session watchdog
@@ -547,6 +552,7 @@ pub struct SolutionAgentStore {
     /// forward-only parent-JSONL scan cursors. The arming / tailing methods
     /// below stay on `Store` (they read `sessions`, spawn on `Context<Store>`,
     /// and emit store events) but route their map-state access through this.
+    #[cfg(any(test, feature = "test-support"))]
     teammate_watchers: TeammateWatchers,
     /// Throttler for `workspace.session_metrics_changed` notifications.
     /// Caps emit rate at ~1 per 2 seconds per session so chatty fields
@@ -599,6 +605,7 @@ pub struct SolutionAgentStore {
     /// In-memory + best-effort: an editor restart forgets the history (the
     /// transcripts from before the restart are then left in place), but new
     /// growth stays bounded for the whole life of a running session.
+    #[cfg(any(test, feature = "test-support"))]
     raw_transcript_history: HashMap<SolutionSessionId, VecDeque<String>>,
     /// The Solution band's geometry per solution (spec 2026-08-26 phase 2a):
     /// divider position, utility-section visibility, and which session's
@@ -955,6 +962,7 @@ impl EventEmitter<SolutionAgentStoreEvent> for SolutionAgentStore {}
 /// Case-insensitive match for the claude `Agent` tool name. Lives next
 /// to `background_agent_dir_for` because both feed the managed-agent
 /// registration path; keeping them adjacent makes the wiring obvious.
+#[cfg(any(test, feature = "test-support"))]
 fn tool_name_is_agent(name: Option<&str>) -> bool {
     matches!(name, Some(n) if n.eq_ignore_ascii_case("agent"))
 }
@@ -983,6 +991,7 @@ const CLOSED_SESSION_REAP_DAYS: i64 = 30;
 /// Lower bound guarded: an id shorter than 4 chars (defensive — claude's
 /// real ids are 24+ chars) falls back to the whole id rather than
 /// panicking on the slice bound.
+#[cfg(any(test, feature = "test-support"))]
 fn short_id_suffix(id: &str) -> &str {
     let len = id.len();
     if len <= 4 { id } else { &id[len - 4..] }
@@ -997,6 +1006,7 @@ fn short_id_suffix(id: &str) -> &str {
 ///   2. `Agent <short-id>` — last-resort label, should only hit in
 ///      adversarial / malformed inputs since claude always ships at
 ///      least `subagent_type` for a real `Task` call.
+#[cfg(any(test, feature = "test-support"))]
 fn label_fallback(id: &SharedString, subagent_type: Option<&str>) -> SharedString {
     let short = short_id_suffix(id.as_ref());
     match subagent_type {
@@ -1062,6 +1072,7 @@ fn is_session_gone_error(err_str: &str) -> bool {
 /// Re-export so the historical `crate::store::EFFORT_LEVELS` path (used by
 /// `status_row` and the crate-root re-export) keeps resolving after the const
 /// moved into `model_catalog`.
+#[cfg(any(test,feature="test-support"))]
 pub use crate::model_catalog::EFFORT_LEVELS;
 
 /// Which state to seed a debug `background_agent` in (`seed_cold_session`).
@@ -1170,7 +1181,9 @@ impl SolutionAgentStore {
                         // the →Idle GC (which only fires on the !Idle→Idle edge).
                         // Runs AFTER the reap so a terminal async agent that the
                         // reap already closed isn't re-examined.
+                        #[cfg(any(test, feature = "test-support"))]
                         this.reconcile_all_finished_teammate_streams(cx);
+                        #[cfg(any(test, feature = "test-support"))]
                         this.scan_parent_jsonls_for_completions(cx);
                         this.tick_background_shells(cx);
                         this.tick_context_handoffs(cx);
@@ -1205,6 +1218,7 @@ impl SolutionAgentStore {
             entries_persist_chain: PersistChains::default(),
             entry_write_failed: HashMap::new(),
             last_auto_reconnect_ms: HashMap::new(),
+            #[cfg(any(test, feature = "test-support"))]
             teammate_watchers: TeammateWatchers::new(),
             metrics_emitter: MetricsEmitter::new(),
             _solution_subscription: solution_subscription,
@@ -1217,7 +1231,8 @@ impl SolutionAgentStore {
             judge_sessions: HashMap::new(),
             auditor_sessions: HashMap::new(),
             backoff_timers: HashMap::new(),
-            raw_transcript_history: HashMap::new(),
+            #[cfg(any(test, feature = "test-support"))]
+    raw_transcript_history: HashMap::new(),
             band_state: HashMap::new(),
             selected_subagent_dialogs: HashMap::new(),
             last_dialog_session: HashMap::new(),
@@ -1608,9 +1623,7 @@ impl SolutionAgentStore {
                 // `claude` launches on it immediately.
                 let mut meta =
                     store.build_session_meta(&pair.1, &solution, Some(session_id), model.clone(), cx);
-                if pair.1.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID || pair.1.as_ref() == crate::codex_adapter::CODEX_AGENT_ID {
-                    meta.get_or_insert_with(acp::Meta::new).insert("sawePermissionMode".into(), serde_json::json!(permission_mode.as_str()));
-                }
+                meta.get_or_insert_with(acp::Meta::new).insert("permissionMode".into(),serde_json::json!(permission_mode.as_str()));
                 if ephemeral_supervisor {
                     meta.get_or_insert_with(acp::Meta::new).insert(
                         "systemPrompt".into(),
@@ -1708,6 +1721,7 @@ impl SolutionAgentStore {
                         &acp_session_id,
                         Some(e),
                         true,
+                        cx,
                     );
                 }
                 let live_models = crate::native_controls::available_models(
@@ -1820,13 +1834,10 @@ impl SolutionAgentStore {
 
     fn fresh_session_permission_mode(
         &self,
-        agent_id: &AgentServerId,
+        _agent_id: &AgentServerId,
         internal: bool,
     ) -> SessionPermissionMode {
         if !internal
-            && (agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID
-                || agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID
-                || agent_id.as_ref() == crate::kimi_adapter::KIMI_AGENT_ID)
         {
             // The remembered default is still on disk and unread: a saved
             // `ReadOnly` must not be downgraded into `FullAccess` just because
@@ -1871,20 +1882,12 @@ impl SolutionAgentStore {
         cx: &App,
     ) -> Option<acp::Meta> {
         let mut meta = acp::Meta::new();
+        if let Some(id) = session_id { meta.insert("clientSessionKey".into(), serde_json::json!(id.to_string())); }
         let permission_mode = session_id
             .and_then(|id| self.sessions.get(&id))
             .map(|session| session.read(cx).permission_mode)
             .unwrap_or_default();
-        // This extension is enforced only by the two native runtimes.
-        // Unknown/custom adapters retain their existing metadata contract.
-        if agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID
-            || agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID
-        {
-            meta.insert(
-                "sawePermissionMode".into(),
-                serde_json::json!(permission_mode.as_str()),
-            );
-        }
+        meta.insert("permissionMode".into(),serde_json::json!(permission_mode.as_str()));
         // Ephemeral supervisor judge/auditor sessions get a Supervisor system
         // prompt instead of the solution's worker framing, so they judge from
         // the outside rather than drifting into doing the task.
@@ -1951,6 +1954,15 @@ impl SolutionAgentStore {
             .and_then(|session| session.read(cx).desired_effort.clone())
         {
             meta.insert("reasoningEffort".into(), serde_json::Value::String(effort));
+        }
+        // Generic editor services; native protocol mapping belongs to the hub.
+        if let Ok(exe)=util::current_exe_resolved(){
+            let agents=solution.root.join(".agents");let worktrees=agents.join("worktrees");let temp=solution.root.join(".tmp");
+            meta.insert("clientRuntimeConfig".into(),serde_json::json!({
+                "workspaceRoot":solution.root,"memoryDirectory":agents.join("memory"),"worktreesDirectory":worktrees,"temporaryDirectory":temp,
+                "createWorktreeCommand":[exe,"--worktree-hook","create","--worktree-base",worktrees],
+                "removeWorktreeCommand":[exe,"--worktree-hook","remove","--worktree-base",worktrees]
+            }));
         }
         if meta.is_empty() {
             return None;
@@ -2806,7 +2818,7 @@ impl SolutionAgentStore {
         session.update(cx, |s, _| s.desired_model = Some(value.clone()));
         if let Some((conn, acp_sid)) = live {
             crate::native_controls::set_model(conn.clone(), &acp_sid, Some(value), true, cx);
-            if session.read(cx).agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID {
+            if true {
                 let supported = self.session_effort_options(session_id, cx);
                 if session
                     .read(cx)
@@ -2815,7 +2827,7 @@ impl SolutionAgentStore {
                     .is_some_and(|effort| !supported.contains(effort))
                 {
                     session.update(cx, |s, _| s.desired_effort = None);
-                    crate::native_controls::set_effort(conn, &acp_sid, None, false);
+                    crate::native_controls::set_effort(conn, &acp_sid, None, false, cx);
                 }
             }
         }
@@ -2833,26 +2845,7 @@ impl SolutionAgentStore {
             return Vec::new();
         };
         let session = session.read(cx);
-        if session.agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID {
-            return session
-                .acp_thread()
-                .map(|thread| {
-                    let thread = thread.read(cx);
-                    crate::native_controls::codex_efforts(
-                        thread.connection().clone(),
-                        thread.session_id(),
-                        session.desired_model.as_deref(),
-                    )
-                })
-                .unwrap_or_default();
-        }
-        if session.agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID {
-            return EFFORT_LEVELS
-                .iter()
-                .map(|level| (*level).to_owned())
-                .collect();
-        }
-        Vec::new()
+        session.acp_thread().map(|thread|{let thread=thread.read(cx);crate::native_controls::effort_options(thread.connection().clone(),thread.session_id(),session.desired_model.as_deref(),cx)}).unwrap_or_else(||crate::adapter::agent_brand(session.agent_id.as_ref()).map(|b|b.effort_options.clone()).unwrap_or_default())
     }
 
     /// Record + apply an effort choice. Persists `desired_effort`; seeds the
@@ -2874,7 +2867,7 @@ impl SolutionAgentStore {
         });
         session.update(cx, |s, _| s.desired_effort = Some(value.clone()));
         if let Some((conn, acp_sid)) = live {
-            crate::native_controls::set_effort(conn, &acp_sid, Some(value), true);
+            crate::native_controls::set_effort(conn, &acp_sid, Some(value), true, cx);
         }
         self.persist_session_row(session_id, cx);
         cx.emit(SolutionAgentStoreEvent::SessionStateChanged(session_id));
@@ -2907,35 +2900,7 @@ impl SolutionAgentStore {
                 "Permissions can change only in an idle chat without pending work or approvals"
             ));
         }
-        let is_native = s.agent_id.as_ref() == crate::claude_adapter::CLAUDE_ACP_AGENT_ID
-            || s.agent_id.as_ref() == crate::codex_adapter::CODEX_AGENT_ID;
-        let is_acp_modes = s.agent_id.as_ref() == crate::kimi_adapter::KIMI_AGENT_ID;
-        if !is_native && !is_acp_modes {
-            return Err(anyhow!(
-                "This provider does not support session permissions"
-            ));
-        }
-        // Only a native runtime has to restart to change policy, so only one
-        // has to prove its close is synchronous — a generic async close could
-        // otherwise race the next resume of the same provider ID. An agent on
-        // ACP session modes (Kimi) retains its provider session across detach.
-        if is_native
-            && let Some(thread) = s.acp_thread()
-        {
-            let connection = thread.read(cx).connection().clone();
-            if connection
-                .clone()
-                .downcast::<claude_native::ClaudeNativeConnection>()
-                .is_none()
-                && connection
-                    .downcast::<codex_native::CodexConnection>()
-                    .is_none()
-            {
-                return Err(anyhow!(
-                    "This provider cannot safely restart its permission policy"
-                ));
-            }
-        }
+        if !crate::adapter::agent_brand(s.agent_id.as_ref()).is_some_and(|b|b.permissions){return Err(anyhow!("This harness does not advertise permission controls"))}
         Ok(())
     }
 
@@ -4639,6 +4604,7 @@ impl SolutionAgentStore {
         self.mark_state_changed(session_id, cx);
         // Bound disk: the pre-rotation transcript is now orphaned —
         // keep only the most recent few of this session's transcripts.
+        #[cfg(any(test, feature = "test-support"))]
         self.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
         // The pre-rotation context (with any attached-image path
         // references) is wiped, so the inbox files can never be `Read`
@@ -4989,6 +4955,7 @@ impl SolutionAgentStore {
         self.persist_context_wipe(session_id, cx);
         // Bound disk: the pre-clear transcript is now orphaned — keep
         // only the most recent few of this session's transcripts.
+        #[cfg(any(test, feature = "test-support"))]
         self.prune_raw_transcripts(session_id, old_acp_session_id.0.to_string(), cx);
         // `/clear` wipes the context, so the inbox attachment paths are
         // unreachable — purge the files + rows. Pixels survive as base64.
@@ -5192,7 +5159,7 @@ impl SolutionAgentStore {
             let mut s = SolutionSession::new_idle(
                 session_id,
                 solution_id,
-                SharedString::from("claude-acp"),
+                crate::adapter::default_harness(),
                 acp::SessionId::new("seed-cold"),
             );
             s.title = title;
@@ -5254,16 +5221,15 @@ impl SolutionAgentStore {
                 // tagged entries, so the fold is its only stream source).
                 let parent_toolu = SharedString::from(format!("toolu_{agent_id}"));
                 let bg_id = crate::background_agent::BackgroundAgentId::new(agent_id);
-                // For the usage-limit state, feed a real wall JSONL line through
-                // the PRODUCTION parser so the seed can't diverge from what a
-                // live subagent produces; running/killed keep the synthetic
-                // activity snapshot (killed is reached via the real transition
-                // below).
+                // Seed the normalized projection; native codecs live in the hub.
                 let latest = match state {
                     SeededAgentState::UsageLimited => {
-                        crate::background_agent::parse_jsonl_snapshot(
-                            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 12:50pm (Asia/Novosibirsk)"}]}}"#,
-                        )
+                        crate::background_agent::BackgroundAgentSnapshot {
+                            mtime: std::time::SystemTime::now(),
+                            activity_label: "Usage limit reached".into(),
+                            stop_reason: None,
+                            usage_limited: true,
+                        }
                     }
                     SeededAgentState::Running | SeededAgentState::Killed => {
                         crate::background_agent::BackgroundAgentSnapshot {
@@ -5927,14 +5893,10 @@ impl SolutionAgentStore {
         // weak store handle so `claude_native` stays free of any
         // `solution_agent` dependency. First-write-wins inside `set_store_pull`,
         // so re-attaches (resume / new thread) are harmless no-ops.
-        if let Some(connection) = acp_thread
-            .read(cx)
-            .connection()
-            .clone()
-            .downcast::<claude_native::ClaudeNativeConnection>()
         {
+            let connection = acp_thread.read(cx).connection().clone();
             let weak = cx.weak_entity();
-            connection.set_store_pull(std::rc::Rc::new(
+            connection.set_followup_pull(std::rc::Rc::new(
                 move |acp_sid: &acp::SessionId,
                       agent_id: Option<&str>,
                       is_end_of_turn: bool,
@@ -6781,14 +6743,14 @@ mod permission_tests {
             assert_eq!(
                 store
                     .build_session_meta(&agent_id, &solution, Some(id), None, cx)
-                    .unwrap()["sawePermissionMode"],
+                    .unwrap()["permissionMode"],
                 "read_only"
             );
             session.update(cx, |s, _| s.context_count += 1);
             assert_eq!(
                 store
                     .build_session_meta(&agent_id, &solution, Some(id), None, cx)
-                    .unwrap()["sawePermissionMode"],
+                    .unwrap()["permissionMode"],
                 "read_only"
             );
             assert_eq!(
@@ -6800,7 +6762,7 @@ mod permission_tests {
                         None,
                         cx
                     )
-                    .unwrap()["sawePermissionMode"],
+                    .unwrap()["permissionMode"],
                 "full_access"
             );
         });
@@ -6944,7 +6906,7 @@ mod permission_tests {
                 .downcast::<MockConnection>()
                 .unwrap();
             assert_eq!(
-                connection.session_meta.borrow().as_ref().unwrap()["sawePermissionMode"],
+                connection.session_meta.borrow().as_ref().unwrap()["permissionMode"],
                 "read_only"
             );
             assert_eq!(

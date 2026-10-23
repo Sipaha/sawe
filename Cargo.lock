@@ -24125,7 +24125,6 @@ dependencies = [
  "channel",
  "chrono",
  "clap",
- "claude_native",
  "cli",
  "client",
  "clock",

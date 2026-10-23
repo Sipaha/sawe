@@ -308,7 +308,7 @@ impl CodexConnection {
         let read_only = generation_only
             || meta
                 .as_ref()
-                .and_then(|m| m.get("sawePermissionMode"))
+                .and_then(|m| m.get("permissionMode").or_else(|| m.get("sawePermissionMode")))
                 .and_then(Value::as_str)
                 == Some("read_only");
         let mut config = session_config(&if generation_only {
@@ -478,6 +478,9 @@ impl CodexConnection {
     }
 }
 impl AgentConnection for CodexConnection {
+    fn runtime_active(&self, id: &acp::SessionId) -> Option<bool> { Some(self.has_active_turn(id)) }
+    fn steer_input(&self, id: &acp::SessionId, blocks: Vec<acp::ContentBlock>, message_id: String, cx: &mut App) -> Option<Task<acp_thread::AgentSteerOutcome>> { Some(self.steer(id, blocks, message_id, cx)) }
+
     fn supports_generation_only(&self) -> bool {
         true
     }

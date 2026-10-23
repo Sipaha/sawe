@@ -717,7 +717,7 @@ fn main() {
         };
         let mut stdin = io::stdin().lock();
         let mut stdout = io::stdout().lock();
-        match claude_native::worktree_hook::main(mode, &base, &mut stdin, &mut stdout) {
+        match solution_agent::workspace_hooks::main(mode, &base, &mut stdin, &mut stdout) {
             Ok(()) => process::exit(0),
             Err(err) => {
                 eprintln!("--worktree-hook: {err:#}");
@@ -740,11 +740,11 @@ fn main() {
         if let Err(err) = io::Read::read_to_end(&mut io::stdin().lock(), &mut payload) {
             eprintln!("--subagent-start-hook: reading stdin: {err}");
         }
-        println!(
-            "{}",
-            claude_native::claude_settings::subagent_start_hook_output(temp_dir)
-        );
-        process::exit(0);
+        let binary = std::env::var_os("SPK_AI_HUB_BINARY").unwrap_or_else(|| "spk-ai-hub".into());
+        match std::process::Command::new(binary).arg("subagent-start-hook").arg(temp_dir).status() {
+            Ok(status) => process::exit(status.code().unwrap_or(1)),
+            Err(error) => { eprintln!("AI Hub hook: {error}"); process::exit(1); }
+        }
     }
 
     // `sawe --git-rebase-helper <todo-path>` runs as `GIT_SEQUENCE_EDITOR`

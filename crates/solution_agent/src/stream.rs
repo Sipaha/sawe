@@ -37,10 +37,11 @@ pub enum StreamState {
 }
 
 /// Where a stream's entries come from. Main + teammates are demultiplexed from
-/// the parent `AcpThread`; a shell tails its `.output` file.
+/// the parent `AcpThread`; hub snapshots carry opaque activity projections.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamSource {
     ParentThreadDemux,
+    HubSnapshot,
     FileTail(PathBuf),
 }
 

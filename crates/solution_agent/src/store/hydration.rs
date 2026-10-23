@@ -248,8 +248,8 @@ fn short_session_title(session_id: SolutionSessionId) -> SharedString {
 /// `Agent New`.
 pub(crate) fn default_session_title_base(agent_id: &str) -> String {
     let provider = crate::adapter::agent_brand(agent_id)
-        .map(|brand| brand.name)
-        .unwrap_or("Agent");
+        .map(|brand| brand.name.clone())
+        .unwrap_or_else(||"Agent".into());
     format!("{provider} New")
 }
 
@@ -639,7 +639,7 @@ impl SolutionAgentStore {
                 let desired = store.session(meta.id).and_then(|s| s.read(cx).desired_model.clone());
                 let effort = store.session(meta.id).and_then(|s| s.read(cx).desired_effort.clone());
                 crate::native_controls::set_model(connection.clone(), &acp_session_id, desired, false, cx);
-                crate::native_controls::set_effort(connection.clone(), &acp_session_id, effort, false);
+                crate::native_controls::set_effort(connection.clone(), &acp_session_id, effort, false, cx);
             })?; }
 
             let resume_meta = this.update(cx, |store, cx| {

@@ -162,7 +162,7 @@ pub(crate) fn render_status_row(
     // cannot drift apart. An agent this build doesn't ship falls back to its
     // raw id rather than rendering blank.
     let agent_label: SharedString = crate::adapter::agent_brand(agent_id.as_ref())
-        .map_or_else(|| agent_id.clone(), |brand| brand.name.into());
+        .map_or_else(|| agent_id.clone(), |brand| brand.name.clone().into());
     // For most states the short label ("Idle", "Running", …) is
     // the right thing to show. For `Errored(msg)` we surface the
     // full message inline so the user actually learns *what* went
@@ -321,20 +321,15 @@ pub(crate) fn render_status_row(
     // while `s` is still borrowed, and compared far below where the meter's
     // ratchet is applied.
     let live_thread_id = s.acp_thread().map(Entity::entity_id);
-    // Codex reports the current context in tokenUsage.last, including native
-    // in-thread compaction. Claude's per-call flicker ratchet would retain an
-    // obsolete pre-compaction peak and disagree with the compaction gate.
-    let uses_current_context_usage = s.agent_id.as_ref() == "codex-native";
-    // Synchronous read of the agent's current session mode
-    // ("default", "plan", …). Claude exposes this via ACP — when
-    // the connection doesn't implement modes (e.g. mock test
-    // adapter) we just hide the segment. Also hidden for an agent
-    // whose permission mode the fork pushes itself through ACP
-    // session modes (Kimi): the permission control beside this
-    // slot already states the mode ("Full access" / "Read only"),
-    // so the raw CLI mode name ("YOLO") would only restate it in
-    // the model segment's place.
-    let mode_text: Option<SharedString> = if crate::native_controls::uses_acp_permission_modes_for_agent(s.agent_id.as_ref()) {
+    // Usage semantics come from the hub catalog. Current-context meters must
+    // reflect native compaction rather than retaining a previous call's peak.
+    let uses_current_context_usage = crate::adapter::agent_brand(s.agent_id.as_ref())
+        .is_some_and(|brand| brand.context_usage_current);
+    // The editor permission selector already displays normalized hub modes.
+    // Preserve the extra native mode label only when it describes another control.
+    let mode_text: Option<SharedString> = if crate::native_controls::uses_acp_permission_modes_for_agent(s.agent_id.as_ref())
+        || (crate::adapter::agent_brand(s.agent_id.as_ref()).is_some_and(|b| b.permissions)
+            && s.acp_thread().is_some_and(|t| t.read(cx).connection().is_hub())) {
         None
     } else {
         s.acp_thread().and_then(|thread| {

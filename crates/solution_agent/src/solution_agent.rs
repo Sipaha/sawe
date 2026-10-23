@@ -1,15 +1,20 @@
-//! Solution-scoped AI sessions: N parallel Claude Code-style chats per Solution,
-//! multiplexed onto a shared subprocess per (solution, agent) pair.
+//! Solution-scoped AI sessions using hub-discovered harnesses. Each session has
+//! one client owner; native processes and protocol adapters belong to AI Hub.
 //!
 //! See `docs/superpowers/specs/2026-04-26-solution-scoped-ai-sessions-design.md`
 //! for the design rationale.
 
+pub mod workspace_hooks;
 pub mod actions;
 pub mod adapter;
+mod client_instructions;
+mod hub_catalog;
 pub mod agent_settings;
 pub mod background_agent;
 pub mod background_shell;
+#[cfg(any(test,feature="test-support"))]
 pub mod claude_adapter;
+#[cfg(any(test,feature="test-support"))]
 pub mod codex_adapter;
 pub(crate) mod cold_persistence;
 pub(crate) mod compact;
@@ -18,6 +23,7 @@ pub(crate) mod conversation_render;
 pub(crate) mod db;
 pub mod event_sources;
 pub(crate) mod expanded_compose;
+#[cfg(any(test,feature="test-support"))]
 pub mod kimi_adapter;
 pub mod mcp;
 pub mod message_generator;
@@ -41,6 +47,7 @@ pub mod store;
 pub mod stream;
 pub mod supervisor;
 pub mod supervisor_instruction_modal;
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod teammate_watchers;
 pub mod upload;
 pub mod utility_buttons;
@@ -61,58 +68,20 @@ pub use model::{
     AgentServerId, SessionPermissionMode, SessionState, SolutionSession, SolutionSessionId,
     SolutionSessionMetadata,
 };
+#[cfg(any(test,feature="test-support"))]
 pub use store::EFFORT_LEVELS;
 
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gpui::{App, AsyncApp, SharedString};
-use project::agent_server_store::AgentId;
+use gpui::{App, AsyncApp};
 
 pub fn init(cx: &mut App) {
     use ::settings::Settings as _;
     agent_settings::SolutionAgentSettings::register(cx);
 
-    let mut adapters = adapter::AdapterRegistry::new();
-    adapters.register(Arc::new(claude_adapter::ClaudeAcpAdapter));
-    adapters.register(Arc::new(codex_adapter::CodexAdapter));
-    adapters.register(Arc::new(kimi_adapter::KimiAdapter));
-    let adapters = Arc::new(adapters);
-
-    store::SolutionAgentStore::init_global(cx, adapters);
-
-    // Register the AgentServer instance for `claude-acp`. The native Rust
-    // stream-json backend (`claude_native::ClaudeNativeAgentServer`) spawns the
-    // `claude` binary directly — no node wrapper. The legacy
-    // `@agentclientprotocol/claude-agent-acp` path was retired in commit
-    // history; revert via git if it ever needs to come back.
-    let claude_id = AgentId(SharedString::from(claude_adapter::CLAUDE_ACP_AGENT_ID));
-    let claude_server: Rc<dyn agent_servers::AgentServer> =
-        Rc::new(claude_native::ClaudeNativeAgentServer::new(claude_id));
-    store::SolutionAgentStore::global(cx).update(cx, |store, _cx| {
-        store.register_agent_server(
-            SharedString::from(claude_adapter::CLAUDE_ACP_AGENT_ID),
-            claude_server,
-        );
-        store.register_agent_server(
-            SharedString::from(codex_adapter::CODEX_AGENT_ID),
-            Rc::new(codex_native::CodexAgentServer::new(AgentId(
-                SharedString::from(codex_adapter::CODEX_AGENT_ID),
-            ))),
-        );
-        // Kimi Code speaks ACP natively, so unlike the two above it needs no
-        // protocol translation crate — `agent_servers::KimiAgentServer` only
-        // launches the installed `kimi` CLI (`kimi acp`) and hands the process
-        // to the shared ACP connection. See `kimi_adapter` for the mapping
-        // onto this fork's permission and model controls.
-        store.register_agent_server(
-            SharedString::from(kimi_adapter::KIMI_AGENT_ID),
-            Rc::new(agent_servers::KimiAgentServer::new(AgentId(SharedString::from(
-                kimi_adapter::KIMI_AGENT_ID,
-            )))),
-        );
-    });
+    store::SolutionAgentStore::init_global(cx,Arc::new(adapter::AdapterRegistry::new()));
+    hub_catalog::init(cx);
 
     // Connect the persistence DB asynchronously and wire it into the store
     // once it's ready. Failure to open the DB is logged but non-fatal — the

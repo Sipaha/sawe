@@ -345,7 +345,8 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
-                    | AcpThreadEvent::PromptUpdated => {}
+                    | AcpThreadEvent::PromptUpdated
+                    | AcpThreadEvent::BackgroundActivity(_) => {}
                 }
             }
         });
@@ -600,7 +601,8 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
-        | AcpThreadEvent::PromptUpdated => false,
+        | AcpThreadEvent::PromptUpdated
+        | AcpThreadEvent::BackgroundActivity(_) => false,
     }
 }
 
@@ -1613,6 +1615,7 @@ impl ConversationView {
             cx.emit(RootThreadUpdated);
         }
         match event {
+            AcpThreadEvent::BackgroundActivity(_) => {}
             AcpThreadEvent::StatusChanged | AcpThreadEvent::ExternalTurnStarted => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {

@@ -687,15 +687,10 @@ impl SolutionAgentStore {
         let Some(thread) = thread else {
             return false;
         };
-        let Some(connection) = thread
-            .read(cx)
-            .connection()
-            .clone()
-            .downcast::<claude_native::ClaudeNativeConnection>()
-        else {
-            return false;
-        };
-        if let Err(error) = connection.write_user_message_to_stdin(&acp_session_id, blocks) {
+        let connection=thread.read(cx).connection().clone();
+        let delivered=connection.send_parked_input(&acp_session_id,blocks,cx);
+        if matches!(delivered,Ok(false)){return false}
+        if let Err(error)=delivered {
             log::warn!(
                 target: "solution_agent::queue",
                 "session={session_id} parked on background work but the stdin write failed \
@@ -957,7 +952,7 @@ impl SolutionAgentStore {
         // A completed turn still awaits receipts before starting queued work.
         let already_running = matches!(session_entity.read(cx).state, SessionState::Running { .. })
             || session_entity.read(cx).acp_thread().is_some_and(|thread| {
-                crate::native_controls::codex_turn_active(thread, cx) == Some(true)
+                crate::native_controls::runtime_turn_active(thread, cx) == Some(true)
             })
             || self.active_steers.contains_key(&session_id);
         if already_running {

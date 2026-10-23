@@ -2869,7 +2869,7 @@ fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
                     cx,
                 )
                 .expect("registered ClaudeAcpAdapter produces a non-empty prompt");
-            assert_eq!(meta["sawePermissionMode"], "full_access");
+            assert_eq!(meta["permissionMode"], "full_access");
             let system_prompt = meta
                 .get("systemPrompt")
                 .expect("meta carries `systemPrompt` key (camelCase, not snake_case — claude-agent-acp matches exactly)")
@@ -2953,7 +2953,9 @@ fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
                     None,
                     cx,
                 );
-            assert!(none_meta.is_none(), "unknown agent yields None");
+            let common=none_meta.expect("unknown harnesses still receive common client metadata");
+            assert!(!common.contains_key("systemPrompt"),"unknown harness must not receive invented provider instructions");
+            assert_eq!(common["permissionMode"],"full_access");
         });
     });
 
@@ -2990,7 +2992,8 @@ fn build_session_meta_emits_correct_json_shape(cx: &mut TestAppContext) {
                 None,
                 cx,
             );
-            assert!(meta.is_none(), "empty prompt yields None");
+            let meta=meta.expect("common client metadata is independent of prompt generation");
+            assert!(!meta.contains_key("systemPrompt"),"an empty prompt must not create an append envelope");
         });
     });
 }

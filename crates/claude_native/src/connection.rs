@@ -2585,6 +2585,10 @@ fn newest_pending_tool_call(thread: &AcpThread, tool_name: &str) -> Option<acp::
 }
 
 impl AgentConnection for ClaudeNativeConnection {
+    fn send_parked_input(&self,id:&acp::SessionId,blocks:&[acp::ContentBlock],_:&mut App)->Result<bool>{self.write_user_message_to_stdin(id,blocks)?;Ok(true)}
+
+    fn set_followup_pull(&self, pull: acp_thread::AgentFollowupPull) -> bool { self.set_store_pull(pull); true }
+
     fn supports_generation_only(&self) -> bool {
         true
     }

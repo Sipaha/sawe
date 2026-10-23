@@ -1383,6 +1383,7 @@ impl SolutionAgentStore {
     /// Best-effort: any IO error is ignored. Keyed by our `SolutionSessionId`,
     /// so only THIS session's transcripts are ever deleted even when several
     /// sessions share the same project cwd.
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn prune_raw_transcripts(
         &mut self,
         id: SolutionSessionId,

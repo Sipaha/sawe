@@ -44,14 +44,18 @@ const MODE_FULL_ACCESS: &str = "auto";
 /// Kimi's chrome in the "new session" picker, on its session tabs and in the
 /// status row. See [`AgentBrand`] for why the model list carries no version
 /// numbers.
-pub const BRAND: AgentBrand = AgentBrand {
-    name: "Kimi",
-    vendor: "Moonshot AI",
+pub static BRAND: std::sync::LazyLock<AgentBrand> = std::sync::LazyLock::new(|| AgentBrand {
+    name: "Kimi".into(),
+    vendor: "Moonshot AI".into(),
+    icon_path: None,
+    permissions:true,
+    context_usage_current: false,
+    effort_options:Vec::new(),
     logo: IconName::AiKimi,
     // Kimi's brand blue.
     color: 0x1783FF,
-    models: "K2 · K3",
-};
+    models: "K2 · K3".into(),
+});
 
 /// The Kimi ACP session mode that enforces `permission_mode`.
 pub fn mode_for(permission_mode: SessionPermissionMode) -> acp::SessionModeId {
@@ -81,7 +85,7 @@ impl SolutionAgentAdapter for KimiAdapter {
     }
 
     fn display_name(&self) -> SharedString {
-        BRAND.name.into()
+        BRAND.name.clone().into()
     }
 
     fn icon(&self) -> IconName {

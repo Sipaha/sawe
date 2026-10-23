@@ -1,22 +1,14 @@
-//! Background-teammate reconciler: the Store-side subsystem that tracks
-//! managed background agents and background shells spawned inside a live
-//! `claude` turn, watches their on-disk `~/.claude/projects/...` artifacts,
-//! reconciles finished teammate (`Task`/`Agent`) streams, and scans the
-//! parent-session JSONL transcript for `<task-notification>` completion
-//! blocks. Relocated verbatim from `store.rs` (Tier-4 god-object refactor)
-//! — these are `impl SolutionAgentStore` methods that still own
-//! `&mut SolutionAgentStore` / `Context<Self>`; this split moves *source
-//! text*, not state ownership.
-//!
-//! The teammate/shell-reap hardening carried by this cluster is preserved
-//! byte-for-byte: #43 (cold-load subagent-dir purge), #47 (stuck-tool
-//! liveness gate reading `pty_running` / `silent_secs`) and #48
-//! (parent-liveness background-shell reap).
+//! Generic background UI aging and cold-restore reconciliation.
+//! Native file readers, tool-name lifecycle inference and watcher plumbing
+//! are historical test/test-support fixtures; production activity is handled
+//! by hub_background from service events.
 
 use super::*;
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use claude_native::transcript::claude_project_dir_for;
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn background_agent_dir_for(
     cwd: &std::path::Path,
     acp_session_id: &str,
@@ -34,6 +26,7 @@ pub(crate) fn background_agent_dir_for(
 /// user message a background shell emits on completion) to this file. Uses
 /// the same cwd encoding as [`background_agent_dir_for`]. `None` under the
 /// same conditions (empty cwd / unresolvable home).
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn parent_session_jsonl_for(
     cwd: &std::path::Path,
     acp_session_id: &str,
@@ -43,12 +36,14 @@ pub(crate) fn parent_session_jsonl_for(
 
 /// How many of a session's raw claude JSONL transcripts to keep on disk: the
 /// live one plus the last `KEEP_RAW_TRANSCRIPTS - 1` abandoned rotations.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const KEEP_RAW_TRANSCRIPTS: usize = 3;
 
 /// Push `abandoned` onto a session's transcript ring and return the ids that
 /// now fall outside the keep-window (oldest first). Pure (no IO) so the
 /// retention math is unit-tested directly. With `keep = 3` the live transcript
 /// is kept implicitly and the last 2 abandoned ones are retained.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn push_and_evict_transcripts(
     history: &mut VecDeque<String>,
     abandoned: String,
@@ -66,6 +61,7 @@ pub(crate) fn push_and_evict_transcripts(
 }
 
 /// What re-registering a resumed async agent needs from claude's files.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, PartialEq)]
 pub(crate) struct ResumedAgentFiles {
     pub(crate) jsonl_path: PathBuf,
@@ -78,6 +74,7 @@ pub(crate) struct ResumedAgentFiles {
 /// `agent-<id>.jsonl` + the `toolUseId` from `agent-<id>.meta.json` in a
 /// session's `subagents/` dir. `None` when the meta file is missing or has no
 /// `toolUseId` — without it there is no stream to reopen.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn resumed_agent_files(
     subagents_dir: &std::path::Path,
     id: &crate::background_agent::BackgroundAgentId,
@@ -96,6 +93,7 @@ pub(crate) fn resumed_agent_files(
 
 /// Defensive per-tick read cap for the parent-JSONL scan. A single JSONL
 /// message line is small; this only bounds a pathological burst.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const PARENT_JSONL_READ_CAP: u64 = 1024 * 1024;
 
 /// Read `[offset, end)` of `path` and split it into COMPLETE lines (those
@@ -103,6 +101,7 @@ pub(crate) const PARENT_JSONL_READ_CAP: u64 = 1024 * 1024;
 /// consumed (the offset of the byte just past the last `\n`), so a trailing
 /// partial line is left unconsumed for the next tick. Returns `None` on any
 /// IO error. The read is capped at [`PARENT_JSONL_READ_CAP`] bytes per call.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn read_complete_lines_from(
     path: &std::path::Path,
     offset: u64,
@@ -154,6 +153,7 @@ pub(crate) fn read_complete_lines_from(
 /// appear LITERALLY in the JSON string value (only newlines inside are
 /// `\n`-escaped), so the existing regex-based `parse_task_notification`
 /// matches the raw line directly — no JSON parse / unescape needed.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn scan_lines_for_completions(
     lines: &[String],
     background_shells: &std::collections::HashMap<
@@ -196,6 +196,7 @@ impl SolutionAgentStore {
     /// the watcher pinned to the pre-rotation directory for the rest of the
     /// session, so every agent dispatched after the first compaction was never
     /// snapshotted at all.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn ensure_background_agent_watcher(
         &mut self,
         session_id: SolutionSessionId,
@@ -270,6 +271,7 @@ impl SolutionAgentStore {
     /// the snapshot was actually stored. No-op when the session has
     /// gone away, the agent isn't tracked anymore, the file can't be
     /// read, or it has no usable last line.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn refresh_background_agent_snapshot(
         &mut self,
         session_id: SolutionSessionId,
@@ -357,6 +359,7 @@ impl SolutionAgentStore {
     /// `background_shell_watchers` keyed by `session_id` — drop the entry
     /// (or drop the store) to cancel. Safe to call repeatedly: a second
     /// call for the same session is a no-op.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn ensure_background_shell_watcher(
         &mut self,
         session_id: SolutionSessionId,
@@ -407,6 +410,7 @@ impl SolutionAgentStore {
     /// the file can't be read yet (missing file → "no snapshot yet", not a
     /// failure). Does NOT touch `state`: registration sets `Running` and
     /// the terminal-state transition (Task 8) owns the rest.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn refresh_background_shell_snapshot(
         &mut self,
         session_id: SolutionSessionId,
@@ -466,6 +470,7 @@ impl SolutionAgentStore {
     /// no longer tracked. Used by both terminal signals: the `KillShell`
     /// tool_call (→ `Killed`) and the `<task-notification>` user message
     /// (→ `Exited(code)`).
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn mark_background_shell_state(
         &mut self,
         session_id: SolutionSessionId,
@@ -561,6 +566,7 @@ impl SolutionAgentStore {
     /// track. The text is read from the user message's `ContentBlock` via
     /// `to_markdown`, which returns the raw markdown source (the unescaped
     /// `<task-notification>` block) for a `Markdown` block.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn observe_task_notification(
         &mut self,
         session_id: SolutionSessionId,
@@ -617,6 +623,7 @@ impl SolutionAgentStore {
     /// `AcpThread`, so when the session is cold (`acp_thread()` is `None`)
     /// there is nothing to track yet. The next live attach will replay the
     /// in-flight tool calls through `NewEntry`, which re-enters this hook.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn apply_subagent_lifecycle(
         &mut self,
         session_id: SolutionSessionId,
@@ -1137,6 +1144,7 @@ impl SolutionAgentStore {
     /// again on the next tick). Its original spawn `toolu` — the teammate
     /// stream's key — comes from the `agent-<id>.meta.json` claude writes next
     /// to the transcript. A no-op for an agent that is still tracked and live.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reregister_resumed_agent(
         &mut self,
         session_id: SolutionSessionId,
@@ -1259,6 +1267,7 @@ impl SolutionAgentStore {
     /// whose watcher IS working has a snapshot newer than
     /// [`BACKGROUND_AGENT_TAIL_FALLBACK_SECS`] and is skipped outright.
     /// Terminal and killed agents are skipped too — no further line can arrive.
+    #[cfg(any(test, feature = "test-support"))]
     fn tail_unobserved_background_agents(&mut self, cx: &mut Context<Self>) {
         let fallback_after = std::time::Duration::from_secs(BACKGROUND_AGENT_TAIL_FALLBACK_SECS);
         let now = std::time::SystemTime::now();
@@ -1319,6 +1328,7 @@ impl SolutionAgentStore {
     /// [`Self::tail_unobserved_background_agents`], which runs first so the
     /// reaping below decides on the freshest state available.
     pub fn tick_background_agents(&mut self, cx: &mut Context<Self>) {
+        #[cfg(any(test, feature = "test-support"))]
         self.tail_unobserved_background_agents(cx);
         let expiry = std::time::Duration::from_secs(
             MANAGED_AGENT_STALE_TIMEOUT_SECS + MANAGED_AGENT_DEAD_LINGER_SECS,
@@ -1449,6 +1459,7 @@ impl SolutionAgentStore {
     /// completion is provable. Runs on the 5s tick so it fires mid-session,
     /// unlike the →Idle GC. See
     /// [`Self::reconcile_finished_teammate_streams`] for the per-session rules.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reconcile_all_finished_teammate_streams(&mut self, cx: &mut Context<Self>) {
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();
@@ -1499,6 +1510,7 @@ impl SolutionAgentStore {
     /// classification is by the `background_agents` map (NOT the tool-call
     /// tool_name), so a spawn-ack terminal `Agent` whose registration is still
     /// pending is kept via the tool_name guard below.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reconcile_finished_teammate_streams(
         &mut self,
         session_id: SolutionSessionId,
@@ -1661,6 +1673,7 @@ impl SolutionAgentStore {
     /// to their terminal [`ShellRuntimeState`]. Runs on the same 5s tick as
     /// the reap pass, BEFORE it, so a freshly-Exited shell is flipped this
     /// tick (and the reap can later drop it once stale).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn scan_parent_jsonls_for_completions(&mut self, cx: &mut Context<Self>) {
         let session_ids: Vec<SolutionSessionId> =
             self.all_sessions().map(|e| e.read(cx).id).collect();
@@ -1679,6 +1692,7 @@ impl SolutionAgentStore {
     /// a half-written trailing line is re-read next tick. No-op when the
     /// session tracks no shells, when none of them are still `Running`, or
     /// when the parent JSONL can't be resolved / doesn't exist.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn scan_parent_jsonl_for_completions(
         &mut self,
         session_id: SolutionSessionId,
@@ -1687,6 +1701,7 @@ impl SolutionAgentStore {
         self.scan_parent_jsonl_with_resolver(session_id, cx, parent_session_jsonl_for);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn scan_parent_jsonl_with_resolver(
         &mut self,
         session_id: SolutionSessionId,

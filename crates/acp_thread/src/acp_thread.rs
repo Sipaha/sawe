@@ -308,6 +308,9 @@ pub const PARENT_TOOL_USE_ID_META_KEY: &str = "parentToolUseId";
 /// Returns `None` for any malformed shape (missing key, non-object nesting,
 /// non-string id) — callers treat absence as "parent-level emission".
 pub fn subagent_id_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
+    if let Some(parent) = meta.as_ref().and_then(|m| m.get("spk")).and_then(|m| m.get("parentToolCallId")).and_then(|v| v.as_str()) {
+        return Some(parent.to_owned().into());
+    }
     meta.as_ref()
         .and_then(|m| m.get(CLAUDE_CODE_META_KEY))
         .and_then(|cc| cc.get(PARENT_TOOL_USE_ID_META_KEY))
@@ -2596,6 +2599,7 @@ impl From<&AcpThread> for ActionLogTelemetry {
 
 #[derive(Debug)]
 pub enum AcpThreadEvent {
+	BackgroundActivity(BackgroundActivity),
     StatusChanged,
     /// The provider started a turn without a client prompt (for example a goal
     /// continuation). No client-owned `run_turn` future drives its lifecycle.
@@ -2621,6 +2625,26 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp::SessionModeId),
     ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+}
+
+/// Provider-neutral background work projection supplied by the agent service.
+/// IDs and parent tool IDs are opaque; native files remain service-owned.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundActivity {
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub parent_tool_call_id: String,
+    #[serde(default)]
+    pub label: String,
+    pub state: String,
+    #[serde(default)]
+    pub text: String,
+    pub updated_ms: i64,
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub stop_reason: String,
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -2741,6 +2765,7 @@ impl AcpThread {
                 | AcpThreadEvent::ElicitationRequested(_)
                 | AcpThreadEvent::ElicitationResponded(_) => this.update_idle_sleep_prevention(cx),
                 AcpThreadEvent::PromptUpdated
+                | AcpThreadEvent::BackgroundActivity(_)
                 | AcpThreadEvent::ExternalTurnStarted
                 | AcpThreadEvent::NewEntry
                 | AcpThreadEvent::TitleUpdated

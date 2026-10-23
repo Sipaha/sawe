@@ -7,57 +7,142 @@ use ui::IconName;
 
 use crate::model::AgentServerId;
 
-/// Brand chrome for an agent: the logo, name and vendor that identify it in
-/// the "new session" picker and on its session tabs, plus the models it
-/// normally runs.
-///
-/// Resolved from a bare agent id by [`agent_brand`] rather than through
-/// [`AdapterRegistry`] on purpose — the chrome that needs it renders in
-/// places where the registry is not reachable or not populated (the store's
-/// test harness registers **no** adapters, and a session restored from disk
-/// can name an agent this build no longer ships). The adapters below then
-/// read their own `display_name`/`icon` back out of the same const, so the
-/// picker, the tabs and the status row cannot disagree about a provider.
+/// Branding is downloaded from SPK AI Hub and cached for offline history.
+#[derive(Clone)]
 pub struct AgentBrand {
-    /// Short product name — "Claude", "Codex".
-    pub name: &'static str,
-    /// Who makes it — "Anthropic", "OpenAI". Shown greyed beside the models.
-    pub vendor: &'static str,
-    /// The vendor's mark, drawn as a monochrome mask by `ui::Icon` (the fill
-    /// colours inside the SVG files are ignored, so the colour always comes
-    /// from the caller — see [`Self::color`]).
+    pub name: String,
+    pub vendor: String,
     pub logo: IconName,
-    /// The vendor's signature colour as `0xRRGGBB`, which tints [`Self::logo`]
-    /// wherever it is meant to read as the brand: always in the new-session
-    /// picker, and on a session tab while that session is working
-    /// (maintainer request, 2026-09-23). A mid-tone, so it holds up on both
-    /// the light and the dark theme.
+    pub icon_path: Option<SharedString>,
+    pub permissions: bool,
+    pub context_usage_current: bool,
+    pub effort_options: Vec<String>,
     pub color: u32,
-    /// The models this agent normally runs, **default first**, `·`-separated.
-    ///
-    /// Display-only and deliberately version-free: the authoritative list
-    /// comes from the agent CLI at probe time
-    /// (`native_controls::probe_models` → `ModelCatalog`), and it moves every
-    /// few weeks. A version number baked in here would be stale before the
-    /// next release, whereas the family names are what both CLIs' own model
-    /// pickers are keyed on and have been stable for a year.
-    pub models: &'static str,
+    pub models: String,
 }
-
 impl AgentBrand {
-    /// [`Self::color`] as a `ui::Color`.
     pub fn tint(&self) -> ui::Color {
         ui::Color::Custom(gpui::rgb(self.color).into())
     }
+    pub fn icon(&self) -> ui::Icon {
+        self.icon_path
+            .as_ref()
+            .map(|path| ui::Icon::from_external_svg(path.clone()))
+            .unwrap_or_else(|| ui::Icon::new(self.logo))
+    }
+}
+#[derive(Default)]
+struct Brands {
+    by_id: HashMap<String, Arc<AgentBrand>>,
+    order: Vec<String>,
+    default: String,
+    actions: HashMap<String, String>,
+}
+static BRANDS: std::sync::LazyLock<std::sync::RwLock<Brands>> =
+    std::sync::LazyLock::new(Default::default);
+pub fn agent_brand(agent_id: &str) -> Option<Arc<AgentBrand>> {
+    if let Some(brand) = BRANDS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_id
+        .get(agent_id)
+        .cloned()
+    {
+        return Some(brand);
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        match agent_id {
+            "claude-acp" => return Some(Arc::new(crate::claude_adapter::BRAND.clone())),
+            "codex-native" => return Some(Arc::new(crate::codex_adapter::BRAND.clone())),
+            "kimi-code" => return Some(Arc::new(crate::kimi_adapter::BRAND.clone())),
+            _ => {}
+        }
+    }
+    None
+}
+pub fn available_brands() -> Vec<(AgentServerId, Arc<AgentBrand>)> {
+    let brands = BRANDS.read().unwrap_or_else(|e| e.into_inner());
+    #[cfg(any(test, feature = "test-support"))]
+    if brands.order.is_empty() {
+        drop(brands);
+        return ["codex-native", "claude-acp", "kimi-code"]
+            .into_iter()
+            .filter_map(|id| agent_brand(id).map(|b| (id.into(), b)))
+            .collect();
+    }
+    brands
+        .order
+        .iter()
+        .filter_map(|id| brands.by_id.get(id).map(|b| (id.clone().into(), b.clone())))
+        .collect()
+}
+pub fn default_harness() -> SharedString {
+    let id = BRANDS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .default
+        .clone();
+    #[cfg(any(test, feature = "test-support"))]
+    if id.is_empty() {
+        return "claude-acp".into();
+    }
+    id.into()
+}
+pub fn harness_for_action(action: &str) -> Option<String> {
+    let result = BRANDS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .actions
+        .get(action)
+        .cloned();
+    #[cfg(any(test, feature = "test-support"))]
+    if result.is_none() {
+        return match action {
+            "console_panel::NewCodexChat" => Some("codex-native".into()),
+            "console_panel::NewKimiChat" => Some("kimi-code".into()),
+            _ => None,
+        };
+    }
+    result
+}
+pub(crate) fn install_brands(
+    entries: Vec<(String, Arc<AgentBrand>, Vec<String>)>,
+    default: String,
+) {
+    let mut brands = BRANDS.write().unwrap_or_else(|e| e.into_inner());
+    brands.order = entries.iter().map(|e| e.0.clone()).collect();
+    brands.default = default;
+    brands.actions.clear();
+    for (id, brand, actions) in entries {
+        for action in actions {
+            brands.actions.insert(action, id.clone());
+        }
+        brands.by_id.insert(id, brand);
+    }
 }
 
-/// The brand for `agent_id`, or `None` for an agent this build does not ship.
-pub fn agent_brand(agent_id: &str) -> Option<&'static AgentBrand> {
-    match agent_id {
-        crate::claude_adapter::CLAUDE_ACP_AGENT_ID => Some(&crate::claude_adapter::BRAND),
-        crate::codex_adapter::CODEX_AGENT_ID => Some(&crate::codex_adapter::BRAND),
-        crate::kimi_adapter::KIMI_AGENT_ID => Some(&crate::kimi_adapter::BRAND),
-        _ => None,
+pub struct HubAdapter {
+    pub id: AgentServerId,
+    pub brand: Arc<AgentBrand>,
+    pub instruction_file: String,
+    pub resume: bool,
+}
+impl SolutionAgentAdapter for HubAdapter {
+    fn agent_id(&self) -> AgentServerId {
+        self.id.clone()
+    }
+    fn display_name(&self) -> SharedString {
+        self.brand.name.clone().into()
+    }
+    fn icon(&self) -> IconName {
+        IconName::Sparkle
+    }
+    fn build_initial_system_prompt(&self, solution: &Solution) -> String {
+        crate::client_instructions::solution_system_prompt(solution, &self.instruction_file)
+    }
+    fn supports_resume(&self) -> bool {
+        self.resume
     }
 }
 
@@ -141,3 +226,6 @@ mod tests {
         assert!(reg.get(&SharedString::from("c")).is_none());
     }
 }
+
+/// Connection state for discovery UI; cached harnesses remain selectable offline.
+pub fn hub_catalog_status() -> Option<String> { crate::hub_catalog::status() }

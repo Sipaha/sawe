@@ -76,3 +76,8 @@ mod tests {
         );
     }
 }
+
+/// Create a chat using an opaque harness ID supplied by SPK AI Hub.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = console_panel)]
+pub struct NewAgentChat {pub agent_id:String}

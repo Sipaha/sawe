@@ -15,7 +15,7 @@
 //! bottom-dock chat tab strip this one is replacing in phase 2a) because a
 //! dependency the other way would cycle: `console_panel` already depends on
 //! `solution_agent`. The trailing `+` therefore dispatches
-//! `console_panel::NewChat` *dynamically by name* (`cx.build_action`) rather
+//! `console_panel::NewAgentChat` *dynamically by name* (`cx.build_action`) rather
 //! than importing the action type — the same cross-crate action-dispatch
 //! idiom already used by `git_ui::commit_context_menu` for
 //! `solution_git::CrossCherryPick` / `git_graph::ShowAffectedPathsInLog`.
@@ -44,6 +44,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     Animation, AnimationExt as _, App, Context, ElementId, IntoElement, ParentElement, Pixels,
@@ -83,7 +84,7 @@ struct TabCandidate {
     /// provider. `None` for a session naming an agent this build no longer
     /// ships; such a tab wears a neutral mark rather than a wrong logo, so its
     /// state still shows.
-    brand: Option<&'static AgentBrand>,
+    brand: Option<Arc<AgentBrand>>,
     is_errored: bool,
     is_running: bool,
     /// The session's activity clock — the same `last_activity_at` the status
@@ -426,9 +427,9 @@ const WORKING_LOGO_SELECTOR: &str = "SESSION-TAB-LOGO-WORKING";
 /// The pulse is `AnimationExt::with_animation`, which honours
 /// `App::reduce_motion`, on the same 1s 0.4→1.0 opacity curve the status
 /// row's "thinking" sparkle uses, so the two working signals beat together.
-fn render_tab_logo(brand: Option<&'static AgentBrand>, look: TabLogoLook, ix: usize) -> AnyElement {
+fn render_tab_logo(brand: Option<Arc<AgentBrand>>, look: TabLogoLook, ix: usize) -> AnyElement {
     let logo = match brand {
-        Some(brand) => render_agent_logo(brand, IconSize::XSmall, brand.tint()),
+        Some(brand) => render_agent_logo(brand.clone(), IconSize::XSmall, brand.tint()),
         None => div().flex().flex_none().items_center().child(
             Icon::new(IconName::Sparkle)
                 .size(IconSize::XSmall)
@@ -550,13 +551,14 @@ fn render_error_stripe(cx: &App) -> Div {
 }
 
 /// The provider mark, wrapped so it carries [`agent_logo_selector`].
-fn render_agent_logo(brand: &'static AgentBrand, size: IconSize, color: Color) -> Div {
+fn render_agent_logo(brand: Arc<AgentBrand>, size: IconSize, color: Color) -> Div {
+    let selector=agent_logo_selector(&brand);
     div()
-        .debug_selector(|| agent_logo_selector(brand))
+        .debug_selector(move ||selector)
         .flex()
         .flex_none()
         .items_center()
-        .child(Icon::new(brand.logo).size(size).color(color))
+        .child(brand.icon().size(size).color(color))
 }
 
 /// One provider row in the `+` picker: the vendor's logo, the agent's name,
@@ -577,13 +579,14 @@ fn render_agent_logo(brand: &'static AgentBrand, size: IconSize, color: Color) -
 /// so the colour is the brand's own [`AgentBrand::color`], and the mark spans
 /// both text lines ([`PICKER_LOGO_PX`]) instead of sitting beside the first
 /// one at 16px (maintainer request, 2026-09-23: "the icon is very small").
-fn render_agent_choice(brand: &'static AgentBrand) -> AnyElement {
+fn render_agent_choice(brand: Arc<AgentBrand>) -> AnyElement {
+    let selector=agent_choice_selector(&brand);
     h_flex()
-        .debug_selector(|| agent_choice_selector(brand))
+        .debug_selector(move ||selector)
         .gap_2p5()
         .py_1()
         .child(render_agent_logo(
-            brand,
+            brand.clone(),
             IconSize::Custom(rems_from_px(PICKER_LOGO_PX)),
             brand.tint(),
         ))
@@ -591,14 +594,14 @@ fn render_agent_choice(brand: &'static AgentBrand) -> AnyElement {
             v_flex()
                 .gap_0p5()
                 .child(
-                    h_flex().gap_1p5().child(Label::new(brand.name)).child(
-                        Label::new(brand.vendor)
+                    h_flex().gap_1p5().child(Label::new(brand.name.clone())).child(
+                        Label::new(brand.vendor.clone())
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     ),
                 )
                 .child(
-                    Label::new(brand.models)
+                    Label::new(brand.models.clone())
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 ),
@@ -927,7 +930,7 @@ impl SessionTabStrip {
                     // right now" — the separate state dot it used to sit beside is
                     // gone (maintainer request, 2026-09-23). `IconSize::XSmall`
                     // at the status bar's rem scale.
-                    .child(render_tab_logo(candidate.brand, logo_look, ix))
+                    .child(render_tab_logo(candidate.brand.clone(), logo_look, ix))
                     .child(
                         // Own flex row at full height so the label is optically
                         // centred in the pill, mirroring `console_panel::panel`'s tab.
@@ -1056,7 +1059,7 @@ impl SessionTabStrip {
         let brand = crate::adapter::agent_brand(&selected);
         let workspace = self.workspace_weak(cx);
         let icon = if default {
-            brand.map(|b| b.logo).unwrap_or(IconName::Sparkle)
+            brand.as_ref().map(|b| b.logo).unwrap_or(IconName::Sparkle)
         } else {
             IconName::Plus
         };
@@ -1072,10 +1075,11 @@ impl SessionTabStrip {
         };
         PopoverMenu::new(menu_id)
             .trigger(
-                IconButton::new(id, icon)
+                IconButton::new(id,icon)
+                    .when_some(if default {brand.as_ref().and_then(|b|b.icon_path.clone())} else {None},|button,path|button.external_svg(path))
                     .icon_size(IconSize::Small)
                     .icon_color(if default {
-                        brand.map(|b| b.tint()).unwrap_or(Color::Muted)
+                        brand.as_ref().map(|b| b.tint()).unwrap_or(Color::Muted)
                     } else {
                         Color::Muted
                     })
@@ -1094,30 +1098,17 @@ impl SessionTabStrip {
                     } else {
                         menu
                     };
-                    for (id, brand, action) in [
-                        (
-                            crate::codex_adapter::CODEX_AGENT_ID,
-                            &crate::codex_adapter::BRAND,
-                            "console_panel::NewCodexChat",
-                        ),
-                        (
-                            crate::claude_adapter::CLAUDE_ACP_AGENT_ID,
-                            &crate::claude_adapter::BRAND,
-                            "console_panel::NewChat",
-                        ),
-                        (
-                            crate::kimi_adapter::KIMI_AGENT_ID,
-                            &crate::kimi_adapter::BRAND,
-                            "console_panel::NewKimiChat",
-                        ),
-                    ] {
+                    if let Some(status) = crate::adapter::hub_catalog_status() {
+                        menu = menu.label(status).label("Start spk-ai-hub; check SPK_AI_HUB_URL. Retrying automatically.");
+                    }
+                    for (id, brand) in crate::adapter::available_brands() {
                         let workspace = workspace.clone();
-                        let is_selected = default && selected.as_ref() == id;
+                        let is_selected = default && selected==id;
                         menu = menu.custom_entry(
                             move |_, _| {
                                 h_flex()
                                     .gap_2()
-                                    .child(render_agent_choice(brand))
+                                    .child(render_agent_choice(brand.clone()))
                                     .when(is_selected, |row| {
                                         row.child(Icon::new(IconName::Check).size(IconSize::Small))
                                     })
@@ -1127,6 +1118,7 @@ impl SessionTabStrip {
                                 if default {
                                     if let Some(ws) = workspace.as_ref().and_then(|w| w.upgrade()) {
                                         let fs = ws.read(cx).project().read(cx).fs().clone();
+                                        let id=id.clone();
                                         settings::update_settings_file(
                                             fs,
                                             cx,
@@ -1138,7 +1130,7 @@ impl SessionTabStrip {
                                             },
                                         );
                                     }
-                                } else if let Ok(action) = cx.build_action(action, None) {
+                                } else if let Ok(action) = cx.build_action("console_panel::NewAgentChat",Some(serde_json::json!({"agent_id":id}))) {
                                     window.dispatch_action(action, cx);
                                 }
                             },
@@ -1617,7 +1609,7 @@ mod tests {
         }
     }
 
-    // The `+` button dispatches `console_panel::NewChat` *by name* (see the
+    // The `+` button dispatches `console_panel::NewAgentChat` *by name* (see the
     // module doc) rather than importing its type — a real dev-dependency on
     // `console_panel` here would create a Cargo dev-dependency CYCLE
     // (`console_panel` depends on `solution_agent` normally) that duplicates
@@ -1863,7 +1855,7 @@ mod tests {
         }
     }
 
-    /// Stand-in for `console_panel::NewChat`, registered under that exact
+    /// Stand-in for `console_panel::NewAgentChat`, registered under that exact
     /// wire name. The `+`'s left click builds the action *by name* because
     /// `solution_agent` cannot depend on `console_panel` (the edge runs the
     /// other way), which also means the real action is not linked into this
@@ -1875,13 +1867,9 @@ mod tests {
     /// `console_panel::panel::tests::new_chat_action_matches_the_status_bar_strips_dispatch_string`,
     /// which pins the real action to the same string, this closes the loop.
     mod stub {
-        gpui::actions!(
-            console_panel,
-            [
-                /// Test stand-in for the real `console_panel::NewChat`.
-                NewChat
-            ]
-        );
+        #[derive(Clone,Debug,Default,PartialEq,serde::Deserialize,schemars::JsonSchema,gpui::Action)]
+        #[action(namespace=console_panel)]
+        pub struct NewAgentChat {pub agent_id:String}
     }
 
     /// Window root hosting the strip's REAL `Render` (not `TabPaintHarness`,
@@ -1904,7 +1892,7 @@ mod tests {
             div()
                 .size_full()
                 .track_focus(&self.focus_handle)
-                .on_action(move |_: &stub::NewChat, _window, _cx| {
+                .on_action(move |_: &stub::NewAgentChat, _window, _cx| {
                     *dispatches.borrow_mut() += 1;
                 })
                 .child(self.strip.clone())

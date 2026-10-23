@@ -1,26 +1,17 @@
-//! Tracking surface for Claude Code's **background shells** — Bash commands
-//! launched with `run_in_background=true` from the parent claude process.
-//! Unlike inline Bash calls whose output is returned inline in the tool
-//! result, a background shell runs detached and writes its combined
-//! stdout/stderr to an on-disk `.output` file whose path is surfaced in the
-//! launch announcement printed to the parent's conversation transcript.
-//!
-//! This module owns:
-//!
-//! - [`BackgroundShellId`] — newtype around the short random token Claude Code
-//!   assigns to each background task (e.g. `bvb4ful1z`).
-//! - [`BackgroundShell`] + [`BackgroundShellSnapshot`] — in-memory tracking
-//!   state per shell.
-//! - [`ShellRuntimeState`] — running / exited / killed lifecycle enum.
-//! - [`parse_task_notification`] — parser for `<task-notification>` completion blocks.
-//! - [`parse_kill_shell_input`] — extractor for `KillShell` tool_call inputs.
-//! - [`tail_output`] — incremental tail helper for plain-text `.output` files.
+//! Provider-neutral background-shell projection and derived UI streams.
+//! Production state and bounded output arrive from AI Hub. Native launch,
+//! completion and output-file codecs compile only for regression fixtures.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(any(test, feature = "test-support"))]
+use std::path::Path;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
+#[cfg(any(test, feature = "test-support"))]
 use regex::Regex;
+#[cfg(any(test, feature = "test-support"))]
 use serde_json::Value;
 
 use chrono::{DateTime, Utc};
@@ -184,12 +175,14 @@ impl BackgroundShell {
 /// the command as its own fenced block, so display never depends on this being
 /// short — it only guards against a pathological multi-megabyte
 /// `raw_input.command`.
+#[cfg(any(test, feature = "test-support"))]
 pub const COMMAND_CAP: usize = 4096;
 
 /// Extract a background shell's launch command from a Bash tool call's
 /// `raw_input`: prefer `command`, fall back to `description`. Capped at
 /// [`COMMAND_CAP`] chars (ellipsis suffix on overflow). Empty `SharedString`
 /// when neither key holds a non-empty string.
+#[cfg(any(test, feature = "test-support"))]
 pub fn command_label_from_raw_input(raw_input: &serde_json::Value) -> SharedString {
     let picked = raw_input
         .get("command")
@@ -226,13 +219,17 @@ fn shell_relative_time(mtime: SystemTime, now: DateTime<Utc>) -> String {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 static SHELL_ID_RE: OnceLock<Regex> = OnceLock::new();
+#[cfg(any(test, feature = "test-support"))]
 static SHELL_OUTPUT_PATH_RE: OnceLock<Regex> = OnceLock::new();
 
+#[cfg(any(test, feature = "test-support"))]
 fn shell_id_re() -> &'static Regex {
     SHELL_ID_RE.get_or_init(|| Regex::new(r"\bID:\s+(\w+)\b").expect("static regex compiles"))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn shell_output_path_re() -> &'static Regex {
     SHELL_OUTPUT_PATH_RE.get_or_init(|| {
         Regex::new(r"written to:\s+(\S+\.output)\b").expect("static regex compiles")
@@ -247,6 +244,7 @@ fn shell_output_path_re() -> &'static Regex {
 /// The caller feeds this the tool call's CONTENT, not its `raw_output`:
 /// `claude_native::translate` only ever sets `raw_input`, so `raw_output` is
 /// always `None` and the announcement only ever lands in the tool_result body.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_bash_bg_launch(announcement: &str) -> Option<(BackgroundShellId, PathBuf)> {
     let shell_id = shell_id_re().captures(announcement)?.get(1)?.as_str();
     let output_path = shell_output_path_re()
@@ -262,21 +260,26 @@ pub fn parse_bash_bg_launch(announcement: &str) -> Option<(BackgroundShellId, Pa
 
 /// Parsed content of a `<task-notification>` block emitted by Claude Code in a
 /// `user`-role message when a background shell completes.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskNotification {
     pub id: BackgroundShellId,
     pub status: ShellRuntimeState,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 static TASK_ID_RE: OnceLock<Regex> = OnceLock::new();
+#[cfg(any(test, feature = "test-support"))]
 static EXIT_CODE_RE: OnceLock<Regex> = OnceLock::new();
 
+#[cfg(any(test, feature = "test-support"))]
 fn task_id_re() -> &'static Regex {
     TASK_ID_RE.get_or_init(|| {
         Regex::new(r"<task-id>\s*([^<\s]+)\s*</task-id>").expect("static regex compiles")
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn exit_code_re() -> &'static Regex {
     EXIT_CODE_RE
         .get_or_init(|| Regex::new(r"\(exit code (-?\d+)\)").expect("static regex compiles"))
@@ -288,6 +291,7 @@ fn exit_code_re() -> &'static Regex {
 /// `(exit code N)` suffix in `<summary>` (defaulting to `Exited(None)` when the
 /// code is absent/unparseable). Any non-"completed" status also maps defensively
 /// to `Exited(None)` (we don't yet know other status spellings).
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_task_notification(text: &str) -> Option<TaskNotification> {
     if !text.contains("<task-notification>") {
         return None;
@@ -310,6 +314,7 @@ pub fn parse_task_notification(text: &str) -> Option<TaskNotification> {
 /// `raw_input`. Accepts `task_id` (current TaskStop schema), `shell_id`
 /// (deprecated TaskStop alias / KillShell), or `bash_id` (string). Returns
 /// `None` if none is a non-empty string.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_kill_shell_input(raw_input: &Value) -> Option<BackgroundShellId> {
     let id_str = raw_input
         .get("task_id")
@@ -325,9 +330,11 @@ pub fn parse_kill_shell_input(raw_input: &Value) -> Option<BackgroundShellId> {
 // ---------------------------------------------------------------------------
 
 /// 64 KiB cap on the trailing chunk returned by [`tail_output`].
+#[cfg(any(test, feature = "test-support"))]
 const OUTPUT_TAIL_CAP: usize = 64 * 1024;
 
 /// Result of a [`tail_output`] call.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct OutputTail {
     /// Trailing chunk of the file's bytes as UTF-8 (lossy), capped at `OUTPUT_TAIL_CAP`.
@@ -343,6 +350,7 @@ pub struct OutputTail {
 /// `since_offset` to 0 when it exceeds `len` (truncation/rotation). A missing file
 /// propagates as `Err` (`std::io::ErrorKind::NotFound`) — the caller treats that as
 /// "no snapshot yet", NOT a hard failure.
+#[cfg(any(test, feature = "test-support"))]
 pub fn tail_output(path: &Path, since_offset: u64) -> std::io::Result<OutputTail> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;

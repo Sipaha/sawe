@@ -19,6 +19,7 @@ pub struct IconButton {
     base: ButtonLike,
     shape: IconButtonShape,
     icon: IconName,
+    external_svg:Option<SharedString>,
     icon_size: IconSize,
     icon_color: Color,
     selected_icon: Option<IconName>,
@@ -35,6 +36,7 @@ impl IconButton {
             base: ButtonLike::new(id),
             shape: IconButtonShape::Wide,
             icon,
+            external_svg:None,
             icon_size: IconSize::default(),
             icon_color: Color::Default,
             selected_icon: None,
@@ -47,6 +49,9 @@ impl IconButton {
         this.base.base = this.base.base.debug_selector(|| format!("ICON-{:?}", icon));
         this
     }
+
+    /// Render a trusted external SVG while retaining the button's behavior.
+    pub fn external_svg(mut self,path:SharedString)->Self{self.external_svg=Some(path);self}
 
     pub fn shape(mut self, shape: IconButtonShape) -> Self {
         self.shape = shape;
@@ -253,7 +258,7 @@ impl RenderOnce for IconButton {
             Color::Custom(base_color.opacity(self.alpha.unwrap_or(1.0)))
         };
 
-        let icon_element = Icon::new(icon).size(self.icon_size).color(icon_color);
+        let icon_element=self.external_svg.map(Icon::from_external_svg).unwrap_or_else(||Icon::new(icon)).size(self.icon_size).color(icon_color);
 
         self.base
             .map(|this| match self.shape {

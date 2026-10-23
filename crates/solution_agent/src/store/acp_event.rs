@@ -22,6 +22,9 @@ impl SolutionAgentStore {
             return;
         };
         match event {
+            acp_thread::AcpThreadEvent::BackgroundActivity(activity) => {
+                self.apply_hub_background_activity(session_id, activity, cx);
+            }
             acp_thread::AcpThreadEvent::ExternalTurnStarted => {
                 session_entity.update(cx, |s, _| {
                     if let Some(ladder) = s.handoff_ladder.as_mut() {
@@ -57,7 +60,7 @@ impl SolutionAgentStore {
                         matches!(thread.entries().last(), Some(acp_thread::AgentThreadEntry::SystemNote(_)))
                             || (matches!(thread.entries().last(), Some(acp_thread::AgentThreadEntry::UserMessage(_)))
                                 && thread.status() == acp_thread::ThreadStatus::Idle
-                                && crate::native_controls::codex_turn_active(t, cx) == Some(false))
+                                && crate::native_controls::runtime_turn_active(t, cx) == Some(false))
                     })
                     .unwrap_or(false);
                 if !is_passive_entry {
@@ -197,10 +200,12 @@ impl SolutionAgentStore {
                 // InProgress is a spawn signal. The `local_entry_index` here is
                 // the live thread's local index (entries.len() - 1), which is
                 // what `apply_subagent_lifecycle` needs to look up the entry.
+                #[cfg(any(test, feature = "test-support"))]
                 let local_entry_index = session_entity
                     .read(cx)
                     .acp_thread()
                     .map(|thread| thread.read(cx).entries().len().saturating_sub(1));
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(idx) = local_entry_index {
                     self.apply_subagent_lifecycle(session_id, idx, cx);
                     // A `<task-notification>` completion block arrives as a
@@ -215,7 +220,7 @@ impl SolutionAgentStore {
                 // started an autonomous continuation. Its Stop must not idle
                 // the newer turn or dispatch queued input over it.
                 if session_entity.read(cx).acp_thread().is_some_and(|thread| {
-                    crate::native_controls::codex_turn_active(thread, cx) == Some(true)
+                    crate::native_controls::runtime_turn_active(thread, cx) == Some(true)
                 }) {
                     return;
                 }
@@ -538,7 +543,7 @@ impl SolutionAgentStore {
             }
             acp_thread::AcpThreadEvent::Error => {
                 if session_entity.read(cx).acp_thread().is_some_and(|thread| {
-                    crate::native_controls::codex_turn_active(thread, cx) == Some(true)
+                    crate::native_controls::runtime_turn_active(thread, cx) == Some(true)
                 }) {
                     return;
                 }
@@ -869,6 +874,7 @@ impl SolutionAgentStore {
                 // the parent thread's `EntryUpdated` is observed, without
                 // waiting for the 500 ms debounce that gates
                 // `SessionMessageAppended`.
+                #[cfg(any(test, feature = "test-support"))]
                 self.apply_subagent_lifecycle(session_id, *idx, cx);
                 // A `<task-notification>` can also surface via an in-place
                 // EntryUpdated (a user message whose text streams in); scan it
@@ -876,6 +882,7 @@ impl SolutionAgentStore {
                 // `mark_background_shell_state` no-op guard rejects a re-observed
                 // terminal state, so a NewEntry + EntryUpdated pair on the same
                 // notification flips the shell exactly once.
+                #[cfg(any(test, feature = "test-support"))]
                 self.observe_task_notification(session_id, *idx, cx);
                 // Tool-call arg deltas, assistant-text chunks, and tool-
                 // status transitions on an existing entry all surface

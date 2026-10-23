@@ -286,6 +286,8 @@ impl<T> FlattenAcpResult<T> for Result<Result<T, acp::Error>, anyhow::Error> {
 /// Holds state needed by foreground work dispatched from background handler closures.
 struct ClientContext {
     generation_only: bool,
+    followup_pull: Rc<RefCell<Option<acp_thread::AgentFollowupPull>>>,
+    runtime_activity: Rc<RefCell<HashSet<acp::SessionId>>>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
@@ -406,6 +408,8 @@ fn enqueue_notification<Notif>(
 }
 
 pub struct AcpConnection {
+    followup_pull: Rc<RefCell<Option<acp_thread::AgentFollowupPull>>>,
+    runtime_activity: Rc<RefCell<HashSet<acp::SessionId>>>,
     generation_profile: Option<tempfile::TempDir>,
     id: AgentId,
     telemetry_id: SharedString,
@@ -765,6 +769,10 @@ fn client_builder(
             on_request!(handle_create_elicitation),
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            on_request!(handle_hub_request),
+            agent_client_protocol::on_receive_request!(),
+        )
         // --- Notification handlers (agent→client) ---
         .on_receive_notification(
             on_notification!(handle_session_notification),
@@ -772,6 +780,10 @@ fn client_builder(
         )
         .on_receive_notification(
             on_notification!(handle_complete_elicitation),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            on_notification!(handle_hub_notification),
             agent_client_protocol::on_receive_notification!(),
         )
 }
@@ -1052,7 +1064,11 @@ impl AcpConnection {
         };
 
         // Set up the foreground dispatch loop to process work items from handlers.
+        let followup_pull = Rc::new(RefCell::new(None));
+        let runtime_activity = Rc::new(RefCell::new(HashSet::default()));
         let dispatch_context = ClientContext {
+            followup_pull: followup_pull.clone(),
+            runtime_activity: runtime_activity.clone(),
             generation_only,
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
@@ -1175,6 +1191,8 @@ impl AcpConnection {
         });
 
         Ok(Self {
+            followup_pull,
+            runtime_activity,
             generation_profile,
             id: agent_id,
             auth_methods,
@@ -1199,6 +1217,7 @@ impl AcpConnection {
         })
     }
 
+    fn hub_capability(&self,key:&str)->bool{self.is_hub() && self.agent_capabilities.meta.as_ref().and_then(|m|m.get("spk")).and_then(|m|m.get(key)).and_then(serde_json::Value::as_bool)==Some(true)}
     pub fn prompt_capabilities(&self) -> &acp::PromptCapabilities {
         &self.agent_capabilities.prompt_capabilities
     }
@@ -1219,6 +1238,8 @@ impl AcpConnection {
         let settings_subscription = defaults.observe_settings(agent_id.clone(), cx);
 
         Self {
+            followup_pull: Default::default(),
+            runtime_activity: Default::default(),
             generation_profile: None,
             id: agent_id,
             telemetry_id: "test".into(),
@@ -1725,24 +1746,78 @@ fn kimi_prompt_context(agent_id: &AgentId, meta: Option<&acp::Meta>) -> Option<S
 }
 
 impl AgentConnection for AcpConnection {
+    fn send_parked_input(&self,id:&acp::SessionId,blocks:&[acp::ContentBlock],cx:&mut App)->Result<bool>{
+        if !self.hub_capability("parkedInput"){return Ok(false)}
+        let request=agent_client_protocol::UntypedMessage::new("_spk/parked_input",serde_json::json!({"sessionId":id,"prompt":blocks}))?;
+        let connection=self.connection.clone();let thread=self.sessions.borrow().get(id).map(|s|s.thread.clone());
+        cx.spawn(async move |cx|{if let Err(error)=connection.send_request(request).block_task().await{if let Some(thread)=thread{thread.update(cx,|thread,cx|{thread.push_system_note(acp_thread::SystemNoteLevel::Error,map_acp_error(error).to_string(),cx);cx.emit(acp_thread::AcpThreadEvent::Error);}).log_err();}}}).detach();
+        Ok(true)
+    }
+    fn supports_in_place_clear(&self) -> bool { self.hub_capability("clearInPlace") }
+    fn clear_session_in_place(self: Rc<Self>, id: &acp::SessionId, cx: &mut App) -> Task<Result<Entity<AcpThread>>> {
+        if !self.supports_in_place_clear(){return Task::ready(Err(anyhow!("Context clear is unsupported")))}
+        let thread=self.sessions.borrow().get(id).and_then(|s|s.thread.upgrade());
+        let Some(thread)=thread else{return Task::ready(Err(anyhow!("Session is closed")))};
+        let (project,work_dirs)={let t=thread.read(cx);(t.project().clone(),t.work_dirs().cloned().unwrap_or_default())};
+        let old_id=id.clone();let conn=self.connection.clone();
+        cx.spawn(async move |cx| {
+            let request=agent_client_protocol::UntypedMessage::new("_spk/clear",serde_json::json!({"sessionId":old_id}))?;
+            let value=conn.send_request(request).block_task().await?;
+            let response:acp::NewSessionResponse=serde_json::from_value(value)?;
+            let new_id=response.session_id;
+            let task=cx.update(|cx|self.clone().open_or_create_session(new_id.clone(),project,work_dirs,None,
+                move |_,_,_|Box::pin(async move {Ok(SessionConfigResponse{modes:response.modes,config_options:response.config_options})}),cx));
+            let thread=task.await?;
+            self.sessions.borrow_mut().remove(&old_id);
+            conn.send_request(agent_client_protocol::UntypedMessage::new("_spk/clear_ack",serde_json::json!({"sessionId":new_id}))?).block_task().await?;
+            Ok(thread)
+        })
+    }
+    fn is_hub(&self) -> bool { self.telemetry_id.starts_with("spk-ai-hub/") }
+    fn set_followup_pull(&self, pull: acp_thread::AgentFollowupPull) -> bool {
+        if !self.is_hub() { return false; }
+        *self.followup_pull.borrow_mut() = Some(pull); true
+    }
+    fn runtime_active(&self, id: &acp::SessionId) -> Option<bool> {
+        self.hub_capability("steering").then(|| self.runtime_activity.borrow().contains(id))
+    }
+    fn steer_input(&self, id: &acp::SessionId, blocks: Vec<acp::ContentBlock>, message_id: String, cx: &mut App) -> Option<Task<acp_thread::AgentSteerOutcome>> {
+        if !self.hub_capability("steering") { return None; }
+        let connection = self.connection.clone();
+        let request = agent_client_protocol::UntypedMessage::new("_spk/steer", serde_json::json!({"sessionId":id,"prompt":blocks,"clientUserMessageId":message_id})).ok()?;
+        Some(cx.spawn(async move |_| {
+            match connection.send_request(request).block_task().await {
+                Ok(value) if value["outcome"] == "accepted" => acp_thread::AgentSteerOutcome::Accepted,
+                Ok(value) if value["outcome"] == "rejected" => acp_thread::AgentSteerOutcome::Rejected(anyhow!(value["reason"].as_str().unwrap_or("Input rejected").to_owned())),
+                Ok(value) => acp_thread::AgentSteerOutcome::Uncertain(anyhow!(value["reason"].as_str().unwrap_or("Delivery uncertain").to_owned())),
+                Err(error) => acp_thread::AgentSteerOutcome::Uncertain(anyhow!(error)),
+            }
+        }))
+    }
+
     fn kill_all_sessions(&self) {
-        if self.generation_profile.is_some()
+        if (self.generation_profile.is_some() || self.is_hub())
             && let Some(child) = self.child.borrow_mut().as_mut()
         {
             child.kill().log_err();
         }
     }
     fn supports_close_session(&self) -> bool {
-        self.generation_profile.is_some()
+        self.generation_profile.is_some() || self.is_hub()
     }
-    fn close_session(self: Rc<Self>, id: &acp::SessionId, _: &mut App) -> Task<Result<()>> {
+    fn close_session(self: Rc<Self>, id: &acp::SessionId, cx: &mut App) -> Task<Result<()>> {
         self.sessions.borrow_mut().remove(id);
+        self.runtime_activity.borrow_mut().remove(id);
+        if self.is_hub() {
+            let connection = self.connection.clone(); let id = id.clone();
+            return cx.spawn(async move |_| { connection.send_request(acp::CloseSessionRequest::new(id)).block_task().await?; Ok(()) });
+        }
         self.kill_all_sessions();
         Task::ready(Ok(()))
     }
 
     fn supports_generation_only(&self) -> bool {
-        self.generation_profile.is_some()
+        self.generation_profile.is_some() || self.hub_capability("generationOnly")
     }
 
     fn agent_id(&self) -> AgentId {
@@ -1784,7 +1859,7 @@ impl AgentConnection for AcpConnection {
         };
         let name = self.id.0.clone();
         let generation_only = self.generation_profile.is_some();
-        let prompt_context = if generation_only {
+        let prompt_context = if generation_only || self.is_hub() {
             None
         } else {
             kimi_prompt_context(&self.id, extra_meta.as_ref())
@@ -2006,6 +2081,17 @@ impl AgentConnection for AcpConnection {
         meta: Option<acp::Meta>,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
+        if self.is_hub() {
+            let mcp_servers = mcp_servers_for_project(&project, cx);
+            return self.open_or_create_session(session_id, project, work_dirs, title,
+                move |connection, session_id, directories| Box::pin(async move {
+                    let mut meta = meta.unwrap_or_default();
+                    meta.insert("importExistingSession".into(), serde_json::json!(true));
+                    let request = directories.into_resume_session_request(session_id, mcp_servers).meta(meta);
+                    let response = connection.send_request(request).block_task().await.map_err(map_acp_error)?;
+                    Ok(SessionConfigResponse { modes: response.modes, config_options: response.config_options })
+                }), cx);
+        }
         let prompt_context = kimi_prompt_context(&self.id, meta.as_ref());
         let task = self.clone().resume_session(session_id.clone(), project, work_dirs, title, cx);
         cx.spawn(async move |_| {
@@ -2133,7 +2219,7 @@ impl AgentConnection for AcpConnection {
                 Ok(response) => Ok(response),
                 Err(err) => {
                     if err.code == acp::ErrorCode::AuthRequired {
-                        return Err(anyhow!(acp::Error::auth_required()));
+                        return Err(map_acp_error(err));
                     }
 
                     if err.code != ErrorCode::InternalError {
@@ -2148,7 +2234,6 @@ impl AgentConnection for AcpConnection {
                     // https://github.com/google-gemini/gemini-cli/pull/6656
 
                     #[derive(Deserialize)]
-                    #[serde(deny_unknown_fields)]
                     struct ErrorDetails {
                         details: Box<str>,
                     }
@@ -2338,14 +2423,13 @@ fn map_acp_error(err: acp::Error) -> anyhow::Error {
     if err.code == acp::ErrorCode::AuthRequired {
         let mut error = AuthRequired::new();
 
-        if err.message != acp::ErrorCode::AuthRequired.to_string() {
-            error = error.with_description(err.message);
-        }
+        if let Some(details)=err.data.as_ref().and_then(|v|v.get("details")).and_then(serde_json::Value::as_str){error=error.with_description(details.to_owned());}
+        else if err.message != acp::ErrorCode::AuthRequired.to_string() {error=error.with_description(err.message);}
 
         anyhow!(error)
-    } else {
-        anyhow!(err)
-    }
+    } else if let Some(details)=err.data.as_ref().and_then(|v|v.get("details")).and_then(serde_json::Value::as_str).filter(|s|!s.is_empty()) {
+        anyhow!(details.to_owned())
+    } else { anyhow!(err) }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2842,6 +2926,8 @@ pub mod test_support {
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let dispatch_context = ClientContext {
+            followup_pull: Default::default(),
+            runtime_activity: Default::default(),
             generation_only: false,
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
@@ -4441,6 +4527,8 @@ mod tests {
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
         let dispatch_context = ClientContext {
+            followup_pull: Default::default(),
+            runtime_activity: Default::default(),
             generation_only: false,
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
@@ -5722,4 +5810,71 @@ fn handle_wait_for_terminal_exit(
         respond_result(responder, result.map(acp::WaitForTerminalExitResponse::new));
     })
     .detach();
+}
+
+
+fn handle_hub_request(request: agent_client_protocol::UntypedMessage, responder: Responder<serde_json::Value>, cx: &mut AsyncApp, ctx: &ClientContext) {
+    if request.method != "_spk/next_followup" {
+        responder.respond_with_error(acp::Error::method_not_found()).log_err(); return;
+    }
+    let id = acp::SessionId::new(request.params["sessionId"].as_str().unwrap_or_default().to_owned());
+    if !ctx.sessions.borrow().contains_key(&id) {
+        responder.respond_with_error(acp::Error::invalid_params()).log_err(); return;
+    }
+    let text = ctx.followup_pull.borrow().as_ref().and_then(|pull| pull(&id, request.params["agentId"].as_str(), request.params["endOfTurn"].as_bool().unwrap_or(false), cx));
+    responder.respond(serde_json::json!({"text":text})).log_err();
+}
+
+fn handle_hub_notification(notification: agent_client_protocol::UntypedMessage, cx: &mut AsyncApp, ctx: &ClientContext) {
+    let id = acp::SessionId::new(notification.params["sessionId"].as_str().unwrap_or_default().to_owned());
+    let thread = ctx.sessions.borrow().get(&id).map(|s| s.thread.clone());
+    let Some(thread) = thread else { return; };
+    match notification.method.as_str() {
+        "_spk/system_note" => {
+            if let Some(text) = notification.params["text"].as_str() {
+                let text: String = text.chars().take(4096).collect();
+                thread.update(cx, |thread, cx| thread.push_system_note(acp_thread::SystemNoteLevel::Info, text, cx)).log_err();
+            }
+        },
+        "_spk/background_activity" => {
+            if let Ok(activity) = serde_json::from_value::<acp_thread::BackgroundActivity>(notification.params["activity"].clone()) {
+                thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::BackgroundActivity(activity))).log_err();
+            }
+        },
+        "_spk/turn_started" => {
+            ctx.runtime_activity.borrow_mut().insert(id);
+            if notification.params["external"].as_bool() == Some(true) { thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::ExternalTurnStarted)).log_err(); }
+        },
+        "_spk/turn_completed" => {
+            ctx.runtime_activity.borrow_mut().remove(&id);
+            if notification.params["external"].as_bool() == Some(true) {
+                thread.update(cx, |thread, cx| {
+                    thread.flush_end_of_turn_tail(cx);
+                    if let Some(error) = notification.params["error"].as_str().filter(|s| !s.is_empty()) {
+                        thread.push_system_note(acp_thread::SystemNoteLevel::Error, error.to_owned(), cx);
+                        cx.emit(acp_thread::AcpThreadEvent::Error);
+                    } else {
+                        let reason = if notification.params["result"]["stopReason"] == "cancelled" { acp::StopReason::Cancelled } else { acp::StopReason::EndTurn };
+                        cx.emit(acp_thread::AcpThreadEvent::Stopped(reason));
+                    }
+                }).log_err();
+            }
+        },
+        _ => {},
+    }
+}
+
+#[cfg(test)]
+mod hub_error_tests {
+    use super::*;
+    #[test]
+    fn preserves_hub_quota_reason_with_additive_error_metadata(){
+        let error=acp::Error::internal_error().data(serde_json::json!({"kind":"quota_exhausted","details":"Fixture: usage limit reached; resets at 18:00","retryable":false}));
+        assert_eq!(map_acp_error(error).to_string(),"Fixture: usage limit reached; resets at 18:00");
+    }
+    #[test]
+    fn preserves_login_reason_when_native_auth_message_is_generic(){
+        let error=acp::Error::auth_required().data(serde_json::json!({"kind":"authentication_required","details":"Fixture: subscription expired; sign in again"}));
+        assert!(map_acp_error(error).to_string().contains("subscription expired; sign in again"));
+    }
 }

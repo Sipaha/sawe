@@ -1,49 +1,51 @@
-//! Tracking surface for Claude Code's built-in **Managed Agents** —
-//! the async sub-agents that the parent claude dispatches via the
-//! `Agent` tool. Unlike inline `Task` subagents whose transcript
-//! is interleaved into the parent's `AcpThread.entries`, a managed
-//! agent gets its own JSONL file at
-//! `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<id>.jsonl`
-//! and runs autonomously until it emits a terminal `stop_reason`.
-//!
-//! This module owns:
-//!
-//! - [`BackgroundAgentId`] — newtype around the hex id Claude Code
-//!   prints in the tool output.
-//! - [`BackgroundAgent`] + [`BackgroundAgentSnapshot`] — in-memory
-//!   tracking state per agent.
-//! - [`parse_managed_agent_announcement`] — the regex parser run on
-//!   completed `Agent`-tool_call `raw_output`.
-//! - JSONL tail / convert helpers (added in later tasks).
+//! Provider-neutral background-agent projection and derived UI streams.
+//! Production snapshots arrive from AI Hub; native parsers and file readers
+//! below are retained only for historical regression fixtures.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
+#[cfg(any(test, feature = "test-support"))]
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(any(test, feature = "test-support"))]
+use std::path::Path;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
+#[cfg(any(test, feature = "test-support"))]
 use acp_thread::{
     AgentThreadEntry, AssistantMessage, AssistantMessageChunk, ContentBlock, ToolCall,
     ToolCallStatus, UserMessage,
 };
+#[cfg(any(test, feature = "test-support"))]
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
-use gpui::{App, AppContext, SharedString};
+use gpui::SharedString;
+#[cfg(any(test, feature = "test-support"))]
+use gpui::{App, AppContext};
+#[cfg(any(test, feature = "test-support"))]
 use markdown::Markdown;
 
 use crate::session_entry::{AssistantChunk, SessionEntry, SessionEntryKind};
+#[cfg(any(test, feature = "test-support"))]
 use regex::Regex;
+#[cfg(any(test, feature = "test-support"))]
 use serde_json::Value;
 
+#[cfg(any(test, feature = "test-support"))]
 static AGENT_ID_RE: OnceLock<Regex> = OnceLock::new();
+#[cfg(any(test, feature = "test-support"))]
 static OUTPUT_FILE_RE: OnceLock<Regex> = OnceLock::new();
 
+#[cfg(any(test, feature = "test-support"))]
 fn agent_id_re() -> &'static Regex {
     AGENT_ID_RE.get_or_init(|| {
         Regex::new(r"agentId:\s+([0-9a-f]{16,32})\b").expect("static regex compiles")
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn output_file_re() -> &'static Regex {
     OUTPUT_FILE_RE.get_or_init(|| {
         Regex::new(r"output_file:\s+(\S+\.output)\b").expect("static regex compiles")
@@ -58,6 +60,7 @@ fn output_file_re() -> &'static Regex {
 ///
 /// Path is returned as-is (often a symlink under `/tmp/claude-<uid>/`);
 /// caller resolves via `read_link` to the canonical JSONL location.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_managed_agent_announcement(raw_output: &str) -> Option<(String, PathBuf)> {
     let id = agent_id_re()
         .captures(raw_output)?
@@ -68,11 +71,13 @@ pub fn parse_managed_agent_announcement(raw_output: &str) -> Option<(String, Pat
     Some((id, PathBuf::from(path)))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 static RESUMED_AGENT_ID_RE: OnceLock<Regex> = OnceLock::new();
 
 /// The agent a `SendMessage` tool result says it resumed: claude answers a
 /// message to a finished async agent with
 /// `{"success":true,"message":"Resuming agent …","resumedAgentId":"<hex>",…}`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_resumed_agent_id(text: &str) -> Option<String> {
     RESUMED_AGENT_ID_RE
         .get_or_init(|| {
@@ -94,6 +99,7 @@ pub fn parse_resumed_agent_id(text: &str) -> Option<String> {
 /// an actively-streaming teammate shows no tab and its parent-thread-tagged
 /// output leaks into Main. `raw_output` is still tried first so a future
 /// dispatcher that stashes the announcement there keeps working.
+#[cfg(any(test, feature = "test-support"))]
 pub fn managed_agent_announcement(
     raw_output: Option<&str>,
     content: Option<&str>,
@@ -393,6 +399,7 @@ pub struct BackgroundAgentSnapshot {
 /// 64 KiB cap on individual JSONL line size. A claude tool_use entry
 /// is well under 4 KiB in practice; an entry past this cap is treated
 /// as `Generating…` so a pathological line can't blow our memory.
+#[cfg(any(test, feature = "test-support"))]
 const JSONL_LINE_CAP: usize = 64 * 1024;
 
 /// Whether an assistant message's `stop_reason` means the agent is **DONE**,
@@ -410,6 +417,7 @@ const JSONL_LINE_CAP: usize = 64 * 1024;
 /// `MANAGED_AGENT_STALE_TIMEOUT_SECS` mtime reap (a self-healing backstop). The
 /// inverse mistake — reading an unknown reason as terminal — silently kills a
 /// running agent's tab with no backstop at all.
+#[cfg(any(test, feature = "test-support"))]
 fn is_terminal_stop_reason(reason: &str) -> bool {
     matches!(
         reason,
@@ -420,6 +428,7 @@ fn is_terminal_stop_reason(reason: &str) -> bool {
 /// Pure JSON → snapshot. Public so the watcher (Task 7) can feed it
 /// arbitrary strings; never panics, returns `Generating…` for any
 /// shape it doesn't recognise.
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_jsonl_snapshot(line: &str) -> BackgroundAgentSnapshot {
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -467,6 +476,7 @@ pub fn parse_jsonl_snapshot(line: &str) -> BackgroundAgentSnapshot {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn generating_snapshot() -> BackgroundAgentSnapshot {
     BackgroundAgentSnapshot {
         mtime: SystemTime::now(),
@@ -478,6 +488,7 @@ fn generating_snapshot() -> BackgroundAgentSnapshot {
 
 /// Concatenate the `text` blocks of an assistant message (usage-limit walls
 /// arrive as plain text, not `tool_use`). `None` when there is no text.
+#[cfg(any(test, feature = "test-support"))]
 fn assistant_text(message: &Value) -> Option<String> {
     let content = message.get("content").and_then(Value::as_array)?;
     let mut out = String::new();
@@ -492,6 +503,7 @@ fn assistant_text(message: &Value) -> Option<String> {
     (!out.trim().is_empty()).then_some(out)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn derive_assistant_label(message: &Value) -> SharedString {
     let content = message
         .get("content")
@@ -523,6 +535,7 @@ fn derive_assistant_label(message: &Value) -> SharedString {
     SharedString::new_static("Generating…")
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct Tail {
     /// Last non-empty, in-cap line of the file. `None` when:
@@ -547,6 +560,7 @@ pub struct Tail {
 /// mid-line will cause `last_line` to contain a JSON fragment, which
 /// `parse_jsonl_snapshot` silently discards as malformed — masking the
 /// real most-recent snapshot.
+#[cfg(any(test, feature = "test-support"))]
 pub fn tail_jsonl(path: &Path, since_offset: u64) -> std::io::Result<Tail> {
     use std::io::{Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
@@ -610,6 +624,7 @@ pub fn tail_jsonl(path: &Path, since_offset: u64) -> std::io::Result<Tail> {
 /// `tool_result`, carrying the result's text + error flag so the
 /// second pass can stamp the matching [`ToolCall`] with its content
 /// and a [`ToolCallStatus::Failed`] when claude flagged `is_error`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn jsonl_to_entries<S: AsRef<str>>(lines: &[S], cx: &mut App) -> Vec<AgentThreadEntry> {
     let mut paired: HashMap<String, ToolResultInfo> = HashMap::new();
     for line in lines {
@@ -668,6 +683,7 @@ pub fn jsonl_to_entries<S: AsRef<str>>(lines: &[S], cx: &mut App) -> Vec<AgentTh
     entries
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn jsonl_user_to_entries(value: &Value, out: &mut Vec<AgentThreadEntry>, cx: &mut App) {
     let Some(content) = value
         .get("message")
@@ -702,6 +718,7 @@ fn jsonl_user_to_entries(value: &Value, out: &mut Vec<AgentThreadEntry>, cx: &mu
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct ToolResultInfo {
     is_error: bool,
     content_text: String,
@@ -710,6 +727,7 @@ struct ToolResultInfo {
 /// Concatenate every `text`-typed block under a `tool_result`'s
 /// `content` array (separated by `\n`). Non-text blocks (images,
 /// resources) are silently dropped — V2 lossy.
+#[cfg(any(test, feature = "test-support"))]
 fn tool_result_content_text(block: &Value) -> String {
     let mut out = String::new();
     let Some(content) = block.get("content").and_then(Value::as_array) else {
@@ -729,6 +747,7 @@ fn tool_result_content_text(block: &Value) -> String {
     out
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn jsonl_assistant_to_entries(
     value: &Value,
     paired: &HashMap<String, ToolResultInfo>,
@@ -825,6 +844,7 @@ fn jsonl_assistant_to_entries(
     flush_pending_assistant_text(&mut pending_text, out, cx);
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn flush_pending_assistant_text(
     pending: &mut String,
     out: &mut Vec<AgentThreadEntry>,

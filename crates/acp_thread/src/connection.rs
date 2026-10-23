@@ -99,7 +99,29 @@ pub fn build_terminal_auth_task(
     }
 }
 
+/// Receipt of input submitted to an active runtime. Only rejection permits retry.
+#[derive(Debug)]
+pub enum AgentSteerOutcome {
+    Accepted,
+    Rejected(anyhow::Error),
+    Uncertain(anyhow::Error),
+}
+
+/// Client-owned follow-ups requested at a runtime-defined safe boundary.
+pub type AgentFollowupPull = Rc<dyn Fn(&acp::SessionId, Option<&str>, bool, &mut gpui::AsyncApp) -> Option<String>>;
+
 pub trait AgentConnection {
+    /// True for a connection whose provider execution lives in SPK AI Hub.
+    fn is_hub(&self) -> bool { false }
+
+    fn runtime_active(&self, _session: &acp::SessionId) -> Option<bool> { None }
+
+    fn steer_input(&self, _session: &acp::SessionId, _blocks: Vec<acp::ContentBlock>, _message_id: String, _cx: &mut App) -> Option<Task<AgentSteerOutcome>> { None }
+
+    fn set_followup_pull(&self, _pull: AgentFollowupPull) -> bool { false }
+
+    fn send_parked_input(&self,_session:&acp::SessionId,_blocks:&[acp::ContentBlock],_cx:&mut App)->Result<bool>{Ok(false)}
+
     fn agent_id(&self) -> AgentId;
 
     /// Whether `_meta.generationOnly = true` enforces a text-only session:

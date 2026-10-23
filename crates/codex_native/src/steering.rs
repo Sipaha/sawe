@@ -2,13 +2,7 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-/// Only Rejected guarantees non-delivery and permits a queued retry.
-#[derive(Debug)]
-pub enum SteerOutcome {
-    Accepted,
-    Rejected(anyhow::Error),
-    Uncertain(anyhow::Error),
-}
+pub use acp_thread::AgentSteerOutcome as SteerOutcome;
 
 pub(crate) async fn request<F: std::future::Future<Output = Result<Value>>>(
     thread: &acp::SessionId,

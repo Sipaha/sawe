@@ -84,7 +84,7 @@ pub async fn run_ephemeral_task(
     let agent_id = cx.update(|cx| crate::agent_settings::default_provider(cx));
     let provider = crate::adapter::agent_brand(&agent_id)
         .ok_or_else(|| anyhow!("Unknown Default Provider: {agent_id}"))?
-        .name;
+        .name.clone();
 
     // Acquire a hidden, generation-only session through the shared connection
     // pool. Each native session owns its subprocess and capabilities; an

@@ -18,20 +18,19 @@ mod terminal_provider;
 
 use gpui::{Context, Focusable as _, SharedString, Window};
 use solution_agent::SolutionSessionId;
-use solution_agent::claude_adapter::CLAUDE_ACP_AGENT_ID;
-use solution_agent::kimi_adapter::KIMI_AGENT_ID;
 use solution_agent::solution_band::SolutionBand;
 use solution_agent::store::SolutionAgentStore;
 use workspace::{UtilityKind, Workspace};
 
 pub use actions::{
-    NewChat, NewCodexChat, NewKimiChat, NewTerminal, ShowSession, ToggleDialog, ToggleFocus,
+    NewAgentChat, NewChat, NewCodexChat, NewKimiChat, NewTerminal, ShowSession, ToggleDialog, ToggleFocus,
 };
 pub use panel::{ConsolePanel, ConsoleTab, console_panel_for_workspace};
 pub use terminal_provider::TerminalProvider;
 
 pub fn init(cx: &mut gpui::App) {
     cx.observe_new(|workspace: &mut workspace::Workspace, _window, _cx| {
+        workspace.register_action(|workspace,action:&NewAgentChat,_,cx|create_chat(workspace,&action.agent_id,cx));
         workspace.register_action(|workspace, _: &NewTerminal, window, cx| {
             // No project directory to run in (an empty solution has 0 member
             // projects) → refuse. A non-empty solution or a plain folder with a
@@ -115,7 +114,7 @@ fn handle_new_chat(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    create_chat(workspace, CLAUDE_ACP_AGENT_ID, cx);
+    let id=solution_agent::agent_settings::default_provider(cx);create_chat(workspace,&id,cx);
 }
 
 fn handle_new_codex_chat(
@@ -124,7 +123,7 @@ fn handle_new_codex_chat(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    create_chat(workspace, "codex-native", cx);
+    if let Some(id)=solution_agent::adapter::harness_for_action("console_panel::NewCodexChat"){create_chat(workspace,&id,cx)}
 }
 
 fn handle_new_kimi_chat(
@@ -133,10 +132,10 @@ fn handle_new_kimi_chat(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    create_chat(workspace, KIMI_AGENT_ID, cx);
+    if let Some(id)=solution_agent::adapter::harness_for_action("console_panel::NewKimiChat"){create_chat(workspace,&id,cx)}
 }
 
-fn create_chat(workspace: &mut Workspace, agent_id: &'static str, cx: &mut Context<Workspace>) {
+fn create_chat(workspace: &mut Workspace, agent_id: &str, cx: &mut Context<Workspace>) {
     let Some(solution_id) = panel::active_solution_id_for_workspace(workspace, cx) else {
         return;
     };

@@ -7,9 +7,9 @@ use std::collections::HashSet;
 fn apply_receipt_to_queue(
     queue: &mut std::collections::VecDeque<crate::model::PendingBundle>,
     bundles: &HashSet<uuid::Uuid>,
-    outcome: &codex_native::SteerOutcome,
+    outcome: &acp_thread::AgentSteerOutcome,
 ) -> Vec<acp::ContentBlock> {
-    if matches!(outcome, codex_native::SteerOutcome::Rejected(_)) {
+    if matches!(outcome, acp_thread::AgentSteerOutcome::Rejected(_)) {
         return Vec::new();
     }
     let mut delivered = Vec::new();
@@ -116,14 +116,8 @@ impl SolutionAgentStore {
         let Some(thread) = s.acp_thread().cloned() else {
             return;
         };
-        let Some(connection) = thread
-            .read(cx)
-            .connection()
-            .clone()
-            .downcast::<codex_native::CodexConnection>()
-        else {
-            return;
-        };
+        let connection = thread.read(cx).connection().clone();
+        if connection.runtime_active(&s.acp_session_id).is_none() { return; }
         // Once the handoff request is in flight, newer user intent belongs in
         // the replacement context. A receipt only proves acceptance, not that
         // the worker incorporated it into the handoff file already written.
@@ -146,7 +140,7 @@ impl SolutionAgentStore {
         let epoch = s.epoch;
         let acp_id = s.acp_session_id.clone();
         let token = uuid::Uuid::new_v4();
-        let task = connection.steer(&acp_id, blocks, token.to_string(), cx);
+        let Some(task) = connection.steer_input(&acp_id, blocks, token.to_string(), cx) else { return; };
         self.active_steers
             .insert(session_id, PendingSteer { token, bundles });
         cx.spawn(async move |this, cx| {
@@ -155,7 +149,7 @@ impl SolutionAgentStore {
             // context. Keep the receipt reserved until its user entry can be
             // recorded on the replacement thread; never discard the text or
             // resend an accepted/ambiguous message during that gap.
-            if !matches!(outcome, codex_native::SteerOutcome::Rejected(_)) {
+            if !matches!(outcome, acp_thread::AgentSteerOutcome::Rejected(_)) {
                 loop {
                     let wait_for_thread = this.update(cx, |store, cx| {
                         store.active_steers.get(&session_id).is_some_and(|pending|
@@ -175,7 +169,7 @@ impl SolutionAgentStore {
                 let pending = store.active_steers.remove(&session_id).unwrap();
                 let Some(session) = store.session(session_id) else { return; };
                 if session.read(cx).epoch != epoch || session.read(cx).acp_session_id != acp_id { return; }
-                let retry = matches!(outcome, codex_native::SteerOutcome::Rejected(_));
+                let retry = matches!(outcome, acp_thread::AgentSteerOutcome::Rejected(_));
                 if !retry {
                     let delivered = session.update(cx, |s, _| apply_receipt_to_queue(&mut s.pending_messages, &pending.bundles, &outcome));
                     if !delivered.is_empty() {
@@ -186,9 +180,9 @@ impl SolutionAgentStore {
                     }
                 }
                 match outcome {
-                    codex_native::SteerOutcome::Accepted => {},
-                    codex_native::SteerOutcome::Rejected(error) => log::info!("Agent follow-up remains queued: {error}"),
-                    codex_native::SteerOutcome::Uncertain(error) => {
+                    acp_thread::AgentSteerOutcome::Accepted => {},
+                    acp_thread::AgentSteerOutcome::Rejected(error) => log::info!("Agent follow-up remains queued: {error}"),
+                    acp_thread::AgentSteerOutcome::Uncertain(error) => {
                         store.push_system_note(session_id, acp_thread::SystemNoteLevel::Error,
                             format!("Agent follow-up delivery could not be confirmed: {error}. It was not resent automatically; verify the conversation before retrying."), cx);
                     }
@@ -197,7 +191,7 @@ impl SolutionAgentStore {
                 // If both runtime and client thread are idle, Running is stale;
                 // start the queued input now instead of waiting for a watchdog.
                 let rejected_idle = retry && session.read(cx).acp_thread().is_some_and(|thread| {
-                    crate::native_controls::codex_turn_active(thread, cx) == Some(false)
+                    crate::native_controls::runtime_turn_active(thread, cx) == Some(false)
                         && thread.read(cx).status() == acp_thread::ThreadStatus::Idle
                 });
                 if rejected_idle && matches!(session.read(cx).state, SessionState::Running { .. }) {
@@ -367,18 +361,18 @@ mod tests {
             apply_receipt_to_queue(
                 &mut queue,
                 &reserved,
-                &codex_native::SteerOutcome::Rejected(anyhow!("turn ended"))
+                &acp_thread::AgentSteerOutcome::Rejected(anyhow!("turn ended"))
             )
             .is_empty()
         );
         assert_eq!(queue.len(), 2);
         let delivered =
-            apply_receipt_to_queue(&mut queue, &reserved, &codex_native::SteerOutcome::Accepted);
+            apply_receipt_to_queue(&mut queue, &reserved, &acp_thread::AgentSteerOutcome::Accepted);
         assert_eq!(delivered.len(), 1);
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].id, newer.id);
         assert!(
-            apply_receipt_to_queue(&mut queue, &reserved, &codex_native::SteerOutcome::Accepted)
+            apply_receipt_to_queue(&mut queue, &reserved, &acp_thread::AgentSteerOutcome::Accepted)
                 .is_empty()
         );
     }
@@ -390,12 +384,12 @@ mod tests {
         let delivered = apply_receipt_to_queue(
             &mut queue,
             &reserved,
-            &codex_native::SteerOutcome::Uncertain(anyhow!("timeout")),
+            &acp_thread::AgentSteerOutcome::Uncertain(anyhow!("timeout")),
         );
         assert_eq!(delivered.len(), 1);
         assert!(queue.is_empty());
         assert!(
-            apply_receipt_to_queue(&mut queue, &reserved, &codex_native::SteerOutcome::Accepted)
+            apply_receipt_to_queue(&mut queue, &reserved, &acp_thread::AgentSteerOutcome::Accepted)
                 .is_empty()
         );
     }
@@ -434,7 +428,7 @@ mod tests {
                     apply_receipt_to_queue(
                         &mut s.pending_messages,
                         &ids,
-                        &codex_native::SteerOutcome::Accepted
+                        &acp_thread::AgentSteerOutcome::Accepted
                     )
                     .len(),
                     1

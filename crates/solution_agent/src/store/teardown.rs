@@ -560,6 +560,7 @@ impl SolutionAgentStore {
     /// writes; see [`ChainDisposition`] for why it cannot be decided here.
     fn evict_session_runtime_maps(&mut self, id: SolutionSessionId, chain: ChainDisposition) {
         self.supervisor_states.remove(&id);
+        #[cfg(any(test, feature = "test-support"))]
         self.teammate_watchers.forget_session(id);
         self.backoff_timers.remove(&id);
         self.entry_update_throttles.retain(|(sid, _), _| *sid != id);
@@ -583,6 +584,7 @@ impl SolutionAgentStore {
         // never pruned — one entry would leak per closed session for the
         // editor's whole lifetime.
         self.metrics_emitter.clear_session(&id);
+        #[cfg(any(test, feature = "test-support"))]
         self.raw_transcript_history.remove(&id);
         self.last_auto_reconnect_ms.remove(&id);
         // Dropped with the session for the same reason as the maps above: it is

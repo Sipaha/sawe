@@ -3701,3 +3701,65 @@ fn parses_the_agent_a_send_message_resumed() {
     );
     assert!(crate::background_agent::parse_resumed_agent_id(r#"{"success":true}"#).is_none());
 }
+
+#[gpui::test]
+async fn hub_background_events_use_opaque_ids_without_native_files(cx: &mut TestAppContext) {
+    let (session_id, thread, _tmp) = create_session_with_thread(cx).await;
+    let mut activity = acp_thread::BackgroundActivity {
+        kind: "agent".into(), id: "unknown-harness/task:7".into(),
+        parent_tool_call_id: "opaque-parent".into(), label: "Review workspace".into(),
+        state: "running".into(), text: "Reading files".into(),
+        updated_ms: Utc::now().timestamp_millis(), exit_code: None, stop_reason: String::new(),
+    };
+    cx.update(|cx| thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::BackgroundActivity(activity.clone()))));
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let session = session.read(cx);
+        let id = crate::background_agent::BackgroundAgentId::new(activity.id.clone());
+        let agent = &session.background_agents[&id];
+        assert!(agent.jsonl_path.as_os_str().is_empty());
+        assert!(agent.vouches_for_parent(Utc::now()));
+        assert_eq!(session.teammate_labels[&SharedString::from("opaque-parent")].as_ref(), "Review workspace");
+        assert!(session.streams.contains_key(&crate::stream::StreamId::Teammate("opaque-parent".into())));
+    });
+    activity.state = "completed".into();
+    cx.update(|cx| thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::BackgroundActivity(activity.clone()))));
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let s = session.read(cx);
+        let id = crate::background_agent::BackgroundAgentId::new(activity.id.clone());
+        assert!(!s.background_agents[&id].vouches_for_parent(Utc::now()), "completion must release the supervisor liveness gate");
+        assert!(s.closed_streams.contains_key(&crate::stream::StreamId::Teammate("opaque-parent".into())));
+    });
+    activity.state = "running".into();
+    activity.text = "Resumed".into();
+    cx.update(|cx| thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::BackgroundActivity(activity.clone()))));
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let s = session.read(cx);
+        assert!(!s.closed_streams.contains_key(&crate::stream::StreamId::Teammate("opaque-parent".into())));
+        assert!(s.streams.contains_key(&crate::stream::StreamId::Teammate("opaque-parent".into())));
+    });
+    activity.kind = "shell".into();
+    activity.id = "build:arbitrary".into();
+    activity.label = "build".into();
+    activity.text = "build output".into();
+    activity.state = "completed".into();
+    activity.exit_code = Some(23);
+    cx.update(|cx| thread.update(cx, |_, cx| cx.emit(acp_thread::AcpThreadEvent::BackgroundActivity(activity.clone()))));
+    cx.executor().run_until_parked();
+    cx.update(|cx| {
+        let store = SolutionAgentStore::global(cx);
+        let session = store.read(cx).session(session_id).unwrap();
+        let s = session.read(cx);
+        let id = crate::background_shell::BackgroundShellId::new(activity.id.clone());
+        assert_eq!(s.background_shells[&id].state, crate::background_shell::ShellRuntimeState::Exited(Some(23)));
+        assert!(s.background_shells[&id].output_path.as_os_str().is_empty());
+    });
+}
