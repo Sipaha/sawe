@@ -583,10 +583,10 @@ impl SolutionSessionView {
         for event in events {
             match event {
                 VoiceCaptureEvent::SpeechStarted => {
-                    // VAD also starts segments that are later discarded as noise.
-                    // Preserve the audio/cursor until recognition confirms input.
+                    // Confirmed energy is not proof of recognized words. Preserve
+                    // the audio/cursor until recognition validates the segment.
                     log::info!(
-                        "session={} voice microphone segment started; pausing reply",
+                        "session={} voice confirmed microphone segment started; pausing reply",
                         self.session_id
                     );
                     self.voice.user_speaking = true;

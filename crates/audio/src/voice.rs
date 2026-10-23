@@ -37,8 +37,9 @@ const MAX_PLAYBACK_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum VoiceCaptureEvent {
+    /// Emitted only after 120ms of voiced frames confirm a candidate segment.
     SpeechStarted,
-    /// Balances every started segment, even noise too short for transcription.
+    /// Balances every confirmed segment; discarded candidates emit neither event.
     SpeechEnded,
     /// Mono, 16kHz, signed PCM16 RIFF/WAV, no longer than 30 seconds.
     Utterance(Vec<u8>),
@@ -459,6 +460,7 @@ struct Segmenter {
     noise_floor: f32,
     start_frames: usize,
     voiced_frames: usize,
+    speech_started: bool,
     silent_frames: usize,
     frames: usize,
     done: bool,
@@ -473,6 +475,7 @@ impl Segmenter {
             noise_floor: 0.001,
             start_frames: 0,
             voiced_frames: 0,
+            speech_started: false,
             silent_frames: 0,
             frames: 0,
             done: false,
@@ -507,7 +510,6 @@ impl Segmenter {
                 self.recording.extend(self.pre_roll.drain(..).flatten());
                 self.voiced_frames = self.start_frames;
                 self.silent_frames = 0;
-                events.push(VoiceCaptureEvent::SpeechStarted);
             }
         } else {
             self.recording.extend_from_slice(frame);
@@ -517,6 +519,12 @@ impl Segmenter {
                 self.silent_frames = 0;
             } else {
                 self.silent_frames += 1;
+            }
+            if !self.speech_started && self.voiced_frames >= MIN_VOICED_FRAMES {
+                // Keep pre-roll/candidate audio, but do not interrupt playback for
+                // a click that will be rejected by the utterance duration gate.
+                self.speech_started = true;
+                events.push(VoiceCaptureEvent::SpeechStarted);
             }
             if self.frames >= MAX_FRAMES
                 || (self.continuous && self.silent_frames >= SILENCE_FRAMES)
@@ -533,13 +541,14 @@ impl Segmenter {
     fn finish(&mut self) -> Vec<VoiceCaptureEvent> {
         let recording = std::mem::take(&mut self.recording);
         let voiced = self.voiced_frames;
+        let speech_started = std::mem::take(&mut self.speech_started);
         self.pre_roll.clear();
         self.start_frames = 0;
         self.voiced_frames = 0;
         self.silent_frames = 0;
         self.frames = 0;
         let mut events = Vec::new();
-        if !recording.is_empty() {
+        if speech_started {
             events.push(VoiceCaptureEvent::SpeechEnded);
         }
         if voiced >= MIN_VOICED_FRAMES {
@@ -726,20 +735,16 @@ mod tests {
     }
 
     #[test]
-    fn discarded_short_segments_end_and_rearm() {
+    fn short_candidates_never_interrupt_and_confirmed_speech_rearms() {
         for continuous in [true, false] {
             let mut segmenter = Segmenter::new(continuous);
-            let onset = frames(&mut segmenter, START_FRAMES, 4_000);
-            assert!(matches!(
-                onset.as_slice(),
-                [VoiceCaptureEvent::SpeechStarted]
-            ));
+            assert!(frames(&mut segmenter, MIN_VOICED_FRAMES - 1, 4_000).is_empty());
             let ended = if continuous {
                 frames(&mut segmenter, SILENCE_FRAMES, 0)
             } else {
                 segmenter.finish()
             };
-            assert!(matches!(ended.as_slice(), [VoiceCaptureEvent::SpeechEnded]));
+            assert!(ended.is_empty());
             assert!(matches!(
                 frames(&mut segmenter, MIN_VOICED_FRAMES, 4_000).as_slice(),
                 [VoiceCaptureEvent::SpeechStarted]
@@ -800,7 +805,7 @@ mod tests {
         let mut segmenter = Segmenter::new(true);
         assert!(frames(&mut segmenter, 60, 180).is_empty());
         assert!(matches!(
-            frames(&mut segmenter, START_FRAMES, 4_000).as_slice(),
+            frames(&mut segmenter, MIN_VOICED_FRAMES, 4_000).as_slice(),
             [VoiceCaptureEvent::SpeechStarted]
         ));
         frames(&mut segmenter, MIN_VOICED_FRAMES, 4_000);

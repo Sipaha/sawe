@@ -6502,7 +6502,8 @@ dismisses it, just like clicking outside.
 
 Solution chat voice uses local or configurable compatible STT/TTS around the
 existing composer/queue, with an `[audio]` prefix for recognized fragments.
-Microphone onset pauses audio pending recognition; rejected noise resumes it,
+Microphone candidates leave playback running until 120ms of voiced activity
+confirms a segment. Only then does audio pause pending recognition; failed STT resumes it,
 while confirmed input and Stop Speaking cancel the old reply. Stopping the agent
 remains explicit. Incremental sentence chunks include commentary before tools;
 real turn events flush remaining prose without repeating it. Hands-free retains

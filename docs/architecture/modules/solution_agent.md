@@ -27,10 +27,12 @@ navigation; claiming it in another dialog synchronously stops the old capture.
 Ordinary dictation/read-aloud retain visibility checks. Closing, history replacement
 and request generations reject stale results. Interrupting audio suppresses the
 old reply until new user input and never cancels the coding agent. Microphone
-onset instead pauses playback provisionally while preserving unread audio and
-queued prose; discarded noise or empty/failed STT resumes it. Playback created
+candidates instead retain audio without affecting playback. Activity confirmed
+by 120ms of voiced frames pauses playback provisionally while preserving unread
+audio and queued prose; empty/failed STT resumes it. Playback created
 while capture/transcription is pending starts paused.
 
 The audio crate's shared mixer provides the AEC reverse stream. Started speech
-segments always have an explicit ending, including discarded short noises. See
+segments have at least 120ms of voiced frames and always have an explicit
+ending. Short discarded candidates emit neither event and never pause audio. See
 [ADR-0007](../decisions/0007-provider-independent-voice.md) for the invariants.

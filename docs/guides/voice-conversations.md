@@ -39,9 +39,10 @@ The API connection is independent of the selected coding provider.
 - **Stop speaking:** cancel playback and pending speech. The coding agent keeps
   running; its existing Stop control remains a separate action.
 
-In hands-free mode, a microphone segment pauses playback immediately while
-recognition validates it. Short discarded noise, empty recognition and recognition
-errors resume the same audio cursor. Nonempty recognized input cancels the old
+In hands-free mode, playback continues through unconfirmed microphone candidates.
+Only after 120ms of voiced frames in a candidate does playback pause while
+recognition validates it. Shorter discarded noise never pauses audio; empty
+recognition and recognition errors resume the same audio cursor. Nonempty recognized input cancels the old
 reply; Stop Speaking still cancels it immediately. Echo cancellation uses the
 same output mixer as application sounds.
 Echo cancellation is unavailable on Windows GNU and FreeBSD. Noise-based voice
