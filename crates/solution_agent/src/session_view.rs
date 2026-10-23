@@ -465,6 +465,7 @@ pub struct SolutionSessionView {
     /// of every `render`, and an owned copy meant a deep clone of the whole
     /// visible transcript per frame.
     main_stream_entries_for_render: Vec<std::sync::Arc<crate::session_entry::SessionEntry>>,
+    conversation_rows: Vec<std::ops::Range<usize>>,
     /// The `StreamId` rendered on the previous frame, or `None` before the
     /// first paint. Tracked so ANY tab switch (Main↔Teammate↔Shell) can
     /// reset `list_state` to the newly-selected view's entry count + tail-anchor
@@ -1182,6 +1183,39 @@ pub enum SolutionSessionViewEvent {}
 impl EventEmitter<SolutionSessionViewEvent> for SolutionSessionView {}
 
 impl SolutionSessionView {
+    fn reconcile_conversation_rows(&mut self, cx: &App) {
+        let entries = self.selected_parent_stream_entries(cx);
+        // Search deliberately expands tools so all existing match highlights and
+        // copy/rewind interactions remain available without hidden matches.
+        let rows = crate::conversation_render::conversation_rows(&entries, self.find.is_some());
+        let old_top = self.list_state.logical_scroll_top();
+        let following = self.list_state.is_following_tail();
+        let anchor = self
+            .conversation_rows
+            .get(old_top.item_ix)
+            .map(|row| row.start);
+        let common = self
+            .conversation_rows
+            .iter()
+            .zip(&rows)
+            .take_while(|(old, new)| old.start == new.start)
+            .count();
+        let current = self.list_state.item_count();
+        if current != self.conversation_rows.len() {
+            self.list_state.splice(0..current, rows.len());
+        } else if common < current || current != rows.len() {
+            self.list_state.splice(common..current, rows.len() - common);
+        }
+        if !following && self.conversation_rows != rows {
+            if let Some(anchor) = anchor {
+                let item_ix = rows.partition_point(|row| row.end <= anchor);
+                self.list_state
+                    .scroll_to(gpui::ListOffset { item_ix, ..old_top });
+            }
+        }
+        self.conversation_rows = rows;
+    }
+
     /// The entries of the stream the current tab selects, cloned out of
     /// `session.streams` (the maintained demux mirror). `Main` reads
     /// `StreamId::Main`; `Task(toolu)` reads `StreamId::Teammate(toolu)`; and
@@ -1446,6 +1480,7 @@ impl Render for SolutionSessionView {
         // here — the last disk-sourced drill-in (`Background`) was folded away in
         // 6d-B, so there is no source-switch to make.
         self.build_main_stream_entries_for_render(cx);
+        self.reconcile_conversation_rows(cx);
         // `list_state` is the render authority for row count. On ANY tab switch
         // (Main↔Task↔Shell) the selected view's entry count changes — each stream
         // now has its own per-stream index space, so the counts almost never
@@ -1456,7 +1491,7 @@ impl Render for SolutionSessionView {
         // preserves scroll.
         let cur_view_key = self.selected_stream.clone();
         if self.prev_render_view.as_ref() != Some(&cur_view_key) {
-            let new_count = self.main_stream_entries_for_render.len();
+            let new_count = self.conversation_rows.len();
             self.list_state.reset(new_count);
             self.list_state.set_follow_mode(FollowMode::Tail);
             self.list_state.scroll_to_end();
@@ -1499,6 +1534,14 @@ impl Render for SolutionSessionView {
         self.markdown_for_render.clear();
         let entry_count = self.entry_texts.len();
         for entry_idx in 0..entry_count {
+            if self.find.is_none()
+                && self
+                    .main_stream_entries_for_render
+                    .get(entry_idx)
+                    .is_some_and(|entry| crate::conversation_render::groupable_tool(entry))
+            {
+                continue;
+            }
             let markdown_stale = self.entry_texts[entry_idx].markdown_stale;
             for span_idx in 0..self.entry_texts[entry_idx].spans.len() {
                 let key = (entry_idx, span_idx);
@@ -1689,7 +1732,7 @@ impl Render for SolutionSessionView {
                 // + coalesced entries (built this frame from `session.streams`).
                 // The per-entry index passed to the list processor is the position
                 // within that single vec.
-                let entries_count = self.main_stream_entries_for_render.len();
+                let entries_count = self.conversation_rows.len();
                 // Render-authority reconcile (phase 2c): `list_state` is sized
                 // HERE, for EVERY view, to the selected stream's count. The
                 // tab-switch reset above handles view changes (reset + tail);
@@ -1752,9 +1795,13 @@ impl Render for SolutionSessionView {
                         self.list_state.clone(),
                         cx.processor(
                             move |this,
-                                  idx: usize,
+                                  row_idx: usize,
                                   _window: &mut Window,
                                   cx: &mut Context<Self>| {
+                                let Some(row) = this.conversation_rows.get(row_idx).cloned() else {
+                                    return Empty.into_any_element();
+                                };
+                                let idx = row.start;
                                 // Re-read everything off `this` per visible
                                 // item — we can't capture references into a
                                 // 'static closure. The fields read here are
@@ -1905,6 +1952,12 @@ impl Render for SolutionSessionView {
                                 render_entry(
                                     idx,
                                     entry,
+                                    (this.find.is_none() && crate::conversation_render::groupable_tool(entry))
+                                        .then(|| crate::conversation_render::ToolGroupRender {
+                                            entries: &this.main_stream_entries_for_render[row.clone()],
+                                            session: this.session.downgrade(),
+                                            stream: this.selected_stream.clone(),
+                                        }),
                                     is_last,
                                     date_separator,
                                     &this.markdown_for_render,

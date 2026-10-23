@@ -377,6 +377,23 @@ pub(crate) fn tool_call_content_summary(
     content: &ToolCallContent,
     cx: &App,
 ) -> String {
+    if let ToolCallContent::Terminal(terminal) = content {
+        let primary = terminal_output_markdown(terminal, cx);
+        let summary = if primary.contains("(no output yet)") {
+            raw_output_fallback_markdown(call.raw_output.as_ref()).unwrap_or(primary)
+        } else {
+            primary
+        };
+        return truncate_tool_summary(&summary);
+    }
+    truncate_tool_summary(&tool_call_content_details(call, content, cx))
+}
+
+pub(crate) fn tool_call_content_details(
+    call: &ToolCall,
+    content: &ToolCallContent,
+    cx: &App,
+) -> String {
     let raw = match content {
         // Tool output via `ContentBlock` is plain text the agent emitted
         // (grep matches, file reads, ls listings — anything not Diff and
@@ -389,7 +406,16 @@ pub(crate) fn tool_call_content_summary(
         ToolCallContent::ContentBlock(block) => fence_plain_text(&content_block_text(block, cx)),
         ToolCallContent::Diff(diff) => diff_summary_markdown(diff, cx),
         ToolCallContent::Terminal(terminal) => {
-            let primary = terminal_output_markdown(terminal, cx);
+            let term = terminal.read(cx);
+            let output = term
+                .output()
+                .map(|output| output.content.clone())
+                .unwrap_or_else(|| term.inner().read(cx).get_content());
+            let primary = if output.trim().is_empty() {
+                "_(no output yet)_".into()
+            } else {
+                fence_plain_text(&output)
+            };
             if primary.contains("(no output yet)") {
                 raw_output_fallback_markdown(call.raw_output.as_ref()).unwrap_or(primary)
             } else {
@@ -397,7 +423,7 @@ pub(crate) fn tool_call_content_summary(
             }
         }
     };
-    truncate_tool_summary(&raw)
+    raw
 }
 
 /// A top-level CommonMark fence. Shorter/different markers inside a block
@@ -455,7 +481,7 @@ fn is_single_fenced_block(text: &str) -> bool {
 /// empty strings and one complete pre-fenced code block. A leading fence
 /// followed by prose is raw output too: leaving it alone leaks that prose
 /// into Markdown headings, links, and other formatting.
-fn fence_plain_text(text: &str) -> String {
+pub(super) fn fence_plain_text(text: &str) -> String {
     let trimmed = text.trim_end();
     if trimmed.is_empty() {
         return text.to_string();

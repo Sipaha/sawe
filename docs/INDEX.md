@@ -9,6 +9,8 @@
 
 ## Entry points
 
+- [Compact tool calls and full details](guides/chat-tool-details.md).
+
 - [Voice conversations: local setup and chat controls](guides/voice-conversations.md).
 
 - Disk pressure: [read-only inventory and missed nested incremental cache](findings/2026-10-13-disk-usage-and-nested-cache.md).

@@ -6519,3 +6519,14 @@ runtime helper is removed from this repository. Default recognition is Russian
 GigaAM v3 CTC INT8 CPU with Piper synthesis, managed in LAIHub.
 See [ADR-0007](docs/architecture/decisions/0007-provider-independent-voice.md)
 and the [voice guide](docs/guides/voice-conversations.md).
+
+
+### 240. Tool runs are compact presentation rows
+
+Consecutive tool calls share a bounded latest-call preview, with full requests
+and output in the existing live conversation modal. Transcript and wire entries
+remain unchanged. Display ranges map raw indices to virtualized rows; search
+expands tools to retain complete match visibility. Approval calls stay outside
+collapsed groups so permission decisions remain explicit. This keeps agent
+activity visible without letting verbose output dominate the conversation.
+See [tool details](docs/guides/chat-tool-details.md).

@@ -21,6 +21,13 @@ const DOCUMENT_FONT_SCALE: f32 = 0.875;
 
 /// Content shown by the workspace preview modal.
 pub(crate) enum PreviewContent {
+    ToolGroup {
+        session: gpui::WeakEntity<crate::model::SolutionSession>,
+        stream: crate::stream::StreamId,
+        first_id: String,
+        first_index: usize,
+        first_created_ms: i64,
+    },
     Image(Arc<gpui::Image>),
     FileInfo {
         title: SharedString,
@@ -50,6 +57,7 @@ pub(crate) enum PreviewContent {
 impl PreviewContent {
     fn window_title(&self) -> SharedString {
         match self {
+            PreviewContent::ToolGroup { .. } => "Tool calls".into(),
             PreviewContent::Image(_) => "Image preview".into(),
             PreviewContent::Text { title, .. }
             | PreviewContent::Markdown { title, .. }
@@ -105,6 +113,9 @@ pub(crate) struct PreviewWindow {
     /// Present only while `content` is `Markdown`. Parsing is the entity's job,
     /// so it is built once per content swap rather than per frame.
     markdown: Option<Entity<Markdown>>,
+    tool_group_subscription: Option<gpui::Subscription>,
+    tool_group_refresh: Option<gpui::Task<()>>,
+    tool_group_terminals: std::collections::HashMap<gpui::EntityId, gpui::Subscription>,
     focus_handle: FocusHandle,
 }
 
@@ -117,6 +128,9 @@ impl PreviewWindow {
             },
             editor: None,
             markdown: None,
+            tool_group_subscription: None,
+            tool_group_refresh: None,
+            tool_group_terminals: Default::default(),
             focus_handle: cx.focus_handle(),
         };
         this.set_content(content, window, cx);
@@ -129,7 +143,13 @@ impl PreviewWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.tool_group_subscription.take();
+        self.tool_group_refresh.take();
+        self.tool_group_terminals.clear();
         self.markdown = match &content {
+            PreviewContent::ToolGroup { .. } => {
+                Some(cx.new(|cx| Markdown::new("Loading tool calls…".into(), None, None, cx)))
+            }
             PreviewContent::Markdown { source, .. } => {
                 // `try_global`, not `global`: a fenced block loses only its
                 // syntax colours without the registry, which is not worth
@@ -145,6 +165,7 @@ impl PreviewWindow {
         };
         self.editor = match &content {
             PreviewContent::Image(_)
+            | PreviewContent::ToolGroup { .. }
             | PreviewContent::Markdown { .. }
             | PreviewContent::FileInfo { .. } => None,
             PreviewContent::Text { body, .. } => Some(cx.new(|cx| {
@@ -163,7 +184,108 @@ impl PreviewWindow {
             })),
         };
         self.content = content;
+        if let PreviewContent::ToolGroup { session, .. } = &self.content
+            && let Some(session) = session.upgrade()
+        {
+            self.tool_group_subscription = Some(cx.observe(&session, |this, _, cx| {
+                this.schedule_tool_group_refresh(cx);
+            }));
+        }
+        self.refresh_tool_group(cx);
         cx.notify();
+    }
+
+    fn schedule_tool_group_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.tool_group_refresh.is_none() {
+            self.tool_group_refresh = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.tool_group_refresh.take();
+                    this.refresh_tool_group(cx);
+                })
+                .ok();
+            }));
+        }
+    }
+
+    fn refresh_tool_group(&mut self, cx: &mut Context<Self>) {
+        let PreviewContent::ToolGroup {
+            session,
+            stream,
+            first_id,
+            first_index,
+            first_created_ms,
+        } = &self.content
+        else {
+            return;
+        };
+        let mut terminals = Vec::new();
+        let source = session
+            .upgrade()
+            .and_then(|session| {
+                let session = session.read(cx);
+                session.streams.get(stream).map(|stream| {
+                    let Some(first) = stream.entries.get(*first_index).filter(|entry| entry.created_ms == *first_created_ms
+                        && matches!(&entry.kind, crate::session_entry::SessionEntryKind::ToolCall { id, .. } if id == first_id))
+                    else { return "These tool calls are no longer in this conversation.".into() };
+                    let entries = &stream.entries[*first_index..];
+                    let start = entries.iter().position(|entry| matches!(&entry.kind,
+                        crate::session_entry::SessionEntryKind::ToolCall { id, .. } if id == first_id));
+                    let wanted: std::collections::HashSet<_> = entries.iter()
+                        .skip(start.unwrap_or(entries.len()))
+                        .take_while(|entry| matches!(entry.kind, crate::session_entry::SessionEntryKind::ToolCall { .. }))
+                        .filter(|entry| entry.subagent_id == first.subagent_id
+                            && session.entries.iter().skip(session.live_base).any(|live| Arc::ptr_eq(entry, live)))
+                        .filter_map(|entry| match &entry.kind {
+                            crate::session_entry::SessionEntryKind::ToolCall { id, .. } => Some(id.as_str()),
+                            _ => None,
+                        }).collect();
+                    let mut outputs = std::collections::HashMap::new();
+                    if let Some(thread) = session.acp_thread() {
+                        for entry in thread.read(cx).entries() {
+                            if let acp_thread::AgentThreadEntry::ToolCall(call) = entry
+                                && wanted.contains(call.id.0.as_ref())
+                            {
+                                for content in &call.content {
+                                    if let acp_thread::ToolCallContent::Terminal(terminal) = content {
+                                        terminals.push(terminal.read(cx).inner().clone());
+                                    }
+                                }
+                                outputs.insert(call.id.0.to_string(), call.content.iter().map(|content| {
+                                    crate::conversation_render::tool_call_content_details(call, content, cx)
+                                }).collect());
+                            }
+                        }
+                    }
+                    if outputs.is_empty() {
+                        crate::conversation_render::tool_group_details(entries, first_id)
+                    } else {
+                        crate::conversation_render::tool_group_details_with_outputs(entries, first_id, &outputs)
+                    }
+                })
+            })
+            .unwrap_or_else(|| "These tool calls are no longer available.".into());
+        let mut keep = std::collections::HashSet::new();
+        for terminal in terminals {
+            let id = terminal.entity_id();
+            keep.insert(id);
+            self.tool_group_terminals.entry(id).or_insert_with(|| {
+                cx.subscribe(&terminal, |this, _, event, cx| {
+                    if matches!(event, terminal::Event::Wakeup) {
+                        this.schedule_tool_group_refresh(cx);
+                    }
+                })
+            });
+        }
+        self.tool_group_terminals.retain(|id, _| keep.contains(id));
+        if let Some(markdown) = &self.markdown
+            && markdown.read(cx).source().as_ref() != source
+        {
+            markdown.update(cx, |markdown, cx| markdown.replace(source, cx));
+            cx.notify();
+        }
     }
 }
 
@@ -183,6 +305,10 @@ impl Render for PreviewWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.content.window_title();
         let copyable = match &self.content {
+            PreviewContent::ToolGroup { .. } => self
+                .markdown
+                .as_ref()
+                .map(|md| md.read(cx).source().clone()),
             PreviewContent::Text { body, .. } => Some(body.clone()),
             // The markdown SOURCE, not the rendering: what a copy is for here
             // is pasting the document somewhere else that also renders it.
@@ -286,17 +412,23 @@ impl Render for PreviewWindow {
             // `set_content` builds the editor for every `Text`, so this is
             // unreachable; an empty body beats an `unwrap` in a render pass.
             (PreviewContent::Text { .. }, None) => div().flex_1().into_any_element(),
-            (PreviewContent::Markdown { base_dir, .. }, _) => match &self.markdown {
-                Some(markdown) => {
-                    // `MarkdownFont::Preview` is the document face (the
-                    // markdown-preview font settings), not the chat's — this
-                    // window is showing a file, not a message.
-                    let style = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
-                    let preview_font_size = ThemeSettings::get_global(cx)
-                        .markdown_preview_font_size(cx)
-                        * DOCUMENT_FONT_SCALE;
-                    let roots: Vec<std::path::PathBuf> = base_dir.iter().cloned().collect();
-                    div()
+            (PreviewContent::Markdown { .. } | PreviewContent::ToolGroup { .. }, _) => {
+                match &self.markdown {
+                    Some(markdown) => {
+                        // `MarkdownFont::Preview` is the document face (the
+                        // markdown-preview font settings), not the chat's — this
+                        // window is showing a file, not a message.
+                        let style = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
+                        let preview_font_size = ThemeSettings::get_global(cx)
+                            .markdown_preview_font_size(cx)
+                            * DOCUMENT_FONT_SCALE;
+                        let roots: Vec<std::path::PathBuf> = match &self.content {
+                            PreviewContent::Markdown { base_dir, .. } => {
+                                base_dir.iter().cloned().collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        div()
                         .id("preview-markdown")
                         .flex_1()
                         .min_h_0()
@@ -327,9 +459,10 @@ impl Render for PreviewWindow {
                             ),
                         )
                         .into_any_element()
+                    }
+                    None => div().flex_1().into_any_element(),
                 }
-                None => div().flex_1().into_any_element(),
-            },
+            }
         };
 
         div()
@@ -338,7 +471,9 @@ impl Render for PreviewWindow {
             .w(px(
                 (window.viewport_size().width.as_f32() * 0.85).min(1100.0)
             ))
-            .h(px((window.viewport_size().height.as_f32() - 120.0).clamp(120.0, 850.0)))
+            .h(px(
+                (window.viewport_size().height.as_f32() - 120.0).clamp(120.0, 850.0)
+            ))
             .flex()
             .flex_col()
             .overflow_hidden()

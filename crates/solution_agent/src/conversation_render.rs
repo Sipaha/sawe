@@ -29,6 +29,7 @@ use util::ResultExt as _;
 mod image;
 pub(crate) mod link;
 mod tool_call;
+mod tool_group;
 mod user_message;
 
 #[cfg(test)]
@@ -39,7 +40,7 @@ mod tests;
 // `cold_persistence`, `compact`) reference these via `crate::conversation_render::<name>`,
 // so the paths must keep resolving after the split. Looks unused to a lib-only build.
 #[allow(unused_imports)]
-pub(crate) use {image::*, tool_call::*, user_message::*};
+pub(crate) use {image::*, tool_call::*, tool_group::*, user_message::*};
 #[derive(Clone, Debug)]
 pub(crate) struct FindMatch {
     pub(crate) entry_idx: usize,
@@ -390,6 +391,7 @@ fn resolve_user_message_id(thread: &AcpThread, target: &str) -> Option<UserMessa
 pub(crate) fn render_entry(
     entry_idx: usize,
     entry: &SessionEntry,
+    tool_group: Option<ToolGroupRender<'_>>,
     is_last: bool,
     date_separator: Option<String>,
     markdown_for: &HashMap<(usize, usize), Entity<Markdown>>,
@@ -437,20 +439,26 @@ pub(crate) fn render_entry(
             raw_input,
             status_started_at,
             ..
-        } => render_tool_call(
-            entry_idx,
-            id,
-            label_md,
-            status,
-            content_md,
-            raw_input.as_ref(),
-            *status_started_at,
-            markdown_for,
-            style,
-            thread.clone(),
-            workspace,
-            cx,
-        ),
+        } => {
+            if let Some(group) = tool_group {
+                render_tool_group(entry_idx, group, cx)
+            } else {
+                render_tool_call(
+                    entry_idx,
+                    id,
+                    label_md,
+                    status,
+                    content_md,
+                    raw_input.as_ref(),
+                    *status_started_at,
+                    markdown_for,
+                    style,
+                    thread.clone(),
+                    workspace,
+                    cx,
+                )
+            }
+        }
         SessionEntryKind::Plan(items) => {
             render_plan(entry_idx, items, markdown_for, style, workspace, cx)
         }

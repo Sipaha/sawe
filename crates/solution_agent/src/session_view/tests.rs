@@ -1246,18 +1246,21 @@ async fn an_in_place_rewrite_that_keeps_mod_seq_still_re_renders(cx: &mut gpui::
     let vcx = &mut VisualTestContext::from_window(view_window.into(), cx);
     vcx.run_until_parked();
 
-    let source_of_first_span = |view: &SolutionSessionView, cx: &gpui::App| {
-        view.markdown_for_render
-            .get(&(0, 0))
-            .expect("the tool call's header span must be cached")
-            .read(cx)
-            .source()
-            .to_string()
-    };
-
+    vcx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    let bounds = vcx
+        .debug_bounds("TOOL-GROUP")
+        .expect("compact tool group must paint");
+    assert!(bounds.size.height <= gpui::px(112.));
+    assert!(vcx.debug_bounds("TOOL-GROUP-STATE-1 running").is_some());
     view_window
-        .update(vcx, |view, _window, cx| {
-            assert_eq!(source_of_first_span(view, cx), "Tool: Bash (running)");
+        .update(vcx, |view, _, _| {
+            assert!(
+                !view.markdown_for_render.contains_key(&(0, 0)),
+                "compact tools must not parse hidden full output in the chat"
+            );
         })
         .unwrap();
 
@@ -1268,15 +1271,15 @@ async fn an_in_place_rewrite_that_keeps_mod_seq_still_re_renders(cx: &mut gpui::
     });
     vcx.run_until_parked();
 
-    view_window
-        .update(vcx, |view, _window, cx| {
-            assert_eq!(
-                source_of_first_span(view, cx),
-                "Tool: Bash (canceled)",
-                "an in-place status rewrite that reuses mod_seq must not be cached away"
-            );
-        })
-        .unwrap();
+    vcx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        vcx.debug_bounds("TOOL-GROUP-STATE-canceled").is_some(),
+        "same-mod_seq status rewrite must paint"
+    );
+    assert!(vcx.debug_bounds("TOOL-GROUP-STATE-1 running").is_none());
 }
 
 #[gpui::test]

@@ -93,23 +93,26 @@ impl SolutionSessionView {
         cx.notify();
     }
 
-    /// Scroll the conversation list so the currently-selected find match is
-    /// in view. The match's `entry_idx` is a LIVE-thread index, but the
-    /// virtualized `list_state` is sized over the cold+live concatenation, so
-    /// offset by the cold-entry count — exactly as the render path and
-    /// `on_thread_event` do. Without this, Enter / the ↑↓ buttons move the
-    /// counter and the active-match highlight but never bring an off-screen
-    /// match into view, so iterating "does nothing" visually.
-    fn scroll_to_selected_match(&mut self, _cx: &mut Context<Self>) {
+    /// Reveal the selected match's raw per-stream entry in the display rows.
+    /// Search expands tool groups, but raw transcript indices remain separate
+    /// from virtual row indices; explicit navigation also disarms tail following.
+    fn scroll_to_selected_match(&mut self, cx: &mut Context<Self>) {
         let Some(entry_idx) = self.find.as_ref().and_then(|find| {
             let selected = find.selected?;
             find.matches.get(selected).map(|m| m.entry_idx)
         }) else {
             return;
         };
-        // `entry_idx` is now the global index into `session.entries`
-        // (which the virtualized list also indexes 1:1), so no cold offset.
-        self.list_state.scroll_to_reveal_item(entry_idx);
+        self.reconcile_conversation_rows(cx);
+        let row = self
+            .conversation_rows
+            .partition_point(|row| row.end <= entry_idx);
+        // Explicit search navigation must disarm tail following, otherwise the
+        // next layout immediately snaps the selected match back out of view.
+        self.list_state.scroll_to(gpui::ListOffset {
+            item_ix: row,
+            offset_in_item: gpui::px(0.),
+        });
     }
 
     pub(super) fn previous_match(
@@ -255,5 +258,72 @@ impl SolutionSessionView {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    async fn explicit_find_navigation_disarms_tail_following(cx: &mut gpui::TestAppContext) {
+        let (id, _thread, _tmp) = crate::store::tests::create_session_with_thread(cx).await;
+        let session = cx.update(|cx| {
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            crate::store::SolutionAgentStore::global(cx)
+                .read(cx)
+                .session(id)
+                .unwrap()
+        });
+        let project = cx.update(|cx| session.read(cx).project.clone().unwrap());
+        let workspace =
+            cx.add_window(|window, cx| workspace::Workspace::test_new(project, window, cx));
+        let weak = cx.update(|cx| workspace.root(cx).unwrap().downgrade());
+        session.update(cx, |session, cx| {
+            session.set_entries(
+                [
+                    "needle in earlier text".to_owned(),
+                    "Later text\n".repeat(100),
+                ]
+                .into_iter()
+                .map(|text| {
+                    std::sync::Arc::new(crate::session_entry::SessionEntry {
+                        created_ms: 0,
+                        mod_seq: 0,
+                        subagent_id: None,
+                        kind: crate::session_entry::SessionEntryKind::AssistantMessage {
+                            chunks: vec![crate::session_entry::AssistantChunk::Message(text)],
+                        },
+                    })
+                })
+                .collect::<Vec<_>>(),
+                cx,
+            );
+        });
+        let view = cx
+            .add_window(|window, cx| SolutionSessionView::for_test(id, session, weak, window, cx));
+        let vcx = &mut gpui::VisualTestContext::from_window(view.into(), cx);
+        vcx.run_until_parked();
+        view.update(vcx, |view, window, cx| {
+            view.list_state.set_follow_mode(gpui::FollowMode::Tail);
+            view.list_state.scroll_to_end();
+            view.open_find(&FindInSession, window, cx);
+            view.find
+                .as_ref()
+                .unwrap()
+                .editor
+                .update(cx, |editor, cx| editor.set_text("needle", window, cx));
+        })
+        .unwrap();
+        vcx.run_until_parked();
+        view.update(vcx, |view, _, _| {
+            assert!(
+                !view.list_state.is_following_tail(),
+                "search must not snap back to the tail"
+            );
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 0);
+            assert_eq!(view.find.as_ref().unwrap().matches.len(), 1);
+        })
+        .unwrap();
     }
 }

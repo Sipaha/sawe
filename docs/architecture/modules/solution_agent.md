@@ -1,4 +1,6 @@
-# Solution agent voice boundary
+# Solution agent
+
+## Voice
 
 Solution chats own voice independently of their coding-provider adapter. See the
 [voice guide](../../guides/voice-conversations.md) for setup and user controls.
@@ -36,3 +38,20 @@ The audio crate's shared mixer provides the AEC reverse stream. Started speech
 segments have at least 120ms of voiced frames and always have an explicit
 ending. Short discarded candidates emit neither event and never pause audio. See
 [ADR-0007](../decisions/0007-provider-independent-voice.md) for the invariants.
+
+## Tool-call presentation
+
+Display rows map ranges of raw stream entries to compact contiguous tool groups.
+Raw transcript indices and wire data do not change. The first entry anchors the
+row and its context menu; the latest entry supplies a bounded preview. Approval
+calls and differing message/agent origins break groups. Hidden tool output is
+not parsed into chat Markdown. Find temporarily uses individual raw rows and
+existing Markdown highlights; scroll offsets map back to raw entry anchors.
+
+The existing conversation preview modal observes the original session/stream
+and tool index/ID/creation time. Full group Markdown reads live ACP content or
+retained raw results rather than the shortened chat summary. Session changes and
+terminal Wakeup events refresh it, coalesced at 100ms;
+opening another preview cancels the old subscription/task. It cannot retarget
+to another group merely because a different chat was selected. Missing history
+shows an explicit unavailable message. See the [tool guide](../../guides/chat-tool-details.md).

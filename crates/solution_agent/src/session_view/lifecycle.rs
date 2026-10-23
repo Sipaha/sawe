@@ -305,6 +305,7 @@ impl SolutionSessionView {
             selected_stream: crate::stream::StreamId::Main,
             tool_tick: None,
             main_stream_entries_for_render: Vec::new(),
+            conversation_rows: Vec::new(),
             prev_render_view: None,
         };
         // Detect any thread that is already attached at construction
