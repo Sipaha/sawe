@@ -579,6 +579,7 @@ pub struct CancellablePlayback {
 struct PlaybackControl {
     player: Player,
     cancelled: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl PlaybackControl {
@@ -623,6 +624,7 @@ impl CancellablePlayback {
         let (player, queue) = Player::new();
         player.append(source);
         let cancelled = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         // The outer guard checks each sample, independent of Player's periodic
         // control polling. The mixer may retain at most a resampling frame.
         let queue = rodio::source::UniformSourceIterator::new(
@@ -633,15 +635,25 @@ impl CancellablePlayback {
         mixer.add(InterruptibleSource {
             inner: queue,
             cancelled: cancelled.clone(),
+            paused: paused.clone(),
         });
         Self {
-            control: PlaybackControl { player, cancelled },
+            control: PlaybackControl {
+                player,
+                cancelled,
+                paused,
+            },
             _output: output,
         }
     }
 
     pub fn cancel(&self) {
         self.control.cancel();
+    }
+
+    /// Keep the source cursor while a microphone segment is being validated.
+    pub fn set_paused(&self, paused: bool) {
+        self.control.paused.store(paused, Ordering::Release);
     }
 
     pub fn is_finished(&self) -> bool {
@@ -652,6 +664,7 @@ impl CancellablePlayback {
 struct InterruptibleSource<S> {
     inner: S,
     cancelled: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl<S: Source> Iterator for InterruptibleSource<S> {
@@ -659,6 +672,8 @@ impl<S: Source> Iterator for InterruptibleSource<S> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.cancelled.load(Ordering::Acquire) {
             None
+        } else if self.paused.load(Ordering::Acquire) {
+            Some(0.0)
         } else {
             self.inner.next()
         }
@@ -956,11 +971,58 @@ mod tests {
         let mut source = InterruptibleSource {
             inner: rodio::source::SineWave::new(440.0),
             cancelled: cancelled.clone(),
+            paused: Arc::new(AtomicBool::new(false)),
         };
         assert!(source.next().is_some());
         cancelled.store(true, Ordering::Release);
         assert!(source.next().is_none());
         assert!(source.next().is_none());
+    }
+
+    #[test]
+    fn pausing_playback_preserves_every_unread_sample() {
+        let samples: Vec<i16> = (0..16_000)
+            .map(|index| (index % 1_000) as i16 - 500)
+            .collect();
+        let (reference_mixer, reference_source) =
+            rodio::mixer::mixer(crate::CHANNEL_COUNT, crate::SAMPLE_RATE);
+        reference_mixer.add(rodio::source::Zero::new(
+            crate::CHANNEL_COUNT,
+            crate::SAMPLE_RATE,
+        ));
+        let _reference_playback =
+            CancellablePlayback::start_on_mixer(pcm_wav(&samples), reference_mixer).unwrap();
+        let reference: Vec<_> = reference_source.take(100_960).collect();
+        let (mixer, mut source) = rodio::mixer::mixer(crate::CHANNEL_COUNT, crate::SAMPLE_RATE);
+        mixer.add(rodio::source::Zero::new(
+            crate::CHANNEL_COUNT,
+            crate::SAMPLE_RATE,
+        ));
+        let playback = CancellablePlayback::start_on_mixer(pcm_wav(&samples), mixer).unwrap();
+        let first: Vec<_> = source.by_ref().take(960).collect();
+        assert!(first.iter().any(|sample| *sample != 0.0));
+        playback.set_paused(true);
+        assert!(source.by_ref().take(96_000).all(|sample| sample == 0.0));
+        assert!(
+            !playback.is_finished(),
+            "a pause must not exhaust the source"
+        );
+        playback.set_paused(false);
+        let remaining: Vec<_> = source.by_ref().take(100_000).collect();
+        assert_eq!([first, remaining].concat(), reference);
+        assert!(playback.is_finished());
+    }
+
+    #[test]
+    fn cancellation_while_paused_remains_immediate() {
+        let (mixer, mut source) = rodio::mixer::mixer(crate::CHANNEL_COUNT, crate::SAMPLE_RATE);
+        let playback =
+            CancellablePlayback::start_on_mixer(pcm_wav(&[1_000; 16_000]), mixer).unwrap();
+        playback.set_paused(true);
+        assert!(source.by_ref().take(960).all(|sample| sample == 0.0));
+        playback.cancel();
+        assert!(playback.is_finished());
+        assert!(source.take(960).all(|sample| sample == 0.0));
     }
 
     #[test]

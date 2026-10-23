@@ -13,16 +13,22 @@ it too. Local recognition must avoid a large resident memory footprint.
 The Solution session view owns explicit voice controls and the capture/request/
 playback lifecycle. It submits recognized speech through the existing composer
 and queue funnel, preserving typed drafts, image attachments and cold-session
-resume behavior. It never routes audio directly into a provider's private
+resume behavior. Recognized fragments carry an agent-visible `[audio]` prefix,
+including when appended to a mixed typed/spoken draft. It never routes audio
+directly into a provider's private
 protocol. Read-aloud consumes main-assistant prose incrementally with an
 exact-once cursor. Sentences are queued before the turn ends, including commentary
 before tools. Tool boundaries and actual completed-turn events flush remaining
 text, because queued turns can start without an observable Idle state. Short
 bounded chunks and queue backpressure avoid whole-reply synthesis latency.
 
-Speech and agent cancellation are distinct. Voice activity detection and Stop
-Speaking cancel the audio source, pending synthesis and queued speech. They do
-not cancel or restart the coding agent. Request generations reject canceled audio;
+Speech and agent cancellation are distinct. Voice activity detection provisionally
+pauses playback without consuming samples or suppressing the reply cursor. A
+discarded noise segment or empty/failed recognition resumes the existing reply;
+only nonempty recognized input or Stop Speaking cancels its audio source,
+pending synthesis and queued speech. A short noise must not silence the rest of
+a turn. Neither operation cancels or restarts the coding agent. Request
+generations reject canceled audio;
 interruption suppresses the old reply until new user input. Ordinary dictation and
 read-aloud reject results after navigation. By the owner's 2026-10-23 decision,
 Hands-free instead keeps one explicit session owner across tab navigation and

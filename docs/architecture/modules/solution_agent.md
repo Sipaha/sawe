@@ -16,7 +16,8 @@ overrides isolate credentials by origin, and loopback transport bypasses proxies
 `speech_text` removes code blocks, images and formatting from spoken prose.
 
 The session view owns capture, request tasks and cancellable playback. It sends
-recognized text through ordinary compose/queue behavior, preserving typed drafts.
+recognized fragments with an `[audio]` prefix through ordinary compose/queue
+behavior, preserving typed drafts.
 An incremental prose cursor queues sentences and pre-tool commentary while the
 agent is running; actual `Stopped` events flush the final tail without replay.
 Short chunks and bounded queue backpressure limit synthesis latency. Reasoning,
@@ -25,7 +26,10 @@ One global weak view owner keeps Hands-free on the original dialog across tab
 navigation; claiming it in another dialog synchronously stops the old capture.
 Ordinary dictation/read-aloud retain visibility checks. Closing, history replacement
 and request generations reject stale results. Interrupting audio suppresses the
-old reply until new user input and never cancels the coding agent.
+old reply until new user input and never cancels the coding agent. Microphone
+onset instead pauses playback provisionally while preserving unread audio and
+queued prose; discarded noise or empty/failed STT resumes it. Playback created
+while capture/transcription is pending starts paused.
 
 The audio crate's shared mixer provides the AEC reverse stream. Started speech
 segments always have an explicit ending, including discarded short noises. See

@@ -6501,7 +6501,9 @@ dismisses it, just like clicking outside.
 ### 239. Voice is shared above coding-provider adapters
 
 Solution chat voice uses local or configurable compatible STT/TTS around the
-existing composer/queue. Speaking interrupts audio only; stopping the agent
+existing composer/queue, with an `[audio]` prefix for recognized fragments.
+Microphone onset pauses audio pending recognition; rejected noise resumes it,
+while confirmed input and Stop Speaking cancel the old reply. Stopping the agent
 remains explicit. Incremental sentence chunks include commentary before tools;
 real turn events flush remaining prose without repeating it. Hands-free retains
 one original dialog across tab navigation until explicit transfer or Off;

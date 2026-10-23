@@ -20,8 +20,8 @@ for connected clients. Sawe never launches, loads, unloads or stops model worker
 unpunctuated Russian; other languages require a compatible speech service.
 
 While Hands-free is active, Sawe sends an activity ping every 30 seconds. LAIHub
-alone decides what that activity means for model retention. Stopping voice,
-navigation or closing the chat stops pings. There are no model idle timers or
+alone decides what that activity means for model retention. Turning voice off,
+transferring ownership or closing the chat stops pings. There are no model idle timers or
 unload commands in Sawe. Keepalives do not load models or leave a permanent pin.
 The microphone never starts automatically.
 
@@ -39,12 +39,18 @@ The API connection is independent of the selected coding provider.
 - **Stop speaking:** cancel playback and pending speech. The coding agent keeps
   running; its existing Stop control remains a separate action.
 
-In hands-free mode, the start of speech interrupts playback before recognition
-finishes. Echo cancellation uses the same output mixer as application sounds.
+In hands-free mode, a microphone segment pauses playback immediately while
+recognition validates it. Short discarded noise, empty recognition and recognition
+errors resume the same audio cursor. Nonempty recognized input cancels the old
+reply; Stop Speaking still cancels it immediately. Echo cancellation uses the
+same output mixer as application sounds.
 Echo cancellation is unavailable on Windows GNU and FreeBSD. Noise-based voice
-activity detection can also react to loud non-speech sounds.
+activity detection can also react to loud non-speech sounds, and a recognizer may
+occasionally turn noise into nonempty text. Such text is treated as voice input.
 
-Recognized text follows the ordinary send/queue path. If a typed draft, images or
+Recognized text is prefixed with `[audio]` so the coding agent can identify
+voice input. Only the spoken fragment receives this marker when appended to a
+typed draft. It follows the ordinary send/queue path. If a typed draft, images or
 an in-progress resume would be affected, recognition appends to the draft for
 review instead of submitting it. Agent errors use the existing draft-restoration
 path. Read-aloud queues complete sentences while the assistant is streaming,
@@ -53,7 +59,7 @@ event flush remaining prose. It skips tool output, reasoning, fenced code and
 images. Short synthesis chunks avoid waiting for a whole reply; at most 12 chunks
 are queued, with backpressure preserving the unspoken tail. Each assistant
 message is limited to 32,000 source characters for speech. Stop Speaking or
-interruption suppresses the old reply until new user input.
+confirmed voice input suppresses the old reply until new user input.
 
 Hands-free stays attached to the original dialog when switching tabs, including
 its recognition, reply playback and activity pings. Recognized text continues to

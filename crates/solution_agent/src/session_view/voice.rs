@@ -50,6 +50,16 @@ struct HandsFreeOwner(Option<(SolutionSessionId, WeakEntity<SolutionSessionView>
 impl gpui::Global for HandsFreeOwner {}
 
 impl SessionVoice {
+    fn speech_paused(&self) -> bool {
+        self.user_speaking || self.transcription.is_some() || !self.pending_recordings.is_empty()
+    }
+
+    fn sync_playback_pause(&self) {
+        if let Some(playback) = &self.playback {
+            playback.set_paused(self.speech_paused());
+        }
+    }
+
     fn speaking(&self) -> bool {
         self.synthesis.is_some() || self.playback.is_some() || !self.pending_speech.is_empty()
     }
@@ -329,7 +339,12 @@ impl SolutionSessionView {
         }
     }
 
-    fn interrupt_speech(&mut self, cx: &App) {
+    fn interrupt_speech(&mut self, reason: &'static str, cx: &App) {
+        log::info!(
+            "session={} voice reply cancelled: {}",
+            self.session_id,
+            reason
+        );
         self.voice.cancel_speech();
         self.voice
             .reset_reply_cursor(self.session.read(cx).entries.len());
@@ -346,6 +361,9 @@ impl SolutionSessionView {
     }
 
     pub(super) fn stop_voice(&mut self, cx: &mut Context<Self>) {
+        if self.voice.capture.is_some() || self.voice.speaking() {
+            log::info!("session={} voice session stopped", self.session_id);
+        }
         self.release_hands_free(cx);
         self.voice.cancel();
         self.voice.read_aloud = false;
@@ -459,7 +477,7 @@ impl SolutionSessionView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.interrupt_speech(cx);
+        self.interrupt_speech("Stop Speaking", cx);
         cx.notify();
     }
 
@@ -565,7 +583,12 @@ impl SolutionSessionView {
         for event in events {
             match event {
                 VoiceCaptureEvent::SpeechStarted => {
-                    self.interrupt_speech(cx);
+                    // VAD also starts segments that are later discarded as noise.
+                    // Preserve the audio/cursor until recognition confirms input.
+                    log::info!(
+                        "session={} voice microphone segment started; pausing reply",
+                        self.session_id
+                    );
                     self.voice.user_speaking = true;
                     self.voice.status = "Recording…";
                     if let Some(store) = SolutionAgentStore::try_global(cx) {
@@ -573,6 +596,7 @@ impl SolutionSessionView {
                     }
                 }
                 VoiceCaptureEvent::SpeechEnded => {
+                    log::info!("session={} voice microphone segment ended", self.session_id);
                     self.voice.user_speaking = false;
                     self.voice.status = if self.voice.continuous {
                         "Listening…"
@@ -616,6 +640,7 @@ impl SolutionSessionView {
         }
         self.queue_voice_replies(cx);
         self.start_next_transcription(window, cx);
+        self.voice.sync_playback_pause();
         self.start_next_speech(cx);
         let active = self.voice.capture.is_some()
             || self.voice.transcription.is_some()
@@ -660,7 +685,13 @@ impl SolutionSessionView {
                     Ok(text) if !text.trim().is_empty() => {
                         this.deliver_voice_text(text, window, cx)
                     }
-                    Ok(_) => this.show_toast("No speech recognized. Please try again.".into(), cx),
+                    Ok(_) => {
+                        log::info!(
+                            "session={} voice segment had no recognized text; resuming reply",
+                            this.session_id
+                        );
+                        this.show_toast("No speech recognized. Please try again.".into(), cx);
+                    }
                     Err(error) => {
                         this.show_toast(format!("Speech recognition failed: {error}").into(), cx)
                     }
@@ -676,7 +707,8 @@ impl SolutionSessionView {
         if !self.voice_can_run(cx) || self.compose_disabled(cx) || self.expanded_window.is_some() {
             return;
         }
-        self.interrupt_speech(cx);
+        self.interrupt_speech("recognized user input", cx);
+        let text = format!("[audio] {text}");
         let draft = self.compose_editor.read(cx).text(cx);
         let may_send = draft.trim().is_empty() && self.pending_images.is_empty() && !self.resuming;
         let combined = if draft.is_empty() {
@@ -739,7 +771,10 @@ impl SolutionSessionView {
                             .speech_output_mixer(device)
                             .and_then(|mixer| CancellablePlayback::start_on_mixer(wav, mixer));
                         match playback {
-                            Ok(playback) => this.voice.playback = Some(playback),
+                            Ok(playback) => {
+                                playback.set_paused(this.voice.speech_paused());
+                                this.voice.playback = Some(playback);
+                            }
                             Err(error) => {
                                 this.voice.cancel_speech();
                                 this.show_toast(
@@ -1141,7 +1176,7 @@ mod tests {
                 view.deliver_voice_text("Spoken original input".into(), window, cx);
                 assert_eq!(
                     view.compose_editor.read(cx).text(cx),
-                    "Original draft\nSpoken original input"
+                    "Original draft\n[audio] Spoken original input"
                 );
                 view.voice
                     .pending_speech
@@ -1172,6 +1207,58 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn rejected_recognition_preserves_reply_and_releases_pause(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, _workspace, _session, _tmp) = voice_fixture(cx).await;
+        let mut wav = vec![0; 46];
+        wav[..4].copy_from_slice(b"RIFF");
+        wav[4..8].copy_from_slice(&38u32.to_le_bytes());
+        wav[8..16].copy_from_slice(b"WAVEfmt ");
+        wav[16..20].copy_from_slice(&16u32.to_le_bytes());
+        wav[20..24].copy_from_slice(&[1, 0, 1, 0]);
+        wav[24..28].copy_from_slice(&16_000u32.to_le_bytes());
+        wav[28..32].copy_from_slice(&32_000u32.to_le_bytes());
+        wav[32..36].copy_from_slice(&[2, 0, 16, 0]);
+        wav[36..40].copy_from_slice(b"data");
+        wav[40..44].copy_from_slice(&2u32.to_le_bytes());
+        for response in [Some("{\"text\":\"\"}"), Some("invalid JSON"), None] {
+            cx.update(|cx| {
+                let mut settings = SolutionAgentSettings::get_global(cx).clone();
+                settings.voice.api_url = "https://speech.example/v1".into();
+                SolutionAgentSettings::override_global(settings, cx);
+                cx.set_http_client(http_client::FakeHttpClient::create(move |_| async move {
+                    match response {
+                        Some(body) => Ok(http_client::Response::new(body.into())),
+                        None => Err(anyhow::anyhow!("Controlled transport failure")),
+                    }
+                }));
+            });
+            view.update(cx, |view, window, cx| {
+                view.voice
+                    .pending_speech
+                    .push_back("Preserved reply.".into());
+                view.voice.pending_recordings.push_back(wav.clone());
+                assert!(view.voice.speech_paused());
+                view.start_next_transcription(window, cx);
+                assert!(view.voice.transcription.is_some());
+                assert!(view.voice.speech_paused());
+            })
+            .unwrap();
+            cx.executor().run_until_parked();
+            view.update(cx, |view, _, _| {
+                assert!(view.voice.transcription.is_none());
+                assert!(!view.voice.speech_paused());
+                assert!(!view.voice.awaiting_user);
+                assert_eq!(view.voice.speech_generation, 0);
+                assert_eq!(view.voice.pending_speech, ["Preserved reply."]);
+                view.voice.pending_speech.clear();
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui::test]
     async fn voice_preserves_typed_drafts_and_uses_the_running_message_queue(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1182,7 +1269,7 @@ mod tests {
             view.deliver_voice_text("Spoken addition".into(), window, cx);
             assert_eq!(
                 view.compose_editor.read(cx).text(cx),
-                "Typed draft\nSpoken addition"
+                "Typed draft\n[audio] Spoken addition"
             );
             assert!(session.read(cx).pending_messages.is_empty());
             view.compose_editor
@@ -1196,6 +1283,12 @@ mod tests {
             view.deliver_voice_text("Please also run tests".into(), window, cx);
             assert!(view.compose_editor.read(cx).text(cx).is_empty());
             assert!(!session.read(cx).pending_messages.is_empty());
+            let queued = &session.read(cx).pending_messages[0].blocks;
+            assert!(queued.iter().any(|block| matches!(
+                block,
+                agent_client_protocol::schema::v1::ContentBlock::Text(text)
+                    if text.text.contains("[audio] Please also run tests")
+            )));
             assert!(
                 matches!(session.read(cx).state, SessionState::Running { .. }),
                 "voice must not stop the agent"
