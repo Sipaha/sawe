@@ -415,13 +415,27 @@ impl Render for PreviewWindow {
             (PreviewContent::Markdown { .. } | PreviewContent::ToolGroup { .. }, _) => {
                 match &self.markdown {
                     Some(markdown) => {
-                        // `MarkdownFont::Preview` is the document face (the
-                        // markdown-preview font settings), not the chat's — this
-                        // window is showing a file, not a message.
-                        let style = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
-                        let preview_font_size = ThemeSettings::get_global(cx)
-                            .markdown_preview_font_size(cx)
-                            * DOCUMENT_FONT_SCALE;
+                        let (style, preview_font_size) =
+                            if matches!(&self.content, PreviewContent::ToolGroup { .. }) {
+                                // Tool details use the chat's compact scale, including
+                                // code blocks, rather than document-preview typography.
+                                let mut style =
+                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                                if let Some(headings) = &mut style.heading_level_styles {
+                                    for heading in [&mut headings.h2, &mut headings.h3] {
+                                        if let Some(heading) = heading {
+                                            heading.font_size = Some(gpui::rems(1.).into());
+                                        }
+                                    }
+                                }
+                                (style, ThemeSettings::get_global(cx).agent_ui_font_size(cx))
+                            } else {
+                                (
+                                    MarkdownStyle::themed(MarkdownFont::Preview, window, cx),
+                                    ThemeSettings::get_global(cx).markdown_preview_font_size(cx)
+                                        * DOCUMENT_FONT_SCALE,
+                                )
+                            };
                         let roots: Vec<std::path::PathBuf> = match &self.content {
                             PreviewContent::Markdown { base_dir, .. } => {
                                 base_dir.iter().cloned().collect()
@@ -435,11 +449,8 @@ impl Render for PreviewWindow {
                         .p_3()
                         .overflow_y_scroll()
                         .child(
-                            // Preview typography is rem-based. The regular
-                            // MarkdownPreviewView supplies this same local rem
-                            // root; this compact modal uses a smaller root,
-                            // but without one it silently inherits the larger
-                            // UI size and ignores markdown_preview.font_size.
+                            // Headings use the selected content's local rem root;
+                            // document previews still follow their own font setting.
                             WithRemSize::new(preview_font_size).child(
                                 MarkdownElement::new(markdown.clone(), style).on_url_click(
                                     move |url, window, cx| {

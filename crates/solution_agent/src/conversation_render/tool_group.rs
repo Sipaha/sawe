@@ -224,21 +224,6 @@ pub(crate) fn render_tool_group(
         .border_1()
         .border_color(cx.theme().colors().border_variant)
         .bg(cx.theme().colors().element_background)
-        .cursor_pointer()
-        .tooltip(ui::Tooltip::text("Show all tool calls and output"))
-        .on_click(move |_, window, cx| {
-            crate::preview_window::open_preview(
-                crate::preview_window::PreviewContent::ToolGroup {
-                    session: group.session.clone(),
-                    stream: group.stream.clone(),
-                    first_id: first_id.clone(),
-                    first_index: entry_idx,
-                    first_created_ms,
-                },
-                window,
-                cx,
-            );
-        })
         .child(
             h_flex()
                 .gap_2()
@@ -255,6 +240,27 @@ pub(crate) fn render_tool_group(
                             Label::new(format!("Tools · {}", group.entries.len()))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
+                        )
+                        .child(
+                            Button::new(("tool-group-view", entry_idx), "View")
+                                .style(ButtonStyle::Subtle)
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(ui::Tooltip::text("Show all tool calls and output"))
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    crate::preview_window::open_preview(
+                                        crate::preview_window::PreviewContent::ToolGroup {
+                                            session: group.session.clone(),
+                                            stream: group.stream.clone(),
+                                            first_id: first_id.clone(),
+                                            first_index: entry_idx,
+                                            first_created_ms,
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                }),
                         ),
                 )
                 .child(

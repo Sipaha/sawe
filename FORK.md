@@ -6524,8 +6524,9 @@ and the [voice guide](docs/guides/voice-conversations.md).
 ### 240. Tool runs are compact presentation rows
 
 Consecutive tool calls share a bounded latest-call preview, with full requests
-and output in the existing live conversation modal. Transcript and wire entries
-remain unchanged. Display ranges map raw indices to virtualized rows; search
+and output in the existing live conversation modal. Only the small **View**
+button beside the call count opens details; the card body stays inert to avoid
+accidental opening. Transcript and wire entries remain unchanged. Display ranges map raw indices to virtualized rows; search
 expands tools to retain complete match visibility. Approval calls stay outside
 collapsed groups so permission decisions remain explicit. This keeps agent
 activity visible without letting verbose output dominate the conversation.
