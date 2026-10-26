@@ -1,4 +1,4 @@
-//! Bounded microphone utterances and interruptible speech playback.
+//! Microphone utterances and interruptible speech playback.
 //!
 //! Device callbacks never wait for a consumer. A slow consumer stops capture with
 //! an error instead of silently dropping words or accumulating unbounded audio.
@@ -30,8 +30,8 @@ const WAV_RATE: u32 = 16_000;
 const PRE_ROLL_FRAMES: usize = 100;
 const START_FRAMES: usize = 3;
 const MIN_VOICED_FRAMES: usize = 12;
-const SILENCE_FRAMES: usize = 70;
-const MAX_FRAMES: usize = 3_000; // 30 seconds, including pre-roll
+const SILENCE_FRAMES: usize = 300; // Three seconds of consecutive silence.
+const MANUAL_RECORDING_LIMIT: Duration = Duration::from_secs(15 * 60);
 const MAX_INPUT_CHUNK: usize = 4_096;
 const MAX_PLAYBACK_BYTES: usize = 32 * 1024 * 1024;
 
@@ -41,7 +41,7 @@ pub enum VoiceCaptureEvent {
     SpeechStarted,
     /// Balances every confirmed segment; discarded candidates emit neither event.
     SpeechEnded,
-    /// Mono, 16kHz, signed PCM16 RIFF/WAV, no longer than 30 seconds.
+    /// Mono, 16kHz, signed PCM16 RIFF/WAV; complete only after silence or explicit finish.
     Utterance(Vec<u8>),
     Error(String),
     Stopped,
@@ -49,7 +49,8 @@ pub enum VoiceCaptureEvent {
 
 /// Owns one microphone stream. Dropping cancels without emitting a final utterance.
 /// `finish` flushes an explicit recording, while continuous capture segments on
-/// silence. Both modes enforce the same maximum utterance length.
+/// three seconds of silence, without a duration cutoff. Manual capture cancels
+/// without an utterance at fifteen minutes, including time spent in silence.
 pub struct VoiceCapture {
     events: Receiver<VoiceCaptureEvent>,
     pending_events: Arc<AtomicUsize>,
@@ -204,6 +205,11 @@ fn capture_worker(
                 "Microphone disconnected or capture could not keep up; please start recording again"
             );
         }
+        // Expiry wins over a simultaneous Finish click. Never submit a timed-out
+        // manual recording, even if the driver stopped delivering samples.
+        if processor.expire(started.elapsed(), events)? {
+            return Ok(());
+        }
         if finish.load(Ordering::Acquire) {
             // Drop the callback stream first, then process its bounded pending data.
             drop(stream);
@@ -212,11 +218,7 @@ fn capture_worker(
                     break;
                 }
             }
-            processor.finish(events)?;
-            return Ok(());
-        }
-        if !continuous && started.elapsed() >= Duration::from_secs(30) {
-            processor.finish(events)?;
+            processor.finish(started.elapsed(), events)?;
             return Ok(());
         }
         match samples_rx.recv_timeout(Duration::from_millis(10)) {
@@ -365,7 +367,18 @@ impl CaptureProcessor {
         Ok(keep_going)
     }
 
-    fn finish(&mut self, events: &EventSender) -> Result<()> {
+    fn expire(&mut self, elapsed: Duration, events: &EventSender) -> Result<bool> {
+        for event in self.segmenter.expire(elapsed) {
+            send_event(events, event)?;
+        }
+        Ok(self.segmenter.done)
+    }
+
+    fn finish(&mut self, elapsed: Duration, events: &EventSender) -> Result<()> {
+        // Stream shutdown and queued AEC work may have crossed the deadline.
+        if self.expire(elapsed, events)? {
+            return Ok(());
+        }
         // Preserve the final incomplete 10ms block; it is too short for AEC.
         if !self.frame.is_empty() {
             let mono: Vec<i16> = self
@@ -462,7 +475,7 @@ struct Segmenter {
     voiced_frames: usize,
     speech_started: bool,
     silent_frames: usize,
-    frames: usize,
+    captured_samples: u64,
     done: bool,
 }
 
@@ -477,7 +490,7 @@ impl Segmenter {
             voiced_frames: 0,
             speech_started: false,
             silent_frames: 0,
-            frames: 0,
+            captured_samples: 0,
             done: false,
         }
     }
@@ -485,6 +498,13 @@ impl Segmenter {
     fn push(&mut self, frame: &[i16]) -> Vec<VoiceCaptureEvent> {
         if self.done {
             return Vec::new();
+        }
+        self.captured_samples = self.captured_samples.saturating_add(frame.len() as u64);
+        let expired = self.expire(Duration::from_secs_f64(
+            self.captured_samples as f64 / f64::from(WAV_RATE),
+        ));
+        if self.done {
+            return expired;
         }
         let mut events = Vec::new();
         let energy = (frame
@@ -506,14 +526,12 @@ impl Segmenter {
                 self.noise_floor = (self.noise_floor * 0.98 + energy * 0.02).min(0.004);
             }
             if self.start_frames >= START_FRAMES {
-                self.frames = self.pre_roll.len();
                 self.recording.extend(self.pre_roll.drain(..).flatten());
                 self.voiced_frames = self.start_frames;
                 self.silent_frames = 0;
             }
         } else {
             self.recording.extend_from_slice(frame);
-            self.frames += 1;
             if voiced {
                 self.voiced_frames += 1;
                 self.silent_frames = 0;
@@ -526,19 +544,31 @@ impl Segmenter {
                 self.speech_started = true;
                 events.push(VoiceCaptureEvent::SpeechStarted);
             }
-            if self.frames >= MAX_FRAMES
-                || (self.continuous && self.silent_frames >= SILENCE_FRAMES)
-            {
+            if self.continuous && self.silent_frames >= SILENCE_FRAMES {
                 events.extend(self.finish());
-                if !self.continuous {
-                    self.done = true;
-                }
             }
         }
         events
     }
 
+    fn expire(&mut self, elapsed: Duration) -> Vec<VoiceCaptureEvent> {
+        if self.continuous || self.done || elapsed < MANUAL_RECORDING_LIMIT {
+            return Vec::new();
+        }
+        self.done = true;
+        self.recording = Vec::new();
+        self.pre_roll.clear();
+        self.speech_started = false;
+        self.voiced_frames = 0;
+        vec![VoiceCaptureEvent::Error(
+            "Recording cancelled: the 15-minute Voice limit was reached. Nothing was sent.".into(),
+        )]
+    }
+
     fn finish(&mut self) -> Vec<VoiceCaptureEvent> {
+        if self.done {
+            return Vec::new();
+        }
         let recording = std::mem::take(&mut self.recording);
         let voiced = self.voiced_frames;
         let speech_started = std::mem::take(&mut self.speech_started);
@@ -546,7 +576,6 @@ impl Segmenter {
         self.start_frames = 0;
         self.voiced_frames = 0;
         self.silent_frames = 0;
-        self.frames = 0;
         let mut events = Vec::new();
         if speech_started {
             events.push(VoiceCaptureEvent::SpeechEnded);
@@ -837,27 +866,87 @@ mod tests {
     }
 
     #[test]
-    fn continuous_and_manual_recordings_are_bounded() {
-        for continuous in [false, true] {
-            let mut segmenter = Segmenter::new(continuous);
-            let events = frames(&mut segmenter, MAX_FRAMES * 2 + 20, 4_000);
-            let utterances: Vec<_> = events
-                .iter()
-                .filter_map(|event| {
-                    if let VoiceCaptureEvent::Utterance(wav) = event {
-                        Some(wav)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            assert_eq!(utterances.len(), if continuous { 2 } else { 1 });
-            for wav in utterances {
-                assert!(wav.len() <= 44 + WAV_RATE as usize * 30 * 2);
-            }
-            assert!(segmenter.recording.len() <= WAV_RATE as usize * 30);
-            assert_eq!(segmenter.done, !continuous);
+    fn hands_free_has_no_duration_cutoff_and_requires_three_seconds_of_silence() {
+        let mut segmenter = Segmenter::new(true);
+        // Longer than both the old 30-second cap and the manual 15-minute limit.
+        let events = frames(&mut segmenter, 90_100, 4_000);
+        assert!(matches!(
+            events.as_slice(),
+            [VoiceCaptureEvent::SpeechStarted]
+        ));
+        assert!(segmenter.expire(Duration::from_secs(3600)).is_empty());
+        assert!(frames(&mut segmenter, 299, 0).is_empty());
+        // Resuming speech restarts the whole silence window.
+        assert!(frames(&mut segmenter, 1, 4_000).is_empty());
+        assert!(frames(&mut segmenter, 299, 0).is_empty());
+        let ended = frames(&mut segmenter, 1, 0);
+        let [
+            VoiceCaptureEvent::SpeechEnded,
+            VoiceCaptureEvent::Utterance(wav),
+        ] = ended.as_slice()
+        else {
+            panic!("Expected one complete utterance after three seconds of silence");
+        };
+        assert_eq!(wav.len(), 44 + (90_100 + 299 + 1 + 300) * 320);
+        assert!(!segmenter.done);
+    }
+
+    #[test]
+    fn manual_timeout_discards_audio_including_silent_recordings() {
+        for amplitude in [0, 4_000] {
+            let mut segmenter = Segmenter::new(false);
+            let events = frames(&mut segmenter, 89_999, amplitude);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, VoiceCaptureEvent::Utterance(_)))
+            );
+            let expired = frames(&mut segmenter, 1, amplitude);
+            assert!(matches!(expired.as_slice(), [VoiceCaptureEvent::Error(_)]));
+            assert!(segmenter.done);
+            assert!(segmenter.recording.is_empty());
+            assert!(segmenter.finish().is_empty());
+            assert!(frames(&mut segmenter, 10, amplitude).is_empty());
         }
+    }
+
+    #[test]
+    fn manual_finish_before_deadline_sends_but_wall_clock_expiry_wins() {
+        let mut segmenter = Segmenter::new(false);
+        frames(&mut segmenter, 89_999, 4_000);
+        assert!(segmenter.expire(Duration::from_millis(899_999)).is_empty());
+        assert!(matches!(
+            segmenter.finish().last(),
+            Some(VoiceCaptureEvent::Utterance(_))
+        ));
+        let mut stalled = Segmenter::new(false);
+        frames(&mut stalled, 20, 4_000);
+        assert!(matches!(
+            stalled.expire(Duration::from_secs(900)).as_slice(),
+            [VoiceCaptureEvent::Error(_)]
+        ));
+        assert!(stalled.finish().is_empty());
+    }
+
+    #[test]
+    fn finish_rechecks_deadline_after_stream_shutdown_and_drain() {
+        let mut processor = CaptureProcessor::new(48_000, false);
+        frames(&mut processor.segmenter, 20, 4_000);
+        assert!(
+            processor
+                .segmenter
+                .expire(Duration::from_secs(899))
+                .is_empty()
+        );
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let events = EventSender {
+            sender,
+            pending: Arc::new(AtomicUsize::new(0)),
+        };
+        processor.finish(Duration::from_secs(900), &events).unwrap();
+        let queued: Vec<_> = receiver.try_iter().collect();
+        assert!(matches!(queued.as_slice(), [VoiceCaptureEvent::Error(_)]));
+        assert!(processor.segmenter.recording.is_empty());
     }
 
     #[test]

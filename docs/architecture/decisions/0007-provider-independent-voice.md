@@ -38,11 +38,16 @@ continues routing input/output to that original dialog. A global weak view owner
 lets another dialog synchronously stop the previous capture before claiming it.
 Closing the dialog, history replacement or rewind still invalidates voice activity.
 
-The existing audio crate supplies bounded PCM16 capture, adaptive energy-based
+The existing audio crate supplies PCM16 capture with bounded device/event queues,
+adaptive energy-based
 voice activity detection and cancellable playback. Speech shares the application
 output mixer so echo cancellation sees a single reverse stream. Every started
 confirmed speech segment ends explicitly; discarded short candidates emit neither
-start nor end.
+start nor end. Hands-free waits for three consecutive seconds of silence;
+phrase duration and length never trigger a send. Manual recording cancels without
+transcription at fifteen minutes, including silent time. Long recordings are
+recognized through sequential short requests and one final combined transcript;
+failures or cancellation never submit partial recognition.
 
 A configurable OpenAI-compatible HTTP service supplies STT/TTS. SPK LAIHub is
 an independently managed service and owns installation, model processes,

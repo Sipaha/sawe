@@ -6,7 +6,8 @@ use http_client::{AsyncBody, HttpClient, HttpRequestExt, RedirectPolicy, Request
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use std::{sync::Arc, time::Duration};
 
-pub const MAX_RECORDING_BYTES: usize = 20 * 1024 * 1024;
+const MAX_REQUEST_RECORDING_BYTES: usize = 20 * 1024 * 1024;
+const TRANSCRIPTION_CHUNK_BYTES: usize = 45 * 16_000 * 2;
 pub const MAX_SPEECH_CHARACTERS: usize = 4000;
 const MAX_TRANSCRIPT_BYTES: usize = 256 * 1024;
 const MAX_SPEECH_BYTES: usize = 24 * 1024 * 1024;
@@ -166,11 +167,50 @@ impl VoiceService {
     }
 
     pub async fn transcribe(&self, wav: Vec<u8>) -> Result<String> {
-        ensure!(
-            wav.len() <= MAX_RECORDING_BYTES,
-            "Voice recording exceeds the 20 MiB limit"
-        );
         ensure!(is_wav(&wav), "Voice recording is not a WAV audio file");
+        // Capture has no Hands-free duration cap. Keep each service request below
+        // the local recognizer's 60-second window, then deliver the entire phrase
+        // once. Cancellation or any failed chunk drops the partial transcript.
+        if let Some(pcm) = captured_pcm(&wav) {
+            let mut text = String::new();
+            let mut remaining = pcm;
+            while !remaining.is_empty() {
+                // Avoid a final <100ms fragment rejected by the local recognizer.
+                let size = transcription_chunk_len(remaining);
+                let (chunk, tail) = remaining.split_at(size);
+                remaining = tail;
+                let mut part = wav[..44].to_vec();
+                part[4..8].copy_from_slice(&((36 + chunk.len()) as u32).to_le_bytes());
+                part[40..44].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+                part.extend_from_slice(chunk);
+                let fragment = self.transcribe_request(part).await?;
+                if !fragment.is_empty() {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(&fragment);
+                }
+            }
+            ensure!(
+                !text.is_empty(),
+                "Voice transcription service returned an empty transcript"
+            );
+            Ok(text)
+        } else {
+            let text = self.transcribe_request(wav).await?;
+            ensure!(
+                !text.is_empty(),
+                "Voice transcription service returned an empty transcript"
+            );
+            Ok(text)
+        }
+    }
+
+    async fn transcribe_request(&self, wav: Vec<u8>) -> Result<String> {
+        ensure!(
+            wav.len() <= MAX_REQUEST_RECORDING_BYTES,
+            "Voice recording request exceeds the 20 MiB limit"
+        );
         let boundary = format!("sawe-voice-{}", uuid::Uuid::new_v4());
         let mut body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\nContent-Type: audio/wav\r\n\r\n",
@@ -194,10 +234,6 @@ impl VoiceService {
         let transcript: Transcript = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("Voice transcription service returned malformed JSON"))?;
         let text = transcript.text.trim();
-        ensure!(
-            !text.is_empty(),
-            "Voice transcription service returned an empty transcript"
-        );
         Ok(text.to_owned())
     }
 
@@ -368,6 +404,60 @@ fn valid_env_name(value: &str) -> bool {
     let mut bytes = value.bytes();
     matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+// Prefer a quiet word/phrase boundary in the last five seconds of a request.
+// If uninterrupted speech has no 100ms quiet gap, retain all samples and fall
+// back to the service window; recognizer accuracy at that boundary is not assured.
+fn transcription_chunk_len(pcm: &[u8]) -> usize {
+    if pcm.len() <= TRANSCRIPTION_CHUNK_BYTES + 3_200 {
+        return pcm.len();
+    }
+    let start = TRANSCRIPTION_CHUNK_BYTES - 5 * 16_000 * 2;
+    let mut quiet = 0;
+    let mut boundary = TRANSCRIPTION_CHUNK_BYTES;
+    for (index, frame) in pcm[start..TRANSCRIPTION_CHUNK_BYTES]
+        .chunks_exact(320)
+        .enumerate()
+    {
+        let energy = frame
+            .chunks_exact(2)
+            .map(|pair| {
+                let value = f64::from(i16::from_le_bytes([pair[0], pair[1]])) / 32768.0;
+                value * value
+            })
+            .sum::<f64>()
+            / 160.0;
+        if energy < 0.008f64.powi(2) {
+            quiet += 1;
+            if quiet >= 10 {
+                boundary = start + (index + 1) * 320 - 5 * 320;
+            }
+        } else {
+            quiet = 0;
+        }
+    }
+    boundary
+}
+
+// The audio crate emits this canonical PCM16/mono/16kHz layout. Only split
+// known capture data; never reinterpret another WAV encoding as raw PCM16.
+fn captured_pcm(wav: &[u8]) -> Option<&[u8]> {
+    if wav.len() <= 44
+        || &wav[..4] != b"RIFF"
+        || &wav[8..16] != b"WAVEfmt "
+        || wav[16..20] != 16u32.to_le_bytes()
+        || wav[20..24] != [1, 0, 1, 0]
+        || wav[24..28] != 16_000u32.to_le_bytes()
+        || wav[28..32] != 32_000u32.to_le_bytes()
+        || wav[32..36] != [2, 0, 16, 0]
+        || &wav[36..40] != b"data"
+        || !wav.len().is_multiple_of(2)
+        || u32::from_le_bytes(wav[40..44].try_into().ok()?) as usize != wav.len() - 44
+    {
+        return None;
+    }
+    Some(&wav[44..])
 }
 
 fn is_wav(bytes: &[u8]) -> bool {
@@ -726,6 +816,127 @@ mod tests {
             let service = VoiceService::with_environment(settings(), client, |_| None).unwrap();
             assert_eq!(service.transcribe(wav()).await.unwrap(), "Check tests");
             assert!(service.transcribe(vec![]).await.is_err());
+        });
+    }
+
+    fn captured_wav(samples: usize) -> Vec<u8> {
+        let mut bytes = wav();
+        bytes.resize(44 + samples * 2, 0);
+        bytes[24..28].copy_from_slice(&16_000u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&32_000u32.to_le_bytes());
+        let size = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&size.to_le_bytes());
+        bytes[40..44].copy_from_slice(&((samples * 2) as u32).to_le_bytes());
+        // Distinct content detects duplicated, reordered or missing PCM.
+        for (index, pair) in bytes[44..].chunks_exact_mut(2).enumerate() {
+            pair.copy_from_slice(&(index as i16).to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn long_capture_is_transcribed_in_order_without_a_total_size_cap() {
+        smol::block_on(async {
+            use std::sync::{
+                Mutex,
+                atomic::{AtomicUsize, Ordering},
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let count = calls.clone();
+            let data = received.clone();
+            let client = FakeHttpClient::create(move |mut request| {
+                let count = count.clone();
+                let data = data.clone();
+                async move {
+                    let index = count.fetch_add(1, Ordering::SeqCst);
+                    let mut body = Vec::new();
+                    request.body_mut().read_to_end(&mut body).await?;
+                    let start = body.windows(4).position(|w| w == b"RIFF").unwrap();
+                    let len = u32::from_le_bytes(body[start + 4..start + 8].try_into().unwrap())
+                        as usize
+                        + 8;
+                    let wav = &body[start..start + len];
+                    assert!(is_wav(wav));
+                    let pcm = captured_pcm(wav).unwrap();
+                    assert!(pcm.len() <= TRANSCRIPTION_CHUNK_BYTES + 3_200);
+                    assert!(pcm.len() >= 3_200);
+                    data.lock().unwrap().extend_from_slice(pcm);
+                    // Silent transport chunks must not cancel an otherwise valid phrase.
+                    let text = if index == 1 {
+                        String::new()
+                    } else {
+                        format!("part{index}")
+                    };
+                    Ok(Response::new(
+                        serde_json::json!({"text": text}).to_string().into(),
+                    ))
+                }
+            });
+            let service = VoiceService::with_environment(settings(), client, |_| None).unwrap();
+            let wav = captured_wav(16_000 * 900 + 160);
+            assert!(wav.len() > 20 * 1024 * 1024);
+            let result = service.transcribe(wav.clone()).await.unwrap();
+            let count = calls.load(Ordering::SeqCst);
+            assert_eq!(count, 20);
+            assert_eq!(
+                result,
+                (0..count)
+                    .filter(|i| *i != 1)
+                    .map(|i| format!("part{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert_eq!(*received.lock().unwrap(), wav[44..]);
+        });
+    }
+
+    #[test]
+    fn long_capture_prefers_a_quiet_boundary_and_preserves_a_tiny_tail() {
+        let mut wav = captured_wav(16_000 * 90);
+        let quiet_start = 16_000 * 44 * 2;
+        wav[44 + quiet_start..44 + quiet_start + 6_400].fill(0);
+        let pcm = captured_pcm(&wav).unwrap();
+        let size = transcription_chunk_len(pcm);
+        assert!(size > quiet_start && size < quiet_start + 6_400);
+        assert_eq!(pcm[..size].len() + pcm[size..].len(), pcm.len());
+        let tiny_tail = captured_wav(16_000 * 45 + 160);
+        let pcm = captured_pcm(&tiny_tail).unwrap();
+        assert_eq!(transcription_chunk_len(pcm), pcm.len());
+    }
+
+    #[test]
+    fn failed_or_cancelled_chunk_never_returns_a_partial_transcript() {
+        smol::block_on(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            for cancel in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let count = calls.clone();
+                let client = FakeHttpClient::create(move |_| {
+                    let index = count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if index == 0 {
+                            Ok(Response::new(r#"{"text":"first fragment"}"#.into()))
+                        } else if cancel {
+                            futures::future::pending().await
+                        } else {
+                            Ok(Response::builder()
+                                .status(500)
+                                .body("unavailable".into())
+                                .unwrap())
+                        }
+                    }
+                });
+                let service = VoiceService::with_environment(settings(), client, |_| None).unwrap();
+                let recording = captured_wav(16_000 * 100);
+                if cancel {
+                    use futures::FutureExt;
+                    assert!(service.transcribe(recording).now_or_never().is_none());
+                } else {
+                    assert!(service.transcribe(recording).await.is_err());
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            }
         });
     }
 

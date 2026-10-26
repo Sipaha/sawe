@@ -4,22 +4,22 @@ Voice works above the existing Solution chat adapters, so Codex, Claude and Kimi
 use the same microphone and speech controls. The default speech service is local
 at `http://127.0.0.1:8095/v1`; a coding-provider subscription is not used for audio.
 
-## Connect LAIHub
+## Connect SPK AI Hub
 
-Sawe is an API client. SPK LAIHub owns model installation, inference processes,
-CPU limits, memory retention and idle unloading. Start LAIHub from its repository:
+Sawe is an API client. SPK AI Hub owns model installation, inference processes,
+CPU limits, memory retention and idle unloading. Start AI Hub from its repository:
 
 ```sh
-./build/spk-laihub-browser --browser --listen 127.0.0.1:5195 --speech-listen 127.0.0.1:8095
+./build/spk-ai-hub-browser --browser --listen 127.0.0.1:5195 --speech-listen 127.0.0.1:8095
 ```
 
 The control panel is on port 5195; the dedicated speech listener on port 8095
-matches Sawe's default endpoint. Install/import and manage models in LAIHub.
-Select the Russian synthesis voice in LAIHub Settings; LAIHub owns that selection
+matches Sawe's default endpoint. Install/import and manage models in AI Hub.
+Select the Russian synthesis voice in AI Hub Settings; AI Hub owns that selection
 for connected clients. Sawe never launches, loads, unloads or stops model workers. GigaAM returns
 unpunctuated Russian; other languages require a compatible speech service.
 
-While Hands-free is active, Sawe sends an activity ping every 30 seconds. LAIHub
+While Hands-free is active, Sawe sends an activity ping every 30 seconds. AI Hub
 alone decides what that activity means for model retention. Turning voice off,
 transferring ownership or closing the chat stops pings. There are no model idle timers or
 unload commands in Sawe. Keepalives do not load models or leave a permanent pin.
@@ -31,10 +31,14 @@ The API connection is independent of the selected coding provider.
 ## Chat controls
 
 - **Microphone:** start a recording; click again to finish and transcribe it.
-  A recording is limited to 30 seconds. Silence and very short clicks are ignored.
-- **Hands-free:** listen continuously, submit each phrase after a pause and enable
+  A recording can last up to 15 minutes, including pauses. Reaching the limit
+  cancels and discards it without transcription or sending; a notice explains why.
+  Silence and very short clicks are ignored.
+- **Hands-free:** listen continuously, submit each phrase after 3 consecutive seconds
+  of silence and enable
   read-aloud. Click again to end the voice session. Recognition is based on
-  completed utterances, rather than live partial text.
+  completed utterances, rather than live partial text. Speech restarts the silence
+  countdown; phrase duration and length do not trigger submission or truncation.
 - **Speaker:** toggle AI-generated read-aloud for new assistant prose as it arrives.
 - **Stop speaking:** cancel playback and pending speech. The coding agent keeps
   running; its existing Stop control remains a separate action.
@@ -48,6 +52,13 @@ same output mixer as application sounds.
 Echo cancellation is unavailable on Windows GNU and FreeBSD. Noise-based voice
 activity detection can also react to loud non-speech sounds, and a recognizer may
 occasionally turn noise into nonempty text. Such text is treated as voice input.
+
+Long recordings are transcribed through sequential short service requests (about
+45 seconds each, within the local recognizer's one-minute window). The complete
+transcript is sent once, after every request succeeds. Empty silent chunks are
+skipped; an error or cancellation never sends a partial transcript. Capture stays
+in memory until silence/Finish, so longer phrases require more memory. Recognition
+quality, especially for words at a request boundary, depends on the speech service.
 
 Recognized text is prefixed with `[audio]` so the coding agent can identify
 voice input. Only the spoken fragment receives this marker when appended to a
@@ -69,7 +80,7 @@ in another dialog stops the previous owner before starting the new microphone.
 Turning it off, closing the dialog or replacing its history/context ends it.
 Ordinary recording and read-aloud without Hands-free still stop on navigation.
 Per-chat voice toggles are not persisted across application restarts; the selected
-Piper voice remains a persistent LAIHub setting. These actions are available in the
+Piper voice remains a persistent AI Hub setting. These actions are available in the
 command palette: `Toggle Voice Recording`, `Toggle Voice Conversation`,
 `Toggle Read Aloud` and `Stop Speaking` in the Solution Agent namespace.
 

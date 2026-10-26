@@ -31,14 +31,19 @@ model workers, load/unload commands or retention settings. A cancellable
 Hands-free task sends activity pings every 30 seconds to eligible local APIs.
 Unsupported services quietly disable that extension; custom endpoints and model
 request fields remain independent of coding-provider selection.
-`voice_service::VoiceService` transcribes bounded PCM WAV recordings and requests
+`voice_service::VoiceService` transcribes complete PCM WAV recordings via sequential short service requests
+and requests
 bounded WAV speech; it uses the HTTP client's complete-request timeout. Endpoint
 overrides isolate credentials by origin, and loopback transport bypasses proxies.
 `speech_text` removes code blocks, images and formatting from spoken prose.
 
 The session view owns capture, request tasks and cancellable playback. It sends
 recognized fragments with an `[audio]` prefix through ordinary compose/queue
-behavior, preserving typed drafts.
+behavior, preserving typed drafts. Long-input recognition returns one combined
+transcript only after every chunk succeeds; cancellation/failure discards partial
+results. Hands-free ends a phrase only after three seconds of consecutive silence,
+with no duration cutoff. Manual Voice cancels without transcription at fifteen
+minutes (wall clock or captured duration), including silence.
 An incremental prose cursor queues sentences and pre-tool commentary while the
 agent is running; actual `Stopped` events flush the final tail without replay.
 Short chunks and bounded queue backpressure limit synthesis latency. Reasoning,

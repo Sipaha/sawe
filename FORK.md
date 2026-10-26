@@ -6517,6 +6517,14 @@ Model installation, inference processes, retention and idle unloading belong to
 LAIHub; Sawe has no worker lifetime or model load/unload logic. The former Python
 runtime helper is removed from this repository. Default recognition is Russian
 GigaAM v3 CTC INT8 CPU with Piper synthesis, managed in LAIHub.
+Hands-free submits only after three consecutive seconds of silence, without a
+phrase duration/length cutoff. Manual Voice cancels and discards at fifteen
+minutes, including silence, rather than auto-sending. Long recordings use short
+sequential STT requests under the local recognizer's window and one final
+combined transcript, so a service request limit cannot force early chat input.
+Errors/cancellation discard partial recognition. Audio remains in memory until
+silence/Finish; bounded device/event queues still fail visibly on overload.
+
 See [ADR-0007](docs/architecture/decisions/0007-provider-independent-voice.md)
 and the [voice guide](docs/guides/voice-conversations.md).
 
