@@ -4124,7 +4124,9 @@ Acceptance reports queued/submitted input, not completed work. See
 ### 169. Editor-owned Codex threads request a large context window
 
 Codex thread start and resume pass `model_context_window = 872000` in their
-session configuration. The native runtime clamps the request to the selected
+session configuration. For Hub-backed chats, SPK AI Hub owns this session-only
+override; the editor does not rewrite native configuration or invent a UI limit.
+The native runtime clamps the request to the selected
 model's maximum; Sawe continues to display reported effective capacity rather
 than the requested size. GPT-6-Astra currently reports 828400 usable tokens,
 while switching the same thread to GPT-5.5 reports 258400. Global Codex settings

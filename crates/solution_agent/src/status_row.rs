@@ -1867,6 +1867,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hub_effective_context_replaces_pre_migration_capacity_and_follows_model_switch() {
+        let (_, cached) = resolve_max_tokens(Some(475_000), None);
+        let (max, cached) = resolve_max_tokens(Some(828_400), cached);
+        assert_eq!(max, 828_400);
+        assert_eq!(format_tokens_compact(max), "828.4k");
+        let (max, cached) = resolve_max_tokens(Some(258_400), cached);
+        assert_eq!(max, 258_400);
+        assert_eq!(resolve_max_tokens(None, cached), (258_400, Some(258_400)));
+    }
+
     /// A fresh thread (compaction / `/clear` / restart) must drop the peak:
     /// the post-compaction context is unrelated to the one it was measured
     /// against, and it is typically well above the 10 % collapse threshold

@@ -25,3 +25,20 @@ does not override its threshold separately.
 
 Reference: [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference),
 `model_context_window`.
+
+## Hub migration regression (2026-10-27)
+
+The native adapter's session-only override was omitted when execution moved to
+SPK AI Hub. Codex then reported its default effective capacity (475000), which
+Sawe correctly displayed. The fix belongs to the Hub-owned native session
+configuration shared by start and resume, including read-only sessions.
+Sawe continues to consume ACP `UsageUpdate.size` unchanged; live effective
+capacity supersedes an older persisted value, and a model switch may lower it.
+A status-row regression covers 475000 → 828400 → 258400 and a later missing
+reading. No account or global CLI settings are changed.
+
+Verification: all 1083 active `solution_agent` library tests passed (one ignored),
+including the seven status-row tests. Strict crate Clippy found existing
+`redundant_clone` in `conversation_render/tool_group.rs:268` and `manual_flatten`
+in `preview_window.rs:425`; the same crate gate passed with only those two lints
+allowed. Those unrelated files were left unchanged.
