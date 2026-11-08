@@ -4087,3 +4087,107 @@ async fn pending_usage_limit_resume_does_not_wake_the_worker_early(cx: &mut gpui
     });
     assert_eq!(queued, 0, "the worker is not woken into a still-live wall");
 }
+
+#[gpui::test]
+async fn changed_usage_keeps_a_silent_running_turn_alive(cx: &mut TestAppContext) {
+    let (id, thread, _tmp) = create_session_with_thread(cx).await;
+    let stale = Utc::now() - chrono::Duration::minutes(6);
+    for (state, previous, used, refresh) in [
+        (
+            SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            },
+            Some(100),
+            Some(101),
+            true,
+        ),
+        (
+            SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            },
+            Some(101),
+            Some(101),
+            false,
+        ),
+        (
+            SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            },
+            Some(101),
+            None,
+            false,
+        ),
+        (
+            SessionState::Running {
+                started_at: std::time::Instant::now(),
+                notified: false,
+            },
+            Some(101),
+            Some(0),
+            false,
+        ),
+        (SessionState::Idle, Some(100), Some(101), false),
+        (
+            SessionState::Stopping {
+                started_at: std::time::Instant::now(),
+            },
+            Some(100),
+            Some(101),
+            false,
+        ),
+        (SessionState::AwaitingInput, Some(100), Some(101), false),
+        (
+            SessionState::Errored("stopped".into()),
+            Some(100),
+            Some(101),
+            false,
+        ),
+    ] {
+        let expected_state = std::mem::discriminant(&state);
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            let session = store.read(cx).session(id).unwrap();
+            session.update(cx, |s, _| {
+                s.state = state;
+                s.cached_total_tokens = previous;
+                s.cached_max_tokens = Some(500_000);
+                s.last_activity_at = stale;
+            });
+            thread.update(cx, |thread, cx| {
+                thread.update_token_usage(
+                    used.map(|used_tokens| acp_thread::TokenUsage {
+                        used_tokens,
+                        max_tokens: 1_000_000,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+        });
+        cx.executor().run_until_parked();
+        cx.update(|cx| {
+            let store = SolutionAgentStore::global(cx);
+            store.update(cx, |store, cx| {
+                let session = store.session(id).unwrap();
+                assert_eq!(
+                    std::mem::discriminant(&session.read(cx).state),
+                    expected_state
+                );
+                assert_eq!(session.read(cx).cached_total_tokens, used);
+                if refresh {
+                    assert!(session.read(cx).last_activity_at > stale);
+                    store.tick_stuck_sessions(cx);
+                    assert!(matches!(
+                        session.read(cx).state,
+                        SessionState::Running { .. }
+                    ));
+                } else {
+                    assert_eq!(session.read(cx).last_activity_at, stale);
+                }
+            });
+        });
+    }
+}

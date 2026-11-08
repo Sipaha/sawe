@@ -492,6 +492,14 @@ impl SolutionAgentStore {
                     // "X / 0" on the meter.
                     let max = usage.as_ref().map(|u| u.max_tokens).filter(|m| *m > 0);
                     s.update(cx, |s, _| {
+                        // Native tools may advance usage without a visible transcript entry.
+                        // Identical metric receipts must not keep a stalled turn alive.
+                        if matches!(s.state, SessionState::Running { .. })
+                            && total.is_some_and(|tokens| tokens > 0)
+                            && s.cached_total_tokens != total
+                        {
+                            s.last_activity_at = Utc::now();
+                        }
                         s.cached_total_tokens = total;
                         s.cached_max_tokens = max;
                     });

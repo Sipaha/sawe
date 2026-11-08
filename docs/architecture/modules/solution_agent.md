@@ -19,6 +19,17 @@ Neither `solution_agent` nor the production editor depends on native harness
 crates. `workspace_hooks` implements editor-owned Git worktree operations; the
 hub owns native hook settings and output codecs.
 
+## Stuck-turn liveness
+
+A changed, positive main-thread usage value refreshes `last_activity_at` only
+while the session is Running. A native tool can complete without a visible
+transcript entry, so visible text/tool rows are not the only evidence of progress.
+Repeated identical usage, missing/zero usage and capacity-only changes do not
+refresh the watchdog. Usage never resumes Idle, Stopping, AwaitingInput or Errored
+sessions. The existing silence thresholds, quota-wall handling and reconnect
+cooldown remain unchanged. The editor does not read native transcript files to
+make this decision.
+
 ## Voice
 
 Solution chats own voice independently of their coding-provider adapter. See the
