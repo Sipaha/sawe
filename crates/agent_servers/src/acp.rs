@@ -5825,6 +5825,21 @@ fn handle_hub_request(request: agent_client_protocol::UntypedMessage, responder:
     responder.respond(serde_json::json!({"text":text})).log_err();
 }
 
+fn format_steer_failed_note(params: &serde_json::Value) -> Option<String> {
+    let reason: String = params["reason"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .chars()
+        .take(4096)
+        .collect();
+    if params["rejected"].as_bool() == Some(true) {
+        Some(format!("Follow-up message was rejected during the active turn: {reason}"))
+    } else {
+        Some(format!("Follow-up message failed during the active turn: {reason}"))
+    }
+}
+
 fn handle_hub_notification(notification: agent_client_protocol::UntypedMessage, cx: &mut AsyncApp, ctx: &ClientContext) {
     let id = acp::SessionId::new(notification.params["sessionId"].as_str().unwrap_or_default().to_owned());
     let thread = ctx.sessions.borrow().get(&id).map(|s| s.thread.clone());
@@ -5834,6 +5849,11 @@ fn handle_hub_notification(notification: agent_client_protocol::UntypedMessage, 
             if let Some(text) = notification.params["text"].as_str() {
                 let text: String = text.chars().take(4096).collect();
                 thread.update(cx, |thread, cx| thread.push_system_note(acp_thread::SystemNoteLevel::Info, text, cx)).log_err();
+            }
+        },
+        "_spk/steer_failed" => {
+            if let Some(note) = format_steer_failed_note(&notification.params) {
+                thread.update(cx, |thread, cx| thread.push_system_note(acp_thread::SystemNoteLevel::Error, note, cx)).log_err();
             }
         },
         "_spk/background_activity" => {
@@ -5876,5 +5896,29 @@ mod hub_error_tests {
     fn preserves_login_reason_when_native_auth_message_is_generic(){
         let error=acp::Error::auth_required().data(serde_json::json!({"kind":"authentication_required","details":"Fixture: subscription expired; sign in again"}));
         assert!(map_acp_error(error).to_string().contains("subscription expired; sign in again"));
+    }
+    #[test]
+    fn formats_steer_failed_hub_notification_notes() {
+        let rejected = format_steer_failed_note(&serde_json::json!({
+            "sessionId": "hub-1",
+            "reason": "prompt in progress",
+            "rejected": true,
+        }));
+        assert_eq!(
+            rejected.as_deref(),
+            Some("Follow-up message was rejected during the active turn: prompt in progress")
+        );
+
+        let ambiguous = format_steer_failed_note(&serde_json::json!({
+            "sessionId": "hub-1",
+            "reason": "harness disconnected",
+            "rejected": false,
+        }));
+        assert_eq!(
+            ambiguous.as_deref(),
+            Some("Follow-up message failed during the active turn: harness disconnected")
+        );
+
+        assert_eq!(format_steer_failed_note(&serde_json::json!({"sessionId": "hub-1", "reason": "  "})), None);
     }
 }
