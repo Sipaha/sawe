@@ -4435,7 +4435,37 @@ mod tests {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |_req: acp::PromptRequest, responder, _cx| {
+                async move |req: acp::PromptRequest, responder, cx| {
+                    let is_steer_failure_probe = req.prompt.iter().any(|block| {
+                        matches!(
+                            block,
+                            acp::ContentBlock::Text(text) if text.text == "emit-steer-failed"
+                        )
+                    });
+                    if is_steer_failure_probe {
+                        cx.send_notification(
+                            agent_client_protocol::UntypedMessage::new(
+                                "_spk/steer_failed",
+                                serde_json::json!({
+                                    "sessionId": req.session_id.0,
+                                    "reason": "prompt in progress",
+                                    "rejected": true,
+                                }),
+                            )
+                            .expect("valid _spk/steer_failed notification"),
+                        )?;
+                        cx.send_notification(
+                            agent_client_protocol::UntypedMessage::new(
+                                "_spk/steer_failed",
+                                serde_json::json!({
+                                    "sessionId": req.session_id.0,
+                                    "reason": "harness disconnected",
+                                    "rejected": false,
+                                }),
+                            )
+                            .expect("valid _spk/steer_failed notification"),
+                        )?;
+                    }
                     responder.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -4910,6 +4940,81 @@ mod tests {
         assert!(
             !connection.sessions.borrow().contains_key(&session_id),
             "session should be removed after the last handle is released"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_steer_failed_hub_notification_pushes_error_system_note(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (
+            connection,
+            project,
+            _load_count,
+            _close_count,
+            _load_session_updates,
+            _load_session_gate,
+            _keep_agent_alive,
+        ) = connect_fake_agent(cx).await;
+
+        let session_id = acp::SessionId::new("session-steer-failed");
+        let work_dirs = util::path_list::PathList::new(&[std::path::Path::new("/a")]);
+
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    session_id.clone(),
+                    project.clone(),
+                    work_dirs,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load_session failed");
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "emit-steer-failed",
+                    ))],
+                    cx,
+                )
+            })
+        })
+        .await
+        .expect("prompt failed");
+        cx.run_until_parked();
+
+        let notes = thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    acp_thread::AgentThreadEntry::SystemNote(note) => {
+                        Some((note.level, note.text.to_string()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            notes,
+            vec![
+                (
+                    acp_thread::SystemNoteLevel::Error,
+                    "Follow-up message was rejected during the active turn: prompt in progress"
+                        .to_string(),
+                ),
+                (
+                    acp_thread::SystemNoteLevel::Error,
+                    "Follow-up message failed during the active turn: harness disconnected"
+                        .to_string(),
+                ),
+            ],
+            "wire _spk/steer_failed notifications must surface as Error system notes on AcpThread"
         );
     }
 
